@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp*/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+*.egg-info/
+
+# Local runtime and test data
+.tmp/
+.test-artifacts/
+backend/data/
+*.db
+*.sqlite
+*.sqlite3
+run_artifacts/*
+!run_artifacts/README.md
+
+# Frontend
+frontend/dist/
+frontend/node_modules/
+frontend/.npm-cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-company-bench"
+version = "0.1.0"
+description = "A deterministic multi-company dairy supply-chain benchmark."
+readme = { text = "Multi-Agent Company Bench dairy MVP.", content-type = "text/markdown" }
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "openai>=2.15,<3",
+    "openai-codex==0.144.4",
+    "pydantic>=2.10,<3",
+    "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8,<10",
+    "ruff>=0.9,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
