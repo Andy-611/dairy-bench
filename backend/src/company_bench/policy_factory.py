@@ -7,9 +7,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from company_bench.agent_gateway import OpenAIAgentConfig, OpenAIModelGateway
-from company_bench.agent_models import ModelGateway
+from company_bench.agent_models import CompanyModelGateway
 from company_bench.agent_policy import PROMPT_VERSION, LlmCompanyPolicy, ReplayPolicy
+from company_bench.agents import (
+    COMMAND_PROMPT_VERSION,
+    BaselineCompanyAgent,
+    CompanyAgent,
+    LlmCompanyAgent,
+    ReplayCompanyAgent,
+)
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
+from company_bench.memory import AgentCheckpoint
 from company_bench.models import (
     EpisodeResult,
     PolicyKind,
@@ -18,10 +26,11 @@ from company_bench.models import (
 )
 from company_bench.policies import BaselinePolicy, CompanyPolicy
 from company_bench.run_models import PolicyAuditSink, PolicyProfileView
+from company_bench.runtime_models import TurnRecord
 
-type OpenAIGatewayFactory = Callable[[OpenAIAgentConfig], ModelGateway]
-type CodexGatewayFactory = Callable[[CodexAgentConfig, str], ModelGateway]
-type CompanyGatewayFactory = Callable[[str], ModelGateway]
+type OpenAIGatewayFactory = Callable[[OpenAIAgentConfig], CompanyModelGateway]
+type CodexGatewayFactory = Callable[[CodexAgentConfig, str], CompanyModelGateway]
+type CompanyGatewayFactory = Callable[[str], CompanyModelGateway]
 # Each call must return a fresh gateway owned by exactly one company.
 _OPENAI_UNAVAILABLE = "OpenAI Agent is unavailable: configure OPENAI_API_KEY on the backend"
 _CODEX_UNAVAILABLE = (
@@ -39,21 +48,23 @@ class PolicyBundle:
     """Policies for one episode and their independently owned gateways."""
 
     policies: Mapping[str, CompanyPolicy]
-    _gateways: tuple[ModelGateway, ...] = ()
+    _gateways: tuple[CompanyModelGateway, ...] = ()
 
     async def close(self) -> None:
         """Release every company gateway even when they close concurrently."""
-        gateways, self._gateways = self._gateways, ()
-        outcomes = await asyncio.gather(
-            *(gateway.close() for gateway in gateways),
-            return_exceptions=True,
-        )
-        failure = next(
-            (outcome for outcome in outcomes if isinstance(outcome, BaseException)),
-            None,
-        )
-        if failure is not None:
-            raise failure
+        await _close_gateways(self)
+
+
+@dataclass(slots=True)
+class AgentBundle:
+    """V2 company actors and their independently owned provider gateways."""
+
+    agents: Mapping[str, CompanyAgent]
+    _gateways: tuple[CompanyModelGateway, ...] = ()
+
+    async def close(self) -> None:
+        """Release every company gateway even when they close concurrently."""
+        await _close_gateways(self)
 
 
 class PolicyFactory:
@@ -76,6 +87,11 @@ class PolicyFactory:
         self._openai_config = openai_config
         self._gateway_factory = gateway_factory
 
+    @property
+    def scenario(self) -> ScenarioSpec:
+        """Return the immutable scenario this factory serves."""
+        return self._scenario
+
     def profiles(self) -> tuple[PolicyProfileView, ...]:
         """Return browser-safe policy choices."""
         codex = self._codex_config
@@ -83,37 +99,41 @@ class PolicyFactory:
         return (
             PolicyProfileView(
                 mode=PolicyKind.BASELINE,
-                label="规则基线",
+                label="Rule baseline",
                 available=True,
-                description="透明、确定性的固定经营规则。",
+                description="Transparent, deterministic operating rules.",
             ),
             PolicyProfileView(
                 mode=PolicyKind.CODEX,
-                label="Codex 公司 Agent",
+                label="Codex company agents",
                 available=codex is not None,
                 provider="codex",
                 model=codex.model if codex else None,
                 reasoning_effort=codex.reasoning_effort if codex else None,
-                description="每家公司由一个独立 Codex runtime 控制。",
+                description="Each company is controlled by an independent Codex runtime.",
                 unavailable_reason=(
-                    None if codex else "请先登录 Codex 并在后端启用 DAIRY_BENCH_CODEX_ENABLED。"
+                    None
+                    if codex
+                    else "Log in to Codex and enable DAIRY_BENCH_CODEX_ENABLED."
                 ),
             ),
             PolicyProfileView(
                 mode=PolicyKind.OPENAI,
-                label="OpenAI 公司 Agent",
+                label="OpenAI company agents",
                 available=openai is not None,
                 provider="openai",
                 model=openai.model if openai else None,
                 reasoning_effort=openai.reasoning_effort if openai else None,
-                description="每家公司由一个独立 LLM Agent 控制。",
-                unavailable_reason=(None if openai else "后端尚未配置 OPENAI_API_KEY。"),
+                description="Each company is controlled by an independent LLM agent.",
+                unavailable_reason=(
+                    None if openai else "OPENAI_API_KEY is not configured on the backend."
+                ),
             ),
             PolicyProfileView(
                 mode=PolicyKind.REPLAY,
-                label="精确回放",
+                label="Exact replay",
                 available=True,
-                description="按 source_run_id 重放历史经营决策。",
+                description="Replay a historical run exactly from its source_run_id.",
             ),
         )
 
@@ -169,6 +189,106 @@ class PolicyFactory:
             }
         )
 
+    def create_agents(
+        self,
+        *,
+        run_id: str,
+        mode: PolicyKind,
+        source_turns: tuple[TurnRecord, ...] = (),
+        checkpoints: tuple[AgentCheckpoint, ...] = (),
+        completed_turns: tuple[TurnRecord, ...] = (),
+    ) -> AgentBundle:
+        """Create fresh event-driven company actors for one V2 episode."""
+        if mode is PolicyKind.BASELINE:
+            return AgentBundle(
+                {company.company_id: BaselineCompanyAgent() for company in self._scenario.companies}
+            )
+        if mode is PolicyKind.REPLAY:
+            if not source_turns:
+                raise ValueError("V2 replay requires a source turn journal")
+            completed_by_company = {
+                company.company_id: sum(
+                    record.turn.company_id == company.company_id for record in completed_turns
+                )
+                for company in self._scenario.companies
+            }
+            return AgentBundle(
+                {
+                    company.company_id: ReplayCompanyAgent(
+                        company.company_id,
+                        source_turns,
+                        completed_turns=completed_by_company[company.company_id],
+                    )
+                    for company in self._scenario.companies
+                }
+            )
+        metadata = self._agent_metadata(mode)
+        checkpoint_by_company = {checkpoint.company_id: checkpoint for checkpoint in checkpoints}
+        gateway_factory: CompanyGatewayFactory
+        if mode is PolicyKind.OPENAI:
+            config = self._openai_config
+            if config is None:
+                raise PolicyUnavailableError(_OPENAI_UNAVAILABLE)
+
+            def gateway_factory(_: str) -> CompanyModelGateway:
+                return self._gateway_factory(config)
+
+        elif mode is PolicyKind.CODEX:
+            config = self._codex_config
+            if config is None:
+                raise PolicyUnavailableError(_CODEX_UNAVAILABLE)
+
+            def gateway_factory(company_id: str) -> CompanyModelGateway:
+                return self._codex_gateway_factory(config, company_id)
+
+        else:
+            raise ValueError(f"unsupported V2 policy mode: {mode.value}")
+
+        agents: dict[str, CompanyAgent] = {}
+        gateways: list[CompanyModelGateway] = []
+        for company in self._scenario.companies:
+            gateway = gateway_factory(company.company_id)
+            gateways.append(gateway)
+            agents[company.company_id] = LlmCompanyAgent(
+                run_id=run_id,
+                company_id=company.company_id,
+                gateway=gateway,
+                audit_sink=self._audit_sink,
+                metadata=metadata,
+                checkpoint=checkpoint_by_company.get(company.company_id),
+                memory_token_budget=self._scenario.runtime.compaction_trigger_tokens,
+                max_prompt_tokens=self._scenario.runtime.max_prompt_tokens,
+            )
+        return AgentBundle(agents, tuple(gateways))
+
+    def _agent_metadata(self, mode: PolicyKind) -> PolicyMetadata:
+        """Build provider metadata shared by equivalent V2 company Agents."""
+        if mode is PolicyKind.OPENAI and self._openai_config is not None:
+            config = self._openai_config
+            return PolicyMetadata(
+                name="llm-company-agent",
+                version="2",
+                kind=mode,
+                provider="openai",
+                model=config.model,
+                prompt_version=COMMAND_PROMPT_VERSION,
+                config_fingerprint=config.fingerprint,
+            )
+        if mode is PolicyKind.CODEX and self._codex_config is not None:
+            config = self._codex_config
+            return PolicyMetadata(
+                name="codex-company-agent",
+                version="2",
+                kind=mode,
+                provider="codex",
+                model=config.model,
+                prompt_version=COMMAND_PROMPT_VERSION,
+                config_fingerprint=config.fingerprint,
+            )
+        raise PolicyUnavailableError(
+            _OPENAI_UNAVAILABLE if mode is PolicyKind.OPENAI else _CODEX_UNAVAILABLE
+        )
+
     def _openai_bundle(self, run_id: str) -> PolicyBundle:
         """Build one isolated policy and provider client per company."""
         config = self._openai_config
@@ -215,7 +335,7 @@ class PolicyFactory:
     ) -> PolicyBundle:
         """Build one isolated LLM policy and gateway per company."""
         policies: dict[str, CompanyPolicy] = {}
-        gateways: list[ModelGateway] = []
+        gateways: list[CompanyModelGateway] = []
         for company in self._scenario.companies:
             gateway = gateway_factory(company.company_id)
             gateways.append(gateway)
@@ -240,3 +360,18 @@ def _policy_timeout(timeout_seconds: float, max_attempts: int) -> float:
     """Include provider attempts, retry delays, and orchestration overhead."""
     retry_delays = sum(0.25 * 2**index for index in range(max_attempts - 1))
     return timeout_seconds * max_attempts + retry_delays + 5
+
+
+async def _close_gateways(bundle: PolicyBundle | AgentBundle) -> None:
+    """Close a bundle's gateways once and surface the first failure."""
+    gateways, bundle._gateways = bundle._gateways, ()
+    outcomes = await asyncio.gather(
+        *(gateway.close() for gateway in gateways),
+        return_exceptions=True,
+    )
+    failure = next(
+        (outcome for outcome in outcomes if isinstance(outcome, BaseException)),
+        None,
+    )
+    if failure is not None:
+        raise failure

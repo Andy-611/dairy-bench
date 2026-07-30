@@ -20,8 +20,9 @@ from company_bench.codex_artifacts import (
     CodexArtifactView,
 )
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
+from company_bench.codex_sessions import CodexSessionManager
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO
+from company_bench.dairy_scenario import DAIRY_V2_SCENARIO
 from company_bench.models import (
     MAX_SEED,
     EpisodeResult,
@@ -38,6 +39,14 @@ from company_bench.run_models import (
     PolicyProfileView,
     RunJob,
 )
+from company_bench.runtime import EpisodeRuntime
+from company_bench.runtime_models import TurnRecord
+from company_bench.timeline import (
+    RunTimelineProjector,
+    TimelineNotFoundError,
+    TimelineUnsupportedError,
+)
+from company_bench.timeline_models import TimelineDay, TimelineDetail
 
 DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench.sqlite3"
 
@@ -79,17 +88,41 @@ def create_app(
         owned_repository = None
         active_repository = repository
     active_artifacts = artifact_store or CodexArtifactStore.from_environment()
-    active_factory = policy_factory or PolicyFactory(
-        scenario=DAIRY_V1_SCENARIO,
-        audit_sink=active_repository,
-        codex_config=CodexAgentConfig.from_environment(),
-        codex_gateway_factory=partial(
-            CodexModelGateway,
-            artifact_sink=active_artifacts,
-        ),
-        openai_config=OpenAIAgentConfig.from_environment(),
+    if policy_factory is None:
+        codex_config = CodexAgentConfig.from_environment()
+        codex_sessions = (
+            CodexSessionManager(codex_config.session_retention)
+            if codex_config is not None
+            else None
+        )
+        active_factory = PolicyFactory(
+            scenario=DAIRY_V2_SCENARIO,
+            audit_sink=active_repository,
+            codex_config=codex_config,
+            codex_gateway_factory=partial(
+                CodexModelGateway,
+                artifact_sink=active_artifacts,
+                session_manager=codex_sessions,
+            ),
+            openai_config=OpenAIAgentConfig.from_environment(),
+        )
+    else:
+        active_factory = policy_factory
+    active_scenario = active_factory.scenario
+    runtime = (
+        EpisodeRuntime(
+            active_scenario,
+            agent_timeout_seconds=active_factory.policy_timeout_seconds,
+        )
+        if active_scenario.version >= 2
+        else None
     )
-    coordinator = RunCoordinator(active_repository, active_factory)
+    coordinator = RunCoordinator(
+        active_repository,
+        active_factory,
+        runtime=runtime,
+    )
+    timeline = RunTimelineProjector(active_repository, active_artifacts)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -101,7 +134,7 @@ def create_app(
 
     app = FastAPI(
         title="Dairy Bench API",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -180,6 +213,41 @@ def create_app(
         return active_repository.list_invocations(run_id)
 
     @app.get(
+        "/api/runs/{run_id}/turns",
+        response_model=tuple[TurnRecord, ...],
+        tags=["runs"],
+    )
+    def list_turns(run_id: str) -> tuple[TurnRecord, ...]:
+        if active_repository.get_job(run_id) is None:
+            raise _not_found("Run job", run_id)
+        return active_repository.list_turns(run_id)
+
+    @app.get(
+        "/api/runs/{run_id}/timeline",
+        response_model=TimelineDay,
+        tags=["runs"],
+    )
+    def read_timeline_day(
+        run_id: str,
+        day: Annotated[int, Query(ge=1)],
+    ) -> TimelineDay:
+        try:
+            return timeline.read_day(run_id, day)
+        except (TimelineNotFoundError, TimelineUnsupportedError, ValueError) as error:
+            raise _timeline_http_error(error) from error
+
+    @app.get(
+        "/api/runs/{run_id}/timeline/{entry_id}",
+        response_model=TimelineDetail,
+        tags=["runs"],
+    )
+    def read_timeline_detail(run_id: str, entry_id: str) -> TimelineDetail:
+        try:
+            return timeline.read_detail(run_id, entry_id)
+        except (TimelineNotFoundError, TimelineUnsupportedError, ValueError) as error:
+            raise _timeline_http_error(error) from error
+
+    @app.get(
         "/api/runs/{run_id}/invocations/{invocation_id}/artifacts",
         response_model=CodexArtifactView,
         tags=["runs"],
@@ -202,7 +270,7 @@ def create_app(
             invocation is None
             or invocation.provider != "codex"
             or invocation.request_id is None
-            or invocation.response_id is None
+            or (invocation.provider_turn_id or invocation.response_id) is None
         ):
             raise _not_found("Codex artifacts", invocation_id)
         identity = CodexArtifactIdentity(
@@ -212,7 +280,8 @@ def create_app(
             day=invocation.day,
             model=invocation.model,
             thread_id=invocation.request_id,
-            turn_id=invocation.response_id,
+            turn_id=invocation.provider_turn_id or invocation.response_id,
+            domain_turn_id=invocation.domain_turn_id,
         )
         artifacts = active_artifacts.read(identity)
         if artifacts is None:
@@ -239,3 +308,12 @@ def _not_found(resource: str, identity: str) -> HTTPException:
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"{resource} '{identity}' was not found.",
     )
+
+
+def _timeline_http_error(error: ValueError | LookupError) -> HTTPException:
+    """Map timeline domain failures consistently across both read Interfaces."""
+    if isinstance(error, TimelineNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error))
+    if isinstance(error, TimelineUnsupportedError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
+    return HTTPException(status_code=422, detail=str(error))

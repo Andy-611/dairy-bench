@@ -7,7 +7,7 @@ import "./styles.css";
 const root = document.getElementById("root");
 
 if (!root) {
-  throw new Error("缺少应用挂载节点 #root");
+  throw new Error("The application mount point #root is missing.");
 }
 
 createRoot(root).render(

@@ -7,6 +7,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
@@ -21,7 +22,7 @@ _SAFE_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class CodexArtifactIdentity(StrictModel):
-    """Stable coordinates for one company-day Codex turn."""
+    """Stable coordinates for one Codex invocation."""
 
     invocation_id: Identifier
     run_id: Identifier
@@ -30,6 +31,7 @@ class CodexArtifactIdentity(StrictModel):
     model: str = Field(min_length=1)
     thread_id: str = Field(min_length=1, max_length=128)
     turn_id: str = Field(min_length=1, max_length=128)
+    domain_turn_id: Identifier | None = None
 
 
 class CodexArtifactView(CodexArtifactIdentity):
@@ -128,12 +130,50 @@ class CodexArtifactStore:
         """Map one invocation to deterministic files inside the artifact root."""
         if not _SAFE_PATH_SEGMENT.fullmatch(identity.run_id):
             raise ValueError("run_id cannot be used as an artifact directory")
-        stem = f"day-{identity.day:03d}__{identity.company_id}"
+        stem = _artifact_stem(identity)
         run_root = self._root / identity.run_id
-        return (
-            run_root / "reasoning" / f"{stem}.md",
-            run_root / "final_outputs" / f"{stem}.json",
+        primary = _artifact_paths(run_root, stem)
+        if identity.domain_turn_id is None:
+            return primary
+        retry = _artifact_paths(
+            run_root,
+            f"{stem}__call-{sha256(identity.invocation_id.encode()).hexdigest()[:12]}",
         )
+        if primary[0].is_file():
+            try:
+                existing = primary[0].read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return retry
+            return primary if _matches_identity(existing, identity) else retry
+        return retry if retry[0].is_file() else primary
+
+
+def _artifact_stem(identity: CodexArtifactIdentity) -> str:
+    """Keep V1 paths stable while making every V2 domain turn unique."""
+    base = f"day-{identity.day:03d}__{identity.company_id}"
+    if identity.domain_turn_id is None:
+        return base
+    prefix = f"{identity.run_id}.{identity.company_id}.t"
+    sequence = identity.domain_turn_id.removeprefix(prefix)
+    canonical = (
+        sequence.isdecimal()
+        and int(sequence) >= 1
+        and sequence == str(int(sequence))
+        and identity.domain_turn_id == f"{prefix}{sequence}"
+    )
+    if canonical:
+        suffix = f"{int(sequence):04d}"
+    else:
+        suffix = sha256(identity.domain_turn_id.encode()).hexdigest()
+    return f"{base}__turn-{suffix}"
+
+
+def _artifact_paths(root: Path, stem: str) -> tuple[Path, Path]:
+    """Build the reasoning and final-output paths for one artifact stem."""
+    return (
+        root / "reasoning" / f"{stem}.md",
+        root / "final_outputs" / f"{stem}.json",
+    )
 
 
 def _parse_session(
@@ -256,9 +296,7 @@ def _render_reasoning(
     lines = [
         f"# {identity.company_id} - Day {identity.day}",
         "",
-        f"- Invocation: {identity.invocation_id}",
-        f"- Thread: {identity.thread_id}",
-        f"- Turn: {identity.turn_id}",
+        *_identity_lines(identity),
         f"- Model: {identity.model}",
         f"- Session: {trace.session_status}",
         f"- Encrypted reasoning present: {_encrypted_status(trace)}",
@@ -325,13 +363,21 @@ def _matches_identity(
     identity: CodexArtifactIdentity,
 ) -> bool:
     """Reject files exported for another Thread or Turn."""
-    return all(
-        line in reasoning
-        for line in (
-            f"- Invocation: {identity.invocation_id}",
-            f"- Thread: {identity.thread_id}",
-            f"- Turn: {identity.turn_id}",
-        )
+    return all(line in reasoning for line in _identity_lines(identity))
+
+
+def _identity_lines(identity: CodexArtifactIdentity) -> tuple[str, ...]:
+    """Render the shared identity coordinates once for export and validation."""
+    domain = (
+        (f"- Domain turn: {identity.domain_turn_id}",)
+        if identity.domain_turn_id is not None
+        else ()
+    )
+    return (
+        f"- Invocation: {identity.invocation_id}",
+        *domain,
+        f"- Thread: {identity.thread_id}",
+        f"- Turn: {identity.turn_id}",
     )
 
 
@@ -344,7 +390,7 @@ def _format_json(value: str) -> str:
 
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temporary = path.with_name(f".tmp-{uuid4().hex[:12]}")
     try:
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(path)

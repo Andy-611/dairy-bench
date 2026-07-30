@@ -1,20 +1,20 @@
-import type { CompanyRole, JsonValue } from "./types";
+import type { CompanyRole } from "./types";
 
-const valueFormatter = new Intl.NumberFormat("zh-CN", {
+const valueFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
   minimumFractionDigits: 0,
 });
 
-const percentFormatter = new Intl.NumberFormat("zh-CN", {
+const percentFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 1,
   minimumFractionDigits: 1,
   style: "percent",
 });
 
 export const ROLE_LABELS: Readonly<Record<CompanyRole, string>> = {
-  farm: "牧场",
-  processor: "加工厂",
-  retailer: "零售商",
+  farm: "Farm",
+  processor: "Processor",
+  retailer: "Retailer",
 };
 
 export function formatValue(value: number): string {
@@ -31,21 +31,5 @@ export function formatPercent(value: number): string {
 }
 
 export function formatGrowth(value: number): string {
-  return `${value.toFixed(3)}×`;
-}
-
-export function formatEventValue(value: JsonValue): string {
-  if (typeof value === "number") {
-    return formatValue(value);
-  }
-  if (typeof value === "boolean") {
-    return value ? "是" : "否";
-  }
-  if (value === null) {
-    return "—";
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  return JSON.stringify(value);
+  return `${value.toFixed(3)}x`;
 }

@@ -3,12 +3,16 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from typing import Self
+
+from pydantic import Field, model_validator
 
 from company_bench.models import (
     MAX_SEED,
     QUANTITY_QUANTUM,
     ZERO,
     CompanyDecision,
+    CompanyId,
     CompanyObservation,
     CompanySnapshot,
     CompanySpec,
@@ -35,8 +39,22 @@ from company_bench.models import (
     RetailerDecision,
     RetailerOperation,
     ScenarioSpec,
+    StrictModel,
     TradeExecutedEvent,
     WorldState,
+)
+from company_bench.runtime_models import (
+    CancelOrder,
+    CommandEnvelope,
+    CommandOutcome,
+    CommandStatus,
+    MarketSide,
+    OpenOrderView,
+    PlaceOrder,
+    Produce,
+    SetRetailPrice,
+    Transform,
+    Wait,
 )
 
 
@@ -91,9 +109,15 @@ class _Account:
 class _Ledger:
     """Centralizes every cash and inventory write within an engine step."""
 
-    def __init__(self, state: WorldState, day: int) -> None:
+    def __init__(
+        self,
+        state: WorldState,
+        day: int,
+        *,
+        lot_sequence: int = 0,
+    ) -> None:
         self._day = day
-        self._lot_sequence = 0
+        self._lot_sequence = lot_sequence
         self._accounts = {
             company.company_id: _Account(
                 company_id=company.company_id,
@@ -247,6 +271,11 @@ class _Ledger:
             for company in scenario.companies
         )
 
+    @property
+    def lot_sequence(self) -> int:
+        """Return the next checkpoint's deterministic lot counter."""
+        return self._lot_sequence
+
     def _next_lot_id(self, company_id: str, source: str) -> str:
         """Allocate a stable lot identity within this deterministic day."""
         self._lot_sequence += 1
@@ -260,6 +289,74 @@ class _Order:
     company_id: str
     quantity: Decimal
     unit_price: Decimal
+
+
+class _CommandRejected(ValueError):
+    """Internal control flow for a typed economic rejection."""
+
+
+class CompanyQuantity(StrictModel):
+    """One company's used daily operating capacity."""
+
+    company_id: CompanyId
+    quantity: Decimal = Field(ge=ZERO)
+
+
+class RetailPriceState(StrictModel):
+    """One retailer's current consumer price."""
+
+    company_id: CompanyId
+    product: ProductId
+    unit_price: Decimal = Field(gt=ZERO)
+
+
+class EconomyState(StrictModel):
+    """Checkpointable state for one active event-driven business day."""
+
+    base_state: WorldState
+    day: int = Field(ge=1)
+    state_version: int = Field(ge=0)
+    companies: tuple[CompanyState, ...]
+    orders: tuple[OpenOrderView, ...] = ()
+    retail_prices: tuple[RetailPriceState, ...] = ()
+    production_used: tuple[CompanyQuantity, ...] = ()
+    transformation_used: tuple[CompanyQuantity, ...] = ()
+    events: tuple[DomainEvent, ...] = ()
+    raw_market: MarketSummary | None = None
+    bottled_market: MarketSummary | None = None
+    lot_sequence: int = Field(default=0, ge=0)
+    order_sequence: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_active_day(self) -> Self:
+        """Keep active or terminal checkpoint counters internally consistent."""
+        active = self.day == self.base_state.day + 1
+        terminal = (
+            self.base_state.day == self.base_state.scenario.days and self.day == self.base_state.day
+        )
+        if not (active or terminal):
+            raise ValueError("economy day must be active or terminal")
+        expected = {company.company_id for company in self.base_state.scenario.companies}
+        actual = [company.company_id for company in self.companies]
+        if len(actual) != len(set(actual)) or set(actual) != expected:
+            raise ValueError("economy state must match the scenario company set")
+        order_ids = [order.order_id for order in self.orders]
+        if len(order_ids) != len(set(order_ids)):
+            raise ValueError("open order ids must be unique")
+        price_keys = [(price.company_id, price.product) for price in self.retail_prices]
+        if len(price_keys) != len(set(price_keys)):
+            raise ValueError("retail prices must be unique per company and product")
+        return self
+
+    @property
+    def scenario(self) -> ScenarioSpec:
+        """Return immutable scenario rules."""
+        return self.base_state.scenario
+
+    @property
+    def seed(self) -> int:
+        """Return the episode seed."""
+        return self.base_state.seed
 
 
 class EconomyEngine:
@@ -283,6 +380,178 @@ class EconomyEngine:
                     cash=company.initial_cash,
                 )
                 for company in scenario.companies
+            ),
+        )
+
+    def open_day(
+        self,
+        state: WorldState,
+        *,
+        state_version: int = 0,
+    ) -> EconomyState:
+        """Open the next event-driven day without changing economic value."""
+        if state.day >= state.scenario.days:
+            raise ValueError("the episode is already complete")
+        return EconomyState(
+            base_state=state,
+            day=state.day + 1,
+            state_version=state_version,
+            companies=state.companies,
+        )
+
+    def observe_active(
+        self,
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> CompanyObservation:
+        """Project one private-safe observation from current intraday facts."""
+        current = economy.base_state.model_copy(update={"companies": economy.companies})
+        observation = next(
+            observation
+            for observation in self.observe(current)
+            if observation.company_id == company_id
+        )
+        retail_price = next(
+            (price.unit_price for price in economy.retail_prices if price.company_id == company_id),
+            None,
+        )
+        return observation.model_copy(update={"retail_price": retail_price})
+
+    @staticmethod
+    def company_orders(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> tuple[OpenOrderView, ...]:
+        """Return only the active commitments owned by one company."""
+        return tuple(order for order in economy.orders if order.owner_id == company_id)
+
+    def apply_batch(
+        self,
+        economy: EconomyState,
+        envelopes: tuple[CommandEnvelope, ...],
+        *,
+        first_apply_sequence: int,
+        apply_sequences: tuple[int, ...] | None = None,
+    ) -> tuple[EconomyState, tuple[CommandOutcome, ...]]:
+        """Apply same-snapshot commands in caller-supplied deterministic order."""
+        if first_apply_sequence < 1:
+            raise ValueError("first_apply_sequence must be positive")
+        company_ids = [envelope.company_id for envelope in envelopes]
+        if len(company_ids) != len(set(company_ids)):
+            raise ValueError("a company may submit at most one command per batch")
+        if any(envelope.state_version != economy.state_version for envelope in envelopes):
+            raise ValueError("every batch command must target the shared base state version")
+        sequences = apply_sequences or tuple(
+            range(first_apply_sequence, first_apply_sequence + len(envelopes))
+        )
+        if len(sequences) != len(envelopes) or any(
+            sequence < first_apply_sequence for sequence in sequences
+        ):
+            raise ValueError("apply_sequences must align with the submitted envelopes")
+        if tuple(sorted(set(sequences))) != sequences:
+            raise ValueError("apply_sequences must be unique and increasing")
+
+        current = economy
+        outcomes: list[CommandOutcome] = []
+        for envelope, apply_sequence in zip(envelopes, sequences, strict=True):
+            current, outcome = self._apply_command(
+                current,
+                envelope,
+                apply_sequence,
+            )
+            outcomes.append(outcome)
+        return current, tuple(outcomes)
+
+    def clear_active_market(
+        self,
+        economy: EconomyState,
+        product: ProductId,
+    ) -> EconomyState:
+        """Clear one standing-order market at its configured system event."""
+        market_field = "raw_market" if product is ProductId.RAW_MILK else "bottled_market"
+        if getattr(economy, market_field) is not None:
+            raise ValueError(f"{product.value} market already cleared")
+
+        ledger = self._active_ledger(economy)
+        orders = tuple(order for order in economy.orders if order.product is product)
+        sellers = [
+            _Order(
+                company_id=order.owner_id,
+                quantity=order.remaining_quantity,
+                unit_price=order.limit_price,
+            )
+            for order in orders
+            if order.side is MarketSide.SELL
+        ]
+        buyers = [
+            _Order(
+                company_id=order.owner_id,
+                quantity=order.remaining_quantity,
+                unit_price=order.limit_price,
+            )
+            for order in orders
+            if order.side is MarketSide.BUY
+        ]
+        events = list(economy.events)
+        market = self._clear_market(
+            economy.day,
+            product,
+            ledger,
+            sellers,
+            buyers,
+            events,
+        )
+        return economy.model_copy(
+            update={
+                "state_version": economy.state_version + 1,
+                "companies": ledger.states(economy.scenario),
+                "orders": tuple(order for order in economy.orders if order.product is not product),
+                "events": tuple(events),
+                "lot_sequence": ledger.lot_sequence,
+                market_field: market,
+            }
+        )
+
+    def close_day(self, economy: EconomyState) -> DayResult:
+        """Settle consumer sales and expiry, then freeze a completed day."""
+        if economy.raw_market is None or economy.bottled_market is None:
+            raise ValueError("both markets must clear before day close")
+
+        ledger = self._active_ledger(economy)
+        events = list(economy.events)
+        decisions = self._retail_decisions(economy)
+        consumer_demand, consumer_sales = self._sell_to_consumers(
+            economy.scenario,
+            economy.seed,
+            economy.day,
+            ledger,
+            decisions,
+            events,
+        )
+        expired_quantity = self._expire(
+            economy.scenario,
+            economy.day,
+            ledger,
+            events,
+        )
+        markets = (economy.raw_market, economy.bottled_market)
+        state = WorldState(
+            scenario=economy.scenario,
+            seed=economy.seed,
+            day=economy.day,
+            companies=ledger.states(economy.scenario),
+            previous_markets=markets,
+        )
+        return DayResult(
+            state=state,
+            events=tuple(events),
+            snapshot=self._snapshot(
+                state,
+                events,
+                markets,
+                consumer_demand,
+                consumer_sales,
+                expired_quantity,
             ),
         )
 
@@ -332,6 +601,7 @@ class EconomyEngine:
                 ),
                 public_companies=public_companies,
                 previous_markets=state.previous_markets,
+                runtime=scenario.runtime,
             )
             for company in scenario.companies
         )
@@ -402,6 +672,476 @@ class EconomyEngine:
             events=tuple(events),
             snapshot=snapshot,
         )
+
+    def _apply_command(
+        self,
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+        apply_sequence: int,
+    ) -> tuple[EconomyState, CommandOutcome]:
+        """Authorize and apply one command without exposing mutable internals."""
+        command = envelope.command
+        try:
+            self._validate_command_time(economy, envelope)
+            if isinstance(command, Produce):
+                updated, order_id = self._apply_produce(economy, envelope)
+            elif isinstance(command, Transform):
+                updated, order_id = self._apply_transform(economy, envelope)
+            elif isinstance(command, PlaceOrder):
+                updated, order_id = self._apply_order(economy, envelope)
+            elif isinstance(command, CancelOrder):
+                updated, order_id = self._apply_cancel(economy, envelope)
+            elif isinstance(command, SetRetailPrice):
+                updated, order_id = self._apply_retail_price(economy, envelope)
+            elif isinstance(command, Wait):
+                updated, order_id = self._apply_wait(economy, envelope)
+            else:
+                raise TypeError(f"unsupported command: {type(command).__name__}")
+        except _CommandRejected as error:
+            return economy, self._command_outcome(
+                economy,
+                envelope,
+                apply_sequence,
+                accepted=False,
+                reason=str(error),
+            )
+
+        new_events = updated.events[len(economy.events) :]
+        return updated, self._command_outcome(
+            updated,
+            envelope,
+            apply_sequence,
+            accepted=True,
+            order_id=order_id,
+            events=new_events,
+        )
+
+    def _apply_produce(
+        self,
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> tuple[EconomyState, None]:
+        command = envelope.command
+        company = economy.scenario.company(envelope.company_id)
+        operation = company.operation
+        if not isinstance(command, Produce) or not isinstance(operation, FarmOperation):
+            raise _CommandRejected("produce is only available to farms")
+        if command.product is not operation.output_product:
+            raise _CommandRejected("farm cannot produce the requested product")
+
+        used = self._used(economy.production_used, company.company_id)
+        # Calculate the remaining daily capacity.
+        remaining_capacity = max(ZERO, operation.daily_capacity - used)
+
+        ledger = self._active_ledger(economy)
+        # Settle cash, inventory, and the production event atomically.
+        event = self._settle_production(
+            economy.scenario,
+            economy.day,
+            ledger,
+            company.company_id,
+            operation,
+            command.quantity,
+            remaining_capacity,
+        )
+        if event.actual_quantity <= ZERO:
+            raise _CommandRejected("production has no available capacity or cash")
+
+        # 返回新的 EconomyState
+        return (
+            economy.model_copy(
+                update={
+                    "state_version": economy.state_version + 1,
+                    "companies": ledger.states(economy.scenario),
+                    "production_used": self._set_used(
+                        economy.production_used,
+                        company.company_id,
+                        used + event.actual_quantity,
+                    ),
+                    "events": (*economy.events, event),
+                    "lot_sequence": ledger.lot_sequence,
+                }
+            ),
+            None,
+        )
+
+    def _apply_transform(
+        self,
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> tuple[EconomyState, None]:
+        command = envelope.command
+        company = economy.scenario.company(envelope.company_id)
+        operation = company.operation
+        if not isinstance(command, Transform) or not isinstance(
+            operation,
+            ProcessorOperation,
+        ):
+            raise _CommandRejected("transform is only available to processors")
+        if (
+            command.input_product is not operation.input_product
+            or command.output_product is not operation.output_product
+        ):
+            raise _CommandRejected("processor cannot perform the requested transformation")
+
+        used = self._used(economy.transformation_used, company.company_id)
+        remaining_capacity = max(ZERO, operation.daily_input_capacity - used)
+        ledger = self._active_ledger(economy)
+        event = self._settle_transformation(
+            economy.scenario,
+            economy.day,
+            ledger,
+            company.company_id,
+            operation,
+            command.input_quantity,
+            remaining_capacity,
+        )
+        if event.actual_input <= ZERO:
+            raise _CommandRejected("transformation has no available inventory, capacity, or cash")
+
+        return (
+            economy.model_copy(
+                update={
+                    "state_version": economy.state_version + 1,
+                    "companies": ledger.states(economy.scenario),
+                    "transformation_used": self._set_used(
+                        economy.transformation_used,
+                        company.company_id,
+                        used + event.actual_input,
+                    ),
+                    "events": (*economy.events, event),
+                    "lot_sequence": ledger.lot_sequence,
+                }
+            ),
+            None,
+        )
+
+    def _apply_order(
+        self,
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> tuple[EconomyState, str]:
+        command = envelope.command
+        if not isinstance(command, PlaceOrder):
+            raise TypeError("order handler requires PlaceOrder")
+        company = economy.scenario.company(envelope.company_id)
+        if not self._order_is_authorized(company, command):
+            raise _CommandRejected("order side or product is not authorized for this company")
+        if (command.product is ProductId.RAW_MILK and economy.raw_market is not None) or (
+            command.product is ProductId.BOTTLED_MILK and economy.bottled_market is not None
+        ):
+            raise _CommandRejected("the requested market has already cleared")
+
+        sequence = economy.order_sequence + 1
+        order_id = f"d{economy.day}.o{sequence}.{company.company_id}"
+        order = OpenOrderView(
+            order_id=order_id,
+            owner_id=company.company_id,
+            side=command.side,
+            product=command.product,
+            remaining_quantity=command.quantity,
+            limit_price=command.limit_price,
+            placed_at=envelope.issued_at,
+        )
+        return (
+            economy.model_copy(
+                update={
+                    "state_version": economy.state_version + 1,
+                    "orders": (*economy.orders, order),
+                    "order_sequence": sequence,
+                }
+            ),
+            order_id,
+        )
+
+    @staticmethod
+    def _apply_cancel(
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> tuple[EconomyState, str]:
+        command = envelope.command
+        if not isinstance(command, CancelOrder):
+            raise TypeError("cancel handler requires CancelOrder")
+        order = next(
+            (candidate for candidate in economy.orders if candidate.order_id == command.order_id),
+            None,
+        )
+        if order is None:
+            raise _CommandRejected("order does not exist or has already cleared")
+        if order.owner_id != envelope.company_id:
+            raise _CommandRejected("a company cannot cancel another company's order")
+        return (
+            economy.model_copy(
+                update={
+                    "state_version": economy.state_version + 1,
+                    "orders": tuple(
+                        candidate
+                        for candidate in economy.orders
+                        if candidate.order_id != command.order_id
+                    ),
+                }
+            ),
+            order.order_id,
+        )
+
+    @staticmethod
+    def _apply_retail_price(
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> tuple[EconomyState, None]:
+        command = envelope.command
+        company = economy.scenario.company(envelope.company_id)
+        operation = company.operation
+        if not isinstance(command, SetRetailPrice) or not isinstance(
+            operation,
+            RetailerOperation,
+        ):
+            raise _CommandRejected("set_retail_price is only available to retailers")
+        if command.product is not operation.input_product:
+            raise _CommandRejected("retailer cannot price the requested product")
+        retained = tuple(
+            price
+            for price in economy.retail_prices
+            if (price.company_id, price.product) != (company.company_id, command.product)
+        )
+        price = RetailPriceState(
+            company_id=company.company_id,
+            product=command.product,
+            unit_price=command.unit_price,
+        )
+        return (
+            economy.model_copy(
+                update={
+                    "state_version": economy.state_version + 1,
+                    "retail_prices": (*retained, price),
+                }
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _apply_wait(
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> tuple[EconomyState, None]:
+        command = envelope.command
+        if not isinstance(command, Wait):
+            raise TypeError("wait handler requires Wait")
+        if command.until is not None:
+            if command.until.absolute_minute <= envelope.issued_at.absolute_minute:
+                raise _CommandRejected("wait deadline must be later than the current time")
+            runtime = economy.scenario.runtime
+            if command.until.day >= economy.scenario.days:
+                raise _CommandRejected("wait deadline exceeds the scenario")
+            if not runtime.open_minute <= command.until.minute_of_day < runtime.close_minute:
+                raise _CommandRejected("wait deadline must be inside business hours")
+        return economy, None
+
+    def _command_outcome(
+        self,
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+        apply_sequence: int,
+        *,
+        accepted: bool,
+        reason: str | None = None,
+        order_id: str | None = None,
+        events: tuple[DomainEvent, ...] = (),
+    ) -> CommandOutcome:
+        command = envelope.command
+        next_available = (
+            command.until
+            if accepted and isinstance(command, Wait)
+            else envelope.issued_at.plus(economy.scenario.runtime.command_duration_minutes)
+        )
+        return CommandOutcome(
+            turn_id=envelope.turn_id,
+            command_id=envelope.command_id,
+            company_id=envelope.company_id,
+            occurred_at=envelope.issued_at,
+            status=CommandStatus.ACCEPTED if accepted else CommandStatus.REJECTED,
+            accepted=accepted,
+            reason=reason,
+            resulting_state_version=economy.state_version,
+            apply_sequence=apply_sequence,
+            order_id=order_id,
+            events=events,
+            next_available_at=next_available,
+        )
+
+    @staticmethod
+    def _validate_command_time(
+        economy: EconomyState,
+        envelope: CommandEnvelope,
+    ) -> None:
+        runtime = economy.scenario.runtime
+        if envelope.issued_at.day != economy.day - 1:
+            raise _CommandRejected("command targets a different business day")
+        if not runtime.open_minute <= envelope.issued_at.minute_of_day < runtime.close_minute:
+            raise _CommandRejected("command is outside business hours")
+
+    @staticmethod
+    def _order_is_authorized(
+        company: CompanySpec,
+        command: PlaceOrder,
+    ) -> bool:
+        operation = company.operation
+        return (
+            (
+                isinstance(operation, FarmOperation)
+                and command.side is MarketSide.SELL
+                and command.product is operation.output_product
+            )
+            or (
+                isinstance(operation, ProcessorOperation)
+                and (
+                    (command.side is MarketSide.BUY and command.product is operation.input_product)
+                    or (
+                        command.side is MarketSide.SELL
+                        and command.product is operation.output_product
+                    )
+                )
+            )
+            or (
+                isinstance(operation, RetailerOperation)
+                and command.side is MarketSide.BUY
+                and command.product is operation.input_product
+            )
+        )
+
+    @staticmethod
+    def _used(
+        usage: tuple[CompanyQuantity, ...],
+        company_id: CompanyId,
+    ) -> Decimal:
+        return next(
+            (entry.quantity for entry in usage if entry.company_id == company_id),
+            ZERO,
+        )
+
+    @staticmethod
+    def _set_used(
+        usage: tuple[CompanyQuantity, ...],
+        company_id: CompanyId,
+        quantity: Decimal,
+    ) -> tuple[CompanyQuantity, ...]:
+        retained = tuple(entry for entry in usage if entry.company_id != company_id)
+        return (*retained, CompanyQuantity(company_id=company_id, quantity=quantity))
+
+    @staticmethod
+    def _settle_production(
+        scenario: ScenarioSpec,
+        day: int,
+        ledger: _Ledger,
+        company_id: CompanyId,
+        operation: FarmOperation,
+        requested: Decimal,
+        capacity: Decimal,
+    ) -> MilkProducedEvent:
+        """Apply the shared V1/V2 farm production formula."""
+        actual = min(
+            requested,
+            capacity,
+            ledger.affordable_quantity(company_id, operation.unit_cost),
+        )
+        cost = actual * operation.unit_cost
+        ledger.charge(company_id, cost)
+        lot_id = ledger.add_new_lot(
+            company_id,
+            operation.output_product,
+            actual,
+            scenario.product(operation.output_product).shelf_life_days,
+            "produce",
+        )
+        return MilkProducedEvent(
+            day=day,
+            company_id=company_id,
+            requested_quantity=requested,
+            actual_quantity=actual,
+            unit_cost=operation.unit_cost,
+            cash_cost=cost,
+            lot_id=lot_id,
+        )
+
+    @staticmethod
+    def _settle_transformation(
+        scenario: ScenarioSpec,
+        day: int,
+        ledger: _Ledger,
+        company_id: CompanyId,
+        operation: ProcessorOperation,
+        requested: Decimal,
+        capacity: Decimal,
+    ) -> MilkProcessedEvent:
+        """Apply the shared V1/V2 processing formula."""
+        cash_limit = (
+            ledger.affordable_quantity(
+                company_id,
+                operation.processing_cost_per_input,
+            )
+            if operation.processing_cost_per_input > ZERO
+            else requested
+        )
+        actual = min(
+            requested,
+            capacity,
+            ledger.quantity(company_id, operation.input_product),
+            cash_limit,
+        )
+        cost = actual * operation.processing_cost_per_input
+        ledger.consume(company_id, operation.input_product, actual)
+        ledger.charge(company_id, cost)
+        output = actual * operation.yield_rate
+        lot_id = ledger.add_new_lot(
+            company_id,
+            operation.output_product,
+            output,
+            scenario.product(operation.output_product).shelf_life_days,
+            "process",
+        )
+        return MilkProcessedEvent(
+            day=day,
+            company_id=company_id,
+            requested_input=requested,
+            actual_input=actual,
+            output_quantity=output,
+            cash_cost=cost,
+            output_lot_id=lot_id,
+        )
+
+    @staticmethod
+    def _active_ledger(economy: EconomyState) -> _Ledger:
+        current = economy.base_state.model_copy(update={"companies": economy.companies})
+        return _Ledger(
+            current,
+            economy.day,
+            lot_sequence=economy.lot_sequence,
+        )
+
+    @staticmethod
+    def _retail_decisions(
+        economy: EconomyState,
+    ) -> dict[str, CompanyDecision]:
+        prices = {
+            (price.company_id, price.product): price.unit_price for price in economy.retail_prices
+        }
+        decisions: dict[str, CompanyDecision] = {}
+        for company in economy.scenario.companies:
+            operation = company.operation
+            if not isinstance(operation, RetailerOperation):
+                decisions[company.company_id] = NoOpDecision(reason="not_a_retailer")
+                continue
+            price = prices.get((company.company_id, operation.input_product))
+            decisions[company.company_id] = (
+                RetailerDecision(
+                    bottled_bid_quantity=ZERO,
+                    maximum_bottled_price=economy.scenario.demand.reference_price,
+                    retail_price=price,
+                )
+                if price is not None
+                else NoOpDecision(reason="retail_price_not_set")
+            )
+        return decisions
 
     def _accepted_decisions(
         self,
@@ -493,39 +1233,21 @@ class EconomyEngine:
         events: list[DomainEvent],
     ) -> None:
         """Settle farm production in stable company order."""
-        product = scenario.product(ProductId.RAW_MILK)
         for company in scenario.companies:
             operation = company.operation
             decision = decisions[company.company_id]
             if not (isinstance(operation, FarmOperation) and isinstance(decision, FarmDecision)):
                 continue
 
-            actual = min(
-                decision.produce_quantity,
-                operation.daily_capacity,
-                ledger.affordable_quantity(
-                    company.company_id,
-                    operation.unit_cost,
-                ),
-            )
-            cost = actual * operation.unit_cost
-            ledger.charge(company.company_id, cost)
-            lot_id = ledger.add_new_lot(
-                company.company_id,
-                ProductId.RAW_MILK,
-                actual,
-                product.shelf_life_days,
-                "produce",
-            )
             events.append(
-                MilkProducedEvent(
-                    day=day,
-                    company_id=company.company_id,
-                    requested_quantity=decision.produce_quantity,
-                    actual_quantity=actual,
-                    unit_cost=operation.unit_cost,
-                    cash_cost=cost,
-                    lot_id=lot_id,
+                self._settle_production(
+                    scenario,
+                    day,
+                    ledger,
+                    company.company_id,
+                    operation,
+                    decision.produce_quantity,
+                    operation.daily_capacity,
                 )
             )
 
@@ -582,7 +1304,6 @@ class EconomyEngine:
         events: list[DomainEvent],
     ) -> None:
         """Convert raw milk using cash, inventory, and capacity limits."""
-        product = scenario.product(ProductId.BOTTLED_MILK)
         for company in scenario.companies:
             operation = company.operation
             decision = decisions[company.company_id]
@@ -592,44 +1313,15 @@ class EconomyEngine:
             ):
                 continue
 
-            cash_limit = (
-                ledger.affordable_quantity(
-                    company.company_id,
-                    operation.processing_cost_per_input,
-                )
-                if operation.processing_cost_per_input > ZERO
-                else decision.process_quantity
-            )
-            actual_input = min(
-                decision.process_quantity,
-                operation.daily_input_capacity,
-                ledger.quantity(company.company_id, operation.input_product),
-                cash_limit,
-            )
-            cash_cost = actual_input * operation.processing_cost_per_input
-            ledger.consume(
-                company.company_id,
-                operation.input_product,
-                actual_input,
-            )
-            ledger.charge(company.company_id, cash_cost)
-            output_quantity = actual_input * operation.yield_rate
-            lot_id = ledger.add_new_lot(
-                company.company_id,
-                operation.output_product,
-                output_quantity,
-                product.shelf_life_days,
-                "process",
-            )
             events.append(
-                MilkProcessedEvent(
-                    day=day,
-                    company_id=company.company_id,
-                    requested_input=decision.process_quantity,
-                    actual_input=actual_input,
-                    output_quantity=output_quantity,
-                    cash_cost=cash_cost,
-                    output_lot_id=lot_id,
+                self._settle_transformation(
+                    scenario,
+                    day,
+                    ledger,
+                    company.company_id,
+                    operation,
+                    decision.process_quantity,
+                    operation.daily_input_capacity,
                 )
             )
 

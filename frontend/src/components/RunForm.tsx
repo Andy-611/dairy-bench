@@ -2,6 +2,13 @@ import type { FormEvent } from "react";
 
 import type { PolicyMode, PolicyProfileView } from "../types";
 
+const MODE_LABELS: Readonly<Record<PolicyMode, string>> = {
+  baseline: "Rule baseline",
+  codex: "Codex agents",
+  openai: "OpenAI agents",
+  replay: "Historical replay",
+};
+
 interface RunFormProps {
   readonly mode: PolicyMode;
   readonly profiles: readonly PolicyProfileView[];
@@ -35,7 +42,7 @@ export function RunForm({
   return (
     <form className="run-form" onSubmit={handleSubmit}>
       <label className="run-field mode-field">
-        <span>公司决策方式</span>
+        <span>Company policy</span>
         <select
           disabled={isLoading}
           onChange={(event) => onModeChange(event.target.value as PolicyMode)}
@@ -47,8 +54,8 @@ export function RunForm({
               key={profile.mode}
               value={profile.mode}
             >
-              {profile.label}
-              {!profile.available ? "（未配置）" : ""}
+              {MODE_LABELS[profile.mode]}
+              {!profile.available ? " (not configured)" : ""}
             </option>
           ))}
         </select>
@@ -56,13 +63,13 @@ export function RunForm({
 
       {mode === "replay" ? (
         <label className="run-field replay-field">
-          <span>来源 Run ID</span>
+          <span>Source run ID</span>
           <input
             autoComplete="off"
             disabled={isLoading}
             name="sourceRunId"
             onChange={(event) => onSourceRunIdChange(event.target.value)}
-            placeholder="粘贴要复放的运行 ID"
+            placeholder="Paste a completed run ID"
             required
             type="text"
             value={sourceRunId}
@@ -70,7 +77,7 @@ export function RunForm({
         </label>
       ) : (
         <label className="run-field seed-field">
-          <span>随机种子</span>
+          <span>Random seed</span>
           <input
             aria-describedby="seed-help"
             autoComplete="off"
@@ -89,7 +96,7 @@ export function RunForm({
       )}
 
       <span className="sr-only" id="seed-help">
-        输入相同随机种子，可复现实验的经济环境。
+        Use the same seed to reproduce the economic environment.
       </span>
       <button
         className="run-button"
@@ -99,12 +106,12 @@ export function RunForm({
         {isLoading ? (
           <>
             <span aria-hidden="true" className="spinner" />
-            正在运行
+            Running
           </>
         ) : (
           <>
             <span aria-hidden="true">▶</span>
-            {mode === "replay" ? "复放运行" : "运行 30 天"}
+            {mode === "replay" ? "Replay run" : "Run 30 days"}
           </>
         )}
       </button>
@@ -116,7 +123,7 @@ export function RunForm({
                 .join(" · ")
             : selectedProfile.description}
           {!selectedProfile.available && selectedProfile.unavailableReason
-            ? `：${selectedProfile.unavailableReason}`
+            ? `: ${selectedProfile.unavailableReason}`
             : ""}
         </span>
       )}

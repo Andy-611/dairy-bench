@@ -20,7 +20,7 @@ export function CompanyTable({ companies }: CompanyTableProps) {
   const orderedCompanies = [...companies].sort(
     (left, right) =>
       ROLE_ORDER[left.role] - ROLE_ORDER[right.role] ||
-      left.companyName.localeCompare(right.companyName, "zh-CN"),
+      left.companyName.localeCompare(right.companyName, "en"),
   );
 
   return (
@@ -28,31 +28,31 @@ export function CompanyTable({ companies }: CompanyTableProps) {
       <div className="section-heading">
         <div>
           <span className="eyebrow">COMPANIES</span>
-          <h2>六家公司经营结果</h2>
+          <h2>Company results</h2>
         </div>
-        <p>所有金额与库存均来自后端结算结果</p>
+        <p>All financial and inventory values come from engine settlement.</p>
       </div>
       <div className="table-scroll">
         <table>
-          <caption className="sr-only">六家公司最终经营结果</caption>
+          <caption className="sr-only">Final results for all six companies</caption>
           <thead>
             <tr>
-              <th scope="col">产业层级 / 公司</th>
-              <th scope="col">策略</th>
+              <th scope="col">Tier / company</th>
+              <th scope="col">Policy</th>
               <th className="numeric" scope="col">
-                初始现金
+                Initial cash
               </th>
               <th className="numeric" scope="col">
-                最终现金
+                Final cash
               </th>
               <th className="numeric" scope="col">
-                库存价值
+                Inventory value
               </th>
               <th className="numeric" scope="col">
-                创造剩余
+                Surplus
               </th>
               <th className="numeric" scope="col">
-                资本倍数
+                Capital multiple
               </th>
             </tr>
           </thead>

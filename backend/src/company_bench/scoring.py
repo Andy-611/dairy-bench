@@ -19,7 +19,7 @@ from company_bench.models import (
 
 
 class Evaluator:
-    """Read-only V1 evaluator: fairness eligibility, then efficiency."""
+    """Read-only evaluator shared by versioned Dairy Bench scenarios."""
 
     def evaluate(
         self,

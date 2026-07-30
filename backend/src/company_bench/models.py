@@ -42,7 +42,7 @@ class StrictModel(BaseModel):
 
 
 class ProductId(StrEnum):
-    """Products traded in Dairy Bench V1."""
+    """Products traded in the Dairy Bench scenarios."""
 
     RAW_MILK = "raw_milk"
     BOTTLED_MILK = "bottled_milk"
@@ -145,6 +145,34 @@ class ScoringSpec(StrictModel):
     max_within_tier_growth_gap: Rate
 
 
+class RuntimeSpec(StrictModel):
+    """Event-time and context budgets for one benchmark scenario."""
+
+    open_minute: int = Field(default=9 * 60, ge=0, lt=24 * 60)
+    raw_market_clear_minute: int = Field(default=11 * 60, ge=0, lt=24 * 60)
+    bottled_market_clear_minute: int = Field(default=16 * 60, ge=0, lt=24 * 60)
+    close_minute: int = Field(default=19 * 60, ge=0, lt=24 * 60)
+    command_duration_minutes: int = Field(default=30, ge=1)
+    max_turns_per_company_day: int = Field(default=20, ge=1)
+    max_prompt_tokens: int = Field(default=16_384, ge=1_024)
+    compaction_trigger_tokens: int = Field(default=12_288, ge=512)
+
+    @model_validator(mode="after")
+    def validate_schedule(self) -> Self:
+        """Require ordered market boundaries and a usable context budget."""
+        boundaries = (
+            self.open_minute,
+            self.raw_market_clear_minute,
+            self.bottled_market_clear_minute,
+            self.close_minute,
+        )
+        if boundaries != tuple(sorted(set(boundaries))):
+            raise ValueError("runtime boundaries must be strictly increasing")
+        if self.compaction_trigger_tokens >= self.max_prompt_tokens:
+            raise ValueError("compaction must start below the prompt-token limit")
+        return self
+
+
 class ScenarioSpec(StrictModel):
     """Complete immutable rules for one benchmark scenario."""
 
@@ -155,6 +183,7 @@ class ScenarioSpec(StrictModel):
     companies: tuple[CompanySpec, ...] = Field(min_length=1)
     demand: DemandSpec
     scoring: ScoringSpec
+    runtime: RuntimeSpec = RuntimeSpec()
 
     @model_validator(mode="after")
     def validate_unique_references(self) -> Self:
@@ -293,6 +322,8 @@ class CompanyObservation(StrictModel):
     inventory: tuple[InventoryPosition, ...]
     public_companies: tuple[PublicCompany, ...]
     previous_markets: tuple[MarketSummary, ...]
+    runtime: RuntimeSpec = RuntimeSpec()
+    retail_price: Money | None = None
 
     def quantity(self, product: ProductId) -> Decimal:
         """Return the observed total for a product."""

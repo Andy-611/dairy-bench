@@ -1,15 +1,19 @@
-# Codex Run Artifacts
+# Run artifacts
 
-每次 Codex 运行会在这里生成：
+Every Codex run exports readable audit material into this directory:
 
 ```text
 <run_id>/
 ├── reasoning/
-│   └── day-001__farm_a.md
+│   └── day-001__farm_a__turn-0001.md
 └── final_outputs/
-    └── day-001__farm_a.json
+    └── day-001__farm_a__turn-0001.json
 ```
 
-`reasoning` 只保存 Codex Session 公开提供的英文推理摘要；
-`final_outputs` 保存未经改写、仅格式化缩进的最终结构化输出。
-`encrypted_content` 不会被复制或尝试解密。
+`reasoning` contains only public reasoning summaries exposed by the Codex
+session. `final_outputs` contains the original structured response with
+formatting applied for readability. Encrypted reasoning is never copied or
+decrypted.
+
+The Codex session-retention policy does not delete these exported artifacts.
+Removing long-term audit results always requires an explicit maintainer action.

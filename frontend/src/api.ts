@@ -1,24 +1,42 @@
 import type {
   AgentUsageSummaryView,
+  AgentTraceView,
+  CommandStateChangeView,
   CompanyResultView,
   CompanyRole,
   DailySnapshotView,
+  EconomicEffectView,
   EpisodeView,
-  EventView,
-  InvocationArtifactsView,
   InvocationOutcome,
   JsonValue,
-  PolicyInvocationView,
   PolicyMode,
   PolicyProfileView,
   RunProgressView,
   RunRequest,
   RunStatus,
+  SystemTimelineItemView,
+  TimelineCommandView,
+  TimelineContextView,
+  TimelineDaySummaryView,
+  TimelineDayView,
+  TimelineDetailView,
+  TimelineMomentView,
   TokenUsageView,
+  TracePreviewView,
+  TurnTimelineItemView,
+  WakeSignalView,
 } from "./types";
+import { companyLabel } from "./domainLabels";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 type ProgressListener = (progress: RunProgressView) => void;
+
+interface InvocationUsageView {
+  readonly model: string;
+  readonly outcome: InvocationOutcome;
+  readonly provider: string;
+  readonly usage: TokenUsageView;
+}
 
 const POLL_INTERVAL_MS = 500;
 const ACTIVE_STATUSES: readonly RunStatus[] = [
@@ -78,7 +96,7 @@ export class DairyBenchApi {
 
     if (progress.status !== "completed") {
       throw new ApiError(
-        progress.errorMessage ?? "运行未完成，请查看后端日志。",
+        progress.errorMessage ?? "The run did not complete. Check the backend log.",
         500,
       );
     }
@@ -90,16 +108,28 @@ export class DairyBenchApi {
     return parseEpisode(episode, parseInvocations(invocations));
   }
 
-  public async invocationArtifacts(
+  public async timelineDay(
     runId: string,
-    invocationId: string,
+    day: number,
     signal?: AbortSignal,
-  ): Promise<InvocationArtifactsView> {
+  ): Promise<TimelineDayView> {
     const payload = await this.getJson(
-      `/api/runs/${encodeURIComponent(runId)}/invocations/${encodeURIComponent(invocationId)}/artifacts`,
+      `/api/runs/${encodeURIComponent(runId)}/timeline?day=${day}`,
       signal,
     );
-    return parseInvocationArtifacts(payload);
+    return parseTimelineDay(payload);
+  }
+
+  public async timelineDetail(
+    runId: string,
+    entryId: string,
+    signal?: AbortSignal,
+  ): Promise<TimelineDetailView> {
+    const payload = await this.getJson(
+      `/api/runs/${encodeURIComponent(runId)}/timeline/${encodeURIComponent(entryId)}`,
+      signal,
+    );
+    return parseTimelineDetail(payload);
   }
 
   private async getJson(path: string, signal?: AbortSignal): Promise<unknown> {
@@ -153,7 +183,7 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     function abort(): void {
       window.clearTimeout(timer);
-      reject(new DOMException("请求已取消", "AbortError"));
+      reject(new DOMException("The request was cancelled.", "AbortError"));
     }
 
     const timer = window.setTimeout(() => {
@@ -176,15 +206,15 @@ function errorMessage(payload: unknown, status: number): string {
       return detail;
     }
     if (Array.isArray(detail)) {
-      return `请求参数未通过校验（${detail.length} 项）`;
+      return `The request failed validation (${detail.length} issues).`;
     }
   }
-  return `后端请求失败（HTTP ${status}）`;
+  return `The backend request failed (HTTP ${status}).`;
 }
 
 function parseEpisode(
   payload: unknown,
-  invocations: readonly PolicyInvocationView[],
+  invocations: readonly InvocationUsageView[],
 ): EpisodeView {
   const episode = record(payload, "EpisodeResult");
   const scenario = record(episode.scenario, "scenario");
@@ -205,7 +235,6 @@ function parseEpisode(
     seed: number(episode.seed, "seed"),
     days: number(scenario.days, "scenario.days"),
     agentUsage: summarizeAgentUsage(invocations),
-    invocations,
     score: {
       eligible: boolean(score.eligible, "score.eligible"),
       efficiency: number(score.efficiency, "score.efficiency"),
@@ -228,56 +257,24 @@ function parseEpisode(
       ),
     ),
     snapshots: parseSnapshots(episode.snapshots),
-    events: parseEvents(episode.events),
   };
 }
 
-function parseInvocations(payload: unknown): readonly PolicyInvocationView[] {
+function parseInvocations(payload: unknown): readonly InvocationUsageView[] {
   return array(payload, "PolicyInvocation[]").map((item, index) => {
     const path = `invocations[${index}]`;
     const invocation = record(item, path);
-    const rawDecision = invocation.decision;
     return {
-      invocationId: text(invocation.invocation_id, `${path}.invocation_id`),
-      companyId: text(invocation.company_id, `${path}.company_id`),
-      day: number(invocation.day, `${path}.day`),
       outcome: invocationOutcome(invocation.outcome, `${path}.outcome`),
       provider: text(invocation.provider, `${path}.provider`),
       model: text(invocation.model, `${path}.model`),
-      decision:
-        rawDecision === null
-          ? null
-          : jsonValue(rawDecision, `${path}.decision`),
-      errorMessage: nullableText(
-        invocation.error_message,
-        `${path}.error_message`,
-      ),
-      threadId: nullableText(invocation.request_id, `${path}.request_id`),
-      turnId: nullableText(invocation.response_id, `${path}.response_id`),
       usage: parseTokenUsage(invocation.usage, `${path}.usage`),
-      attempts: number(invocation.attempts, `${path}.attempts`),
-      latencyMs: number(invocation.latency_ms, `${path}.latency_ms`),
     };
   });
 }
 
-function parseInvocationArtifacts(payload: unknown): InvocationArtifactsView {
-  const artifacts = record(payload, "InvocationArtifacts");
-  return {
-    invocationId: text(artifacts.invocation_id, "invocation_id"),
-    threadId: text(artifacts.thread_id, "thread_id"),
-    turnId: text(artifacts.turn_id, "turn_id"),
-    model: text(artifacts.model, "model"),
-    reasoningMarkdown: plainText(
-      artifacts.reasoning_markdown,
-      "reasoning_markdown",
-    ),
-    finalOutput: plainText(artifacts.final_output, "final_output"),
-  };
-}
-
 function summarizeAgentUsage(
-  invocations: readonly PolicyInvocationView[],
+  invocations: readonly InvocationUsageView[],
 ): AgentUsageSummaryView | null {
   if (invocations.length === 0) {
     return null;
@@ -350,14 +347,14 @@ function parseCompany(
   const policy = policies.find((candidate) => candidate.company_id === companyId);
 
   if (!companySpec) {
-    throw new Error(`后端响应缺少公司配置：${companyId}`);
+    throw new Error(`The backend response has no specification for ${companyId}.`);
   }
 
   return {
     companyId,
-    companyName: text(companySpec.name, `company ${companyId}.name`),
+    companyName: companyLabel(companyId),
     role: role(companyScore.tier, `${path}.tier`),
-    policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "未知策略",
+    policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "Unknown policy",
     initialCash: number(companyScore.initial_value, `${path}.initial_value`),
     finalCash: number(companyScore.final_cash, `${path}.final_cash`),
     inventoryValue: number(
@@ -401,38 +398,681 @@ function parseSnapshots(payload: unknown): readonly DailySnapshotView[] {
   });
 }
 
-function parseEvents(payload: unknown): readonly EventView[] {
-  return array(payload, "events").map((item, index) => {
-    const eventRecord = record(item, `events[${index}]`);
-    const event = record(eventRecord.event, `events[${index}].event`);
-    const type = text(event.event_type, `events[${index}].event.event_type`);
-    const actor =
-      optionalText(event.company_id) ?? optionalText(event.seller_id) ?? null;
-    const counterparty = optionalText(event.buyer_id) ?? null;
-    const details = Object.fromEntries(
-      Object.entries(event)
-        .filter(
-          ([key]) =>
-            ![
-              "event_type",
-              "day",
-              "company_id",
-              "seller_id",
-              "buyer_id",
-            ].includes(key),
-        )
-        .map(([key, value]) => [key, jsonValue(value, `${type}.${key}`)]),
-    );
+function parseTimelineDay(payload: unknown): TimelineDayView {
+  const timeline = record(payload, "TimelineDay");
+  return {
+    context: parseTimelineContext(timeline.context, "context"),
+    selectedDay: number(timeline.selected_day, "selected_day"),
+    daySummaries: array(timeline.day_summaries, "day_summaries").map(
+      (item, index) =>
+        parseTimelineDaySummary(item, `day_summaries[${index}]`),
+    ),
+    moments: array(timeline.moments, "moments").map((item, index) =>
+      parseTimelineMoment(item, `moments[${index}]`),
+    ),
+  };
+}
 
-    return {
-      sequence: number(eventRecord.sequence, `events[${index}].sequence`),
-      day: number(event.day, `events[${index}].event.day`),
-      type,
-      actorCompanyId: actor,
-      counterpartyCompanyId: counterparty,
-      payload: details,
-    };
+function parseTimelineDetail(payload: unknown): TimelineDetailView {
+  const detail = record(payload, "TimelineDetail");
+  const item = parseTimelineItem(detail.item, "item");
+  const turnRecord =
+    detail.turn === null
+      ? null
+      : jsonValue(detail.turn, "TimelineDetail.turn");
+  const systemStepRecord =
+    detail.system_step === null
+      ? null
+      : jsonValue(detail.system_step, "TimelineDetail.system_step");
+  if (
+    (item.entryType === "turn") !== (turnRecord !== null) ||
+    (item.entryType === "system") !== (systemStepRecord !== null)
+  ) {
+    throw new Error(
+      "Timeline detail must contain the complete journal record for its entry type.",
+    );
+  }
+  return {
+    context: parseTimelineContext(detail.context, "context"),
+    entry: item,
+    turnRecord,
+    systemStepRecord,
+    traces: array(detail.traces, "traces").map((value, index) =>
+      parseAgentTrace(value, `traces[${index}]`),
+    ),
+  };
+}
+
+function parseTimelineContext(
+  payload: unknown,
+  path: string,
+): TimelineContextView {
+  const context = record(payload, path);
+  return {
+    currentRunId: text(context.run_id, `${path}.run_id`),
+    scenarioId: text(context.scenario_id, `${path}.scenario_id`),
+    scenarioVersion: number(
+      context.scenario_version,
+      `${path}.scenario_version`,
+    ),
+    totalDays: number(context.total_days, `${path}.total_days`),
+    mode: text(context.mode, `${path}.mode`),
+    sourceRunId: nullableText(context.source_run_id, `${path}.source_run_id`),
+    traceRunId: text(context.trace_run_id, `${path}.trace_run_id`),
+    isReplay: boolean(context.replay, `${path}.replay`),
+    currentModelCallCount: number(
+      context.model_call_count,
+      `${path}.model_call_count`,
+    ),
+    sourceModelCallCount: number(
+      context.source_model_call_count,
+      `${path}.source_model_call_count`,
+    ),
+    currentUsage: parseTokenUsage(
+      context.current_usage,
+      `${path}.current_usage`,
+    ),
+    sourceUsage: parseTokenUsage(
+      context.source_usage,
+      `${path}.source_usage`,
+    ),
+  };
+}
+
+function parseTimelineDaySummary(
+  payload: unknown,
+  path: string,
+): TimelineDaySummaryView {
+  const summary = record(payload, path);
+  return {
+    day: number(summary.day, `${path}.day`),
+    turnCount: number(summary.turn_count, `${path}.turn_count`),
+    acceptedCount: number(summary.accepted_count, `${path}.accepted_count`),
+    rejectedCount: number(summary.rejected_count, `${path}.rejected_count`),
+    waitCount: number(summary.wait_count, `${path}.wait_count`),
+    systemStepCount: number(
+      summary.system_step_count,
+      `${path}.system_step_count`,
+    ),
+    eventCount: number(summary.event_count, `${path}.event_count`),
+    tradeQuantity: number(summary.trade_quantity, `${path}.trade_quantity`),
+    consumerSales: number(summary.consumer_sales, `${path}.consumer_sales`),
+    expiredQuantity: number(
+      summary.expired_quantity,
+      `${path}.expired_quantity`,
+    ),
+  };
+}
+
+function parseTimelineMoment(
+  payload: unknown,
+  path: string,
+): TimelineMomentView {
+  const moment = record(payload, path);
+  const rawTurns = array(moment.turns, `${path}.turns`);
+  return {
+    simMinute: simMinute(moment.sim_time, `${path}.sim_time`),
+    totalTurnCount: rawTurns.length,
+    systemSteps: array(moment.system_steps, `${path}.system_steps`).map(
+      (value, index) =>
+        parseSystemTimelineItem(value, `${path}.system_steps[${index}]`),
+    ),
+    turns: rawTurns.map((value, index) =>
+      parseTurnTimelineItem(value, `${path}.turns[${index}]`),
+    ),
+  };
+}
+
+function parseTimelineItem(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView | SystemTimelineItemView {
+  const item = record(payload, path);
+  const entryType = text(item.entry_type, `${path}.entry_type`);
+  if (entryType === "turn") {
+    return parseTurnTimelineItem(item, path);
+  }
+  if (entryType === "system_step") {
+    return parseSystemTimelineItem(item, path);
+  }
+  throw new Error(`Backend field ${path}.entry_type is not a timeline item.`);
+}
+
+function parseTurnTimelineItem(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView {
+  const item = record(payload, path);
+  const outcome = record(item.outcome, `${path}.outcome`);
+  const companyId = text(item.company_id, `${path}.company_id`);
+  const companyName = text(item.company_name, `${path}.company_name`);
+  const replayOrigin =
+    item.replay_origin === null
+      ? null
+      : record(item.replay_origin, `${path}.replay_origin`);
+  return {
+    entryType: "turn",
+    entryId: text(item.entry_id, `${path}.entry_id`),
+    companyId,
+    companyName: companyLabel(companyId, companyName),
+    role: role(item.tier, `${path}.tier`),
+    simMinute: simMinute(item.sim_time, `${path}.sim_time`),
+    stateVersion: number(item.state_version, `${path}.state_version`),
+    applySequence: number(item.apply_sequence, `${path}.apply_sequence`),
+    journalSequence: nullableNumber(
+      item.journal_sequence,
+      `${path}.journal_sequence`,
+    ),
+    wakeSignals: array(item.wake_signals, `${path}.wake_signals`).map(
+      (value, index) =>
+        parseWakeSignal(value, `${path}.wake_signals[${index}]`),
+    ),
+    observation: parseObservation(item.observation, `${path}.observation`),
+    observationDelta: parseObservationDelta(
+      item.observation_delta,
+      `${path}.observation_delta`,
+    ),
+    command: parseTimelineCommand(item.command, `${path}.command`),
+    accepted: boolean(outcome.accepted, `${path}.outcome.accepted`),
+    reason: nullableText(outcome.reason, `${path}.outcome.reason`),
+    effects: parseTimelineEffects(item.effects, `${path}.effects`),
+    stateChanges: array(item.state_changes, `${path}.state_changes`).map(
+      (value, index) =>
+        parseCommandStateChange(value, `${path}.state_changes[${index}]`),
+    ),
+    nextAvailableMinute:
+      item.next_available_at === null
+        ? null
+        : simMinute(item.next_available_at, `${path}.next_available_at`),
+    sourceRunId:
+      replayOrigin === null
+        ? null
+        : text(
+            replayOrigin.source_run_id,
+            `${path}.replay_origin.source_run_id`,
+          ),
+    sourceTurnId:
+      replayOrigin === null
+        ? null
+        : text(
+            replayOrigin.source_turn_id,
+            `${path}.replay_origin.source_turn_id`,
+          ),
+    traces: array(item.traces, `${path}.traces`).map((value, index) =>
+      parseTracePreview(value, `${path}.traces[${index}]`),
+    ),
+    protocolError: nullableText(
+      item.protocol_error,
+      `${path}.protocol_error`,
+    ),
+    title: text(item.title, `${path}.title`),
+    summary: text(item.summary, `${path}.summary`),
+  };
+}
+
+function parseSystemTimelineItem(
+  payload: unknown,
+  path: string,
+): SystemTimelineItemView {
+  const item = record(payload, path);
+  return {
+    entryType: "system",
+    entryId: text(item.entry_id, `${path}.entry_id`),
+    simMinute: simMinute(item.sim_time, `${path}.sim_time`),
+    kind: text(item.kind, `${path}.kind`),
+    journalSequence: nullableNumber(
+      item.journal_sequence,
+      `${path}.journal_sequence`,
+    ),
+    stateVersionBefore: nullableNumber(
+      item.state_version_before,
+      `${path}.state_version_before`,
+    ),
+    stateVersionAfter: nullableNumber(
+      item.state_version_after,
+      `${path}.state_version_after`,
+    ),
+    effects: parseTimelineEffects(item.effects, `${path}.effects`),
+    affectedCompanyIds: array(
+      item.affected_company_ids,
+      `${path}.affected_company_ids`,
+    ).map((value, index) =>
+      text(value, `${path}.affected_company_ids[${index}]`),
+    ),
+    reconstructed: boolean(item.reconstructed, `${path}.reconstructed`),
+    title: text(item.title, `${path}.title`),
+    summary: text(item.summary, `${path}.summary`),
+  };
+}
+
+function parseWakeSignal(payload: unknown, path: string): WakeSignalView {
+  const signal = record(payload, path);
+  const source =
+    signal.source === null
+      ? null
+      : record(signal.source, `${path}.source`);
+  const sourceType =
+    source === null
+      ? null
+      : text(source.entry_type, `${path}.source.entry_type`);
+  if (
+    sourceType !== null &&
+    sourceType !== "turn" &&
+    sourceType !== "system_step"
+  ) {
+    throw new Error(`Backend field ${path}.source.entry_type is invalid.`);
+  }
+  return {
+    reason: text(signal.reason, `${path}.reason`),
+    sourceEntryId:
+      source === null
+        ? null
+        : text(source.entry_id, `${path}.source.entry_id`),
+    sourceEntryType: sourceType,
+    referenceIds: array(signal.reference_ids, `${path}.reference_ids`).map(
+      (value, index) => text(value, `${path}.reference_ids[${index}]`),
+    ),
+  };
+}
+
+function parseObservation(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"] {
+  const observation = record(payload, path);
+  return {
+    cash: number(observation.cash, `${path}.cash`),
+    inventory: Object.fromEntries(
+      array(observation.inventory, `${path}.inventory`).map((value, index) => {
+        const position = record(value, `${path}.inventory[${index}]`);
+        return [
+          text(position.product, `${path}.inventory[${index}].product`),
+          number(position.quantity, `${path}.inventory[${index}].quantity`),
+        ];
+      }),
+    ),
+    retailPrice: nullableNumber(
+      observation.retail_price,
+      `${path}.retail_price`,
+    ),
+    openOrders: array(observation.open_orders, `${path}.open_orders`).map(
+      (value, index) =>
+        parseOpenOrder(value, `${path}.open_orders[${index}]`),
+    ),
+    visibleEventCount: number(
+      observation.visible_event_count,
+      `${path}.visible_event_count`,
+    ),
+    visibleEvents: parseTimelineEffects(
+      observation.visible_events,
+      `${path}.visible_events`,
+    ),
+  };
+}
+
+function parseOpenOrder(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["openOrders"][number] {
+  const order = record(payload, path);
+  const side = text(order.side, `${path}.side`);
+  if (side !== "buy" && side !== "sell") {
+    throw new Error(`Backend field ${path}.side is not a market side.`);
+  }
+  return {
+    orderId: text(order.order_id, `${path}.order_id`),
+    ownerId: text(order.owner_id, `${path}.owner_id`),
+    side,
+    product: text(order.product, `${path}.product`),
+    remainingQuantity: number(
+      order.remaining_quantity,
+      `${path}.remaining_quantity`,
+    ),
+    limitPrice: number(order.limit_price, `${path}.limit_price`),
+    placedAtMinute: simMinute(order.placed_at, `${path}.placed_at`),
+  };
+}
+
+function parseObservationDelta(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observationDelta"] {
+  const delta = record(payload, path);
+  return {
+    cashBefore: nullableNumber(delta.cash_before, `${path}.cash_before`),
+    cashAfter: number(delta.cash_after, `${path}.cash_after`),
+    cashChange: nullableNumber(delta.cash_change, `${path}.cash_change`),
+    inventory: array(delta.inventory, `${path}.inventory`).map(
+      (value, index) => {
+        const itemPath = `${path}.inventory[${index}]`;
+        const item = record(value, itemPath);
+        return {
+          product: text(item.product, `${itemPath}.product`),
+          before: nullableNumber(item.before, `${itemPath}.before`),
+          after: number(item.after, `${itemPath}.after`),
+          change: nullableNumber(item.change, `${itemPath}.change`),
+        };
+      },
+    ),
+    retailPriceBefore: nullableNumber(
+      delta.retail_price_before,
+      `${path}.retail_price_before`,
+    ),
+    retailPriceAfter: nullableNumber(
+      delta.retail_price_after,
+      `${path}.retail_price_after`,
+    ),
+    openOrderCountBefore: nullableNumber(
+      delta.open_order_count_before,
+      `${path}.open_order_count_before`,
+    ),
+    openOrderCountAfter: number(
+      delta.open_order_count_after,
+      `${path}.open_order_count_after`,
+    ),
+  };
+}
+
+function parseTimelineEffects(
+  payload: unknown,
+  path: string,
+): readonly EconomicEffectView[] {
+  return array(payload, path).map((value, index) => {
+    const effectPath = `${path}[${index}]`;
+    const effect = record(value, effectPath);
+    const kind = text(effect.event_type, `${effectPath}.event_type`);
+    if (kind === "milk_produced") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        requestedQuantity: number(
+          effect.requested_quantity,
+          `${effectPath}.requested_quantity`,
+        ),
+        actualQuantity: number(
+          effect.actual_quantity,
+          `${effectPath}.actual_quantity`,
+        ),
+        unitCost: number(effect.unit_cost, `${effectPath}.unit_cost`),
+        cashCost: number(effect.cash_cost, `${effectPath}.cash_cost`),
+      };
+    }
+    if (kind === "trade_executed") {
+      return {
+        kind,
+        sellerId: text(effect.seller_id, `${effectPath}.seller_id`),
+        buyerId: text(effect.buyer_id, `${effectPath}.buyer_id`),
+        product: text(effect.product, `${effectPath}.product`),
+        quantity: number(effect.quantity, `${effectPath}.quantity`),
+        unitPrice: number(effect.unit_price, `${effectPath}.unit_price`),
+        totalValue: number(effect.total_value, `${effectPath}.total_value`),
+      };
+    }
+    if (kind === "milk_processed") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        requestedInput: number(
+          effect.requested_input,
+          `${effectPath}.requested_input`,
+        ),
+        actualInput: number(
+          effect.actual_input,
+          `${effectPath}.actual_input`,
+        ),
+        outputQuantity: number(
+          effect.output_quantity,
+          `${effectPath}.output_quantity`,
+        ),
+        cashCost: number(effect.cash_cost, `${effectPath}.cash_cost`),
+      };
+    }
+    if (kind === "consumer_sale") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        potentialDemand: number(
+          effect.potential_demand_quantity,
+          `${effectPath}.potential_demand_quantity`,
+        ),
+        demandQuantity: number(
+          effect.demand_quantity,
+          `${effectPath}.demand_quantity`,
+        ),
+        soldQuantity: number(
+          effect.sold_quantity,
+          `${effectPath}.sold_quantity`,
+        ),
+        retailPrice: nullableNumber(
+          effect.retail_price,
+          `${effectPath}.retail_price`,
+        ),
+        revenue: number(effect.revenue, `${effectPath}.revenue`),
+      };
+    }
+    if (kind === "inventory_expired") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        product: text(effect.product, `${effectPath}.product`),
+        quantity: number(effect.quantity, `${effectPath}.quantity`),
+        valueLoss: number(
+          effect.reference_value_loss,
+          `${effectPath}.reference_value_loss`,
+        ),
+      };
+    }
+    if (kind === "decision_rejected" || kind === "policy_failed") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        reason: text(effect.reason, `${effectPath}.reason`),
+      };
+    }
+    throw new Error(`Backend field ${effectPath}.event_type is unknown.`);
   });
+}
+
+function parseTimelineCommand(
+  payload: unknown,
+  path: string,
+): TimelineCommandView {
+  const command = record(payload, path);
+  const kind = text(command.kind, `${path}.kind`);
+  if (kind === "produce") {
+    return {
+      kind,
+      product: text(command.product, `${path}.product`),
+      quantity: number(command.quantity, `${path}.quantity`),
+    };
+  }
+  if (kind === "transform") {
+    return {
+      kind,
+      inputProduct: text(command.input_product, `${path}.input_product`),
+      outputProduct: text(command.output_product, `${path}.output_product`),
+      inputQuantity: number(
+        command.input_quantity,
+        `${path}.input_quantity`,
+      ),
+    };
+  }
+  if (kind === "place_order") {
+    const side = text(command.side, `${path}.side`);
+    if (side !== "buy" && side !== "sell") {
+      throw new Error(`Backend field ${path}.side is not a market side.`);
+    }
+    return {
+      kind,
+      side,
+      product: text(command.product, `${path}.product`),
+      quantity: number(command.quantity, `${path}.quantity`),
+      limitPrice: number(command.limit_price, `${path}.limit_price`),
+    };
+  }
+  if (kind === "cancel_order") {
+    return {
+      kind,
+      orderId: text(command.order_id, `${path}.order_id`),
+    };
+  }
+  if (kind === "set_retail_price") {
+    return {
+      kind,
+      product: text(command.product, `${path}.product`),
+      unitPrice: number(command.unit_price, `${path}.unit_price`),
+    };
+  }
+  if (kind === "wait") {
+    return {
+      kind,
+      untilMinute:
+        command.until === null
+          ? null
+          : simMinute(command.until, `${path}.until`),
+    };
+  }
+  throw new Error(`Backend field ${path}.kind is not an atomic command.`);
+}
+
+function parseTracePreview(
+  payload: unknown,
+  path: string,
+): TracePreviewView {
+  const preview = record(payload, path);
+  return {
+    traceRunId: text(preview.trace_run_id, `${path}.trace_run_id`),
+    invocationId: text(preview.invocation_id, `${path}.invocation_id`),
+    isSourceTrace: boolean(preview.source_trace, `${path}.source_trace`),
+    provider: text(preview.provider, `${path}.provider`),
+    model: text(preview.model, `${path}.model`),
+    outcome: invocationOutcome(preview.outcome, `${path}.outcome`),
+    usage: parseTokenUsage(preview.usage, `${path}.usage`),
+    latencyMs: number(preview.latency_ms, `${path}.latency_ms`),
+    attempts: number(preview.attempts, `${path}.attempts`),
+    appliedToCommittedTurn: boolean(
+      preview.applied_to_committed_turn,
+      `${path}.applied_to_committed_turn`,
+    ),
+  };
+}
+
+function parseCommandStateChange(
+  payload: unknown,
+  path: string,
+): CommandStateChangeView {
+  const change = record(payload, path);
+  const changeType = text(change.change_type, `${path}.change_type`);
+  if (changeType === "order_placed") {
+    const side = text(change.side, `${path}.side`);
+    if (side !== "buy" && side !== "sell") {
+      throw new Error(`Backend field ${path}.side is not a market side.`);
+    }
+    return {
+      changeType,
+      orderId: text(change.order_id, `${path}.order_id`),
+      side,
+      product: text(change.product, `${path}.product`),
+      quantity: number(change.quantity, `${path}.quantity`),
+      limitPrice: number(change.limit_price, `${path}.limit_price`),
+    };
+  }
+  if (changeType === "order_cancelled") {
+    return {
+      changeType,
+      orderId: text(change.order_id, `${path}.order_id`),
+    };
+  }
+  if (changeType === "retail_price_changed") {
+    return {
+      changeType,
+      product: text(change.product, `${path}.product`),
+      before: nullableNumber(change.before, `${path}.before`),
+      after: number(change.after, `${path}.after`),
+    };
+  }
+  throw new Error(`Backend field ${path}.change_type is not a state change.`);
+}
+
+function parseAgentTrace(payload: unknown, path: string): AgentTraceView {
+  const trace = record(payload, path);
+  const preview = parseTracePreview(trace.preview, `${path}.preview`);
+  const artifactStatus = text(
+    trace.artifact_status,
+    `${path}.artifact_status`,
+  );
+  const artifactUnavailableReason = parseArtifactUnavailableReason(
+    trace.artifact_unavailable_reason,
+    `${path}.artifact_unavailable_reason`,
+  );
+  if (artifactStatus !== "available" && artifactStatus !== "unavailable") {
+    throw new Error(`Backend field ${path}.artifact_status is unknown.`);
+  }
+  const reasoningMarkdown = nullableText(
+    trace.reasoning_markdown,
+    `${path}.reasoning_markdown`,
+  );
+  const finalOutput = nullableText(
+    trace.final_output,
+    `${path}.final_output`,
+  );
+  if (artifactStatus === "available") {
+    if (
+      artifactUnavailableReason !== null ||
+      reasoningMarkdown === null ||
+      finalOutput === null
+    ) {
+      throw new Error(
+        `Backend trace artifact fields at ${path} are inconsistent.`,
+      );
+    }
+    return {
+      preview,
+      artifactStatus,
+      artifactUnavailableReason: null,
+      reasoningMarkdown,
+      finalOutput,
+    };
+  }
+  if (
+    artifactUnavailableReason === null ||
+    reasoningMarkdown !== null ||
+    finalOutput !== null
+  ) {
+    throw new Error(
+      `Backend trace artifact fields at ${path} are inconsistent.`,
+    );
+  }
+  return {
+    preview,
+    artifactStatus,
+    artifactUnavailableReason,
+    reasoningMarkdown: null,
+    finalOutput: null,
+  };
+}
+
+function parseArtifactUnavailableReason(
+  value: unknown,
+  path: string,
+): AgentTraceView["artifactUnavailableReason"] {
+  const reason = nullableText(value, path);
+  switch (reason) {
+    case null:
+    case "store_not_configured":
+    case "provider_not_supported":
+    case "identity_unavailable":
+    case "not_found":
+    case "read_error":
+      return reason;
+    default:
+      throw new Error(`Backend field ${path} is unknown.`);
+  }
+}
+
+function simMinute(payload: unknown, path: string): number {
+  const time = record(payload, path);
+  return number(time.absolute_minute, `${path}.absolute_minute`);
 }
 
 function jsonValue(value: unknown, path: string): JsonValue {
@@ -440,8 +1080,7 @@ function jsonValue(value: unknown, path: string): JsonValue {
     return value;
   }
   if (typeof value === "string") {
-    const numeric = Number(value);
-    return value.trim() !== "" && Number.isFinite(numeric) ? numeric : value;
+    return value;
   }
   if (Array.isArray(value)) {
     return value.map((item, index) => jsonValue(item, `${path}[${index}]`));
@@ -454,19 +1093,19 @@ function jsonValue(value: unknown, path: string): JsonValue {
       ]),
     );
   }
-  throw new Error(`后端响应字段 ${path} 不是有效 JSON`);
+  throw new Error(`Backend field ${path} is not valid JSON.`);
 }
 
 function record(value: unknown, path: string): JsonRecord {
   if (!isRecord(value)) {
-    throw new Error(`后端响应字段 ${path} 应为对象`);
+    throw new Error(`Backend field ${path} must be an object.`);
   }
   return value;
 }
 
 function array(value: unknown, path: string): readonly unknown[] {
   if (!Array.isArray(value)) {
-    throw new Error(`后端响应字段 ${path} 应为数组`);
+    throw new Error(`Backend field ${path} must be an array.`);
   }
   return value;
 }
@@ -474,7 +1113,7 @@ function array(value: unknown, path: string): readonly unknown[] {
 function text(value: unknown, path: string): string {
   const parsed = plainText(value, path);
   if (parsed.length === 0) {
-    throw new Error(`后端响应字段 ${path} 应为非空文本`);
+    throw new Error(`Backend field ${path} must be non-empty text.`);
   }
   return parsed;
 }
@@ -491,14 +1130,14 @@ function number(value: unknown, path: string): number {
         ? Number(value)
         : Number.NaN;
   if (!Number.isFinite(parsed)) {
-    throw new Error(`后端响应字段 ${path} 应为有限数值`);
+    throw new Error(`Backend field ${path} must be a finite number.`);
   }
   return parsed;
 }
 
 function boolean(value: unknown, path: string): boolean {
   if (typeof value !== "boolean") {
-    throw new Error(`后端响应字段 ${path} 应为布尔值`);
+    throw new Error(`Backend field ${path} must be a boolean.`);
   }
   return value;
 }
@@ -507,7 +1146,7 @@ function role(value: unknown, path: string): CompanyRole {
   if (value === "farm" || value === "processor" || value === "retailer") {
     return value;
   }
-  throw new Error(`后端响应字段 ${path} 不是已知产业层级`);
+  throw new Error(`Backend field ${path} is not a known company tier.`);
 }
 
 function policyMode(value: unknown, path: string): PolicyMode {
@@ -519,7 +1158,7 @@ function policyMode(value: unknown, path: string): PolicyMode {
   ) {
     return value;
   }
-  throw new Error(`后端响应字段 ${path} 不是已知运行模式`);
+  throw new Error(`Backend field ${path} is not a known run mode.`);
 }
 
 function runStatus(value: unknown, path: string): RunStatus {
@@ -532,7 +1171,7 @@ function runStatus(value: unknown, path: string): RunStatus {
   ) {
     return value;
   }
-  throw new Error(`后端响应字段 ${path} 不是已知运行状态`);
+  throw new Error(`Backend field ${path} is not a known run status.`);
 }
 
 function invocationOutcome(value: unknown, path: string): InvocationOutcome {
@@ -543,7 +1182,7 @@ function invocationOutcome(value: unknown, path: string): InvocationOutcome {
   ) {
     return value;
   }
-  throw new Error(`后端响应字段 ${path} 不是已知调用结果`);
+  throw new Error(`Backend field ${path} is not a known invocation outcome.`);
 }
 
 function nullableText(value: unknown, path: string): string | null {
@@ -551,14 +1190,18 @@ function nullableText(value: unknown, path: string): string | null {
     return null;
   }
   if (typeof value !== "string") {
-    throw new Error(`后端响应字段 ${path} 应为文本或 null`);
+    throw new Error(`Backend field ${path} must be text or null.`);
   }
   return value.length > 0 ? value : null;
 }
 
+function nullableNumber(value: unknown, path: string): number | null {
+  return value === null || value === undefined ? null : number(value, path);
+}
+
 function plainText(value: unknown, path: string): string {
   if (typeof value !== "string") {
-    throw new Error(`后端响应字段 ${path} 应为文本`);
+    throw new Error(`Backend field ${path} must be text.`);
   }
   return value;
 }

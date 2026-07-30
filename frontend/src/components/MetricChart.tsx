@@ -27,9 +27,9 @@ const ROW_HEIGHT = 72;
 const ROW_GAP = 25;
 
 const SERIES: readonly Series[] = [
-  { key: "efficiency", label: "累计系统剩余", color: "#147d64" },
-  { key: "inventoryValue", label: "库存价值", color: "#2d6cdf" },
-  { key: "consumerSales", label: "当日消费销量", color: "#e08c30" },
+  { key: "efficiency", label: "Cumulative surplus", color: "#147d64" },
+  { key: "inventoryValue", label: "Inventory value", color: "#2d6cdf" },
+  { key: "consumerSales", label: "Daily consumer sales", color: "#e08c30" },
 ];
 
 function aggregateSnapshots(
@@ -95,9 +95,9 @@ export function MetricChart({ snapshots }: MetricChartProps) {
       <div className="section-heading">
         <div>
           <span className="eyebrow">30-DAY TREND</span>
-          <h2>产业链运行趋势</h2>
+          <h2>Supply-chain trends</h2>
         </div>
-        <p>三条曲线各用独立纵轴，避免量纲互相干扰</p>
+        <p>Each series uses its own vertical scale.</p>
       </div>
       <div className="chart-scroll">
         <svg
@@ -106,9 +106,10 @@ export function MetricChart({ snapshots }: MetricChartProps) {
           role="img"
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         >
-          <title id="trend-title">30 天产业链运行趋势</title>
+          <title id="trend-title">30-day supply-chain trends</title>
           <desc id="trend-description">
-            分别展示累计系统剩余、库存价值和当日消费销量。
+            Cumulative system surplus, inventory value, and daily consumer
+            sales.
           </desc>
           {tickDays.map((day) => {
             const x = LEFT + ((day - firstDay) / daySpan) * (WIDTH - LEFT - RIGHT);
@@ -122,7 +123,7 @@ export function MetricChart({ snapshots }: MetricChartProps) {
                   y2={HEIGHT - 24}
                 />
                 <text className="chart-tick" textAnchor="middle" x={x} y={HEIGHT - 4}>
-                  第 {day} 天
+                  Day {day}
                 </text>
               </g>
             );
@@ -147,7 +148,7 @@ export function MetricChart({ snapshots }: MetricChartProps) {
                   {series.label}
                 </text>
                 <text className="chart-range" x={16} y={rowTop + 52}>
-                  {formatValue(minimum)} — {formatValue(maximum)}
+                  {formatValue(minimum)} to {formatValue(maximum)}
                 </text>
                 <path
                   className="chart-line"
@@ -174,7 +175,7 @@ export function MetricChart({ snapshots }: MetricChartProps) {
                       r={3}
                     >
                       <title>
-                        第 {metric.day} 天：{formatValue(metric[series.key])}
+                        Day {metric.day}: {formatValue(metric[series.key])}
                       </title>
                     </circle>
                   );

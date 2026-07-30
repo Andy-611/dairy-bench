@@ -1,16 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import { ApiError, DairyBenchApi } from "./api";
+import { DairyBenchApi } from "./api";
 import { CompanyTable } from "./components/CompanyTable";
 import { EmptyState } from "./components/EmptyState";
-import { EventTable } from "./components/EventTable";
 import { MetricChart } from "./components/MetricChart";
+import { OperationsReplay } from "./components/OperationsReplay";
 import { RunForm } from "./components/RunForm";
 import { SummaryCards } from "./components/SummaryCards";
 import { TokenSummary } from "./components/TokenSummary";
+import { isAbortError, requestErrorMessage } from "./requestErrors";
 import type {
   EpisodeView,
-  InvocationArtifactsView,
   PolicyMode,
   PolicyProfileView,
   RunProgressView,
@@ -30,12 +30,6 @@ export function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeRequest = useRef<AbortController | null>(null);
-  const artifactCache = useRef(
-    new Map<
-      string,
-      Map<string, Promise<InvocationArtifactsView | null>>
-    >(),
-  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -43,11 +37,11 @@ export function App() {
       .policyProfiles(controller.signal)
       .then(setProfiles)
       .catch((reason: unknown) => {
-        if (!(reason instanceof DOMException && reason.name === "AbortError")) {
+        if (!isAbortError(reason)) {
           setError(
-            reason instanceof Error
-              ? reason.message
-              : "无法读取后端的策略配置。",
+            requestErrorMessage(reason, {
+              fallback: "The backend policy profiles could not be loaded.",
+            }),
           );
         }
       });
@@ -74,19 +68,18 @@ export function App() {
 
     try {
       const nextResult = await api.run(request, setProgress, controller.signal);
-      artifactCache.current.clear();
-      artifactCache.current.set(nextResult.runId, new Map());
       setResult(nextResult);
     } catch (reason: unknown) {
-      if (reason instanceof DOMException && reason.name === "AbortError") {
+      if (isAbortError(reason)) {
         return;
       }
       setError(
-        reason instanceof TypeError
-          ? "无法连接后端服务，请确认 FastAPI 已在 127.0.0.1:8000 启动。"
-          : reason instanceof Error
-            ? reason.message
-            : "运行失败，请确认后端服务已经启动。",
+        requestErrorMessage(reason, {
+          fallback:
+            "The run failed. Confirm that the backend service is running.",
+          network:
+            "Could not reach the backend. Confirm FastAPI is running at 127.0.0.1:8000.",
+        }),
       );
     } finally {
       if (activeRequest.current === controller) {
@@ -95,41 +88,6 @@ export function App() {
       }
     }
   }
-
-  const loadInvocationArtifacts = useCallback(
-    (
-      runId: string,
-      invocationId: string,
-    ): Promise<InvocationArtifactsView | null> => {
-      let runCache = artifactCache.current.get(runId);
-      if (!runCache) {
-        runCache = new Map();
-        artifactCache.current.set(runId, runCache);
-      }
-
-      const cached = runCache.get(invocationId);
-      if (cached) {
-        return cached;
-      }
-
-      const pending = api
-        .invocationArtifacts(runId, invocationId)
-        .catch((reason: unknown) => {
-          if (reason instanceof ApiError && reason.status === 404) {
-            return null;
-          }
-          throw reason;
-        });
-      runCache.set(invocationId, pending);
-      void pending.catch(() => {
-        if (runCache?.get(invocationId) === pending) {
-          runCache.delete(invocationId);
-        }
-      });
-      return pending;
-    },
-    [],
-  );
 
   return (
     <div className="app-shell">
@@ -140,7 +98,7 @@ export function App() {
           </span>
           <span>
             <strong>Dairy Bench</strong>
-            <small>单 Agent 公司 · 多公司鲜奶产业链</small>
+            <small>Independent company agents · perishable dairy economy</small>
           </span>
         </div>
         <RunForm
@@ -159,27 +117,27 @@ export function App() {
       <main>
         <section className="hero">
           <div>
-            <span className="eyebrow">FLOW.DAIRY.BASE.S6.V1</span>
-            <h1>让六家公司共同经营一条鲜奶产业链</h1>
+            <span className="eyebrow">FLOW.DAIRY.BASE.S6.V2</span>
+            <h1>Six companies. One living dairy economy.</h1>
             <p>
-              每家公司由一个独立 Agent 决策。30
-              天内完成原奶生产、两级现货交易、加工、零售与库存过期结算，
-              同时观察整个经济系统的效率与公平。
+              Each company uses an independent agent to make event-driven,
+              atomic decisions across production, two spot markets,
+              processing, retail, and perishable inventory settlement.
             </p>
           </div>
           {result && (
             <dl className="run-meta">
               <div>
-                <dt>本次运行</dt>
+                <dt>Run</dt>
                 <dd>{result.runId}</dd>
               </div>
               <div>
-                <dt>随机种子</dt>
+                <dt>Seed</dt>
                 <dd>{result.seed}</dd>
               </div>
               <div>
-                <dt>运行周期</dt>
-                <dd>{result.days} 天</dd>
+                <dt>Horizon</dt>
+                <dd>{result.days} days</dd>
               </div>
             </dl>
           )}
@@ -190,11 +148,11 @@ export function App() {
             <div className="error-banner" role="alert">
               <span aria-hidden="true">!</span>
               <div>
-                <strong>暂时无法完成运行</strong>
+                <strong>The run could not be completed</strong>
                 <p>{error}</p>
               </div>
               <button onClick={() => setError(null)} type="button">
-                关闭
+                Dismiss
               </button>
             </div>
           )}
@@ -220,11 +178,12 @@ export function App() {
             {result.agentUsage && <TokenSummary summary={result.agentUsage} />}
             <CompanyTable companies={result.companies} />
             <MetricChart snapshots={result.snapshots} />
-            <EventTable
-              events={result.events}
-              invocations={result.invocations}
+            <OperationsReplay
+              companies={result.companies}
+              days={result.days}
               key={result.runId}
-              loadArtifacts={loadInvocationArtifacts}
+              loadDetail={loadTimelineDetail}
+              loadTimeline={loadTimelineDay}
               runId={result.runId}
             />
           </div>
@@ -232,8 +191,8 @@ export function App() {
       </main>
 
       <footer>
-        <span>Dairy Bench V1</span>
-        <span>API Key 与 Codex 登录凭证只由后端使用，不会进入浏览器。</span>
+        <span>Dairy Bench V2</span>
+        <span>API keys and Codex credentials remain on the backend.</span>
       </footer>
     </div>
   );
@@ -248,7 +207,7 @@ function buildRunRequest(
     const normalizedRunId = sourceRunId.trim();
     return normalizedRunId
       ? { policyMode: mode, sourceRunId: normalizedRunId }
-      : "复放模式需要填写来源 Run ID。";
+      : "Replay mode requires a source run ID.";
   }
 
   const parsedSeed = Number(seed);
@@ -256,15 +215,31 @@ function buildRunRequest(
     parsedSeed >= 0 &&
     parsedSeed <= MAX_SEED
     ? { policyMode: mode, seed: parsedSeed }
-    : `随机种子必须是 0 到 ${MAX_SEED} 之间的整数。`;
+    : `The random seed must be an integer from 0 to ${MAX_SEED}.`;
 }
 
 function progressText(progress: RunProgressView | null): string {
   if (!progress || progress.status === "queued") {
-    return "运行已进入队列，正在准备六家公司……";
+    return "Run queued. Preparing six independent companies…";
   }
   if (progress.status === "interrupted") {
-    return "上次运行被中断，后端正在恢复……";
+    return "Resuming an interrupted run…";
   }
-  return `正在运行第 ${progress.currentDay} / ${progress.totalDays} 天`;
+  return `Running day ${progress.currentDay} of ${progress.totalDays}`;
+}
+
+function loadTimelineDay(
+  runId: string,
+  day: number,
+  signal?: AbortSignal,
+) {
+  return api.timelineDay(runId, day, signal);
+}
+
+function loadTimelineDetail(
+  runId: string,
+  entryId: string,
+  signal?: AbortSignal,
+) {
+  return api.timelineDetail(runId, entryId, signal);
 }

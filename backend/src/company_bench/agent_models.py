@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Protocol, TypeVar
+from typing import Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -15,14 +15,29 @@ from company_bench.models import (
     StrictModel,
 )
 from company_bench.run_models import TokenUsage
+from company_bench.runtime_models import AgentTurn, CompanyCommand
 
 DecisionModel = TypeVar("DecisionModel", bound=BaseModel)
+type CommandName = Literal[
+    "produce",
+    "transform",
+    "place_order",
+    "cancel_order",
+    "set_retail_price",
+    "wait",
+]
 
 
 class DecisionSubmission[SubmissionModel: BaseModel](StrictModel):
     """Structured-output envelope accepted from a model provider."""
 
     decision: SubmissionModel | NoOpDecision
+
+
+class CommandSubmission(StrictModel):
+    """Structured command envelope for providers without native tool calls."""
+
+    command: CompanyCommand
 
 
 class ModelRequest(StrictModel):
@@ -39,6 +54,30 @@ class ModelResult(StrictModel):
     """Validated decision plus provider observability metadata."""
 
     decision: CompanyDecision
+    provider: str
+    model: str
+    response_id: str | None = None
+    request_id: str | None = None
+    usage: TokenUsage = TokenUsage()
+    attempts: int = Field(default=1, ge=1)
+    latency_ms: int = Field(default=0, ge=0)
+
+
+class CommandModelRequest(StrictModel):
+    """Complete provider-neutral request for one atomic company command."""
+
+    invocation_id: Identifier
+    run_id: Identifier
+    turn: AgentTurn
+    instructions: str
+    input_text: str
+    allowed_commands: tuple[CommandName, ...] = Field(min_length=1)
+
+
+class CommandModelResult(StrictModel):
+    """Validated atomic command plus provider observability metadata."""
+
+    command: CompanyCommand
     provider: str
     model: str
     response_id: str | None = None
@@ -93,4 +132,24 @@ class ModelGateway(Protocol):
         ...
 
 
+class CommandGateway(Protocol):
+    """External model seam for one native or adapted atomic command."""
+
+    async def generate_command(
+        self,
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
+        """Return exactly one validated command."""
+        ...
+
+    async def close(self) -> None:
+        """Release owned provider resources."""
+        ...
+
+
+class CompanyModelGateway(ModelGateway, CommandGateway, Protocol):
+    """Provider adapter supporting both preserved V1 and V2 protocols."""
+
+
 type DecisionFactory = Callable[[ModelRequest], CompanyDecision]
+type CommandFactory = Callable[[CommandModelRequest], CompanyCommand]

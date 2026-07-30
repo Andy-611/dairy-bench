@@ -107,3 +107,16 @@ def build_dairy_scenario() -> ScenarioSpec:
 
 
 DAIRY_V1_SCENARIO = build_dairy_scenario()
+
+
+def build_dairy_v2_scenario() -> ScenarioSpec:
+    """Build V2 with the same economy and an event-driven runtime."""
+    return DAIRY_V1_SCENARIO.model_copy(
+        update={
+            "scenario_id": "flow.dairy.base.s6.v2",
+            "version": 2,
+        }
+    )
+
+
+DAIRY_V2_SCENARIO = build_dairy_v2_scenario()

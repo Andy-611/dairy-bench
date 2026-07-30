@@ -15,39 +15,41 @@ interface MetricCard {
 export function SummaryCards({ score }: SummaryCardsProps) {
   const cards: readonly MetricCard[] = [
     {
-      label: "公平门槛",
-      value: score.eligible ? "已通过" : "未通过",
-      detail: score.eligible ? "具备效率排名资格" : "至少一项硬约束未满足",
+      label: "Eligibility",
+      value: score.eligible ? "Passed" : "Not passed",
+      detail: score.eligible
+        ? "Eligible for efficiency ranking"
+        : "At least one hard constraint failed",
       tone: score.eligible ? "positive" : "negative",
     },
     {
-      label: "系统效率",
+      label: "System efficiency",
       value: formatSignedValue(score.efficiency),
-      detail: "六家公司累计创造的剩余",
+      detail: "Cumulative surplus created by all six companies",
       tone: score.efficiency >= 0 ? "positive" : "negative",
     },
     {
-      label: "公平度",
+      label: "Fairness",
       value: formatPercent(score.fairness),
-      detail: "1 − 层级内平均 Gini",
+      detail: "1 minus the mean within-tier Gini",
       tone: "neutral",
     },
     {
-      label: "需求满足率",
+      label: "Demand fulfillment",
       value: formatPercent(score.fulfillmentRate),
-      detail: "实际零售量 ÷ 消费需求",
+      detail: "Fulfilled retail demand divided by total demand",
       tone: "neutral",
     },
     {
-      label: "过期量",
+      label: "Expired volume",
       value: formatValue(score.expiredQuantity),
-      detail: "30 天内报废的鲜奶总量",
+      detail: "Total milk discarded during the 30-day run",
       tone: score.expiredQuantity > 0 ? "negative" : "positive",
     },
   ];
 
   return (
-    <section aria-label="运行摘要" className="summary-grid">
+    <section aria-label="Run summary" className="summary-grid">
       {cards.map((card) => (
         <article className={`metric-card ${card.tone}`} key={card.label}>
           <span className="metric-label">{card.label}</span>

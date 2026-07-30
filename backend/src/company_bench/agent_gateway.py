@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from time import monotonic
 from typing import Literal
@@ -17,9 +18,13 @@ from openai import (
     LengthFinishReasonError,
     RateLimitError,
 )
-from pydantic import Field, SecretStr, ValidationError
+from pydantic import BaseModel, Field, SecretStr, TypeAdapter, ValidationError
 
 from company_bench.agent_models import (
+    CommandFactory,
+    CommandModelRequest,
+    CommandModelResult,
+    CommandName,
     DecisionFactory,
     DecisionModel,
     DecisionSubmission,
@@ -32,8 +37,26 @@ from company_bench.agent_models import (
 from company_bench.diagnostics import bounded_error
 from company_bench.models import NoOpDecision, StrictModel
 from company_bench.run_models import TokenUsage
+from company_bench.runtime_models import (
+    CancelOrder,
+    CompanyCommand,
+    PlaceOrder,
+    Produce,
+    SetRetailPrice,
+    Transform,
+    Wait,
+)
 
 type ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh"]
+_COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
+_COMMAND_MODELS: dict[CommandName, type[BaseModel]] = {
+    "produce": Produce,
+    "transform": Transform,
+    "place_order": PlaceOrder,
+    "cancel_order": CancelOrder,
+    "set_retail_price": SetRetailPrice,
+    "wait": Wait,
+}
 
 
 class OpenAIAgentConfig(StrictModel):
@@ -150,6 +173,60 @@ class OpenAIModelGateway(ModelGateway):
             await asyncio.sleep(0.25 * 2 ** (attempt - 1))
         raise AssertionError("bounded retry loop did not terminate")
 
+    async def generate_command(
+        self,
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
+        """Call native function tools and require exactly one atomic command."""
+        started = monotonic()
+        for attempt in range(1, self.config.max_attempts + 1):
+            try:
+                response = await self._client.responses.create(
+                    model=self.config.model,
+                    instructions=request.instructions,
+                    input=request.input_text,
+                    tools=_command_tools(request.allowed_commands),
+                    tool_choice="required",
+                    parallel_tool_calls=False,
+                    max_tool_calls=1,
+                    max_output_tokens=self.config.max_output_tokens,
+                    reasoning={"effort": self.config.reasoning_effort},
+                    store=False,
+                )
+                try:
+                    command = _parse_command(response, request.allowed_commands)
+                except (json.JSONDecodeError, ValidationError, ValueError) as error:
+                    raise ModelOutputError(
+                        f"invalid native tool call: {error}",
+                        request_id=response._request_id,
+                        response_id=response.id,
+                        usage=_token_usage(response.usage),
+                        attempts=attempt,
+                        latency_ms=int((monotonic() - started) * 1000),
+                    ) from error
+                return CommandModelResult(
+                    command=command,
+                    provider=self.provider,
+                    model=response.model or self.config.model,
+                    response_id=response.id,
+                    request_id=response._request_id,
+                    usage=_token_usage(response.usage),
+                    attempts=attempt,
+                    latency_ms=int((monotonic() - started) * 1000),
+                )
+            except ModelOutputError:
+                raise
+            except (APIConnectionError, APITimeoutError, RateLimitError) as error:
+                if attempt == self.config.max_attempts:
+                    raise _infrastructure_error(error) from error
+            except APIStatusError as error:
+                if (
+                    error.status_code not in {408, 409, 429} and error.status_code < 500
+                ) or attempt == self.config.max_attempts:
+                    raise _infrastructure_error(error) from error
+            await asyncio.sleep(0.25 * 2 ** (attempt - 1))
+        raise AssertionError("bounded retry loop did not terminate")
+
     async def close(self) -> None:
         """Close the client created by this adapter."""
         if self._owns_client:
@@ -161,9 +238,16 @@ class ScriptedModelGateway(ModelGateway):
 
     provider = "scripted"
 
-    def __init__(self, factory: DecisionFactory) -> None:
+    def __init__(
+        self,
+        factory: DecisionFactory,
+        *,
+        command_factory: CommandFactory | None = None,
+    ) -> None:
         self._factory = factory
+        self._command_factory = command_factory
         self.requests: list[ModelRequest] = []
+        self.command_requests: list[CommandModelRequest] = []
 
     async def generate(
         self,
@@ -183,6 +267,23 @@ class ScriptedModelGateway(ModelGateway):
             model="scripted-v1",
         )
 
+    async def generate_command(
+        self,
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
+        """Return one command from the injected deterministic factory."""
+        self.command_requests.append(request)
+        if self._command_factory is None:
+            raise ModelOutputError("scripted command factory is not configured")
+        command = _COMMAND_ADAPTER.validate_python(self._command_factory(request))
+        if command.kind not in request.allowed_commands:
+            raise ModelOutputError(f"command {command.kind} is not allowed")
+        return CommandModelResult(
+            command=command,
+            provider=self.provider,
+            model="scripted-v2",
+        )
+
     async def close(self) -> None:
         """Release no resources."""
 
@@ -200,6 +301,48 @@ def _token_usage(usage: object | None) -> TokenUsage:
         reasoning_tokens=getattr(output_details, "reasoning_tokens", 0),
         total_tokens=getattr(usage, "total_tokens", 0),
     )
+
+
+def _command_tools(names: tuple[CommandName, ...]) -> list[dict[str, object]]:
+    """Build strict native function schemas from the canonical command models."""
+    tools: list[dict[str, object]] = []
+    for name in names:
+        model = _COMMAND_MODELS[name]
+        schema = model.model_json_schema()
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            properties.pop("kind", None)
+            schema["required"] = list(properties)
+        schema["additionalProperties"] = False
+        tools.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": model.__doc__ or f"Execute {name}.",
+                "parameters": schema,
+                "strict": True,
+            }
+        )
+    return tools
+
+
+def _parse_command(
+    response: object,
+    allowed_commands: tuple[CommandName, ...],
+) -> CompanyCommand:
+    """Normalize exactly one provider function call into a domain command."""
+    output = getattr(response, "output", ())
+    calls = tuple(item for item in output if getattr(item, "type", None) == "function_call")
+    if len(calls) != 1:
+        raise ValueError(f"expected exactly one function call, received {len(calls)}")
+    call = calls[0]
+    name = getattr(call, "name", "")
+    if name not in allowed_commands:
+        raise ValueError(f"unknown or unauthorized command: {name}")
+    arguments = json.loads(getattr(call, "arguments", ""))
+    if not isinstance(arguments, dict):
+        raise ValueError("function arguments must be a JSON object")
+    return _COMMAND_ADAPTER.validate_python({"kind": name, **arguments})
 
 
 def _infrastructure_error(error: Exception) -> ModelInfrastructureError:

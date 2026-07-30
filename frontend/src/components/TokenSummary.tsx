@@ -18,29 +18,29 @@ export function TokenSummary({ summary }: TokenSummaryProps) {
   const metrics: readonly TokenMetric[] = [
     {
       code: "IN",
-      detail: "提示词、企业状态与显式历史",
-      label: "输入 Token",
+      detail: "Prompts, company state, and explicit history",
+      label: "Input tokens",
       tone: "input",
       value: usage.inputTokens,
     },
     {
       code: "CACHE",
-      detail: `占输入 ${ratio(usage.cachedTokens, usage.inputTokens)}`,
-      label: "缓存 Token",
+      detail: `${ratio(usage.cachedTokens, usage.inputTokens)} of input`,
+      label: "Cached tokens",
       tone: "cached",
       value: usage.cachedTokens,
     },
     {
       code: "OUT",
-      detail: "模型生成的决策与结构化响应",
-      label: "输出 Token",
+      detail: "Model decisions and structured responses",
+      label: "Output tokens",
       tone: "output",
       value: usage.outputTokens,
     },
     {
       code: "THINK",
-      detail: `占输出 ${ratio(usage.reasoningTokens, usage.outputTokens)}`,
-      label: "推理 Token",
+      detail: `${ratio(usage.reasoningTokens, usage.outputTokens)} of output`,
+      label: "Reasoning tokens",
       tone: "reasoning",
       value: usage.reasoningTokens,
     },
@@ -53,12 +53,12 @@ export function TokenSummary({ summary }: TokenSummaryProps) {
       <div className="section-heading token-heading">
         <div>
           <span className="eyebrow">AGENT USAGE</span>
-          <h2 id="token-summary-title">Agent Token 汇总</h2>
+          <h2 id="token-summary-title">Agent token usage</h2>
         </div>
         <div className="token-run-meta">
           <span className={`token-status ${allSucceeded ? "success" : "warning"}`}>
             <i aria-hidden="true" />
-            {summary.successfulInvocations} / {summary.invocationCount} 次成功
+            {summary.successfulInvocations} / {summary.invocationCount} successful
           </span>
           <span className="token-model">
             {[...summary.providers, ...summary.models].join(" · ")}
@@ -70,10 +70,10 @@ export function TokenSummary({ summary }: TokenSummaryProps) {
         <article className="token-total-card">
           <span>TOTAL TOKENS</span>
           <strong>{formatValue(usage.totalTokens)}</strong>
-          <p>由模型运行时逐次返回并汇总</p>
+          <p>Reported and aggregated by the model runtime</p>
           <div>
-            <span>{summary.invocationCount} 次公司日决策</span>
-            <span>完整审计记录</span>
+            <span>{summary.invocationCount} Agent turns</span>
+            <span>Fully auditable</span>
           </div>
         </article>
 
@@ -92,8 +92,8 @@ export function TokenSummary({ summary }: TokenSummaryProps) {
       </div>
 
       <p className="token-footnote">
-        缓存 Token 已包含在输入 Token 中，推理 Token 已包含在输出 Token
-        中；总量无需再次相加。
+        Cached tokens are included in input tokens; reasoning tokens are included
+        in output tokens. Do not add them to the total again.
       </p>
     </section>
   );

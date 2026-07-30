@@ -11,7 +11,9 @@ htmlcov/
 *.egg-info/
 
 # Local runtime and test data
+.dairy-bench/
 .tmp/
+.tmp_pytest/
 .test-artifacts/
 backend/data/
 *.db

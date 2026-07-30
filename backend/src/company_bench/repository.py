@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import sqlite3
 from collections import OrderedDict
-from datetime import datetime
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
 from threading import RLock
@@ -14,11 +15,13 @@ from company_bench.models import EpisodeResult, EventRecord, RunSummary, TradeEx
 from company_bench.run_models import (
     PolicyAuditSink,
     PolicyInvocation,
+    RunCheckpoint,
     RunJob,
     RunStatus,
 )
+from company_bench.runtime_models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 2
+_DATABASE_SCHEMA_VERSION = 4
 _PAYLOAD_SCHEMA_VERSION = 1
 _RESUMABLE_STATUSES = (
     RunStatus.QUEUED,
@@ -55,6 +58,35 @@ class LifecycleRepository(RunRepository, PolicyAuditSink, Protocol):
     def list_invocations(self, run_id: str) -> tuple[PolicyInvocation, ...]:
         """Return one run's Agent invocations in decision order."""
 
+    def record_turn(self, record: TurnRecord) -> None:
+        """Append one immutable, idempotent turn journal entry."""
+
+    def list_turns(self, run_id: str) -> tuple[TurnRecord, ...]:
+        """Return one run's complete turn journal in apply order."""
+
+    def record_system_step(self, record: SystemStepRecord) -> None:
+        """Append one immutable, idempotent system journal entry."""
+
+    def list_system_steps(self, run_id: str) -> tuple[SystemStepRecord, ...]:
+        """Return one run's system journal in chronological order."""
+
+    def save_checkpoint(self, checkpoint: RunCheckpoint) -> None:
+        """Atomically replace one run's complete recovery state."""
+
+    def save_progress(
+        self,
+        turns: tuple[TurnRecord, ...],
+        system_steps: tuple[SystemStepRecord, ...],
+        checkpoint: RunCheckpoint,
+    ) -> None:
+        """Atomically append journal entries and replace their checkpoint."""
+
+    def get_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        """Return one run's latest complete recovery state."""
+
+    def clear_checkpoint(self, run_id: str) -> None:
+        """Remove one run's recovery state while retaining its journal."""
+
     def complete_job(
         self,
         result: EpisodeResult,
@@ -70,6 +102,9 @@ class MemoryRunRepository:
         self._results: OrderedDict[str, EpisodeResult] = OrderedDict()
         self._jobs: OrderedDict[str, RunJob] = OrderedDict()
         self._invocations: dict[str, PolicyInvocation] = {}
+        self._turns: dict[tuple[str, str], TurnRecord] = {}
+        self._system_steps: dict[tuple[str, str], SystemStepRecord] = {}
+        self._checkpoints: dict[str, RunCheckpoint] = {}
         self._lock = RLock()
 
     def save(self, result: EpisodeResult) -> None:
@@ -111,22 +146,99 @@ class MemoryRunRepository:
             self._invocations[invocation.invocation_id] = invocation
 
     def list_invocations(self, run_id: str) -> tuple[PolicyInvocation, ...]:
-        """Return one run's invocations in day and company order."""
+        """Return one run's invocations in deterministic decision order."""
         with self._lock:
             invocations = (
                 invocation
                 for invocation in self._invocations.values()
                 if invocation.run_id == run_id
             )
-            return tuple(
-                sorted(
-                    invocations,
-                    key=lambda invocation: (
-                        invocation.day,
-                        invocation.company_id,
-                    ),
-                )
+            return tuple(sorted(invocations, key=_invocation_order))
+
+    def record_turn(self, record: TurnRecord) -> None:
+        """Append one immutable turn, accepting exact retries only."""
+        with self._lock:
+            self._record_turn(record)
+
+    def list_turns(self, run_id: str) -> tuple[TurnRecord, ...]:
+        """Return one run's turns in deterministic apply order."""
+        with self._lock:
+            records = (
+                record
+                for (record_run_id, _), record in self._turns.items()
+                if record_run_id == run_id
             )
+            return tuple(sorted(records, key=_turn_order))
+
+    def record_system_step(self, record: SystemStepRecord) -> None:
+        """Append one immutable system step, accepting exact retries only."""
+        with self._lock:
+            self._record_system_step(record)
+
+    def list_system_steps(self, run_id: str) -> tuple[SystemStepRecord, ...]:
+        """Return one run's system steps in chronological journal order."""
+        with self._lock:
+            records = (
+                record
+                for (record_run_id, _), record in self._system_steps.items()
+                if record_run_id == run_id
+            )
+            return tuple(sorted(records, key=_system_step_order))
+
+    def save_checkpoint(self, checkpoint: RunCheckpoint) -> None:
+        """Atomically replace one run's complete recovery state."""
+        with self._lock:
+            self._checkpoints[checkpoint.run_id] = checkpoint
+
+    def save_progress(
+        self,
+        turns: tuple[TurnRecord, ...],
+        system_steps: tuple[SystemStepRecord, ...],
+        checkpoint: RunCheckpoint,
+    ) -> None:
+        """Append journal entries and checkpoint under one process lock."""
+        _validate_progress_identity(turns, system_steps, checkpoint)
+        with self._lock:
+            staged_turns: dict[tuple[str, str], TurnRecord] = {}
+            for record in turns:
+                key = (record.run_id, record.turn.turn_id)
+                existing = staged_turns.get(key, self._turns.get(key))
+                if existing is not None:
+                    _require_same_turn(existing, record)
+                else:
+                    staged_turns[key] = record
+            staged_steps: dict[tuple[str, str], SystemStepRecord] = {}
+            for record in system_steps:
+                key = (record.run_id, record.entry_id)
+                existing = staged_steps.get(key, self._system_steps.get(key))
+                if existing is not None:
+                    _require_same_system_step(existing, record)
+                else:
+                    staged_steps[key] = record
+            durable_turns = (
+                record
+                for (run_id, _), record in (self._turns | staged_turns).items()
+                if run_id == checkpoint.run_id
+            )
+            durable_steps = (
+                record
+                for (run_id, _), record in (self._system_steps | staged_steps).items()
+                if run_id == checkpoint.run_id
+            )
+            _require_matching_checkpoint(durable_turns, durable_steps, checkpoint)
+            self._turns.update(staged_turns)
+            self._system_steps.update(staged_steps)
+            self._checkpoints[checkpoint.run_id] = checkpoint
+
+    def get_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        """Return one run's latest recovery state."""
+        with self._lock:
+            return self._checkpoints.get(run_id)
+
+    def clear_checkpoint(self, run_id: str) -> None:
+        """Remove recovery state while retaining the immutable journal."""
+        with self._lock:
+            self._checkpoints.pop(run_id, None)
 
     def complete_job(
         self,
@@ -138,11 +250,30 @@ class MemoryRunRepository:
         with self._lock:
             self._save_result(result)
             self._save_job(completed_job)
+            self._checkpoints.pop(result.run_id, None)
 
     def _save_result(self, result: EpisodeResult) -> None:
         """Replace one result while retaining completion order."""
         self._results.pop(result.run_id, None)
         self._results[result.run_id] = result
+
+    def _record_turn(self, record: TurnRecord) -> None:
+        """Append one turn while the repository lock is held."""
+        key = (record.run_id, record.turn.turn_id)
+        existing = self._turns.get(key)
+        if existing is not None:
+            _require_same_turn(existing, record)
+            return
+        self._turns[key] = record
+
+    def _record_system_step(self, record: SystemStepRecord) -> None:
+        """Append one system step while the repository lock is held."""
+        key = (record.run_id, record.entry_id)
+        existing = self._system_steps.get(key)
+        if existing is not None:
+            _require_same_system_step(existing, record)
+            return
+        self._system_steps[key] = record
 
     def _save_job(self, job: RunJob) -> None:
         """Replace one job while retaining submission order."""
@@ -244,18 +375,208 @@ class SQLiteRunRepository:
             self._upsert_invocation(invocation)
 
     def list_invocations(self, run_id: str) -> tuple[PolicyInvocation, ...]:
-        """Return one run's invocations in day and company order."""
+        """Return one run's invocations in deterministic decision order."""
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT payload_json
                 FROM policy_invocations
                 WHERE run_id = ?
-                ORDER BY day ASC, company_id ASC
                 """,
                 (run_id,),
             ).fetchall()
-        return tuple(PolicyInvocation.model_validate_json(row["payload_json"]) for row in rows)
+        invocations = (PolicyInvocation.model_validate_json(row["payload_json"]) for row in rows)
+        return tuple(sorted(invocations, key=_invocation_order))
+
+    def record_turn(self, record: TurnRecord) -> None:
+        """Append one immutable turn, accepting exact retries only."""
+        with self._lock, self._connection:
+            self._insert_turn(record)
+
+    def list_turns(self, run_id: str) -> tuple[TurnRecord, ...]:
+        """Return one run's turns in deterministic apply order."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM run_turns
+                WHERE run_id = ?
+                ORDER BY sim_minute ASC, apply_sequence ASC, turn_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(TurnRecord.model_validate_json(row["payload_json"]) for row in rows)
+
+    def record_system_step(self, record: SystemStepRecord) -> None:
+        """Append one immutable system step, accepting exact retries only."""
+        with self._lock, self._connection:
+            self._insert_system_step(record)
+
+    def list_system_steps(self, run_id: str) -> tuple[SystemStepRecord, ...]:
+        """Return one run's system steps in chronological journal order."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM run_system_steps
+                WHERE run_id = ?
+                ORDER BY sim_minute ASC, journal_sequence ASC, entry_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(SystemStepRecord.model_validate_json(row["payload_json"]) for row in rows)
+
+    def save_checkpoint(self, checkpoint: RunCheckpoint) -> None:
+        """Atomically replace the canonical versioned checkpoint payload."""
+        with self._lock, self._connection:
+            self._upsert_checkpoint(checkpoint)
+
+    def save_progress(
+        self,
+        turns: tuple[TurnRecord, ...],
+        system_steps: tuple[SystemStepRecord, ...],
+        checkpoint: RunCheckpoint,
+    ) -> None:
+        """Append journal entries and checkpoint in one transaction."""
+        _validate_progress_identity(turns, system_steps, checkpoint)
+        with self._lock, self._connection:
+            for record in turns:
+                self._insert_turn(record)
+            for record in system_steps:
+                self._insert_system_step(record)
+            turn_rows = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM run_turns
+                WHERE run_id = ?
+                """,
+                (checkpoint.run_id,),
+            ).fetchall()
+            step_rows = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM run_system_steps
+                WHERE run_id = ?
+                """,
+                (checkpoint.run_id,),
+            ).fetchall()
+            durable_turns = (
+                TurnRecord.model_validate_json(row["payload_json"]) for row in turn_rows
+            )
+            durable_steps = (
+                SystemStepRecord.model_validate_json(row["payload_json"]) for row in step_rows
+            )
+            _require_matching_checkpoint(durable_turns, durable_steps, checkpoint)
+            self._upsert_checkpoint(checkpoint)
+
+    def get_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        """Return one run's latest complete recovery state."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT payload_json FROM run_checkpoints WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return RunCheckpoint.model_validate_json(row["payload_json"]) if row is not None else None
+
+    def clear_checkpoint(self, run_id: str) -> None:
+        """Remove recovery state while retaining the immutable journal."""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM run_checkpoints WHERE run_id = ?",
+                (run_id,),
+            )
+
+    def _insert_turn(self, record: TurnRecord) -> None:
+        """Insert one immutable journal record inside the active transaction."""
+        payload = record.model_dump_json()
+        self._connection.execute(
+            """
+            INSERT INTO run_turns (
+                run_id, turn_id, company_id, sim_minute, state_version,
+                apply_sequence, schema_version, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, turn_id) DO NOTHING
+            """,
+            (
+                record.run_id,
+                record.turn.turn_id,
+                record.turn.company_id,
+                record.turn.sim_time.absolute_minute,
+                record.turn.state_version,
+                record.outcome.apply_sequence,
+                _PAYLOAD_SCHEMA_VERSION,
+                payload,
+            ),
+        )
+        row = self._connection.execute(
+            """
+            SELECT payload_json
+            FROM run_turns
+            WHERE run_id = ? AND turn_id = ?
+            """,
+            (record.run_id, record.turn.turn_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("turn insert did not produce a journal row")
+        _require_same_turn(
+            TurnRecord.model_validate_json(row["payload_json"]),
+            record,
+        )
+
+    def _insert_system_step(self, record: SystemStepRecord) -> None:
+        """Insert one immutable system journal row inside a transaction."""
+        self._connection.execute(
+            """
+            INSERT INTO run_system_steps (
+                run_id, entry_id, sim_minute, journal_sequence, kind,
+                schema_version, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, entry_id) DO NOTHING
+            """,
+            (
+                record.run_id,
+                record.entry_id,
+                record.occurred_at.absolute_minute,
+                record.journal_sequence,
+                record.kind.value,
+                _PAYLOAD_SCHEMA_VERSION,
+                record.model_dump_json(),
+            ),
+        )
+        row = self._connection.execute(
+            """
+            SELECT payload_json
+            FROM run_system_steps
+            WHERE run_id = ? AND entry_id = ?
+            """,
+            (record.run_id, record.entry_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("system step insert did not produce a journal row")
+        _require_same_system_step(
+            SystemStepRecord.model_validate_json(row["payload_json"]),
+            record,
+        )
+
+    def _upsert_checkpoint(self, checkpoint: RunCheckpoint) -> None:
+        """Replace one checkpoint inside the active transaction."""
+        self._connection.execute(
+            """
+            INSERT INTO run_checkpoints (
+                run_id, current_day, updated_at, payload_json
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                current_day = excluded.current_day,
+                updated_at = excluded.updated_at,
+                payload_json = excluded.payload_json
+            """,
+            (
+                checkpoint.run_id,
+                checkpoint.economy.day,
+                datetime.now(UTC).isoformat(),
+                checkpoint.model_dump_json(),
+            ),
+        )
 
     def complete_job(
         self,
@@ -269,11 +590,15 @@ class SQLiteRunRepository:
             self._upsert_run(result, summary)
             self._replace_projections(result)
             self._upsert_job(completed_job)
+            self._connection.execute(
+                "DELETE FROM run_checkpoints WHERE run_id = ?",
+                (result.run_id,),
+            )
 
     def _create_schema(self) -> None:
-        """Create schema v2, upgrading v1 databases without data loss."""
+        """Create schema v4, upgrading earlier databases without data loss."""
         current_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        if current_version not in (0, 1, _DATABASE_SCHEMA_VERSION):
+        if current_version not in (0, 1, 2, 3, _DATABASE_SCHEMA_VERSION):
             raise RuntimeError(f"unsupported database schema version: {current_version}")
         schema = """
         CREATE TABLE IF NOT EXISTS runs (
@@ -392,10 +717,37 @@ class SQLiteRunRepository:
             payload_json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS run_turns (
+            run_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            company_id TEXT NOT NULL,
+            sim_minute INTEGER NOT NULL,
+            state_version INTEGER NOT NULL,
+            apply_sequence INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (run_id, turn_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS run_system_steps (
+            run_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            sim_minute INTEGER NOT NULL,
+            journal_sequence INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (run_id, entry_id)
+        );
+
         CREATE INDEX IF NOT EXISTS ix_run_jobs_status_submitted
             ON run_jobs(status, submitted_at);
         CREATE INDEX IF NOT EXISTS ix_invocations_run_day_company
             ON policy_invocations(run_id, day, company_id);
+        CREATE INDEX IF NOT EXISTS ix_run_turns_order
+            ON run_turns(run_id, sim_minute, apply_sequence, turn_id);
+        CREATE INDEX IF NOT EXISTS ix_run_system_steps_order
+            ON run_system_steps(run_id, sim_minute, journal_sequence, entry_id);
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
@@ -677,6 +1029,93 @@ def _validate_completion(
         raise ValueError("result and completed job must have the same run_id")
     if completed_job.status != RunStatus.COMPLETED:
         raise ValueError("complete_job requires status=completed")
+    if (
+        completed_job.scenario_id != result.scenario.scenario_id
+        or completed_job.total_days != result.scenario.days
+        or completed_job.seed != result.seed
+    ):
+        raise ValueError("result and completed job must describe the same episode")
+
+
+def _turn_order(record: TurnRecord) -> tuple[int, int, str]:
+    """Return the stable chronological journal key."""
+    return (
+        record.turn.sim_time.absolute_minute,
+        record.outcome.apply_sequence,
+        record.turn.turn_id,
+    )
+
+
+def _system_step_order(record: SystemStepRecord) -> tuple[int, int, str]:
+    """Return the stable chronological system-journal key."""
+    return (
+        record.occurred_at.absolute_minute,
+        record.journal_sequence,
+        record.entry_id,
+    )
+
+
+def _invocation_order(
+    invocation: PolicyInvocation,
+) -> tuple[int, int, bool, int, str, str]:
+    """Order V1 calls by company and V2 calls by time and application."""
+    return (
+        invocation.day,
+        invocation.sim_minute if invocation.sim_minute is not None else -1,
+        invocation.apply_sequence is None,
+        invocation.apply_sequence or 0,
+        invocation.company_id,
+        invocation.invocation_id,
+    )
+
+
+def _validate_progress_identity(
+    turns: tuple[TurnRecord, ...],
+    system_steps: tuple[SystemStepRecord, ...],
+    checkpoint: RunCheckpoint,
+) -> None:
+    """Require each journal delta to be carried exactly by the checkpoint."""
+    if any(record.run_id != checkpoint.run_id for record in turns):
+        raise ValueError("progress turns must match checkpoint run_id")
+    if any(record.run_id != checkpoint.run_id for record in system_steps):
+        raise ValueError("progress system steps must match checkpoint run_id")
+    checkpoint_turns = {record.turn.turn_id: record for record in checkpoint.turns}
+    if any(checkpoint_turns.get(record.turn.turn_id) != record for record in turns):
+        raise ValueError("progress turns must match checkpoint turns")
+    checkpoint_steps = {record.entry_id: record for record in checkpoint.system_steps}
+    if any(checkpoint_steps.get(record.entry_id) != record for record in system_steps):
+        raise ValueError("progress system steps must match checkpoint system steps")
+
+
+def _require_matching_checkpoint(
+    durable_turns: Iterable[TurnRecord],
+    durable_system_steps: Iterable[SystemStepRecord],
+    checkpoint: RunCheckpoint,
+) -> None:
+    """Require the recovery payload to describe the exact durable journal."""
+    durable_turns_by_id = {record.turn.turn_id: record for record in durable_turns}
+    checkpoint_turns = {record.turn.turn_id: record for record in checkpoint.turns}
+    if durable_turns_by_id != checkpoint_turns:
+        raise ValueError("checkpoint turns must match the durable journal")
+    durable_steps_by_id = {record.entry_id: record for record in durable_system_steps}
+    checkpoint_steps = {record.entry_id: record for record in checkpoint.system_steps}
+    if durable_steps_by_id != checkpoint_steps:
+        raise ValueError("checkpoint system steps must match the durable journal")
+
+
+def _require_same_turn(existing: TurnRecord, incoming: TurnRecord) -> None:
+    """Reject reuse of one turn identity for different immutable content."""
+    if existing != incoming:
+        raise ValueError(f"turn identity conflict: {incoming.run_id}/{incoming.turn.turn_id}")
+
+
+def _require_same_system_step(
+    existing: SystemStepRecord,
+    incoming: SystemStepRecord,
+) -> None:
+    """Reject reuse of one system identity for different immutable content."""
+    if existing != incoming:
+        raise ValueError(f"system step identity conflict: {incoming.run_id}/{incoming.entry_id}")
 
 
 def _isoformat(value: datetime | None) -> str | None:
