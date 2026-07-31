@@ -11,7 +11,7 @@ from company_bench.codex_artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
 )
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO, DAIRY_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.models import (
     CompanyObservation,
     EpisodeResult,
@@ -32,14 +32,14 @@ from company_bench.web import create_app
 
 def _app(repository: MemoryRunRepository) -> FastAPI:
     """Create an app with deterministic server-side policy availability."""
-    factory = PolicyFactory(DAIRY_V1_SCENARIO, repository)
+    factory = PolicyFactory(DAIRY_S12_V2_SCENARIO, repository)
     return create_app(repository, factory)
 
 
 def _wait_for_terminal_job(
     client: TestClient,
     run_id: str,
-    timeout_seconds: float = 5,
+    timeout_seconds: float = 15,
 ) -> RunJob:
     """Poll the public job endpoint until the run reaches a terminal state."""
     deadline = time.monotonic() + timeout_seconds
@@ -74,12 +74,21 @@ def test_run_list_and_detail_http_flow() -> None:
         assert detail.status_code == 200
         result = EpisodeResult.model_validate(detail.json())
         assert result.seed == 42
-        assert len(result.decisions) == 6 * 30
+        assert result.scenario == DAIRY_S12_V2_SCENARIO
+        assert len(result.scenario.companies) == 12
+        assert result.decisions == ()
         assert len(result.snapshots) == 30
+        turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
+        assert len(turns) > (DAIRY_S12_V2_SCENARIO.days * len(DAIRY_S12_V2_SCENARIO.companies))
+        assert turns[0]["turn"]["state_version"] == 0
+        assert turns[0]["envelope"]["command"]["kind"] in {
+            "produce",
+            "place_order",
+        }
 
         summaries = client.get("/api/runs").json()
         assert summaries[0]["run_id"] == result.run_id
-        assert summaries[0]["scenario_id"] == "flow.dairy.base.s6.v1"
+        assert summaries[0]["scenario_id"] == "flow.dairy.base.s12.v2"
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -113,54 +122,11 @@ def test_run_list_and_detail_http_flow() -> None:
         assert replay.events == result.events
         assert replay.snapshots == result.snapshots
         assert replay.score == result.score
+        assert all(policy.source_run_id == result.run_id for policy in replay.policies)
 
         assert client.get("/api/runs/missing").status_code == 404
         assert client.get("/api/run-jobs/missing").status_code == 404
         assert client.get("/api/runs/missing/invocations").status_code == 404
-
-
-def test_v2_http_flow_exposes_atomic_turn_journal() -> None:
-    repository = MemoryRunRepository()
-    factory = PolicyFactory(DAIRY_V2_SCENARIO, repository)
-    with TestClient(create_app(repository, factory)) as client:
-        submitted = RunJob.model_validate(
-            client.post(
-                "/api/runs",
-                json={"mode": "baseline", "seed": 42},
-            ).json()
-        )
-        completed = _wait_for_terminal_job(client, submitted.run_id)
-        assert completed.status is RunStatus.COMPLETED
-
-        result = EpisodeResult.model_validate(client.get(f"/api/runs/{submitted.run_id}").json())
-        turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
-
-        assert result.scenario.scenario_id == "flow.dairy.base.s6.v2"
-        assert result.decisions == ()
-        assert len(turns) > DAIRY_V2_SCENARIO.days * len(DAIRY_V2_SCENARIO.companies)
-        assert turns[0]["turn"]["state_version"] == 0
-        assert turns[0]["envelope"]["command"]["kind"] in {
-            "produce",
-            "place_order",
-        }
-
-        replay_job = _wait_for_terminal_job(
-            client,
-            RunJob.model_validate(
-                client.post(
-                    "/api/runs",
-                    json={
-                        "mode": "replay",
-                        "source_run_id": submitted.run_id,
-                    },
-                ).json()
-            ).run_id,
-        )
-        replay = EpisodeResult.model_validate(client.get(f"/api/runs/{replay_job.run_id}").json())
-        assert replay.events == result.events
-        assert replay.snapshots == result.snapshots
-        assert replay.score == result.score
-        assert all(policy.source_run_id == submitted.run_id for policy in replay.policies)
 
 
 def test_http_validation_and_localhost_cors() -> None:
@@ -261,8 +227,8 @@ def test_default_app_runs_the_v2_scenario(monkeypatch: MonkeyPatch) -> None:
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
 
     assert completed.status is RunStatus.COMPLETED
-    assert result.scenario == DAIRY_V2_SCENARIO
-    assert len(turns) > DAIRY_V2_SCENARIO.days * len(DAIRY_V2_SCENARIO.companies)
+    assert result.scenario == DAIRY_S12_V2_SCENARIO
+    assert len(turns) > (DAIRY_S12_V2_SCENARIO.days * len(DAIRY_S12_V2_SCENARIO.companies))
 
 
 def test_codex_profile_can_be_enabled_without_exposing_credentials(
@@ -303,8 +269,8 @@ def test_codex_artifacts_are_loaded_lazily_from_run_files(
             run_id=run_id,
             mode=PolicyKind.CODEX,
             seed=42,
-            scenario_id=DAIRY_V1_SCENARIO.scenario_id,
-            total_days=DAIRY_V1_SCENARIO.days,
+            scenario_id=DAIRY_S12_V2_SCENARIO.scenario_id,
+            total_days=DAIRY_S12_V2_SCENARIO.days,
             submitted_at=now,
         )
     )
@@ -371,8 +337,8 @@ def test_v2_codex_artifacts_are_resolved_by_domain_turn(
             run_id=run_id,
             mode=PolicyKind.CODEX,
             seed=42,
-            scenario_id=DAIRY_V2_SCENARIO.scenario_id,
-            total_days=DAIRY_V2_SCENARIO.days,
+            scenario_id=DAIRY_S12_V2_SCENARIO.scenario_id,
+            total_days=DAIRY_S12_V2_SCENARIO.days,
             submitted_at=now,
         )
     )

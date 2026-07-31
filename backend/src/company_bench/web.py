@@ -22,7 +22,7 @@ from company_bench.codex_artifacts import (
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
 from company_bench.codex_sessions import CodexSessionManager
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.models import (
     MAX_SEED,
     EpisodeResult,
@@ -96,7 +96,7 @@ def create_app(
             else None
         )
         active_factory = PolicyFactory(
-            scenario=DAIRY_V2_SCENARIO,
+            scenario=DAIRY_S12_V2_SCENARIO,
             audit_sink=active_repository,
             codex_config=codex_config,
             codex_gateway_factory=partial(
@@ -109,18 +109,16 @@ def create_app(
     else:
         active_factory = policy_factory
     active_scenario = active_factory.scenario
-    runtime = (
-        EpisodeRuntime(
-            active_scenario,
-            agent_timeout_seconds=active_factory.policy_timeout_seconds,
-        )
-        if active_scenario.version >= 2
-        else None
+    if active_scenario.version < 2:
+        raise ValueError("the web application requires an event-driven V2 scenario")
+    runtime = EpisodeRuntime(
+        active_scenario,
+        agent_timeout_seconds=active_factory.policy_timeout_seconds,
     )
     coordinator = RunCoordinator(
         active_repository,
         active_factory,
-        runtime=runtime,
+        runtime,
     )
     timeline = RunTimelineProjector(active_repository, active_artifacts)
 

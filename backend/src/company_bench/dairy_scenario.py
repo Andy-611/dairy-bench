@@ -1,6 +1,8 @@
 from decimal import Decimal
+from typing import Final, Literal
 
 from company_bench.models import (
+    CompanyOperation,
     CompanySpec,
     DemandSpec,
     FarmOperation,
@@ -12,70 +14,63 @@ from company_bench.models import (
     ScoringSpec,
 )
 
+__all__ = ("DAIRY_S12_V2_SCENARIO",)
+
+type _CompanySuffix = Literal["a", "b", "c", "d"]
+type _CompanyTemplate = tuple[str, CompanyOperation]
+
+_COMPANY_SUFFIXES: Final[tuple[_CompanySuffix, ...]] = ("a", "b", "c", "d")
+
 
 def _money(value: str) -> Decimal:
     """Create an exact benchmark decimal from a readable literal."""
     return Decimal(value)
 
 
-def build_dairy_scenario() -> ScenarioSpec:
-    """Build the fixed six-company Dairy Bench V1 scenario."""
-    starting_cash = _money("1000")
-    companies = (
-        CompanySpec(
-            company_id="farm_a",
-            name="牧场 A",
-            initial_cash=starting_cash,
-            operation=FarmOperation(
-                daily_capacity=_money("60"),
-                unit_cost=_money("1.00"),
-            ),
-        ),
-        CompanySpec(
-            company_id="farm_b",
-            name="牧场 B",
-            initial_cash=starting_cash,
-            operation=FarmOperation(
-                daily_capacity=_money("60"),
-                unit_cost=_money("1.00"),
-            ),
-        ),
-        CompanySpec(
-            company_id="processor_a",
-            name="加工厂 A",
-            initial_cash=starting_cash,
-            operation=ProcessorOperation(
-                daily_input_capacity=_money("50"),
-                yield_rate=_money("0.8"),
-                processing_cost_per_input=_money("0.40"),
-            ),
-        ),
-        CompanySpec(
-            company_id="processor_b",
-            name="加工厂 B",
-            initial_cash=starting_cash,
-            operation=ProcessorOperation(
-                daily_input_capacity=_money("50"),
-                yield_rate=_money("0.8"),
-                processing_cost_per_input=_money("0.40"),
-            ),
-        ),
-        CompanySpec(
-            company_id="retailer_a",
-            name="零售商 A",
-            initial_cash=starting_cash,
-            operation=RetailerOperation(),
-        ),
-        CompanySpec(
-            company_id="retailer_b",
-            name="零售商 B",
-            initial_cash=starting_cash,
-            operation=RetailerOperation(),
-        ),
+def _company(
+    suffix: _CompanySuffix,
+    template: _CompanyTemplate,
+) -> CompanySpec:
+    """Compose one immutable company from its operation and roster suffix."""
+    name, operation = template
+    return CompanySpec(
+        company_id=f"{operation.kind}_{suffix}",
+        name=f"{name} {suffix.upper()}",
+        initial_cash=_money("1000"),
+        operation=operation,
     )
+
+
+def _build_companies() -> tuple[CompanySpec, ...]:
+    """Build the canonical four-company roster for every value-chain tier."""
+    templates: tuple[_CompanyTemplate, ...] = (
+        (
+            "牧场",
+            FarmOperation(
+                daily_capacity=_money("60"),
+                unit_cost=_money("1.00"),
+            ),
+        ),
+        (
+            "加工厂",
+            ProcessorOperation(
+                daily_input_capacity=_money("50"),
+                yield_rate=_money("0.8"),
+                processing_cost_per_input=_money("0.40"),
+            ),
+        ),
+        ("零售商", RetailerOperation()),
+    )
+    return tuple(
+        _company(suffix, template) for template in templates for suffix in _COMPANY_SUFFIXES
+    )
+
+
+def _build_dairy_scenario() -> ScenarioSpec:
+    """Build the canonical event-driven Dairy Bench scenario."""
     return ScenarioSpec(
-        scenario_id="flow.dairy.base.s6.v1",
-        version=1,
+        scenario_id="flow.dairy.base.s12.v2",
+        version=2,
         days=30,
         products=(
             ProductSpec(
@@ -91,7 +86,7 @@ def build_dairy_scenario() -> ScenarioSpec:
                 reference_value=_money("1.75"),
             ),
         ),
-        companies=companies,
+        companies=_build_companies(),
         demand=DemandSpec(
             base_demand=_money("40"),
             reference_price=_money("3.50"),
@@ -106,17 +101,4 @@ def build_dairy_scenario() -> ScenarioSpec:
     )
 
 
-DAIRY_V1_SCENARIO = build_dairy_scenario()
-
-
-def build_dairy_v2_scenario() -> ScenarioSpec:
-    """Build V2 with the same economy and an event-driven runtime."""
-    return DAIRY_V1_SCENARIO.model_copy(
-        update={
-            "scenario_id": "flow.dairy.base.s6.v2",
-            "version": 2,
-        }
-    )
-
-
-DAIRY_V2_SCENARIO = build_dairy_v2_scenario()
+DAIRY_S12_V2_SCENARIO: Final[ScenarioSpec] = _build_dairy_scenario()

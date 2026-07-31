@@ -62,7 +62,7 @@ as provenance.
 
 ## Time protocol
 
-The default `flow.dairy.base.s6.v2` scenario schedules:
+The default `flow.dairy.base.s12.v2` scenario schedules:
 
 | Time | System step |
 |---|---|

@@ -10,7 +10,6 @@ from uuid import uuid4
 from pydantic import TypeAdapter
 
 from company_bench.agent_models import PolicyInfrastructureError
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import (
     CompanyDecision,
@@ -32,16 +31,18 @@ _DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 
 
 class DairyBenchmark:
-    """Run a complete deterministic episode behind one small interface."""
+    """Run one explicit pre-V2 daily-decision scenario."""
 
     def __init__(
         self,
-        scenario: ScenarioSpec = DAIRY_V1_SCENARIO,
+        scenario: ScenarioSpec,
         *,
         engine: EconomyEngine | None = None,
         evaluator: Evaluator | None = None,
         policy_timeout_seconds: float = 5.0,
     ) -> None:
+        if scenario.version >= 2:
+            raise ValueError("DairyBenchmark does not implement event-driven V2 scenarios")
         if policy_timeout_seconds <= 0:
             raise ValueError("policy_timeout_seconds must be positive")
         self.scenario = scenario
@@ -184,15 +185,15 @@ class DairyBenchmark:
 
 
 class RunService:
-    """Run, persist, and query completed episodes."""
+    """Persist episodes produced by an explicit pre-V2 benchmark."""
 
     def __init__(
         self,
         repository: RunRepository,
-        benchmark: DairyBenchmark | None = None,
+        benchmark: DairyBenchmark,
     ) -> None:
         self._repository = repository
-        self._benchmark = benchmark or DairyBenchmark()
+        self._benchmark = benchmark
 
     async def run(
         self,

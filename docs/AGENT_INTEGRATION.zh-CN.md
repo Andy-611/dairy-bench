@@ -2,7 +2,7 @@
 
 ## V2 Agent 契约
 
-Dairy Bench 运行六家公司，并为每家公司提供一个独立 Agent。Agent 不再提交
+Dairy Bench 运行十二家公司，并为每家公司提供一个独立 Agent。Agent 不再提交
 一份完整的每日计划。每当 Scheduler 唤醒它时，它都会完成一个闭环：
 
 ```text
@@ -111,7 +111,7 @@ cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench"
 `%USERPROFILE%\.codex` 隔离。第一次启动时可能会要求单独登录。后端验证会
 拒绝直接使用个人 Codex home。
 
-六家公司都会获得独立的 `AsyncCodex` Runtime，而且每个 Turn 都使用一个
+十二家公司都会获得独立的 `AsyncCodex` Runtime，而且每个 Turn 都使用一个
 隔离 thread。Runtime 为只读模式，使用 `deny_all` 审批，并禁用 shell、
 搜索、插件、Codex memory 和多 Agent 功能。
 

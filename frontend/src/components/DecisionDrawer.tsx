@@ -610,7 +610,7 @@ function RawAudit({
       ) : (
         <>
           <p>
-            Legacy display names are translated for this English UI; the stored
+            Known product names are translated for this English UI; the stored
             journal remains unchanged.
           </p>
           <pre>{formatAuditPayload(data)}</pre>

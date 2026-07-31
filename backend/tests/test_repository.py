@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from company_bench.application import RunService
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO
+from company_bench.application import DairyBenchmark, RunService
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.memory import AgentCheckpoint
 from company_bench.models import (
@@ -41,11 +41,17 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 from company_bench.scheduler import SchedulerCheckpoint
+from tests.scenarios import LEGACY_S12_SCENARIO
 
 
 def run_episode(seed: int = 42) -> EpisodeResult:
     """Create one real episode through the public application service."""
-    return asyncio.run(RunService(MemoryRunRepository()).run(seed))
+    repository = MemoryRunRepository()
+    service = RunService(
+        repository,
+        DairyBenchmark(LEGACY_S12_SCENARIO),
+    )
+    return asyncio.run(service.run(seed))
 
 
 def test_memory_repository_round_trip_and_summary() -> None:
@@ -371,7 +377,7 @@ def _checkpoint_for(
 ) -> RunCheckpoint:
     """Build a complete, versioned recovery payload around one turn."""
     engine = EconomyEngine()
-    world = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    world = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
     return RunCheckpoint(
         run_id=record.run_id,
         episode_started_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -390,7 +396,7 @@ def _checkpoint_for(
                     else PolicyKind.BASELINE
                 ),
             )
-            for company in DAIRY_V1_SCENARIO.companies
+            for company in DAIRY_S12_V2_SCENARIO.companies
         ),
         agent_states=(
             AgentCheckpoint(
@@ -407,7 +413,7 @@ def _checkpoint_for(
                 company_id=company.company_id,
                 next_turn_sequence=(2 if company.company_id == observation.company_id else 1),
             )
-            for company in DAIRY_V1_SCENARIO.companies
+            for company in DAIRY_S12_V2_SCENARIO.companies
         ),
     )
 

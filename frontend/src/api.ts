@@ -352,7 +352,10 @@ function parseCompany(
 
   return {
     companyId,
-    companyName: companyLabel(companyId),
+    companyName: companyLabel(
+      companyId,
+      text(companySpec.name, `company ${companyId}.name`),
+    ),
     role: role(companyScore.tier, `${path}.tier`),
     policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "Unknown policy",
     initialCash: number(companyScore.initial_value, `${path}.initial_value`),

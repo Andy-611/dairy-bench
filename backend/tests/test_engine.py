@@ -5,22 +5,29 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import (
     CompanyDecision,
+    CompanyOperation,
     CompanyState,
     ConsumerSaleEvent,
     DecisionRejectedEvent,
+    DemandSpec,
     FarmDecision,
+    FarmOperation,
     InventoryExpiredEvent,
     MilkProcessedEvent,
     MilkProducedEvent,
     NoOpDecision,
     ProcessorDecision,
+    ProcessorOperation,
     ProductId,
+    ProductSpec,
     RecordedDecision,
     RetailerDecision,
+    RetailerOperation,
+    ScoringSpec,
     TradeExecutedEvent,
     WorldState,
 )
@@ -55,9 +62,7 @@ def _baseline_records(
     async def decide_all() -> tuple[CompanyDecision, ...]:
         policy = BaselinePolicy()
         return tuple(
-            await asyncio.gather(
-                *(policy.decide(observation) for observation in observations)
-            )
+            await asyncio.gather(*(policy.decide(observation) for observation in observations))
         )
 
     decisions = asyncio.run(decide_all())
@@ -81,16 +86,75 @@ def _no_op(_: str) -> CompanyDecision:
     return NoOpDecision()
 
 
-def test_scenario_is_strongly_typed_frozen_and_six_company() -> None:
-    scenario = DAIRY_V1_SCENARIO
+def test_scenario_is_strongly_typed_frozen_and_has_four_companies_per_tier() -> None:
+    scenario = DAIRY_S12_V2_SCENARIO
+    expected_company_ids = tuple(
+        f"{tier}_{suffix}"
+        for tier in ("farm", "processor", "retailer")
+        for suffix in ("a", "b", "c", "d")
+    )
 
+    assert scenario.scenario_id == "flow.dairy.base.s12.v2"
+    assert scenario.version == 2
     assert scenario.days == 30
-    assert len(scenario.companies) == 6
+    assert tuple(company.company_id for company in scenario.companies) == expected_company_ids
+    assert len({company.company_id for company in scenario.companies}) == 12
+    assert all(
+        sum(company.tier.value == tier for company in scenario.companies) == 4
+        for tier in ("farm", "processor", "retailer")
+    )
     assert {company.tier.value for company in scenario.companies} == {
         "farm",
         "processor",
         "retailer",
     }
+    assert tuple(company.initial_cash for company in scenario.companies) == (Decimal("1000"),) * 12
+    expected_operations: tuple[CompanyOperation, ...] = (
+        FarmOperation(
+            daily_capacity=Decimal("60"),
+            unit_cost=Decimal("1.00"),
+        ),
+        ProcessorOperation(
+            daily_input_capacity=Decimal("50"),
+            yield_rate=Decimal("0.8"),
+            processing_cost_per_input=Decimal("0.40"),
+        ),
+        RetailerOperation(),
+    )
+    for operation in expected_operations:
+        assert (
+            tuple(
+                company.operation
+                for company in scenario.companies
+                if company.operation.kind == operation.kind
+            )
+            == (operation,) * 4
+        )
+    assert scenario.products == (
+        ProductSpec(
+            product=ProductId.RAW_MILK,
+            name="原奶",
+            shelf_life_days=2,
+            reference_value=Decimal("1.00"),
+        ),
+        ProductSpec(
+            product=ProductId.BOTTLED_MILK,
+            name="盒装奶",
+            shelf_life_days=4,
+            reference_value=Decimal("1.75"),
+        ),
+    )
+    assert scenario.demand == DemandSpec(
+        base_demand=Decimal("40"),
+        reference_price=Decimal("3.50"),
+        price_sensitivity=Decimal("8"),
+        shock_min=-5,
+        shock_max=5,
+    )
+    assert scenario.scoring == ScoringSpec(
+        max_gini=Decimal("0.20"),
+        max_within_tier_growth_gap=Decimal("0.20"),
+    )
     with pytest.raises(ValidationError):
         scenario.model_copy(update={"unexpected": "field"}).model_validate(
             {
@@ -109,41 +173,29 @@ def test_scenario_is_strongly_typed_frozen_and_six_company() -> None:
 @pytest.mark.parametrize("seed", [-1, True, 2_147_483_648])
 def test_engine_rejects_invalid_seed(seed: int) -> None:
     with pytest.raises(ValueError, match="seed must be"):
-        EconomyEngine().initial_state(DAIRY_V1_SCENARIO, seed)
+        EconomyEngine().initial_state(DAIRY_S12_V2_SCENARIO, seed)
 
 
 def test_baseline_settles_the_complete_chain_without_negative_balances() -> None:
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
 
     result = engine.step(state, _baseline_records(engine, state))
 
     assert result.state.day == 1
-    assert result.snapshot.markets[0].volume == Decimal("100")
-    assert result.snapshot.markets[1].volume == Decimal("80.0")
+    assert result.snapshot.markets[0].volume == Decimal("200")
+    assert result.snapshot.markets[1].volume == Decimal("160.0")
     assert all(company.cash >= 0 for company in result.state.companies)
-    assert all(
-        lot.quantity > 0
-        for company in result.state.companies
-        for lot in company.inventory
-    )
-    assert sum(
-        isinstance(event, MilkProducedEvent) for event in result.events
-    ) == 2
-    assert sum(
-        isinstance(event, MilkProcessedEvent) for event in result.events
-    ) == 2
-    assert sum(
-        isinstance(event, TradeExecutedEvent) for event in result.events
-    ) == 4
-    assert sum(
-        isinstance(event, ConsumerSaleEvent) for event in result.events
-    ) == 2
+    assert all(lot.quantity > 0 for company in result.state.companies for lot in company.inventory)
+    assert sum(isinstance(event, MilkProducedEvent) for event in result.events) == 4
+    assert sum(isinstance(event, MilkProcessedEvent) for event in result.events) == 4
+    assert sum(isinstance(event, TradeExecutedEvent) for event in result.events) == 8
+    assert sum(isinstance(event, ConsumerSaleEvent) for event in result.events) == 4
 
 
 def test_market_caps_purchase_by_cash() -> None:
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=7)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=7)
 
     def decide(company_id: str) -> CompanyDecision:
         if company_id == "farm_a":
@@ -166,41 +218,30 @@ def test_market_caps_purchase_by_cash() -> None:
     raw_trades = [
         event
         for event in result.events
-        if isinstance(event, TradeExecutedEvent)
-        and event.product == ProductId.RAW_MILK
+        if isinstance(event, TradeExecutedEvent) and event.product == ProductId.RAW_MILK
     ]
     processor = next(
-        company
-        for company in result.state.companies
-        if company.company_id == "processor_a"
+        company for company in result.state.companies if company.company_id == "processor_a"
     )
 
     assert len(raw_trades) == 1
     assert raw_trades[0].quantity == Decimal("10")
     assert processor.cash == Decimal("0")
     assert sum(
-        (
-            lot.quantity
-            for lot in processor.inventory
-            if lot.product == ProductId.RAW_MILK
-        ),
+        (lot.quantity for lot in processor.inventory if lot.product == ProductId.RAW_MILK),
         start=Decimal("0"),
     ) == Decimal("10")
 
 
 def test_fractional_affordability_is_rounded_down() -> None:
     engine = EconomyEngine()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=7)
+    initial = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=7)
     state = initial.model_copy(
         update={
             "companies": tuple(
                 CompanyState(
                     company_id=company.company_id,
-                    cash=(
-                        Decimal("20")
-                        if company.company_id == "processor_a"
-                        else company.cash
-                    ),
+                    cash=(Decimal("20") if company.company_id == "processor_a" else company.cash),
                     inventory=company.inventory,
                 )
                 for company in initial.companies
@@ -226,15 +267,9 @@ def test_fractional_affordability_is_rounded_down() -> None:
         return NoOpDecision()
 
     result = engine.step(state, _record(engine, state, decide))
-    trade = next(
-        event
-        for event in result.events
-        if isinstance(event, TradeExecutedEvent)
-    )
+    trade = next(event for event in result.events if isinstance(event, TradeExecutedEvent))
     processor = next(
-        company
-        for company in result.state.companies
-        if company.company_id == "processor_a"
+        company for company in result.state.companies if company.company_id == "processor_a"
     )
 
     assert trade.quantity == Decimal("14.2857")
@@ -243,7 +278,7 @@ def test_fractional_affordability_is_rounded_down() -> None:
 
 def test_fefo_moves_oldest_lot_then_expiration_removes_it() -> None:
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=9)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=9)
 
     def day_one(company_id: str) -> CompanyDecision:
         if company_id == "farm_a":
@@ -277,16 +312,8 @@ def test_fefo_moves_oldest_lot_then_expiration_removes_it() -> None:
         first.state,
         _record(engine, first.state, day_two),
     )
-    farm = next(
-        company
-        for company in second.state.companies
-        if company.company_id == "farm_a"
-    )
-    expired = [
-        event
-        for event in second.events
-        if isinstance(event, InventoryExpiredEvent)
-    ]
+    farm = next(company for company in second.state.companies if company.company_id == "farm_a")
+    expired = [event for event in second.events if isinstance(event, InventoryExpiredEvent)]
 
     assert len(farm.inventory) == 1
     assert farm.inventory[0].produced_day == 2
@@ -298,7 +325,7 @@ def test_fefo_moves_oldest_lot_then_expiration_removes_it() -> None:
 
 def test_wrong_decision_type_is_rejected_without_side_effects() -> None:
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=4)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=4)
 
     def decide(company_id: str) -> CompanyDecision:
         if company_id == "farm_a":
@@ -312,23 +339,18 @@ def test_wrong_decision_type_is_rejected_without_side_effects() -> None:
     result = engine.step(state, _record(engine, state, decide))
 
     assert any(
-        isinstance(event, DecisionRejectedEvent)
-        and event.company_id == "farm_a"
+        isinstance(event, DecisionRejectedEvent) and event.company_id == "farm_a"
         for event in result.events
     )
-    farm = next(
-        company
-        for company in result.state.companies
-        if company.company_id == "farm_a"
-    )
+    farm = next(company for company in result.state.companies if company.company_id == "farm_a")
     assert farm.cash == Decimal("1000")
     assert farm.inventory == ()
 
 
 def test_same_seed_and_decisions_are_exactly_reproducible() -> None:
     engine = EconomyEngine()
-    left = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-    right = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    left = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
+    right = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
 
     left_result = engine.step(left, _baseline_records(engine, left))
     right_result = engine.step(right, _baseline_records(engine, right))
@@ -338,21 +360,19 @@ def test_same_seed_and_decisions_are_exactly_reproducible() -> None:
 
 def test_observation_hides_seed_and_exposes_public_rules() -> None:
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=314159)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=314159)
 
     observation = engine.observe(state)[0]
 
-    assert observation.observation_id == (
-        "flow.dairy.base.s6.v1|1|farm_a"
-    )
-    assert observation.products == DAIRY_V1_SCENARIO.products
-    assert observation.demand == DAIRY_V1_SCENARIO.demand
-    assert observation.scoring == DAIRY_V1_SCENARIO.scoring
+    assert observation.observation_id == ("flow.dairy.base.s12.v2|1|farm_a")
+    assert observation.products == DAIRY_S12_V2_SCENARIO.products
+    assert observation.demand == DAIRY_S12_V2_SCENARIO.demand
+    assert observation.scoring == DAIRY_S12_V2_SCENARIO.scoring
 
 
-def test_equal_price_priority_rotates_between_companies() -> None:
+def test_equal_price_priority_rotates_across_all_four_companies() -> None:
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=1)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=1)
 
     def decide(company_id: str) -> CompanyDecision:
         if company_id == "farm_a":
@@ -371,33 +391,37 @@ def test_equal_price_priority_rotates_between_companies() -> None:
             )
         return NoOpDecision()
 
-    first = engine.step(state, _record(engine, state, decide))
-    second = engine.step(
-        first.state,
-        _record(engine, first.state, decide),
-    )
+    results = []
+    for _ in range(4):
+        result = engine.step(state, _record(engine, state, decide))
+        results.append(result)
+        state = result.state
     buyers = [
         next(
             event.buyer_id
             for event in result.events
-            if isinstance(event, TradeExecutedEvent)
-            and event.product == ProductId.RAW_MILK
+            if isinstance(event, TradeExecutedEvent) and event.product == ProductId.RAW_MILK
         )
-        for result in (first, second)
+        for result in results
     ]
 
-    assert buyers == ["processor_a", "processor_b"]
+    assert buyers == [
+        "processor_a",
+        "processor_b",
+        "processor_c",
+        "processor_d",
+    ]
 
 
 def test_thirty_day_baseline_can_be_scored_read_only() -> None:
     engine = EconomyEngine()
     evaluator = Evaluator()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    initial = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
     state = initial
     snapshots = []
     events = []
 
-    for _ in range(DAIRY_V1_SCENARIO.days):
+    for _ in range(DAIRY_S12_V2_SCENARIO.days):
         result = engine.step(state, _baseline_records(engine, state))
         state = result.state
         snapshots.append(result.snapshot)
@@ -405,7 +429,7 @@ def test_thirty_day_baseline_can_be_scored_read_only() -> None:
 
     state_before_scoring = state.model_dump_json()
     score = evaluator.evaluate(
-        DAIRY_V1_SCENARIO,
+        DAIRY_S12_V2_SCENARIO,
         initial,
         state,
         tuple(snapshots),
@@ -426,19 +450,19 @@ def test_thirty_day_baseline_can_be_scored_read_only() -> None:
 def test_no_op_retailers_have_zero_fill_rate() -> None:
     engine = EconomyEngine()
     evaluator = Evaluator()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    initial = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
     state = initial
     snapshots = []
     events = []
 
-    for _ in range(DAIRY_V1_SCENARIO.days):
+    for _ in range(DAIRY_S12_V2_SCENARIO.days):
         result = engine.step(state, _record(engine, state, _no_op))
         state = result.state
         snapshots.append(result.snapshot)
         events.extend(result.events)
 
     score = evaluator.evaluate(
-        DAIRY_V1_SCENARIO,
+        DAIRY_S12_V2_SCENARIO,
         initial,
         state,
         tuple(snapshots),
@@ -446,19 +470,19 @@ def test_no_op_retailers_have_zero_fill_rate() -> None:
     )
 
     assert score.consumer_fill_rate == 0
-    assert sum(
-        isinstance(event, ConsumerSaleEvent)
-        for event in events
-    ) == 2 * DAIRY_V1_SCENARIO.days
+    assert (
+        sum(isinstance(event, ConsumerSaleEvent) for event in events)
+        == 4 * DAIRY_S12_V2_SCENARIO.days
+    )
 
 
 def test_evaluator_rejects_an_incomplete_episode() -> None:
     engine = EconomyEngine()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    initial = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
 
     with pytest.raises(ValueError, match="complete episode"):
         Evaluator().evaluate(
-            DAIRY_V1_SCENARIO,
+            DAIRY_S12_V2_SCENARIO,
             initial,
             initial,
             (),

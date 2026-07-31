@@ -3,7 +3,7 @@ import pytest
 from company_bench.agent_gateway import ScriptedModelGateway
 from company_bench.agent_models import ModelOutputError
 from company_bench.agents import LlmCompanyAgent, observation_hash
-from company_bench.dairy_scenario import DAIRY_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.models import (
     CompanyObservation,
     NoOpDecision,
@@ -173,7 +173,7 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
 
 @pytest.mark.asyncio
 async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     run_id = "llm_runtime_cycle"
     repository = MemoryRunRepository()
     agents: dict[str, LlmCompanyAgent] = {}

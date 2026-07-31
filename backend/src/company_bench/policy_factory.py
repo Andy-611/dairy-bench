@@ -68,7 +68,7 @@ class AgentBundle:
 
 
 class PolicyFactory:
-    """Create six separate company controllers from one server profile."""
+    """Create an isolated controller for every configured company."""
 
     def __init__(
         self,
@@ -112,9 +112,7 @@ class PolicyFactory:
                 reasoning_effort=codex.reasoning_effort if codex else None,
                 description="Each company is controlled by an independent Codex runtime.",
                 unavailable_reason=(
-                    None
-                    if codex
-                    else "Log in to Codex and enable DAIRY_BENCH_CODEX_ENABLED."
+                    None if codex else "Log in to Codex and enable DAIRY_BENCH_CODEX_ENABLED."
                 ),
             ),
             PolicyProfileView(
@@ -160,7 +158,9 @@ class PolicyFactory:
         mode: PolicyKind,
         source: EpisodeResult | None = None,
     ) -> PolicyBundle:
-        """Create a new policy object for every configured company."""
+        """Create daily policies for an explicit pre-V2 scenario."""
+        if self._scenario.version >= 2:
+            raise ValueError("daily policies do not implement event-driven V2 scenarios")
         if mode is PolicyKind.BASELINE:
             return PolicyBundle(
                 {company.company_id: BaselinePolicy() for company in self._scenario.companies}
@@ -199,6 +199,8 @@ class PolicyFactory:
         completed_turns: tuple[TurnRecord, ...] = (),
     ) -> AgentBundle:
         """Create fresh event-driven company actors for one V2 episode."""
+        if self._scenario.version < 2:
+            raise ValueError("event-driven Agents require a V2 scenario")
         if mode is PolicyKind.BASELINE:
             return AgentBundle(
                 {company.company_id: BaselineCompanyAgent() for company in self._scenario.companies}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.memory import (
     AgentCheckpoint,
@@ -31,7 +31,7 @@ RUN_ID = "memory_run"
 def observations() -> dict[str, CompanyObservation]:
     """Return one private day-one observation per company."""
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
+    state = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
     return {observation.company_id: observation for observation in engine.observe(state)}
 
 

@@ -1,7 +1,7 @@
 # Dairy Bench
 
-Dairy Bench 是一个事件驱动的多 Agent Benchmark，其中两家农场、两家
-加工商和两家零售商共同经营一条易腐乳制品供应链。每家公司都由一个独立
+Dairy Bench 是一个事件驱动的多 Agent Benchmark，其中四家农场、四家
+加工商和四家零售商共同经营一条易腐乳制品供应链。每家公司都由一个独立
 Agent 控制。
 
 一个 episode 持续 30 个模拟日。决策单位不是每日计划，而是一个原子公司
@@ -16,13 +16,13 @@ Turn：
 
 ## 已实现的内容
 
-- 六家异构公司、原奶和瓶装奶、FEFO 库存以及两个现货市场。
+- 十二家异构公司、原奶和瓶装奶、FEFO 库存以及两个现货市场。
 - 每家公司都可以使用独立的规则、Codex、OpenAI 或精确 Replay Agent。
 - 虚拟分钟时钟、固定市场清算时间、事件驱动唤醒、同一时刻并发推理以及
   确定性的串行命令提交。
 - 每个 Turn 恰好执行一个强类型原子命令。OpenAI 使用原生函数工具；
   Codex 使用等价的严格结构化 Adapter。
-- 六个 Agent 各自拥有独立的 token 预算记忆、模型 Gateway 和模型客户端
+- 十二个 Agent 各自拥有独立的 token 预算记忆、模型 Gateway 和模型客户端
   生命周期。
 - 不可变的 Turn Journal、原子 checkpoint、崩溃恢复以及无需模型调用的
   Replay。
@@ -37,8 +37,8 @@ React → FastAPI → RunCoordinator → EpisodeRuntime → Scheduler + EconomyE
                          │                └── Evaluator
                          ├── PolicyFactory
                          │   ├── BaselineCompanyAgent
-                         │   ├── LlmCompanyAgent × 6 → Gateway × 6
-                         │   └── ReplayCompanyAgent × 6
+                         │   ├── LlmCompanyAgent × 12 → Gateway × 12
+                         │   └── ReplayCompanyAgent × 12
                          └── LifecycleRepository → Journal + Checkpoint + SQLite
 ```
 
@@ -150,5 +150,5 @@ npm.cmd run build
 
 - [Agent 接入](docs/AGENT_INTEGRATION.md)
 - [V2 架构与不变量](docs/V2_ARCHITECTURE.md)
-- [MVP 框架](docs/MVP_FRAMEWORK.md)
-- [V1 场景目录](docs/SCENARIO_CATALOG_V1.md)
+- [历史 V1 MVP 框架](docs/MVP_FRAMEWORK.md)
+- [历史 V1 场景目录](docs/SCENARIO_CATALOG_V1.md)

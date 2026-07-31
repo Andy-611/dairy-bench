@@ -34,7 +34,9 @@ export function CompanyTable({ companies }: CompanyTableProps) {
       </div>
       <div className="table-scroll">
         <table>
-          <caption className="sr-only">Final results for all six companies</caption>
+          <caption className="sr-only">
+            Final results for {companies.length} companies
+          </caption>
           <thead>
             <tr>
               <th scope="col">Tier / company</th>

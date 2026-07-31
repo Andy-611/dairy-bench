@@ -2,7 +2,7 @@
 
 ## V2 agent contract
 
-Dairy Bench runs six companies and gives each company one independent agent.
+Dairy Bench runs twelve companies and gives each company one independent agent.
 An agent no longer submits one complete daily plan. It completes a closed cycle
 whenever the scheduler wakes it:
 
@@ -120,7 +120,7 @@ The launcher sets `CODEX_HOME=.dairy-bench/codex`, isolated from the user's
 personal `%USERPROFILE%\.codex`. First launch may request a separate login.
 Backend validation refuses to use the personal Codex home directly.
 
-All six companies receive independent `AsyncCodex` runtimes, and each turn uses
+All twelve companies receive independent `AsyncCodex` runtimes, and each turn uses
 an isolated thread. The runtime is read-only, uses `deny_all` approval, and
 disables shell, search, plugins, Codex memory, and multi-agent features.
 

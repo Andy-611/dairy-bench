@@ -1,7 +1,7 @@
 # Dairy Bench
 
-Dairy Bench is an event-driven multi-agent benchmark in which two farms, two
-processors, and two retailers operate a shared perishable dairy supply chain.
+Dairy Bench is an event-driven multi-agent benchmark in which four farms, four
+processors, and four retailers operate a shared perishable dairy supply chain.
 Each company is controlled by one independent agent.
 
 An episode lasts 30 simulated days. The decision unit is not a daily plan; it
@@ -16,7 +16,7 @@ trade results. Agents can only submit strongly typed business commands.
 
 ## What is implemented
 
-- Six heterogeneous companies, raw and bottled milk, FEFO inventory, and two
+- Twelve heterogeneous companies, raw and bottled milk, FEFO inventory, and two
   spot markets.
 - Independent rule, Codex, OpenAI, or exact-replay agents for every company.
 - A virtual-minute clock, fixed market-clearing times, event-driven wakes,
@@ -24,7 +24,7 @@ trade results. Agents can only submit strongly typed business commands.
 - Exactly one strongly typed atomic command per turn. OpenAI uses native
   function tools; Codex uses an equivalent strict structured adapter.
 - Independent token-budget memory, model gateway, and model client lifecycles
-  for all six agents.
+  for all twelve agents.
 - An immutable turn journal, atomic checkpoints, crash recovery, and replay
   without model calls.
 - Background execution, 30-day progress polling, explicit failures, and full
@@ -40,8 +40,8 @@ React → FastAPI → RunCoordinator → EpisodeRuntime → Scheduler + EconomyE
                          │                 └─ Evaluator
                          ├─ PolicyFactory
                          │   ├─ BaselineCompanyAgent
-                         │   ├─ LlmCompanyAgent × 6 → Gateway × 6
-                         │   └─ ReplayCompanyAgent × 6
+                         │   ├─ LlmCompanyAgent × 12 → Gateway × 12
+                         │   └─ ReplayCompanyAgent × 12
                          └─ LifecycleRepository → Journal + Checkpoint + SQLite
 ```
 
@@ -156,5 +156,5 @@ cd ..
 
 - [Agent integration](docs/AGENT_INTEGRATION.md)
 - [V2 architecture and invariants](docs/V2_ARCHITECTURE.md)
-- [MVP framework](docs/MVP_FRAMEWORK.md)
-- [V1 scenario catalog](docs/SCENARIO_CATALOG_V1.md)
+- [Historical V1 MVP framework](docs/MVP_FRAMEWORK.md)
+- [Historical V1 scenario catalog](docs/SCENARIO_CATALOG_V1.md)

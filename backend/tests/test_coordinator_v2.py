@@ -1,11 +1,10 @@
 import asyncio
-from datetime import UTC, datetime
 
 import pytest
 
 from company_bench.agents import BaselineCompanyAgent
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO, DAIRY_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.models import PolicyKind
 from company_bench.policy_factory import PolicyFactory
 from company_bench.repository import MemoryRunRepository
@@ -27,40 +26,18 @@ async def _wait_for_terminal(
             await asyncio.sleep(0)
 
 
-@pytest.mark.asyncio
-async def test_start_fails_a_resumable_job_from_another_scenario() -> None:
+def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
     repository = MemoryRunRepository()
-    legacy_job = RunJob(
-        run_id="legacy_v1_job",
-        mode=PolicyKind.BASELINE,
-        seed=42,
-        scenario_id=DAIRY_V1_SCENARIO.scenario_id,
-        total_days=DAIRY_V1_SCENARIO.days,
-        submitted_at=datetime.now(UTC),
-    )
-    repository.save_job(legacy_job)
-    factory = PolicyFactory(DAIRY_V2_SCENARIO, repository)
-    coordinator = RunCoordinator(
-        repository,
-        factory,
-        runtime=EpisodeRuntime(DAIRY_V2_SCENARIO),
-    )
+    factory = PolicyFactory(DAIRY_S12_V2_SCENARIO, repository)
+    runtime = EpisodeRuntime(DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1}))
 
-    await coordinator.start()
-    try:
-        await _wait_for_terminal(repository, legacy_job.run_id)
-    finally:
-        await coordinator.close()
-
-    failed = repository.get_job(legacy_job.run_id)
-    assert failed is not None
-    assert "does not match the active runtime" in (failed.error_message or "")
-    assert repository.get(legacy_job.run_id) is None
+    with pytest.raises(ValueError, match="factory scenarios must match"):
+        RunCoordinator(repository, factory, runtime)
 
 
 @pytest.mark.asyncio
 async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -111,7 +88,7 @@ class _InterruptAfterCheckpoint:
 
 @pytest.mark.asyncio
 async def test_start_resumes_a_v2_checkpoint_to_completion() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     runtime = EpisodeRuntime(scenario)
     seed = 18
     run_id = "restart_resume"

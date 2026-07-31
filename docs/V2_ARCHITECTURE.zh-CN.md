@@ -56,7 +56,7 @@ Projector 还会将源运行和 Replay 的核算分开：Replay 不会调用 pro
 
 ## 时间协议
 
-默认的 `flow.dairy.base.s6.v2` 场景安排如下：
+默认的 `flow.dairy.base.s12.v2` 场景安排如下：
 
 | 时间 | 系统步骤 |
 |---|---|

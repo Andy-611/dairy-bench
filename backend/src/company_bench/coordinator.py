@@ -6,9 +6,8 @@ import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from company_bench.application import DairyBenchmark
 from company_bench.diagnostics import bounded_error
-from company_bench.models import MAX_SEED, PolicyKind, ScenarioSpec
+from company_bench.models import MAX_SEED, PolicyKind
 from company_bench.policy_factory import PolicyFactory
 from company_bench.repository import LifecycleRepository
 from company_bench.run_models import PolicyProfileView, RunJob, RunStatus
@@ -16,24 +15,22 @@ from company_bench.runtime import EpisodeRuntime
 
 
 class RunCoordinator:
-    """Queue episodes, report progress, and persist terminal outcomes."""
+    """Queue event-driven episodes and persist their terminal outcomes."""
 
     def __init__(
         self,
         repository: LifecycleRepository,
         policy_factory: PolicyFactory,
-        benchmark: DairyBenchmark | None = None,
+        runtime: EpisodeRuntime,
         *,
-        runtime: EpisodeRuntime | None = None,
         max_concurrent_runs: int = 1,
     ) -> None:
         if max_concurrent_runs <= 0:
             raise ValueError("max_concurrent_runs must be positive")
+        if runtime.scenario != policy_factory.scenario:
+            raise ValueError("execution and policy factory scenarios must match")
         self._repository = repository
         self._policy_factory = policy_factory
-        self._benchmark = benchmark or DairyBenchmark(
-            policy_timeout_seconds=policy_factory.policy_timeout_seconds
-        )
         self._runtime = runtime
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -70,14 +67,10 @@ class RunCoordinator:
         if not 0 <= active_seed <= MAX_SEED:
             raise ValueError(f"seed must be between 0 and {MAX_SEED}")
 
-        scenario = self._scenario
+        scenario = self._runtime.scenario
         if source is not None and source.scenario != scenario:
             raise ValueError("replay source uses a different scenario")
-        if (
-            source_run_id is not None
-            and self._runtime is not None
-            and not self._repository.list_turns(source_run_id)
-        ):
+        if source_run_id is not None and not self._repository.list_turns(source_run_id):
             raise ValueError("replay source has no V2 turn journal")
         run_id = f"run_{uuid4().hex}"
         self._policy_factory.ensure_available(mode)
@@ -119,7 +112,7 @@ class RunCoordinator:
         job = initial_job
         try:
             async with self._semaphore:
-                scenario = self._scenario
+                scenario = self._runtime.scenario
                 if job.scenario_id != scenario.scenario_id or job.total_days != scenario.days:
                     raise ValueError("persisted job scenario does not match the active runtime")
                 job = job.model_copy(
@@ -138,48 +131,32 @@ class RunCoordinator:
                     job = job.model_copy(update={"current_day": day})
                     self._repository.save_job(job)
 
-                if self._runtime is None:
-                    bundle = self._policy_factory.create(
+                checkpoint = self._repository.get_checkpoint(job.run_id)
+                agent_bundle = self._policy_factory.create_agents(
+                    run_id=job.run_id,
+                    mode=job.mode,
+                    source_turns=(
+                        self._repository.list_turns(job.source_run_id)
+                        if job.source_run_id is not None
+                        else ()
+                    ),
+                    checkpoints=(checkpoint.agent_states if checkpoint is not None else ()),
+                    completed_turns=(checkpoint.turns if checkpoint is not None else ()),
+                )
+                try:
+                    execution = await self._runtime.run(
+                        agent_bundle.agents,
+                        job.seed,
                         run_id=job.run_id,
-                        mode=job.mode,
-                        source=source,
+                        started_at=job.started_at,
+                        on_day_completed=report_progress,
+                        store=self._repository,
+                        checkpoint=checkpoint,
+                        replay_source=source,
                     )
-                    try:
-                        result = await self._benchmark.run(
-                            bundle.policies,
-                            job.seed,
-                            run_id=job.run_id,
-                            on_day_completed=report_progress,
-                        )
-                    finally:
-                        await bundle.close()
-                else:
-                    checkpoint = self._repository.get_checkpoint(job.run_id)
-                    agent_bundle = self._policy_factory.create_agents(
-                        run_id=job.run_id,
-                        mode=job.mode,
-                        source_turns=(
-                            self._repository.list_turns(job.source_run_id)
-                            if job.source_run_id is not None
-                            else ()
-                        ),
-                        checkpoints=(checkpoint.agent_states if checkpoint is not None else ()),
-                        completed_turns=(checkpoint.turns if checkpoint is not None else ()),
-                    )
-                    try:
-                        execution = await self._runtime.run(
-                            agent_bundle.agents,
-                            job.seed,
-                            run_id=job.run_id,
-                            started_at=job.started_at,
-                            on_day_completed=report_progress,
-                            store=self._repository,
-                            checkpoint=checkpoint,
-                            replay_source=source,
-                        )
-                        result = execution.episode
-                    finally:
-                        await agent_bundle.close()
+                    result = execution.episode
+                finally:
+                    await agent_bundle.close()
                 job = job.model_copy(
                     update={
                         "status": RunStatus.COMPLETED,
@@ -209,8 +186,3 @@ class RunCoordinator:
                     }
                 )
             )
-
-    @property
-    def _scenario(self) -> ScenarioSpec:
-        """Return the single scenario served by this coordinator."""
-        return self._runtime.scenario if self._runtime is not None else self._benchmark.scenario

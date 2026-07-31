@@ -25,7 +25,7 @@ export function SummaryCards({ score }: SummaryCardsProps) {
     {
       label: "System efficiency",
       value: formatSignedValue(score.efficiency),
-      detail: "Cumulative surplus created by all six companies",
+      detail: "Cumulative surplus created across the economy",
       tone: score.efficiency >= 0 ? "positive" : "negative",
     },
     {

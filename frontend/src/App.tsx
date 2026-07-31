@@ -117,8 +117,10 @@ export function App() {
       <main>
         <section className="hero">
           <div>
-            <span className="eyebrow">FLOW.DAIRY.BASE.S6.V2</span>
-            <h1>Six companies. One living dairy economy.</h1>
+            <span className="eyebrow">
+              {(result?.scenarioId ?? "flow.dairy.base.s12.v2").toUpperCase()}
+            </span>
+            <h1>Independent companies. One living dairy economy.</h1>
             <p>
               Each company uses an independent agent to make event-driven,
               atomic decisions across production, two spot markets,
@@ -220,7 +222,7 @@ function buildRunRequest(
 
 function progressText(progress: RunProgressView | null): string {
   if (!progress || progress.status === "queued") {
-    return "Run queued. Preparing six independent companies…";
+    return "Run queued. Preparing independent company agents…";
   }
   if (progress.status === "interrupted") {
     return "Resuming an interrupted run…";

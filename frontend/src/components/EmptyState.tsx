@@ -15,9 +15,9 @@ export function EmptyState() {
         retail, and perishable inventory settlement.
       </p>
       <ul>
-        <li>2 farms</li>
-        <li>2 processors</li>
-        <li>2 retailers</li>
+        <li>4 farms</li>
+        <li>4 processors</li>
+        <li>4 retailers</li>
       </ul>
     </section>
   );

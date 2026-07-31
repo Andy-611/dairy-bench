@@ -6,13 +6,12 @@ from pathlib import Path
 import pytest
 
 from company_bench.agents import BaselineCompanyAgent, ReplayCompanyAgent
-from company_bench.application import RunService
 from company_bench.codex_artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
     CodexArtifactView,
 )
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO, DAIRY_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.models import PolicyKind
 from company_bench.repository import MemoryRunRepository, SQLiteRunRepository
 from company_bench.run_models import (
@@ -25,12 +24,8 @@ from company_bench.run_models import (
 )
 from company_bench.runtime import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime_models import SystemStepRecord, TurnRecord
-from company_bench.timeline import RunTimelineProjector, TimelineUnsupportedError
+from company_bench.timeline import RunTimelineProjector
 from company_bench.timeline_models import ArtifactStatus, ArtifactUnavailableReason
-
-
-def _agents() -> dict[str, BaselineCompanyAgent]:
-    return {company.company_id: BaselineCompanyAgent() for company in DAIRY_V2_SCENARIO.companies}
 
 
 def _complete(
@@ -73,7 +68,7 @@ class _UnreadableArtifactStore(CodexArtifactStore):
 
 @pytest.mark.asyncio
 async def test_timeline_projects_system_steps_turns_and_typed_state_changes() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -121,7 +116,7 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
 
 @pytest.mark.asyncio
 async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -202,7 +197,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
 async def test_trace_detail_degrades_when_optional_artifact_is_missing_or_unreadable(
     tmp_path: Path,
 ) -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -266,7 +261,7 @@ async def test_trace_detail_degrades_when_optional_artifact_is_missing_or_unread
 async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
     tmp_path: Path,
 ) -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     memory = MemoryRunRepository()
     await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -286,7 +281,7 @@ async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
 
 @pytest.mark.asyncio
 async def test_completed_legacy_journal_reconstructs_and_merges_system_steps() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     durable = MemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -326,7 +321,7 @@ class _StopAfterFirstProgress:
 
 @pytest.mark.asyncio
 async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -375,7 +370,7 @@ async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
-    scenario = DAIRY_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -432,12 +427,3 @@ async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
     assert page.context.trace_run_id == source.episode.run_id
     assert first_turn.replay_origin is not None
     assert first_turn.replay_origin.source_run_id == source.episode.run_id
-
-
-@pytest.mark.asyncio
-async def test_v1_timeline_is_explicitly_unsupported() -> None:
-    repository = MemoryRunRepository()
-    result = await RunService(repository).run(seed=1)
-    assert result.scenario == DAIRY_V1_SCENARIO
-    with pytest.raises(TimelineUnsupportedError):
-        RunTimelineProjector(repository).read_day(result.run_id, 1)

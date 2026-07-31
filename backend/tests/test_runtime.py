@@ -15,7 +15,7 @@ from company_bench.agents import (
     ReplayCompanyAgent,
     ReplayDriftError,
 )
-from company_bench.dairy_scenario import DAIRY_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
 from company_bench.models import (
     CompanyEvent,
     FarmOperation,
@@ -26,7 +26,7 @@ from company_bench.models import (
 )
 from company_bench.repository import MemoryRunRepository, SQLiteRunRepository
 from company_bench.run_models import RunCheckpoint, RunJob, RunStatus
-from company_bench.runtime import EpisodeRuntime
+from company_bench.runtime import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime_models import (
     AgentTurn,
     CompanyCommand,
@@ -41,7 +41,7 @@ from company_bench.runtime_models import (
 
 
 def _scenario(days: int = 1) -> ScenarioSpec:
-    return DAIRY_V2_SCENARIO.model_copy(update={"days": days})
+    return DAIRY_S12_V2_SCENARIO.model_copy(update={"days": days})
 
 
 def _baseline_agents(scenario: ScenarioSpec) -> dict[str, CompanyAgent]:
@@ -57,7 +57,7 @@ async def test_v2_runs_multiple_atomic_turns_per_company_day() -> None:
         run_id="run_v2",
     )
 
-    assert execution.episode.scenario.scenario_id == "flow.dairy.base.s6.v2"
+    assert execution.episode.scenario.scenario_id == "flow.dairy.base.s12.v2"
     assert len(execution.turns) > len(scenario.companies)
     assert {record.envelope.command.kind for record in execution.turns} >= {
         "produce",
@@ -78,6 +78,43 @@ async def test_v2_runs_multiple_atomic_turns_per_company_day() -> None:
             set(),
         ).add(record.turn.state_version)
     assert all(len(versions) == 1 for versions in versions_by_minute.values())
+
+
+@pytest.mark.asyncio
+async def test_thirty_day_baseline_is_exactly_reproducible() -> None:
+    scenario = _scenario(days=30)
+    runtime = EpisodeRuntime(scenario)
+
+    first = await runtime.run(
+        _baseline_agents(scenario),
+        42,
+        run_id="deterministic_first",
+    )
+    second = await runtime.run(
+        _baseline_agents(scenario),
+        42,
+        run_id="deterministic_second",
+    )
+
+    def turn_projection(execution: EpisodeExecution) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            (
+                record.turn.company_id,
+                record.turn.sim_time,
+                record.turn.state_version,
+                record.turn.wake_reasons,
+                record.observation_hash,
+                record.envelope.command,
+                record.outcome.status,
+                record.outcome.reason,
+            )
+            for record in execution.turns
+        )
+
+    assert turn_projection(first) == turn_projection(second)
+    assert first.episode.events == second.episode.events
+    assert first.episode.snapshots == second.episode.snapshots
+    assert first.episode.score == second.episode.score
 
 
 class _AlwaysActAgent:
@@ -133,7 +170,9 @@ async def test_system_generated_wakes_merge_with_existing_same_minute_wakes() ->
         if record.turn.company_id.startswith("farm_")
         and record.turn.sim_time.minute_of_day == scenario.runtime.raw_market_clear_minute
     )
-    assert len(farm_clear_turns) == 2
+    assert len(farm_clear_turns) == sum(
+        company.company_id.startswith("farm_") for company in scenario.companies
+    )
     assert all(
         set(record.turn.wake_reasons) == {WakeReason.CONTINUE, WakeReason.MARKET_CLEARED}
         for record in farm_clear_turns
@@ -726,7 +765,9 @@ async def test_market_clear_checkpoint_keeps_same_minute_continuation_wake() -> 
         if record.turn.company_id.startswith("farm_")
         and record.turn.sim_time.minute_of_day == scenario.runtime.raw_market_clear_minute
     )
-    assert len(clear_turns) == 2
+    assert len(clear_turns) == sum(
+        company.company_id.startswith("farm_") for company in scenario.companies
+    )
     assert all(
         set(record.turn.wake_reasons) == {WakeReason.CONTINUE, WakeReason.MARKET_CLEARED}
         for record in clear_turns
