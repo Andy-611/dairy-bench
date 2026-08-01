@@ -135,7 +135,10 @@ Scheduler 对同一分钟的系统事件使用显式优先级：
 ## 决策与确定性并发
 
 除物理后果外，命令本身没有模拟耗时。Runtime 通过每家公司每分钟最多一次决策的
-节流和可配置的每日安全上限，避免零时间循环。
+节流和每日每家公司 25 Turn 的硬上限，避免零时间循环。每个 `AgentTurn` 都包含当日
+Turn 序号和上限；触达上限时写入一条不改变经济状态的 `TURN_LIMIT_REACHED` Journal
+记录。此后的每个因果 Wake 不再调用模型，但都会连同强类型信号写成
+`AGENT_WAKE_SUPPRESSED` 审计步骤，而不是静默丢弃。
 
 同一分钟唤醒的 Agent 观察同一个基础 `state_version`。推理并发执行，命令则按一个
 完整的确定性排列应用：
@@ -145,8 +148,17 @@ sort_key = SHA256(seed | absolute_minute | company_id)
 ```
 
 产生的全局 `apply_sequence` 写入 Journal，并作为订单到达优先级。真实响应延迟、重试
-和 Provider 负载只用于审计，不参与撮合。订单簿变化后，相关市场参与者在下一分钟
-被唤醒；长期挂单还有周期性复查唤醒。
+和 Provider 负载只用于审计，不参与撮合。
+
+稀疏决策由进程内 `AgentAttention` 模块负责。成功的 `wait` 可以设置最多三个 Agent
+可见的 `best_bid` / `best_ask` 阈值 Alert，多个条件固定为 OR，并可指定一个绝对兜底
+复查时间。显式时间必须在当日后续营业时间内，且最多等待 120 分钟；省略时默认在
+120 分钟后复查，但若已经跨过关市则当天不再安排复查。重复、不可见或提交时已经为真
+的 Alert 会使整条命令被拒绝，且不改变经济状态。
+
+Alert 为一次性。系统只在同一分钟所有 seed 排序命令提交完成后，根据最终订单簿判断，
+并在下一分钟唤醒企业。自有成交、作业完成和到货属于重要唤醒；普通订单簿变化不广播，
+挂单也没有独立的轮询定时器。
 
 ## Agent 投影与信息边界
 
@@ -158,7 +170,8 @@ sort_key = SHA256(seed | absolute_minute | company_id)
 - `reserved_cash` 与 `reserved_inventory`；
 - `pending_deliveries`，包含准确到达时间和数量守恒的到期日分桶；
 - `active_operation`；
-- `remaining_operation_capacity`。
+- `remaining_operation_capacity`；
+- 当日 Turn 序号与硬上限。
 
 其他企业的身份、资产、订单、记忆和 trace 均不可见。自然语言推理没有约束力；只有
 通过校验的结构化命令能够改变经济状态。
@@ -170,9 +183,10 @@ Turn/Command/Outcome 循环保留原文，更早的完整循环压缩为确定�
 截断，也永远不能替代当前权威事实。
 
 不可变 Journal 记录企业 Turn 和有序 System Step。`RunCheckpoint` 保存精确恢复
-所需的全部状态，包括订单簿及冻结资产、作业、到货、Scheduler、企业私有记忆、序号
-计数器、事件和快照。每个稳定虚拟时间边界上，Journal 增量与 Checkpoint 替换在同一
-数据库事务中提交。
+所需的全部状态，包括订单簿及冻结资产、作业、到货、Scheduler、已激活注意力计划、
+企业私有记忆、序号计数器、事件和快照。每个计划都必须与来源 Wait Turn 及准确的兜底
+唤醒匹配。每个稳定虚拟时间边界上，Journal 增量与 Checkpoint 替换在同一数据库事务
+中提交。
 
 Replay 使用相同 Runtime 和引擎，但不调用模型。观察哈希、命令或协议拒绝、Outcome、
 `apply_sequence`、系统影响、事件、快照和最终得分都必须完全一致。
@@ -191,6 +205,8 @@ Replay 使用相同 Runtime 和引擎，但不调用模型。观察哈希、命�
 9. 19:30 日终快照前，订单簿、作业和待到货必须全部清空。
 10. Provider 完成顺序永远不能改变经济应用顺序。
 11. Journal 与 Checkpoint 才是 Replay 权威，Prompt 和 UI 投影都不是。
+12. 注意力模块只读取 Agent 的匿名市场投影；观察者 UI 的完整订单簿不能唤醒 Agent，
+    也不能改变经济状态。
 
 ## 明确不做的事情
 

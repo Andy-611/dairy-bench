@@ -157,7 +157,11 @@ job does not restore that day's capacity.
 
 Commands have zero modeled duration except for their physical consequences.
 The runtime prevents zero-time loops with a one-decision-per-company-per-minute
-throttle and a configurable daily safety cap.
+throttle and a hard cap of 25 Agent turns per company per day. The current turn
+number and limit are part of every `AgentTurn`; reaching the limit produces one
+state-neutral, journaled `TURN_LIMIT_REACHED` step. Every later causal Wake is
+suppressed without a model call but remains auditable as an
+`AGENT_WAKE_SUPPRESSED` step with its typed signals.
 
 Agents woken in the same minute observe the same base `state_version`. Inference
 runs concurrently, but commands apply in a full deterministic permutation:
@@ -168,8 +172,21 @@ sort_key = SHA256(seed | absolute_minute | company_id)
 
 The resulting global `apply_sequence` is journaled and supplies order arrival
 priority. Real response latency, retries, and provider load are audited but never
-feed matching. Relevant market participants wake on the following minute after
-a book mutation; resting orders also receive a periodic review wake.
+feed matching.
+
+Sparse decisions are governed by the in-process `AgentAttention` module. An
+accepted `wait` may arm up to three Agent-visible `best_bid`/`best_ask` threshold
+alerts, combined with OR semantics, plus an optional absolute fallback. An
+explicit fallback must be later on the same business day and at most 120 minutes
+away. Omitting it schedules a 120-minute review when that still falls before
+market close; otherwise there is no same-day review. Duplicate, hidden, or
+already-true alerts reject the entire command without changing economic state.
+
+Alerts are one-shot. They observe only the final committed order books after all
+seed-ordered commands for a minute have applied, then wake the company on the
+following minute. Own trades, operation completion, and delivery completion are
+important wakes; generic order-book mutations are not broadcast and resting
+orders do not receive an independent polling timer.
 
 ## Agent projection and information boundary
 
@@ -183,7 +200,8 @@ Along with available assets and events, it contains:
 - `pending_deliveries` with exact arrival times and quantity-preserving expiry
   buckets;
 - `active_operation`; and
-- `remaining_operation_capacity`.
+- `remaining_operation_capacity`; and
+- the current daily turn number and hard limit.
 
 Other companies' identities, holdings, orders, memories, and traces stay hidden.
 Natural-language reasoning is non-binding; only the validated structured command
@@ -198,9 +216,11 @@ current authoritative facts.
 
 The immutable journal records company turns and ordered system steps. A
 `RunCheckpoint` captures all state needed to resume exactly, including books and
-collateral, jobs, deliveries, scheduler state, per-company memory, sequence
-counters, events, and snapshots. Journal additions and checkpoint replacement
-commit in one database transaction at a stable virtual-time boundary.
+collateral, jobs, deliveries, scheduler state, armed attention plans,
+per-company memory, sequence counters, events, and snapshots. Each armed plan is
+validated against its source Wait turn and exact fallback wake. Journal additions
+and checkpoint replacement commit in one database transaction at a stable
+virtual-time boundary.
 
 Replay uses the same runtime and engine without model calls. Observation hashes,
 commands or protocol rejections, outcomes, `apply_sequence`, system effects,
@@ -222,6 +242,8 @@ events, snapshots, and final score must match exactly.
 10. Provider completion order never changes economic application order.
 11. Journal plus checkpoint, not prompts or UI projections, is the replay
     authority.
+12. Attention reads only the anonymous Agent market projection; observer UI
+    order-book data can never wake an Agent or change economic state.
 
 ## Deliberate non-goals
 

@@ -165,6 +165,8 @@ def test_output_failure_retains_codex_artifact_coordinates(
         company_id=first_observation.company_id,
         sim_time=SimTime(absolute_minute=540),
         state_version=0,
+        turn_number_today=1,
+        turn_limit_today=first_observation.runtime.max_turns_per_company_day,
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=first_observation,
         available_cash=first_observation.cash,

@@ -201,8 +201,8 @@ class RuntimeSpec(StrictModel):
     operation_duration_minutes: int = Field(default=30, ge=1)
     delivery_duration_minutes: int = Field(default=30, ge=1)
     decision_interval_minutes: int = Field(default=1, ge=1)
-    order_review_interval_minutes: int = Field(default=30, ge=1)
-    max_turns_per_company_day: int = Field(default=20, ge=1)
+    max_wait_minutes: int = Field(default=120, ge=1)
+    max_turns_per_company_day: int = Field(default=25, ge=1)
     max_prompt_tokens: int = Field(default=16_384, ge=1_024)
     compaction_trigger_tokens: int = Field(default=12_288, ge=512)
 

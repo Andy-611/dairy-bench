@@ -189,6 +189,8 @@ class TurnTimelineItem(StrictModel):
     state_version: int = Field(ge=0)
     apply_sequence: int = Field(ge=1)
     journal_sequence: int | None = Field(default=None, ge=1)
+    turn_number_today: int = Field(ge=1)
+    turn_limit_today: int = Field(ge=1)
     wake_signals: tuple[WakeSignal, ...]
     observation: ObservationFacts
     observation_delta: ObservationDelta
@@ -215,6 +217,7 @@ class SystemTimelineItem(StrictModel):
     state_version_before: int | None = Field(default=None, ge=0)
     state_version_after: int | None = Field(default=None, ge=0)
     reference_ids: tuple[Identifier, ...] = ()
+    suppressed_wake_signals: tuple[WakeSignal, ...] = ()
     effects: tuple[DomainEvent, ...] = ()
     affected_company_ids: tuple[CompanyId, ...] = ()
     title: str

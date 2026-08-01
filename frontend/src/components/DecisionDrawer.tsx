@@ -18,10 +18,12 @@ import {
   commandSummary,
   effectSummary,
   plural,
+  quoteAlertSummary,
   shortId,
   stateChangeKey,
   stateChangeSummary,
   systemLabel,
+  waitFallbackSummary,
   wakeLabel,
 } from "../timelineFormatters";
 import type {
@@ -120,6 +122,11 @@ function TurnDetail({
             return (
               <li key={`${signal.reason}-${index}`}>
                 <strong>{wakeLabel(signal.reason)}</strong>
+                {signal.referenceIds.length > 0 && (
+                  <span>
+                    References: {signal.referenceIds.map(shortId).join(", ")}
+                  </span>
+                )}
                 {sourceEntryId !== null && (
                   <button
                     onClick={() => onSelectEntry(sourceEntryId)}
@@ -155,6 +162,13 @@ function TurnDetail({
         </div>
         {turn.effects.length > 0 && <EffectList effects={turn.effects} />}
         <StateChangeList changes={turn.stateChanges} />
+        {turn.command.kind === "wait" && (
+          <WaitPlan
+            accepted={turn.accepted}
+            command={turn.command}
+            nextAvailableMinute={turn.nextAvailableMinute}
+          />
+        )}
         {turn.effects.length === 0 && turn.stateChanges.length === 0 && (
           <p className="inline-empty">No immediate economic change.</p>
         )}
@@ -173,6 +187,46 @@ function TurnDetail({
         data={detail.turnRecord}
         label="Complete TurnRecord journal payload"
       />
+    </div>
+  );
+}
+
+function WaitPlan({
+  accepted,
+  command,
+  nextAvailableMinute,
+}: {
+  readonly accepted: boolean;
+  readonly command: Extract<TurnTimelineItemView["command"], { kind: "wait" }>;
+  readonly nextAvailableMinute: number | null;
+}) {
+  return (
+    <div className="observed-facts">
+      <h4>{accepted ? "Attention plan" : "Requested attention plan"}</h4>
+      {command.alerts.length > 0 ? (
+        <ul className="effect-list">
+          {command.alerts.map((alert, index) => (
+            <li key={`${alert.product}-${alert.quote}-${alert.operator}-${index}`}>
+              <span>Price alert</span>
+              <strong>
+                {accepted ? "Watch" : "Requested"} {quoteAlertSummary(alert)}
+              </strong>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p>No price alert was armed.</p>
+      )}
+      <p>
+        Requested fallback: {waitFallbackSummary(command)}.
+      </p>
+      {!accepted ? (
+        <p>The attention plan was not armed because the command was rejected.</p>
+      ) : nextAvailableMinute === null ? (
+        <p>No same-day fallback wake was scheduled.</p>
+      ) : (
+        <p>Effective fallback: {clockTime(nextAvailableMinute)}.</p>
+      )}
     </div>
   );
 }

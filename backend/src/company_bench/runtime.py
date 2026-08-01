@@ -21,18 +21,22 @@ from company_bench.agents import (
     TurnMemory,
     observation_hash,
 )
+from company_bench.attention import (
+    AgentAttention,
+    ArmedWait,
+    AttentionMatch,
+    AttentionRejected,
+)
 from company_bench.engine import EconomyEngine, EconomyState
 from company_bench.models import (
     CompanyEvent,
     CompanyId,
-    CompanyTier,
     DaySnapshot,
     DomainEvent,
     EpisodeResult,
     EventRecord,
     PolicyDescriptor,
     PolicyKind,
-    ProductId,
     ScenarioSpec,
     TradeExecutedEvent,
 )
@@ -43,15 +47,12 @@ from company_bench.run_models import (
 from company_bench.runtime_models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
-    CancelOrder,
     CommandEnvelope,
     CommandOutcome,
     CommandStatus,
     CompanyCommand,
     JournalEntryKind,
     JournalEntryReference,
-    PlaceOrder,
-    ReplaceOrder,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
@@ -59,6 +60,7 @@ from company_bench.runtime_models import (
     TurnReplayOrigin,
     Wait,
     WakeReason,
+    WakeSignal,
     system_step_id,
 )
 from company_bench.scheduler import ScheduledEvent, Scheduler
@@ -95,6 +97,7 @@ class _Cursor:
     next_turn_sequence: int = 1
     last_visible_event_sequence: int = 0
     available_at: SimTime | None = None
+    active_wait: ArmedWait | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +105,13 @@ class _PendingTurn:
     turn: AgentTurn
     command: CompanyCommand
     protocol_error: str | None = None
+    command_error: str | None = None
+    attention_plan: ArmedWait | None = None
+
+    @property
+    def preflight_accepted(self) -> bool:
+        """Return whether the engine may receive this command."""
+        return self.protocol_error is None and self.command_error is None
 
 
 class EpisodeRuntime:
@@ -121,6 +131,7 @@ class EpisodeRuntime:
             raise ValueError("agent_timeout_seconds must be positive")
         self.scenario = scenario
         self._engine = engine or EconomyEngine()
+        self._attention = AgentAttention()
         self._evaluator = evaluator or Evaluator()
         self._agent_timeout_seconds = agent_timeout_seconds
 
@@ -179,6 +190,12 @@ class EpisodeRuntime:
             }
         previous_outcomes = self._previous_outcomes(turns)
         turn_counts = self._turn_counts(turns)
+        turn_limit_audits: set[tuple[int, CompanyId]] = {
+            (step.occurred_at.day + 1, step.company_id)
+            for step in system_steps
+            if step.kind is SystemEventKind.TURN_LIMIT_REACHED
+            and step.company_id is not None
+        }
         next_apply_sequence = (
             max((record.outcome.apply_sequence for record in turns), default=0) + 1
         )
@@ -211,6 +228,7 @@ class EpisodeRuntime:
                 snapshots,
                 next_journal_sequence,
             )
+            self._expire_attention(bucket, cursors)
             pending_system_steps = list(new_steps)
             pending_completed_days = list(completed_days)
             if completed:
@@ -253,6 +271,7 @@ class EpisodeRuntime:
                     snapshots,
                     next_journal_sequence,
                 )
+                self._expire_attention(same_time, cursors)
                 pending_system_steps.extend(step_delta)
                 pending_completed_days.extend(day_delta)
                 if completed:
@@ -306,11 +325,22 @@ class EpisodeRuntime:
                     for completed_day in pending_completed_days:
                         await on_day_completed(completed_day)
                 continue
-            eligible = tuple(
-                event
-                for event in ready_wakes
-                if self._within_turn_budget(event, economy.day, turn_counts)
+            (
+                eligible,
+                limit_steps,
+                next_journal_sequence,
+            ) = self._enforce_turn_limit(
+                run_id,
+                economy,
+                ready_wakes,
+                turn_counts,
+                turn_limit_audits,
+                cursors,
+                scheduler,
+                next_journal_sequence,
             )
+            system_steps.extend(limit_steps)
+            pending_system_steps.extend(limit_steps)
             if not eligible:
                 self._save_progress(
                     store,
@@ -335,6 +365,7 @@ class EpisodeRuntime:
             for event in eligible:
                 if event.company_id is not None:
                     scheduler.cancel_company_wakes(event.company_id)
+                    cursors[event.company_id].active_wait = None
             pending = await self._query_bucket(
                 run_id,
                 economy,
@@ -343,8 +374,12 @@ class EpisodeRuntime:
                 event_records,
                 cursors,
                 previous_outcomes,
+                turn_counts,
             )
-            ordered = self._application_order(pending, seed, scheduler.now)
+            ordered = tuple(
+                self._prepare_attention(item)
+                for item in self._application_order(pending, seed, scheduler.now)
+            )
             envelopes = tuple(
                 CommandEnvelope(
                     turn_id=item.turn.turn_id,
@@ -359,12 +394,12 @@ class EpisodeRuntime:
             accepted_envelopes = tuple(
                 envelope
                 for envelope, item in zip(envelopes, ordered, strict=True)
-                if item.protocol_error is None
+                if item.preflight_accepted
             )
             accepted_sequences = tuple(
                 next_apply_sequence + offset
                 for offset, item in enumerate(ordered)
-                if item.protocol_error is None
+                if item.preflight_accepted
             )
             before_event_count = len(economy.events)
             economy, accepted_outcomes = self._engine.apply_batch(
@@ -426,8 +461,36 @@ class EpisodeRuntime:
                     record,
                     turn_counts[(economy.day, company_id)],
                 )
-                self._schedule_market_change(scheduler, economy, record)
-                self._schedule_order_review(scheduler, economy, record)
+                self._install_attention(
+                    scheduler,
+                    cursors[company_id],
+                    record,
+                    item.attention_plan,
+                    turn_counts[(economy.day, company_id)],
+                )
+                self._schedule_trade_wakes(scheduler, record)
+            self._schedule_price_alerts(scheduler, economy, cursors)
+            for record in new_records:
+                company_id = record.turn.company_id
+                audit_key = (economy.day, company_id)
+                if (
+                    turn_counts[audit_key]
+                    != self.scenario.runtime.max_turns_per_company_day
+                    or audit_key in turn_limit_audits
+                ):
+                    continue
+                cursors[company_id].active_wait = None
+                step = self._turn_limit_step(
+                    run_id,
+                    economy,
+                    record.turn.sim_time,
+                    company_id,
+                    next_journal_sequence,
+                )
+                next_journal_sequence += 1
+                turn_limit_audits.add(audit_key)
+                system_steps.append(step)
+                pending_system_steps.append(step)
             self._save_progress(
                 store,
                 tuple(new_records),
@@ -698,6 +761,7 @@ class EpisodeRuntime:
         event_records: list[EventRecord],
         cursors: dict[str, _Cursor],
         previous_outcomes: dict[str, CommandOutcome],
+        turn_counts: Mapping[tuple[int, str], int],
     ) -> tuple[_PendingTurn, ...]:
         turns = tuple(
             self._build_turn(
@@ -707,6 +771,7 @@ class EpisodeRuntime:
                 event_records,
                 cursors[event.company_id],
                 previous_outcomes.get(event.company_id),
+                turn_counts.get((economy.day, event.company_id), 0) + 1,
             )
             for event in sorted(wake_events, key=lambda item: item.company_id or "")
             if event.company_id is not None
@@ -730,6 +795,7 @@ class EpisodeRuntime:
         event_records: list[EventRecord],
         cursor: _Cursor,
         previous_outcome: CommandOutcome | None,
+        turn_number_today: int,
     ) -> AgentTurn:
         company_id = wake_event.company_id
         if company_id is None:
@@ -748,6 +814,8 @@ class EpisodeRuntime:
             company_id=company_id,
             sim_time=wake_event.at,
             state_version=economy.state_version,
+            turn_number_today=turn_number_today,
+            turn_limit_today=self.scenario.runtime.max_turns_per_company_day,
             wake_reasons=wake_event.wake_reasons,
             wake_signals=wake_event.wake_signals,
             observation=observation,
@@ -825,6 +893,24 @@ class EpisodeRuntime:
                 f"unexpected Agent failure: {type(error).__name__}"
             ) from error
 
+    def _prepare_attention(self, item: _PendingTurn) -> _PendingTurn:
+        """Preflight Wait semantics without exposing them to the economy module."""
+        if item.protocol_error is not None or not isinstance(item.command, Wait):
+            return item
+        try:
+            plan = self._attention.arm(item.command, item.turn)
+        except AttentionRejected as error:
+            return _PendingTurn(
+                turn=item.turn,
+                command=item.command,
+                command_error=str(error),
+            )
+        return _PendingTurn(
+            turn=item.turn,
+            command=item.command,
+            attention_plan=plan,
+        )
+
     @staticmethod
     def _application_order(
         pending: tuple[_PendingTurn, ...],
@@ -853,11 +939,22 @@ class EpisodeRuntime:
         outcomes: list[CommandOutcome] = []
         state_version = pending[0].turn.state_version if pending else 0
         for offset, (item, envelope) in enumerate(zip(pending, envelopes, strict=True)):
-            if item.protocol_error is None:
+            if item.preflight_accepted:
                 outcome = next(successful)
+                if item.attention_plan is not None and outcome.accepted:
+                    outcome = outcome.model_copy(
+                        update={"next_available_at": item.attention_plan.review_at}
+                    )
                 outcomes.append(outcome)
                 state_version = outcome.resulting_state_version
                 continue
+            reason = (
+                f"{PROTOCOL_ERROR_PREFIX}{item.protocol_error}"
+                if item.protocol_error is not None
+                else item.command_error
+            )
+            if reason is None:
+                raise RuntimeError("rejected preflight is missing a reason")
             outcomes.append(
                 CommandOutcome(
                     turn_id=envelope.turn_id,
@@ -866,7 +963,7 @@ class EpisodeRuntime:
                     occurred_at=envelope.issued_at,
                     status=CommandStatus.REJECTED,
                     accepted=False,
-                    reason=f"{PROTOCOL_ERROR_PREFIX}{item.protocol_error}",
+                    reason=reason,
                     resulting_state_version=state_version,
                     apply_sequence=first_apply_sequence + offset,
                     next_available_at=envelope.issued_at.plus(
@@ -885,17 +982,7 @@ class EpisodeRuntime:
         if turns_today >= self.scenario.runtime.max_turns_per_company_day:
             return
         command = record.envelope.command
-        if isinstance(command, Wait) and record.protocol_error is None:
-            if command.until is not None and record.outcome.accepted:
-                scheduler.schedule_wake(
-                    record.turn.company_id,
-                    command.until,
-                    WakeReason.WAIT_EXPIRED,
-                    source=JournalEntryReference(
-                        entry_id=record.turn.turn_id,
-                        entry_type=JournalEntryKind.TURN,
-                    ),
-                )
+        if isinstance(command, Wait) and record.outcome.accepted:
             return
         available = record.outcome.next_available_at
         if (
@@ -906,7 +993,11 @@ class EpisodeRuntime:
             scheduler.schedule_wake(
                 record.turn.company_id,
                 available,
-                WakeReason.CONTINUE,
+                (
+                    WakeReason.CONTINUE
+                    if record.outcome.accepted
+                    else WakeReason.COMMAND_REJECTED
+                ),
                 source=JournalEntryReference(
                     entry_id=record.turn.turn_id,
                     entry_type=JournalEntryKind.TURN,
@@ -953,91 +1044,243 @@ class EpisodeRuntime:
                     reference_ids=(completion.reference_id,),
                 )
 
-    def _schedule_market_change(
+    def _install_attention(
         self,
         scheduler: Scheduler,
-        economy: EconomyState,
+        cursor: _Cursor,
         record: TurnRecord,
+        plan: ArmedWait | None,
+        turns_today: int,
     ) -> None:
-        """Notify relevant companies one minute after a committed book mutation."""
-        product = self._order_product(record)
-        if not record.outcome.accepted or product is None:
+        """Persist an accepted Wait and schedule only its fallback review."""
+        command = record.envelope.command
+        if not isinstance(command, Wait) or not record.outcome.accepted:
             return
-        at = record.turn.sim_time.plus(self.scenario.runtime.decision_interval_minutes)
-        if not self._can_wake_on_day(at, record.turn.sim_time.day):
+        if plan is None:
+            raise RuntimeError("accepted wait is missing its attention plan")
+        if turns_today >= self.scenario.runtime.max_turns_per_company_day:
             return
-        tiers = (
-            {CompanyTier.FARM, CompanyTier.PROCESSOR}
-            if product is ProductId.RAW_MILK
-            else {CompanyTier.PROCESSOR, CompanyTier.RETAILER}
-        )
-        change_id = (
-            f"market_change.{record.turn.sim_time.absolute_minute}.{product.value}"
-        )
-        for company in economy.scenario.companies:
-            if company.tier in tiers:
-                scheduler.schedule_wake(
-                    company.company_id,
-                    at,
-                    WakeReason.MARKET_CHANGED,
-                    reference_ids=(change_id, product.value),
-                )
-
-    def _schedule_order_review(
-        self,
-        scheduler: Scheduler,
-        economy: EconomyState,
-        record: TurnRecord,
-    ) -> None:
-        """Revisit resting commitments on a bounded deterministic cadence."""
-        orders = self._engine.company_orders(economy, record.turn.company_id)
-        if not orders:
-            return
-        at = record.turn.sim_time.plus(self.scenario.runtime.order_review_interval_minutes)
-        if not self._can_wake_on_day(at, record.turn.sim_time.day):
+        cursor.active_wait = plan
+        if plan.review_at is None:
             return
         scheduler.schedule_wake(
             record.turn.company_id,
-            at,
-            WakeReason.ORDER_UPDATED,
-            source=JournalEntryReference(
-                entry_id=record.turn.turn_id,
-                entry_type=JournalEntryKind.TURN,
-            ),
-            reference_ids=tuple(order.order_id for order in orders),
+            plan.review_at,
+            WakeReason.WAIT_EXPIRED,
+            source=self._turn_reference(record.turn.turn_id),
         )
+
+    def _schedule_trade_wakes(
+        self,
+        scheduler: Scheduler,
+        record: TurnRecord,
+    ) -> None:
+        """Notify only the companies whose own orders actually traded."""
+        trades = tuple(
+            event for event in record.outcome.events if isinstance(event, TradeExecutedEvent)
+        )
+        at = record.turn.sim_time.plus(self.scenario.runtime.decision_interval_minutes)
+        if not trades or not self._can_wake_on_day(at, record.turn.sim_time.day):
+            return
+        trade_ids_by_company: dict[CompanyId, list[str]] = {}
+        for trade in trades:
+            for company_id in (trade.seller_id, trade.buyer_id):
+                trade_ids_by_company.setdefault(company_id, []).append(trade.trade_id)
+        for company_id, trade_ids in sorted(trade_ids_by_company.items()):
+            scheduler.schedule_wake(
+                company_id,
+                at,
+                WakeReason.TRADE_EXECUTED,
+                source=(
+                    self._turn_reference(record.turn.turn_id)
+                    if company_id == record.turn.company_id
+                    else None
+                ),
+                reference_ids=tuple(dict.fromkeys(trade_ids)),
+            )
+
+    def _schedule_price_alerts(
+        self,
+        scheduler: Scheduler,
+        economy: EconomyState,
+        cursors: Mapping[str, _Cursor],
+    ) -> None:
+        """Evaluate every plan once against the committed minute-end books."""
+        wake_at = scheduler.now.plus(self.scenario.runtime.decision_interval_minutes)
+        for company_id, cursor in sorted(cursors.items()):
+            plan = cursor.active_wait
+            if plan is None:
+                continue
+            match = self._attention.evaluate(
+                plan,
+                self._engine.market_views(economy, company_id),
+            )
+            if match is None:
+                continue
+            if plan.review_at is not None:
+                scheduler.cancel_wake(
+                    company_id,
+                    plan.review_at,
+                    WakeReason.WAIT_EXPIRED,
+                )
+            cursor.active_wait = None
+            if not self._can_wake_on_day(wake_at, scheduler.now.day):
+                continue
+            scheduler.schedule_wake(
+                company_id,
+                wake_at,
+                WakeReason.PRICE_ALERT,
+                source=self._turn_reference(plan.source_turn_id),
+                reference_ids=self._alert_reference_ids(match),
+            )
 
     def _can_wake_on_day(self, at: SimTime, day: int) -> bool:
         """Return whether Agents may still act on this simulation day."""
         return at.day == day and at.minute_of_day < self.scenario.runtime.close_minute
 
     @staticmethod
-    def _order_product(record: TurnRecord) -> ProductId | None:
-        """Resolve the book changed by an accepted order command."""
-        command = record.envelope.command
-        if isinstance(command, PlaceOrder):
-            return command.product
-        if isinstance(command, (ReplaceOrder, CancelOrder)):
-            return next(
-                (
-                    order.product
-                    for order in record.turn.open_orders
-                    if order.order_id == command.order_id
-                ),
-                None,
-            )
-        return None
-
-    def _within_turn_budget(
-        self,
-        event: ScheduledEvent,
-        day: int,
-        counts: dict[tuple[int, str], int],
-    ) -> bool:
-        company_id = event.company_id
-        return company_id is not None and (
-            counts.get((day, company_id), 0) < self.scenario.runtime.max_turns_per_company_day
+    def _turn_reference(turn_id: str) -> JournalEntryReference:
+        """Return the canonical causal pointer to one Agent turn."""
+        return JournalEntryReference(
+            entry_id=turn_id,
+            entry_type=JournalEntryKind.TURN,
         )
+
+    @staticmethod
+    def _alert_reference_ids(match: AttentionMatch) -> tuple[str, ...]:
+        """Build stable opaque identities for the matched rules."""
+        return tuple(
+            "alert_"
+            + hashlib.sha256(
+                f"{match.source_turn_id}|{alert.model_dump_json()}".encode()
+            ).hexdigest()[:16]
+            for alert in match.matched_alerts
+        )
+
+    def _enforce_turn_limit(
+        self,
+        run_id: str,
+        economy: EconomyState,
+        wakes: tuple[ScheduledEvent, ...],
+        counts: Mapping[tuple[int, str], int],
+        audited: set[tuple[int, CompanyId]],
+        cursors: Mapping[str, _Cursor],
+        scheduler: Scheduler,
+        next_journal_sequence: int,
+    ) -> tuple[tuple[ScheduledEvent, ...], tuple[SystemStepRecord, ...], int]:
+        """Admit bounded turns and backfill any missing limit audit."""
+        eligible: list[ScheduledEvent] = []
+        steps: list[SystemStepRecord] = []
+        limit = self.scenario.runtime.max_turns_per_company_day
+        for wake in wakes:
+            company_id = wake.company_id
+            if company_id is None:
+                raise ValueError("wake event is missing company_id")
+            key = (economy.day, company_id)
+            if counts.get(key, 0) < limit:
+                eligible.append(wake)
+                continue
+            cursors[company_id].active_wait = None
+            if key not in audited:
+                steps.append(
+                    self._turn_limit_step(
+                        run_id,
+                        economy,
+                        wake.at,
+                        company_id,
+                        next_journal_sequence,
+                    )
+                )
+                next_journal_sequence += 1
+                audited.add(key)
+            step = self._suppressed_wake_step(
+                run_id,
+                economy,
+                wake,
+                next_journal_sequence,
+            )
+            next_journal_sequence += 1
+            steps.append(step)
+        return tuple(eligible), tuple(steps), next_journal_sequence
+
+    @staticmethod
+    def _turn_limit_step(
+        run_id: str,
+        economy: EconomyState,
+        at: SimTime,
+        company_id: CompanyId,
+        journal_sequence: int,
+    ) -> SystemStepRecord:
+        """Create one state-neutral audit marker for a daily hard cap."""
+        event_id = f"d{economy.day}.turn_limit.{company_id}"
+        return EpisodeRuntime._agent_audit_step(
+            run_id,
+            economy,
+            at,
+            company_id,
+            event_id,
+            kind=SystemEventKind.TURN_LIMIT_REACHED,
+            journal_sequence=journal_sequence,
+        )
+
+    @staticmethod
+    def _suppressed_wake_step(
+        run_id: str,
+        economy: EconomyState,
+        wake: ScheduledEvent,
+        journal_sequence: int,
+    ) -> SystemStepRecord:
+        """Persist one causal Wake rejected by the daily Agent limit."""
+        if wake.company_id is None:
+            raise ValueError("wake event is missing company_id")
+        event_id = f"d{economy.day}.wake_suppressed.{wake.company_id}.{wake.event_id}"
+        return EpisodeRuntime._agent_audit_step(
+            run_id,
+            economy,
+            wake.at,
+            wake.company_id,
+            event_id,
+            kind=SystemEventKind.AGENT_WAKE_SUPPRESSED,
+            journal_sequence=journal_sequence,
+            signals=wake.wake_signals,
+        )
+
+    @staticmethod
+    def _agent_audit_step(
+        run_id: str,
+        economy: EconomyState,
+        at: SimTime,
+        company_id: CompanyId,
+        event_id: str,
+        *,
+        kind: SystemEventKind,
+        journal_sequence: int,
+        signals: tuple[WakeSignal, ...] = (),
+    ) -> SystemStepRecord:
+        """Build one state-neutral per-company Agent audit record."""
+        return SystemStepRecord(
+            run_id=run_id,
+            entry_id=system_step_id(run_id, event_id),
+            journal_sequence=journal_sequence,
+            scheduled_event_id=event_id,
+            occurred_at=at,
+            kind=kind,
+            company_id=company_id,
+            suppressed_wake_signals=signals,
+            state_version_before=economy.state_version,
+            state_version_after=economy.state_version,
+        )
+
+    @staticmethod
+    def _expire_attention(
+        events: tuple[ScheduledEvent, ...],
+        cursors: Mapping[str, _Cursor],
+    ) -> None:
+        """Discard same-day plans when the continuous markets close."""
+        if not any(event.kind is SystemEventKind.MARKET_CLOSE for event in events):
+            return
+        for cursor in cursors.values():
+            cursor.active_wait = None
 
     @staticmethod
     def _restore_cursor(
@@ -1050,6 +1293,7 @@ class EpisodeRuntime:
                 next_turn_sequence=cursor.next_turn_sequence,
                 last_visible_event_sequence=cursor.last_visible_event_sequence,
                 available_at=cursor.available_at,
+                active_wait=cursor.active_wait,
             )
             if cursor is not None
             else _Cursor()
@@ -1114,6 +1358,7 @@ class EpisodeRuntime:
                     next_turn_sequence=cursor.next_turn_sequence,
                     last_visible_event_sequence=cursor.last_visible_event_sequence,
                     available_at=cursor.available_at,
+                    active_wait=cursor.active_wait,
                 )
                 for company_id, cursor in sorted(cursors.items())
             ),

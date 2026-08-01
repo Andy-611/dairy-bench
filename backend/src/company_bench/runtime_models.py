@@ -42,6 +42,7 @@ __all__ = [
     "PlaceOrder",
     "PriceLevel",
     "Produce",
+    "QuoteAlert",
     "ReplaceOrder",
     "ScheduledCompletion",
     "SetRetailPrice",
@@ -110,10 +111,11 @@ class WakeReason(StrEnum):
     DAY_OPEN = "day_open"
     CONTINUE = "continue"
     WAIT_EXPIRED = "wait_expired"
-    ORDER_UPDATED = "order_updated"
+    PRICE_ALERT = "price_alert"
+    TRADE_EXECUTED = "trade_executed"
+    COMMAND_REJECTED = "command_rejected"
     OPERATION_COMPLETED = "operation_completed"
     DELIVERY_COMPLETED = "delivery_completed"
-    MARKET_CHANGED = "market_changed"
     EXTERNAL_EVENT = "external_event"
 
 
@@ -156,6 +158,8 @@ class SystemEventKind(StrEnum):
     DELIVERY_COMPLETED = "delivery_completed"
     MARKET_CLOSE = "market_close"
     CONSUMER_SALES = "consumer_sales"
+    TURN_LIMIT_REACHED = "turn_limit_reached"
+    AGENT_WAKE_SUPPRESSED = "agent_wake_suppressed"
 
     @property
     def priority(self) -> int:
@@ -167,6 +171,8 @@ class SystemEventKind(StrEnum):
             self.MARKET_CLOSE: 30,
             self.CONSUMER_SALES: 40,
             self.DAY_CLOSE: 50,
+            self.TURN_LIMIT_REACHED: 90,
+            self.AGENT_WAKE_SUPPRESSED: 90,
             self.COMPANY_WAKE: 100,
         }[self]
 
@@ -236,11 +242,21 @@ class SetRetailPrice(StrictModel):
     unit_price: PositiveMoney
 
 
+class QuoteAlert(StrictModel):
+    """Wake when one visible best quote crosses a price threshold."""
+
+    product: ProductId
+    quote: Literal["best_bid", "best_ask"]
+    operator: Literal["at_least", "at_most"]
+    price: PositiveMoney
+
+
 class Wait(StrictModel):
-    """Yield until a selected time or the next relevant external event."""
+    """Yield until a bounded review time or a visible quote alert."""
 
     kind: Literal["wait"] = "wait"
     until: SimTime | None = None
+    alerts: tuple[QuoteAlert, ...] = Field(default=(), max_length=3)
 
 
 type CompanyCommand = Annotated[
@@ -399,6 +415,8 @@ class AgentTurn(StrictModel):
     company_id: CompanyId
     sim_time: SimTime
     state_version: int = Field(ge=0)
+    turn_number_today: int = Field(ge=1)
+    turn_limit_today: int = Field(ge=1)
     wake_reasons: tuple[WakeReason, ...] = Field(min_length=1)
     wake_signals: tuple[WakeSignal, ...] = ()
     observation: CompanyObservation
@@ -416,6 +434,10 @@ class AgentTurn(StrictModel):
     @model_validator(mode="after")
     def validate_turn(self) -> Self:
         """Reject inconsistent identity, version, and wake metadata."""
+        if self.turn_number_today > self.turn_limit_today:
+            raise ValueError("turn_number_today cannot exceed turn_limit_today")
+        if self.turn_limit_today != self.observation.runtime.max_turns_per_company_day:
+            raise ValueError("turn_limit_today must match the runtime turn limit")
         if len(self.wake_reasons) != len(set(self.wake_reasons)):
             raise ValueError("wake_reasons must be unique")
         if self.wake_signals:
@@ -454,7 +476,9 @@ class SystemStepRecord(StrictModel):
     scheduled_event_id: Identifier
     occurred_at: SimTime
     kind: SystemEventKind
+    company_id: CompanyId | None = None
     reference_ids: tuple[Identifier, ...] = ()
+    suppressed_wake_signals: tuple[WakeSignal, ...] = ()
     state_version_before: int = Field(ge=0)
     state_version_after: int = Field(ge=0)
     effects: tuple[EventRecord, ...] = ()
@@ -465,6 +489,15 @@ class SystemStepRecord(StrictModel):
         """Keep one system transition chronological and internally consistent."""
         if self.kind is SystemEventKind.COMPANY_WAKE:
             raise ValueError("company wakes are signals, not system journal steps")
+        company_audit = self.kind in {
+            SystemEventKind.TURN_LIMIT_REACHED,
+            SystemEventKind.AGENT_WAKE_SUPPRESSED,
+        }
+        if company_audit != (self.company_id is not None):
+            raise ValueError("Agent limit audit steps alone require company_id")
+        wake_suppressed = self.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED
+        if wake_suppressed != bool(self.suppressed_wake_signals):
+            raise ValueError("suppressed-wake steps require their causal signals")
         if self.state_version_after < self.state_version_before:
             raise ValueError("system step cannot move the state version backwards")
         expected_day = self.occurred_at.day + 1

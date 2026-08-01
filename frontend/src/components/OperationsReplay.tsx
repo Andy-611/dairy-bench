@@ -612,6 +612,9 @@ function filterMoments(
   filters: TimelineFilters,
 ): readonly TimelineMomentView[] {
   return moments.flatMap((moment) => {
+    const systemSteps = moment.systemSteps.filter(
+      (step) => step.kind !== "agent_wake_suppressed",
+    );
     const turns = moment.turns.filter((turn) => {
       return (
         (filters.company === ALL || turn.companyId === filters.company) &&
@@ -622,10 +625,10 @@ function filterMoments(
         (filters.showNoEffectWaits || !isCollapsibleWait(turn))
       );
     });
-    if (turns.length === 0 && moment.systemSteps.length === 0) {
+    if (turns.length === 0 && systemSteps.length === 0) {
       return [];
     }
-    return [{ ...moment, turns }];
+    return [{ ...moment, systemSteps, turns }];
   });
 }
 
@@ -670,6 +673,7 @@ function isCollapsibleWait(turn: TurnTimelineItemView): boolean {
   return (
     turn.accepted &&
     turn.command.kind === "wait" &&
+    turn.command.alerts.length === 0 &&
     turn.command.untilMinute === null &&
     turn.effects.length === 0 &&
     turn.stateChanges.length === 0 &&

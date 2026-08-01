@@ -1213,17 +1213,8 @@ class EconomyEngine:
 
     @staticmethod
     def _wait(economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
-        command = envelope.command
-        if not isinstance(command, Wait):
+        if not isinstance(envelope.command, Wait):
             raise TypeError("wait handler requires Wait")
-        if command.until is not None:
-            if command.until.absolute_minute <= envelope.issued_at.absolute_minute:
-                raise _CommandRejected("wait deadline must be later than current time")
-            if command.until.day >= economy.scenario.days:
-                raise _CommandRejected("wait deadline exceeds the scenario")
-            runtime = economy.scenario.runtime
-            if not runtime.open_minute <= command.until.minute_of_day < runtime.close_minute:
-                raise _CommandRejected("wait deadline must be inside business hours")
         return _CommandEffect(economy=economy)
 
     def _commit_order(

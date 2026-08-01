@@ -99,6 +99,8 @@ def _turn(
         company_id=observation.company_id,
         sim_time=SimTime(absolute_minute=540),
         state_version=0,
+        turn_number_today=1,
+        turn_limit_today=observation.runtime.max_turns_per_company_day,
         wake_reasons=(wake_reason,),
         observation=observation,
         available_cash=observation.cash,
@@ -326,7 +328,7 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
         _turn(
             "processor_sell",
             bottled_stock,
-            wake_reason=WakeReason.MARKET_CHANGED,
+            wake_reason=WakeReason.PRICE_ALERT,
             active_operation=active_operation,
         )
     ) == PlaceOrder(
@@ -364,7 +366,7 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
         _turn(
             "retailer_buy",
             priced,
-            wake_reason=WakeReason.MARKET_CHANGED,
+            wake_reason=WakeReason.PRICE_ALERT,
             pending_deliveries=(delivery,),
         )
     ) == PlaceOrder(
@@ -394,7 +396,7 @@ async def test_baseline_does_not_duplicate_a_resting_order() -> None:
         _turn(
             "processor_wait",
             observation,
-            wake_reason=WakeReason.MARKET_CHANGED,
+            wake_reason=WakeReason.PRICE_ALERT,
             open_orders=(order,),
         )
     ) == Wait()

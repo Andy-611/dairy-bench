@@ -81,7 +81,7 @@ export function useRunExplorer(api: DairyBenchApi): RunExplorer {
   }, []);
 
   useEffect(() => {
-    if (!selectedRunId || selectedJob) {
+    if (!selectedRunId || selectedJob || isHistoryLoading) {
       setSelectionError(null);
       return;
     }
@@ -101,7 +101,7 @@ export function useRunExplorer(api: DairyBenchApi): RunExplorer {
         }
       });
     return () => controller.abort();
-  }, [api, selectedJob, selectedRunId]);
+  }, [api, isHistoryLoading, selectedJob, selectedRunId]);
 
   useEffect(() => {
     if (!selectedJob) {

@@ -397,6 +397,8 @@ def _turn_for(
         company_id=observation.company_id,
         sim_time=at,
         state_version=sequence - 1,
+        turn_number_today=sequence,
+        turn_limit_today=observation.runtime.max_turns_per_company_day,
         wake_reasons=(WakeReason.DAY_OPEN if sequence == 1 else WakeReason.CONTINUE,),
         observation=observation,
         available_cash=observation.cash,

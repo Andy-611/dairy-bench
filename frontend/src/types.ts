@@ -146,6 +146,13 @@ export interface WakeSignalView {
   readonly referenceIds: readonly string[];
 }
 
+export interface QuoteAlertView {
+  readonly product: string;
+  readonly quote: "best_ask" | "best_bid";
+  readonly operator: "at_least" | "at_most";
+  readonly price: DecimalText;
+}
+
 export type EconomicEffectView =
   | {
       readonly kind: "milk_produced";
@@ -239,6 +246,7 @@ export type TimelineCommandView =
   | {
       readonly kind: "wait";
       readonly untilMinute: number | null;
+      readonly alerts: readonly QuoteAlertView[];
     };
 
 export type CommandStateChangeView =

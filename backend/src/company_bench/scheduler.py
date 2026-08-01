@@ -203,6 +203,33 @@ class Scheduler:
         self._heap = [entry for entry in self._heap if entry[3] in retained]
         heapq.heapify(self._heap)
 
+    def cancel_wake(
+        self,
+        company_id: CompanyId,
+        at: SimTime,
+        reason: WakeReason,
+    ) -> None:
+        """Remove one causal reason without discarding coalesced wakes."""
+        key = (at.absolute_minute, company_id)
+        event_id = self._wake_event_ids.get(key)
+        if event_id is None:
+            return
+        event = self._events[event_id]
+        retained_signals = tuple(
+            signal for signal in event.wake_signals if signal.reason is not reason
+        )
+        if len(retained_signals) == len(event.wake_signals):
+            return
+        if retained_signals:
+            self._events[event_id] = event.model_copy(
+                update={"wake_signals": retained_signals}
+            )
+            return
+        self._events.pop(event_id)
+        self._wake_event_ids.pop(key)
+        self._heap = [entry for entry in self._heap if entry[3] != event_id]
+        heapq.heapify(self._heap)
+
     def pop_bucket(self) -> tuple[ScheduledEvent, ...]:
         """Pop every event at the earliest minute and advance once."""
         if not self._heap:

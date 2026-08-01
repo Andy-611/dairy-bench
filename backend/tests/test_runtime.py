@@ -9,6 +9,7 @@ from itertools import pairwise
 from typing import ClassVar
 
 import pytest
+from pydantic import ValidationError
 
 from company_bench.agent_models import ModelOutputError
 from company_bench.agents import CompanyAgent, ReplayCompanyAgent
@@ -33,6 +34,7 @@ from company_bench.runtime_models import (
     MarketSide,
     PlaceOrder,
     Produce,
+    QuoteAlert,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -89,6 +91,27 @@ class _InterruptOnCommit:
         if commitments and not self.interrupted:
             self.interrupted = True
             raise RuntimeError("interrupted after durable commitment")
+
+
+@dataclass(slots=True)
+class _InterruptOnAttention:
+    repository: MemoryRunRepository
+    interrupted: bool = False
+
+    def save_progress(
+        self,
+        turns: tuple[TurnRecord, ...],
+        system_steps: tuple[SystemStepRecord, ...],
+        checkpoint: RunCheckpoint,
+    ) -> None:
+        """Stop after an armed Wait and its fallback wake are durable."""
+        self.repository.save_progress(turns, system_steps, checkpoint)
+        if (
+            not self.interrupted
+            and any(cursor.active_wait is not None for cursor in checkpoint.cursors)
+        ):
+            self.interrupted = True
+            raise RuntimeError("interrupted after durable attention plan")
 
 
 def _scenario(
@@ -171,12 +194,19 @@ def _timed_retail_agents(
 ) -> dict[str, CompanyAgent]:
     trade_at = SimTime(absolute_minute=trade_minute)
 
+    def wait_toward(turn: AgentTurn) -> Wait:
+        deadline = SimTime(
+            absolute_minute=min(
+                trade_at.absolute_minute,
+                turn.sim_time.absolute_minute + turn.observation.runtime.max_wait_minutes,
+            )
+        )
+        return Wait(until=deadline)
+
     def decide(turn: AgentTurn) -> CompanyCommand:
         if turn.company_id == "farm_a":
             if WakeReason.DAY_OPEN in turn.wake_reasons:
                 return Produce(product=ProductId.BOTTLED_MILK, quantity=_QUANTITY)
-            if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
-                return Wait(until=trade_at)
             if turn.sim_time == trade_at:
                 return PlaceOrder(
                     side=MarketSide.SELL,
@@ -184,14 +214,14 @@ def _timed_retail_agents(
                     quantity=_QUANTITY,
                     limit_price=Decimal("2.50"),
                 )
+            if turn.sim_time.absolute_minute < trade_at.absolute_minute:
+                return wait_toward(turn)
         elif turn.company_id == "retailer_a":
             if WakeReason.DAY_OPEN in turn.wake_reasons:
                 return SetRetailPrice(
                     product=ProductId.BOTTLED_MILK,
                     unit_price=Decimal("3.50"),
                 )
-            if turn.sim_time.minute_of_day == _OPEN + 1:
-                return Wait(until=trade_at)
             if turn.sim_time == trade_at:
                 return PlaceOrder(
                     side=MarketSide.BUY,
@@ -199,6 +229,8 @@ def _timed_retail_agents(
                     quantity=_QUANTITY,
                     limit_price=Decimal("3.00"),
                 )
+            if turn.sim_time.absolute_minute < trade_at.absolute_minute:
+                return wait_toward(turn)
         return Wait()
 
     return _agents(scenario, decide)
@@ -250,15 +282,53 @@ async def test_runtime_orders_open_market_close_consumer_sales_and_day_close() -
         store=repository,
     )
 
+    steps = repository.list_system_steps("clock_order")
     assert tuple(
         (step.kind, step.occurred_at.minute_of_day)
-        for step in repository.list_system_steps("clock_order")
+        for step in steps
+        if step.kind is not SystemEventKind.TURN_LIMIT_REACHED
     ) == (
         (SystemEventKind.DAY_OPEN, _OPEN),
         (SystemEventKind.MARKET_CLOSE, _MARKET_CLOSE),
         (SystemEventKind.CONSUMER_SALES, _MARKET_CLOSE),
         (SystemEventKind.DAY_CLOSE, _DAY_CLOSE),
     )
+    limit_steps = tuple(
+        step for step in steps if step.kind is SystemEventKind.TURN_LIMIT_REACHED
+    )
+    assert {step.company_id for step in limit_steps} == {
+        company.company_id for company in scenario.companies
+    }
+    assert all(step.occurred_at.minute_of_day == _OPEN for step in limit_steps)
+
+
+@pytest.mark.asyncio
+async def test_turn_limit_journals_each_suppressed_wake_with_its_cause() -> None:
+    scenario = _scenario(max_turns=1, company_ids=("farm_a",))
+    repository = MemoryRunRepository()
+
+    def produce_once(turn: AgentTurn) -> CompanyCommand:
+        return Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY)
+
+    execution = await EpisodeRuntime(scenario).run(
+        _agents(scenario, produce_once),
+        8,
+        run_id="turn_limit_audit",
+        store=repository,
+    )
+    steps = repository.list_system_steps("turn_limit_audit")
+    suppressed = tuple(
+        step for step in steps if step.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED
+    )
+
+    assert len(execution.turns) == 1
+    assert len(suppressed) == 1
+    assert suppressed[0].company_id == "farm_a"
+    assert suppressed[0].occurred_at.minute_of_day == _OPEN + 30
+    assert tuple(signal.reason for signal in suppressed[0].suppressed_wake_signals) == (
+        WakeReason.OPERATION_COMPLETED,
+    )
+    assert suppressed[0].suppressed_wake_signals[0].reference_ids
 
 
 @pytest.mark.asyncio
@@ -337,11 +407,32 @@ async def test_operation_and_delivery_completions_wake_the_owning_companies() ->
         isinstance(event, DeliveryCompletedEvent) for event in delivery_turn.turn.visible_events
     )
     assert any(isinstance(record.event, TradeExecutedEvent) for record in execution.episode.events)
+    trade_wakes = tuple(
+        record
+        for record in execution.turns
+        if WakeReason.TRADE_EXECUTED in record.turn.wake_reasons
+    )
+    assert {record.turn.company_id for record in trade_wakes} == {
+        "farm_a",
+        "processor_a",
+    }
+    assert {record.turn.sim_time.minute_of_day for record in trade_wakes} == {
+        _OPEN + 31
+    }
+    for trade_wake in trade_wakes:
+        signal = next(
+            signal
+            for signal in trade_wake.turn.wake_signals
+            if signal.reason is WakeReason.TRADE_EXECUTED
+        )
+        assert signal.source is None or (
+            f".{trade_wake.turn.company_id}.t" in signal.source.entry_id
+        )
     _assert_one_turn_per_company_minute(execution)
 
 
 @pytest.mark.asyncio
-async def test_market_change_wakes_next_minute_and_resting_order_gets_reviewed() -> None:
+async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -> None:
     scenario = _scenario(max_turns=4)
 
     def place_one_bid(turn: AgentTurn) -> CompanyCommand:
@@ -359,60 +450,80 @@ async def test_market_change_wakes_next_minute_and_resting_order_gets_reviewed()
         23,
         run_id="market_notifications",
     )
-    changed = {
-        record.turn.company_id
-        for record in execution.turns
-        if record.turn.sim_time.minute_of_day == _OPEN + 1
-        and WakeReason.MARKET_CHANGED in record.turn.wake_reasons
-    }
-    notifications = tuple(
+    at_next_minute = tuple(
         record
         for record in execution.turns
         if record.turn.sim_time.minute_of_day == _OPEN + 1
-        and WakeReason.MARKET_CHANGED in record.turn.wake_reasons
     )
-    placed = next(
-        record
-        for record in execution.turns
-        if record.turn.company_id == "processor_a" and record.turn.sim_time.minute_of_day == _OPEN
-    )
-    review = next(
+    processor_review = next(
         record
         for record in execution.turns
         if record.turn.company_id == "processor_a"
-        and WakeReason.ORDER_UPDATED in record.turn.wake_reasons
-    )
-    review_signal = next(
-        signal for signal in review.turn.wake_signals if signal.reason is WakeReason.ORDER_UPDATED
+        and WakeReason.WAIT_EXPIRED in record.turn.wake_reasons
     )
 
-    assert changed == {"farm_a", "processor_a"}
-    for notification in notifications:
-        market_signal = next(
-            signal
-            for signal in notification.turn.wake_signals
-            if signal.reason is WakeReason.MARKET_CHANGED
-        )
-        assert market_signal.source is None
-        assert all(".t" not in reference for reference in market_signal.reference_ids)
-        continuation = next(
-            (
-                signal
-                for signal in notification.turn.wake_signals
-                if signal.reason is WakeReason.CONTINUE
-            ),
-            None,
-        )
-        if continuation is not None:
-            assert continuation.source is not None
-            assert f".{notification.turn.company_id}.t" in continuation.source.entry_id
-    assert review.turn.sim_time.minute_of_day == (
-        _OPEN + 1 + scenario.runtime.order_review_interval_minutes
+    assert tuple(record.turn.company_id for record in at_next_minute) == ("processor_a",)
+    assert at_next_minute[0].turn.wake_reasons == (WakeReason.CONTINUE,)
+    assert processor_review.turn.sim_time.minute_of_day == (
+        _OPEN + 1 + scenario.runtime.max_wait_minutes
     )
-    assert review.turn.wake_reasons == (WakeReason.ORDER_UPDATED,)
-    assert tuple(order.order_id for order in review.turn.open_orders) == (placed.outcome.order_id,)
-    assert review_signal.reference_ids == (placed.outcome.order_id,)
+    assert tuple(order.product for order in processor_review.turn.open_orders) == (
+        ProductId.RAW_MILK,
+    )
     _assert_one_turn_per_company_minute(execution)
+
+
+@pytest.mark.asyncio
+async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> None:
+    scenario = _scenario(max_turns=3, company_ids=("farm_a", "processor_a"))
+    alert = QuoteAlert(
+        product=ProductId.RAW_MILK,
+        quote="best_bid",
+        operator="at_least",
+        price=Decimal("1.50"),
+    )
+
+    def decide(turn: AgentTurn) -> CompanyCommand:
+        if WakeReason.DAY_OPEN in turn.wake_reasons:
+            if turn.company_id == "farm_a":
+                return Wait(alerts=(alert,))
+            return PlaceOrder(
+                side=MarketSide.BUY,
+                product=ProductId.RAW_MILK,
+                quantity=_QUANTITY,
+                limit_price=Decimal("1.50"),
+            )
+        return Wait()
+
+    execution = await EpisodeRuntime(scenario).run(
+        _agents(scenario, decide),
+        24,
+        run_id="price_alert",
+    )
+    source = next(
+        record
+        for record in execution.turns
+        if record.turn.company_id == "farm_a"
+        and record.turn.sim_time.minute_of_day == _OPEN
+    )
+    alerted = tuple(
+        record
+        for record in execution.turns
+        if WakeReason.PRICE_ALERT in record.turn.wake_reasons
+    )
+
+    assert len(alerted) == 1
+    assert alerted[0].turn.company_id == "farm_a"
+    assert alerted[0].turn.sim_time.minute_of_day == _OPEN + 1
+    signal = next(
+        signal
+        for signal in alerted[0].turn.wake_signals
+        if signal.reason is WakeReason.PRICE_ALERT
+    )
+    assert signal.source is not None
+    assert signal.source.entry_id == source.turn.turn_id
+    assert len(signal.reference_ids) == 1
+    assert "processor_a" not in signal.reference_ids[0]
 
 
 @pytest.mark.asyncio
@@ -445,8 +556,39 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
             for record in records
         )
         assert all(right.turn.previous_outcome == left.outcome for left, right in pairwise(records))
-        assert all(WakeReason.CONTINUE in record.turn.wake_reasons for record in records[1:])
+        assert all(
+            WakeReason.COMMAND_REJECTED in record.turn.wake_reasons
+            for record in records[1:]
+        )
     _assert_one_turn_per_company_minute(execution)
+
+
+@pytest.mark.asyncio
+async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> None:
+    scenario = _scenario(max_turns=2, company_ids=("farm_a",))
+
+    def decide(turn: AgentTurn) -> CompanyCommand:
+        if WakeReason.DAY_OPEN in turn.wake_reasons:
+            return Wait(
+                until=turn.sim_time.plus(
+                    turn.observation.runtime.max_wait_minutes + 1
+                )
+            )
+        return Wait()
+
+    execution = await EpisodeRuntime(scenario).run(
+        _agents(scenario, decide),
+        30,
+        run_id="invalid_attention",
+    )
+    first, correction = execution.turns
+
+    assert not first.outcome.accepted
+    assert first.outcome.reason == "wait deadline cannot exceed 120 minutes"
+    assert first.outcome.resulting_state_version == first.turn.state_version
+    assert correction.turn.sim_time == first.turn.sim_time.plus(1)
+    assert correction.turn.wake_reasons == (WakeReason.COMMAND_REJECTED,)
+    assert correction.turn.previous_outcome == first.outcome
 
 
 @pytest.mark.parametrize(
@@ -591,6 +733,92 @@ async def test_atomic_completion_checkpoint_resumes_each_commitment_exactly_once
     assert resumed.episode.score == expected.episode.score
     assert sum(step.kind is completion_kind for step in repository.list_system_steps(run_id)) == 1
     assert sum(isinstance(record.event, completion_type) for record in resumed.episode.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() -> None:
+    scenario = _scenario(max_turns=3)
+    run_id = "resume_attention"
+    runtime = EpisodeRuntime(scenario)
+    agents = _agents(scenario, _wait)
+    expected = await runtime.run(agents, 39, run_id=run_id)
+    repository = MemoryRunRepository()
+    store = _InterruptOnAttention(repository)
+
+    with pytest.raises(RuntimeError, match="durable attention plan"):
+        await runtime.run(
+            _agents(scenario, _wait),
+            39,
+            run_id=run_id,
+            store=store,
+        )
+    checkpoint = repository.get_checkpoint(run_id)
+    assert checkpoint is not None
+    assert all(cursor.active_wait is not None for cursor in checkpoint.cursors)
+    wait_expiries = tuple(
+        event
+        for event in checkpoint.scheduler.pending_events
+        if event.kind is SystemEventKind.COMPANY_WAKE
+        and WakeReason.WAIT_EXPIRED in event.wake_reasons
+    )
+    assert len(wait_expiries) == len(scenario.companies)
+
+    target_cursor = checkpoint.cursors[0]
+    target_plan = target_cursor.active_wait
+    assert target_plan is not None
+    invalid_review = target_plan.armed_at.plus(
+        scenario.runtime.max_wait_minutes + 1
+    )
+    invalid_plan = target_plan.model_copy(update={"review_at": invalid_review})
+    invalid_cursors = tuple(
+        cursor.model_copy(update={"active_wait": invalid_plan})
+        if cursor.company_id == target_cursor.company_id
+        else cursor
+        for cursor in checkpoint.cursors
+    )
+    invalid_turns = tuple(
+        record.model_copy(
+            update={
+                "outcome": record.outcome.model_copy(
+                    update={"next_available_at": invalid_review}
+                )
+            }
+        )
+        if record.turn.turn_id == target_plan.source_turn_id
+        else record
+        for record in checkpoint.turns
+    )
+    invalid_events = tuple(
+        event.model_copy(update={"at": invalid_review})
+        if event.company_id == target_cursor.company_id
+        and WakeReason.WAIT_EXPIRED in event.wake_reasons
+        else event
+        for event in checkpoint.scheduler.pending_events
+    )
+    invalid_checkpoint = checkpoint.model_copy(
+        update={
+            "cursors": invalid_cursors,
+            "turns": invalid_turns,
+            "scheduler": checkpoint.scheduler.model_copy(
+                update={"pending_events": invalid_events}
+            ),
+        }
+    )
+    with pytest.raises(ValidationError, match="active wait must match"):
+        RunCheckpoint.model_validate(invalid_checkpoint.model_dump())
+
+    resumed = await runtime.run(
+        _agents(scenario, _wait),
+        39,
+        run_id=run_id,
+        store=repository,
+        checkpoint=checkpoint,
+    )
+
+    assert resumed.turns == expected.turns
+    assert resumed.episode.events == expected.episode.events
+    assert resumed.episode.snapshots == expected.episode.snapshots
+    assert resumed.episode.score == expected.episode.score
 
 
 @pytest.mark.asyncio

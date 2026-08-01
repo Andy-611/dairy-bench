@@ -1,3 +1,5 @@
+import { companyLabel } from "./domainLabels";
+import { isAbortError } from "./requestErrors";
 import type {
   AgentUsageSummaryView,
   AgentTraceView,
@@ -13,6 +15,7 @@ import type {
   MarketMatchLegView,
   PolicyMode,
   PolicyProfileView,
+  QuoteAlertView,
   RunJobView,
   RunRequest,
   RunStatus,
@@ -28,7 +31,6 @@ import type {
   TurnTimelineItemView,
   WakeSignalView,
 } from "./types";
-import { companyLabel } from "./domainLabels";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 type ProgressListener = (progress: RunJobView) => void;
@@ -82,7 +84,7 @@ export class DairyBenchApi {
       method: "POST",
       signal,
     });
-    const payload: unknown = await response.json().catch(() => null);
+    const payload = await readJsonBody(response, signal);
 
     if (!response.ok) {
       throw new ApiError(errorMessage(payload, response.status), response.status);
@@ -165,11 +167,30 @@ export class DairyBenchApi {
 
   private async getJson(path: string, signal?: AbortSignal): Promise<unknown> {
     const response = await fetch(`${this.baseUrl}${path}`, { signal });
-    const payload: unknown = await response.json().catch(() => null);
+    const payload = await readJsonBody(response, signal);
     if (!response.ok) {
       throw new ApiError(errorMessage(payload, response.status), response.status);
     }
     return payload;
+  }
+}
+
+async function readJsonBody(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  try {
+    const payload: unknown = await response.json();
+    signal?.throwIfAborted();
+    return payload;
+  } catch (reason: unknown) {
+    if (isAbortError(reason)) {
+      throw reason;
+    }
+    if (signal?.aborted) {
+      throw new DOMException("The request was cancelled.", "AbortError");
+    }
+    return null;
   }
 }
 
@@ -1262,9 +1283,30 @@ function parseTimelineCommand(
         command.until === null
           ? null
           : simMinute(command.until, `${path}.until`),
+      alerts: array(command.alerts, `${path}.alerts`).map((value, index) =>
+        parseQuoteAlert(value, `${path}.alerts[${index}]`),
+      ),
     };
   }
   throw new Error(`Backend field ${path}.kind is not an atomic command.`);
+}
+
+function parseQuoteAlert(payload: unknown, path: string): QuoteAlertView {
+  const alert = record(payload, path);
+  const quote = text(alert.quote, `${path}.quote`);
+  const operator = text(alert.operator, `${path}.operator`);
+  if (quote !== "best_ask" && quote !== "best_bid") {
+    throw new Error(`Backend field ${path}.quote is not a supported quote.`);
+  }
+  if (operator !== "at_least" && operator !== "at_most") {
+    throw new Error(`Backend field ${path}.operator is not a price comparison.`);
+  }
+  return {
+    product: text(alert.product, `${path}.product`),
+    quote,
+    operator,
+    price: decimalText(alert.price, `${path}.price`),
+  };
 }
 
 function parseTracePreview(

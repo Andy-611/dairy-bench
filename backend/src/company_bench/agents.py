@@ -554,8 +554,14 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "available. Use only supplied facts and submit exactly one atomic command; never "
         "invent identity, time, or state version. Every order quantity must be at least "
         f"{QUANTITY_QUANTUM} and use at most four decimal places (an exact multiple of "
-        f"{QUANTITY_QUANTUM}); never submit a dust quantity. Use wait when no action is "
-        "justified. "
+        f"{QUANTITY_QUANTUM}); never submit a dust quantity. Replacing an order loses its "
+        "former time priority. Use wait when no action is justified: set until to null to "
+        "use the runtime's bounded fallback review when it remains before market close, or "
+        "select an earlier deadline within max_wait_minutes. Set alerts to [] when no price "
+        "condition is needed; otherwise provide up to three OR price alerts over "
+        "visible best_bid or best_ask values; every alert must still be false when armed. "
+        "Background monitoring consumes no turn, but every model call counts against the "
+        "daily turn budget supplied in the turn. Do not poll for ordinary quote changes. "
         f"Authorized commands: {commands}."
     )
 

@@ -3,6 +3,7 @@ import { formatExactDecimal } from "./format";
 import type {
   CommandStateChangeView,
   EconomicEffectView,
+  QuoteAlertView,
   TimelineCommandView,
 } from "./types";
 
@@ -17,14 +18,16 @@ const COMMAND_LABELS: Readonly<Record<TimelineCommandView["kind"], string>> = {
 };
 
 const WAKE_LABELS: Readonly<Record<string, string>> = {
+  command_rejected: "Previous command was rejected",
   continue: "Decision interval elapsed",
   day_open: "Market day opened",
   delivery_completed: "Delivery arrived",
   external_event: "Relevant external event",
-  market_changed: "Market quote changed",
   operation_completed: "Operation completed",
-  order_updated: "Own order updated",
-  wait_expired: "Requested wait expired",
+  price_alert: "Watched price reached",
+  trade_executed: "Own order executed",
+  turn_limit_reached: "Daily turn limit reached",
+  wait_expired: "Fallback review became due",
 };
 
 const SYSTEM_LABELS: Readonly<Record<string, string>> = {
@@ -34,6 +37,7 @@ const SYSTEM_LABELS: Readonly<Record<string, string>> = {
   delivery_completed: "Delivery completed",
   market_close: "Continuous-market close",
   operation_completed: "Operation completed",
+  turn_limit_reached: "Daily turn limit reached",
 };
 
 export function commandLabel(kind: TimelineCommandView["kind"]): string {
@@ -63,10 +67,32 @@ export function commandSummary(command: TimelineCommandView): string {
     case "set_retail_price":
       return `Set ${productLabel(command.product)} retail price to ${formatExactDecimal(command.unitPrice)}`;
     case "wait":
-      return command.untilMinute === null
-        ? "Wait for the next relevant event"
-        : `Wait until ${clockTime(command.untilMinute)}`;
+      return waitSummary(command);
   }
+}
+
+export function quoteAlertSummary(alert: QuoteAlertView): string {
+  const quote = alert.quote === "best_bid" ? "best bid" : "best ask";
+  const operator = alert.operator === "at_least" ? "≥" : "≤";
+  return `${productLabel(alert.product)} ${quote} ${operator} ${formatExactDecimal(alert.price)}`;
+}
+
+export function waitFallbackSummary(
+  command: Extract<TimelineCommandView, { readonly kind: "wait" }>,
+): string {
+  return command.untilMinute === null
+    ? "use the runtime's bounded fallback review"
+    : `review at ${clockTime(command.untilMinute)}`;
+}
+
+function waitSummary(
+  command: Extract<TimelineCommandView, { readonly kind: "wait" }>,
+): string {
+  const fallback = waitFallbackSummary(command);
+  if (command.alerts.length === 0) {
+    return `Wait · ${fallback}`;
+  }
+  return `Watch ${command.alerts.map(quoteAlertSummary).join(" or ")} · fallback ${fallback}`;
 }
 
 export function effectSummary(effect: EconomicEffectView): string {

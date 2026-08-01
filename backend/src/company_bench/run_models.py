@@ -9,6 +9,7 @@ from typing import Literal, Protocol, Self
 
 from pydantic import Field, model_validator
 
+from company_bench.attention import AgentAttention, ArmedWait, AttentionRejected
 from company_bench.engine import EconomyState
 from company_bench.memory import AgentCheckpoint
 from company_bench.models import (
@@ -25,10 +26,13 @@ from company_bench.models import (
 from company_bench.runtime_models import (
     CommandOutcome,
     CompanyCommand,
+    JournalEntryKind,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
+    Wait,
+    WakeReason,
 )
 from company_bench.scheduler import SchedulerCheckpoint
 
@@ -125,12 +129,13 @@ class CompanyRuntimeCursor(StrictModel):
     next_turn_sequence: int = Field(ge=1)
     last_visible_event_sequence: int = Field(default=0, ge=0)
     available_at: SimTime | None = None
+    active_wait: ArmedWait | None = None
 
 
 class RunCheckpoint(StrictModel):
     """Complete atomic state needed to resume one V3 episode."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -377,6 +382,58 @@ def _validate_runtime_commitments(checkpoint: RunCheckpoint) -> None:
         for event in pending
     ):
         raise ValueError("company wakes must remain inside business hours")
+    _validate_attention_commitments(checkpoint)
+
+
+def _validate_attention_commitments(checkpoint: RunCheckpoint) -> None:
+    """Pair each armed Wait with its source Turn and fallback wake."""
+    attention = AgentAttention()
+    turns_by_id = {record.turn.turn_id: record for record in checkpoint.turns}
+    latest_by_company: dict[CompanyId, TurnRecord] = {}
+    for record in checkpoint.turns:
+        latest_by_company[record.turn.company_id] = record
+
+    expected: list[tuple[CompanyId, int, Identifier]] = []
+    for cursor in checkpoint.cursors:
+        plan = cursor.active_wait
+        if plan is None:
+            continue
+        source = turns_by_id.get(plan.source_turn_id)
+        if (
+            source is None
+            or source.turn.company_id != cursor.company_id
+            or latest_by_company.get(cursor.company_id) != source
+            or not isinstance(source.envelope.command, Wait)
+            or not source.outcome.accepted
+            or source.turn.turn_number_today >= source.turn.turn_limit_today
+        ):
+            raise ValueError("active wait must reference the company's latest accepted Wait")
+        try:
+            derived = attention.arm(source.envelope.command, source.turn)
+        except AttentionRejected as error:
+            raise ValueError("active wait source no longer forms a valid plan") from error
+        if derived != plan or plan.review_at != source.outcome.next_available_at:
+            raise ValueError("active wait must match its source Turn and outcome")
+        if plan.review_at is not None:
+            expected.append(
+                (cursor.company_id, plan.review_at.absolute_minute, plan.source_turn_id)
+            )
+
+    actual: list[tuple[CompanyId, int, Identifier]] = []
+    for event in checkpoint.scheduler.pending_events:
+        if event.kind is not SystemEventKind.COMPANY_WAKE or event.company_id is None:
+            continue
+        for signal in event.wake_signals:
+            if signal.reason is not WakeReason.WAIT_EXPIRED:
+                continue
+            if signal.source is None or signal.source.entry_type is not JournalEntryKind.TURN:
+                raise ValueError("wait-expiry wakes require a source Turn")
+            actual.append(
+                (event.company_id, event.at.absolute_minute, signal.source.entry_id)
+            )
+    _require_unique(actual, "wait-expiry commitments")
+    if set(actual) != set(expected):
+        raise ValueError("armed waits and wait-expiry wakes must match")
 
 
 def _require_unique(values: Iterable[Hashable], label: str) -> None:

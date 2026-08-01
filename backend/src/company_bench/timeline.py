@@ -360,6 +360,8 @@ class RunTimelineProjector:
             state_version=record.turn.state_version,
             apply_sequence=record.outcome.apply_sequence,
             journal_sequence=record.journal_sequence,
+            turn_number_today=record.turn.turn_number_today,
+            turn_limit_today=record.turn.turn_limit_today,
             wake_signals=signals,
             observation=ObservationFacts(
                 cash=record.turn.available_cash,
@@ -406,8 +408,13 @@ class RunTimelineProjector:
             state_version_before=step.state_version_before,
             state_version_after=step.state_version_after,
             reference_ids=step.reference_ids,
+            suppressed_wake_signals=step.suppressed_wake_signals,
             effects=tuple(record.event for record in step.effects),
-            affected_company_ids=_affected_companies(step.effects),
+            affected_company_ids=(
+                (step.company_id,)
+                if step.company_id is not None
+                else _affected_companies(step.effects)
+            ),
             title=_system_title(step),
             summary=_system_summary(step),
         )
@@ -828,6 +835,8 @@ def _system_title(step: SystemStepRecord) -> str:
         SystemEventKind.MARKET_CLOSE: "Continuous markets closed",
         SystemEventKind.CONSUMER_SALES: "Consumer sales settled",
         SystemEventKind.DAY_CLOSE: "Simulation day closed",
+        SystemEventKind.TURN_LIMIT_REACHED: "Daily Agent turn limit reached",
+        SystemEventKind.AGENT_WAKE_SUPPRESSED: "Agent wake suppressed",
     }[step.kind]
 
 
@@ -841,5 +850,10 @@ def _system_summary(step: SystemStepRecord) -> str:
         return f"{effect_count} consumer settlement effect{'s' if effect_count != 1 else ''}"
     if step.kind is SystemEventKind.DAY_CLOSE:
         return f"{effect_count} expiry effect{'s' if effect_count != 1 else ''}"
+    if step.kind is SystemEventKind.TURN_LIMIT_REACHED:
+        return f"{step.company_id} used its complete daily Agent turn budget"
+    if step.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED:
+        reasons = ", ".join(signal.reason.value for signal in step.suppressed_wake_signals)
+        return f"{step.company_id} was not called at the daily limit: {reasons}"
     reference = "" if not step.reference_ids else f" for {', '.join(step.reference_ids)}"
     return f"{effect_count} economic effect{'s' if effect_count != 1 else ''}{reference}"

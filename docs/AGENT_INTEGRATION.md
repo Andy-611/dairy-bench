@@ -50,7 +50,8 @@ not mutate the economy.
 
 `AgentTurn` contains only runtime-authorized facts for one company:
 
-- simulation time, state version, typed wake reasons, and causal references;
+- simulation time, state version, daily turn number and limit, typed wake reasons,
+  and causal references;
 - available cash and inventory, plus retail price where applicable;
 - cash and FEFO inventory reserved by its own resting orders;
 - its own open orders, including remaining quantity and priority sequence;
@@ -96,14 +97,23 @@ for transformation, input inventory; output becomes available only at completion
 
 The business window is `[09:00, 19:00)`. Commands have no 30-minute economic
 cooldown; the runtime permits at most one decision per company per virtual
-minute. At 19:00, due operation and delivery completions run first, then markets
-close, then consumer sales run. Previously committed completions may drain until
-19:29; day close occurs at 19:30.
+minute and 25 turns per company per day. At 19:00, due operation and delivery
+completions run first, then markets close, then consumer sales run. Previously
+committed completions may drain until 19:29; day close occurs at 19:30.
 
-Relevant companies are woken one minute after an accepted book mutation. A
-resting order also gets a deterministic 30-minute review wake. Operation and
-delivery completions wake the owning company when they occur before market
-close. `wait` may request another time inside the current business window.
+`wait` is an attention plan rather than a polling action. It may declare up to
+three anonymous quote conditions over visible `best_bid` or `best_ask` values;
+conditions use fixed OR semantics. It may also provide an absolute same-day
+fallback no more than 120 minutes away. Without one, the runtime schedules the
+same 120-minute fallback when it remains before 19:00. Alerts are one-shot and
+are evaluated only after all commands for a minute have committed; a match wakes
+the company on the following minute. Duplicate, hidden, or already-true alerts,
+and invalid fallback times, reject the whole command without changing the
+economy. Own trades, operation completions, and delivery completions also wake
+the affected company. Generic book mutations are not broadcast, and resting
+orders have no separate review timer. Reaching the daily cap writes an explicit
+state-neutral audit step and suppresses further Agent calls for that day. Each
+later Wake is still journaled with its typed causal signals.
 
 ## Deterministic concurrency
 

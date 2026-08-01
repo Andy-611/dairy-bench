@@ -198,6 +198,8 @@ def _command_request(observation: CompanyObservation) -> CommandModelRequest:
         company_id="farm_a",
         sim_time=SimTime(absolute_minute=540),
         state_version=0,
+        turn_number_today=1,
+        turn_limit_today=observation.runtime.max_turns_per_company_day,
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=observation,
         available_cash=observation.cash,

@@ -170,6 +170,8 @@ def test_turn_record_requires_runtime_identity_consistency(
         company_id="farm_a",
         sim_time=at,
         state_version=0,
+        turn_number_today=1,
+        turn_limit_today=first_observation.runtime.max_turns_per_company_day,
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=first_observation.model_copy(update={"company_id": "farm_a"}),
         available_cash=first_observation.cash,
@@ -252,7 +254,7 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
     first = scheduler.schedule_wake(
         "processor_a",
         at,
-        WakeReason.ORDER_UPDATED,
+        WakeReason.PRICE_ALERT,
         reference_ids=("order_1",),
     )
     system_kinds = (
@@ -277,12 +279,12 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
     assert len(scheduler) == 7
     assert merged.sequence == first.sequence
     assert merged.wake_reasons == (
-        WakeReason.ORDER_UPDATED,
+        WakeReason.PRICE_ALERT,
         WakeReason.EXTERNAL_EVENT,
     )
     assert merged.wake_signals == (
         WakeSignal(
-            reason=WakeReason.ORDER_UPDATED,
+            reason=WakeReason.PRICE_ALERT,
             reference_ids=("order_1",),
         ),
         WakeSignal(
@@ -369,6 +371,27 @@ def test_scheduler_cancels_superseded_company_wake_timers() -> None:
 
     assert scheduler.checkpoint().pending_events == (retained,)
     assert scheduler.pop_bucket() == (retained,)
+
+
+def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
+    scheduler = Scheduler()
+    at = SimTime(absolute_minute=600)
+    scheduler.schedule_wake("farm_a", at, WakeReason.WAIT_EXPIRED)
+    retained = scheduler.schedule_wake(
+        "farm_a",
+        at,
+        WakeReason.TRADE_EXECUTED,
+        reference_ids=("trade_1",),
+    )
+
+    scheduler.cancel_wake("farm_a", at, WakeReason.WAIT_EXPIRED)
+    scheduler.cancel_wake("farm_a", at, WakeReason.WAIT_EXPIRED)
+
+    pending = scheduler.checkpoint().pending_events
+    assert len(pending) == 1
+    assert pending[0].event_id == retained.event_id
+    assert pending[0].wake_reasons == (WakeReason.TRADE_EXECUTED,)
+    assert scheduler.pop_bucket() == pending
 
 
 def test_wait_can_target_time_but_cannot_spoof_runtime_fields() -> None:

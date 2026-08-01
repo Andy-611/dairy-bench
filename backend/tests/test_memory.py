@@ -202,6 +202,8 @@ def _exchange(
         company_id=company_id,
         sim_time=sim_time,
         state_version=index - 1,
+        turn_number_today=index,
+        turn_limit_today=observation.runtime.max_turns_per_company_day,
         wake_reasons=(WakeReason.CONTINUE,),
         observation=observation,
         available_cash=observation.cash,
