@@ -1,145 +1,167 @@
 # Agent 接入
 
-## V2 Agent 契约
+## V3 Agent 契约
 
-Dairy Bench 运行十二家公司，并为每家公司提供一个独立 Agent。Agent 不再提交
-一份完整的每日计划。每当 Scheduler 唤醒它时，它都会完成一个闭环：
+Dairy Bench 运行十二个独立企业 Agent：四家牧场、四家加工厂和四家零售商。Scheduler
+每次唤醒 Agent 时只执行一个封闭、可审计的决策循环：
 
 ```text
 唤醒
-  → AgentTurn（当前事实、可见事件、私有记忆）
-  → 一个原子 CompanyCommand
-  → EconomyEngine 验证和 CommandOutcome
-  → 不可变的 TurnRecord
+  -> AgentTurn（权威的企业私有观察）
+  -> 恰好一条 CompanyCommand
+  -> EconomyEngine 校验并返回 CommandOutcome
+  -> 不可变 TurnRecord
 ```
 
-一天限定市场开市、清算、消费者销售、过期和评分，但不限定 provider 调用。
+Agent 不提交整日计划，也不能自行提供身份、时间、状态版本、命令 ID 或 Turn ID；这些
+字段由 `EpisodeRuntime` 写入 `CommandEnvelope`。
 
-默认系统时间表如下：
+## 结构化命令格式
 
-| 时间 | 事件 |
+模型必须选择一条且仅一条符合企业角色的命令：
+
+| 命令 | 含义 |
 |---|---|
-| 09:00 | 开市并唤醒所有公司 |
-| 11:00 | 清算原奶市场 |
-| 16:00 | 清算瓶装奶市场 |
-| 19:00 | 执行消费者销售、过期处理和日终快照 |
+| `produce(product, quantity)` | 启动一项牧场生产作业 |
+| `transform(input_product, output_product, input_quantity)` | 启动一项加工转换作业 |
+| `place_order(side, product, quantity, limit_price)` | 提交全额担保的限价单 |
+| `replace_order(order_id, quantity, limit_price)` | 原子替换自有订单，并失去原时间优先级 |
+| `cancel_order(order_id)` | 撤销自有挂单并释放剩余冻结资产 |
+| `set_retail_price(product, unit_price)` | 设置零售消费者价格 |
+| `wait(until?)` | 等待指定时刻或下一个相关事件 |
 
-一条普通命令会占用公司 30 个虚拟分钟。在冷却期间收到的唤醒会被延迟到
-`available_at` 并合并，从而为每家公司保留一条行动链。默认的每日上限是
-每家公司 20 个 Turn。
+牧场可以生产和交易原奶；加工厂可以转换并交易原奶或盒装奶；零售商可以交易盒装奶
+并设置消费者价格。
 
-## 模型提交格式
+`place_order` 和 `replace_order` 的 `quantity` 必须为正数，并且是 `0.0001` 的整数倍
+（最多四位小数）。引擎会整条拒绝非法命令而不是四舍五入；没有有意义的数量时，Agent
+应选择 `wait`，不要提交尘埃订单。
 
-模型必须选择一个且仅一个经过其公司角色授权的命令：
+OpenAI 使用一次必选、不可并行的 Responses API 函数工具调用；Codex 使用严格的
+结构化输出 envelope。两者都按照同一个带判别字段的 Pydantic `CompanyCommand`
+联合类型校验。缺失、多条、未知、未授权或参数错误的调用会成为明确的协议拒绝，且不
+修改经济状态。
 
-- `produce`
-- `transform`
-- `place_order`
-- `cancel_order`
-- `set_retail_price`
-- `wait`
+## Agent 可以看到什么
 
-由 Runtime 而不是模型绑定 `turn_id`、`company_id`、模拟时间和
-`state_version`。
+`AgentTurn` 只包含 Runtime 授权给当前企业的事实：
 
-OpenAI Adapter 使用 Responses API 函数工具，并设置：
+- 模拟时间、状态版本、强类型唤醒原因及因果引用；
+- 可用现金和库存，以及适用时的零售价；
+- 自有挂单冻结的现金和 FEFO 库存；
+- 自有未完成订单，包括剩余数量和优先序号；
+- 与自身业务有关的匿名 `MarketView`：最优买卖价、买卖各前三档聚合深度、最近
+  成交价和当日成交量；
+- 已保证的待到货商品、数量、准确到货时间及数量守恒的到期日分桶；
+- 当前生产或加工任务，以及当日剩余作业产能；
+- 企业可见领域事件和上一条命令结果；
+- 当前企业独立且有预算上限的记忆上下文。
+
+Agent 看不到公开订单簿中其他企业的身份，也看不到其他企业的私有资产、记忆、Prompt
+或 Provider trace。引擎而不是 Prompt 才是事实来源。
+
+## 市场与时间语义
+
+两个商品市场都采用连续、全额担保的限价订单簿：
+
+1. 订单数量必须为正数且是 `0.0001` 的整数倍；精度非法的挂单或改单整条拒绝，不做
+   四舍五入。
+2. 买单冻结 `quantity * limit_price`，卖单冻结真实 FEFO 批次。
+3. 可用现金或库存不足时，整张新订单被拒绝。
+4. 只要 `best_bid >= best_ask`，新订单立即交叉撮合。
+5. 更优价格优先；同价按持久化的到达优先级排序。
+6. 成交价取静止在订单簿中的 maker 订单价格。
+7. 成交可只消耗订单的一部分。剩余部分保留优先级；显式 Replace 会获得新订单 ID
+   和新优先级。
+8. 买方价差资金立即释放；撤单或 19:00 关市会释放全部未成交冻结资产。
+
+每笔成交都让卖方立即收款，并安排买方在 30 个虚拟分钟后自动到货。在到货前，这些
+批次只作为待到货可见，不能加工、出售或再次冻结。这不是物流工作流：系统没有发货
+命令、路线、承运商、运力、延迟、失败或托管状态。
+
+`produce` 和 `transform` 同样在恰好 30 个虚拟分钟后完成。每家公司同时最多有一项
+物理作业，但该作业不会阻塞市场、等待或零售价命令。启动作业时即消耗现金；加工还会
+消耗输入库存，产出只在完成时变为可用。
+
+营业窗口为 `[09:00, 19:00)`。命令没有 30 分钟经济冷却；Runtime 只限制每家公司
+每个虚拟分钟最多决策一次。19:00 先处理到期作业和到货，再关市，最后执行消费者
+购买。此前已承诺的任务最晚可在 19:29 完成，19:30 日结。
+
+订单簿发生有效变化后，相关企业会在下一分钟被唤醒；仍有挂单的企业还会得到确定性的
+30 分钟复查唤醒。19:00 前发生作业完成或到货时，所属企业会被唤醒。`wait` 可指定
+当前营业日内的另一个时刻。
+
+## 确定性并发
+
+同一分钟被唤醒的所有 Agent 都观察同一个基础状态版本，Provider 请求并发执行，但
+完成速度不决定经济优先级。应用命令前，Runtime 按以下键对企业排序：
 
 ```text
-tool_choice = required
-parallel_tool_calls = false
-max_tool_calls = 1
+SHA256(seed | absolute_minute | company_id)
 ```
 
-Codex Adapter 使用由同一个 Pydantic 命令联合类型支持的严格结构化输出
-envelope。两条 provider 路径都会规范化为 `CompanyCommand`。缺少调用、
-存在多个调用、工具未知或参数无效都会成为明确的协议拒绝，并且不会修改
-经济状态。协议拒绝会消耗一个 Turn 和正常的 30 分钟时长，随后安排
-`CONTINUE`，让 Agent 可以看到错误并提交修正。
+随后命令串行提交，全局 `apply_sequence` 被持久化。Provider 延迟、重试和 token
+使用量只属于调用审计指标。这使运行可以复现并公平比较，而不会把网络延迟误当作经营
+能力。
 
-## Agent 记忆
+## 企业私有记忆
 
-每家公司都拥有独立的 `ConversationMemory`。它的请求上下文分为三层：
+每家公司拥有独立的 `ConversationMemory`、模型客户端和 Gateway 生命周期。一次
+Provider 请求由三层上下文构成：
 
-1. 从 `EconomyState` 投影得到的当前现金、库存、零售价格和长期有效订单；
-2. 自上一个 Turn 以来公司可见的事件，以及上一次结果；
-3. 近期完整的 Turn/Command/Outcome 循环和确定性的长期摘要。
+1. 当前权威 `AgentTurn` 事实；
+2. 最近的完整 Turn/Command/Outcome 循环；
+3. 更早完整循环的确定性长期摘要。
 
-旧循环按照预估 token 数量压缩，绝不会把一条命令和它的结果拆开。默认记忆
-预算在大约 12,288 tokens 时开始压缩，而完整请求具有独立的 16,384
-预估上限。如果仅当前权威事实就超过上限，该 Turn 会明确失败，而不是静默
-删除业务事实。
+记忆按 token 预算压缩，而不是固定保留最近七天。压缩不会拆开命令和结果，也不产生
+额外模型调用。默认在约 12,288 个估算 token 时开始压缩，完整 Prompt 另有 16,384
+token 上限。如果仅当前权威事实就无法装入，请求会明确失败，而不会隐藏业务事实。
 
-摘要不需要额外的模型调用，也不是经济事实来源。完整的 `TurnRecord` 对象会
-永久保留在 Journal 中；provider thread 不是 Benchmark 的记忆权威。
+记忆用于辅助 Agent 推理，但不是经济事实权威。即使 Prompt 已压缩，完整
+`TurnRecord` 仍永久保留在不可变 Journal 中。
 
-## Journal、恢复和 Replay
+## Journal、Checkpoint 与 Replay
 
-Turn Journal 存储：
+Turn Journal 记录精确观察、Runtime 绑定的命令、结果、`apply_sequence`、观察哈希、
+因果引用以及协议错误。System Step 记录作业完成、到货、关市、消费者购买和日结及其
+经济影响。
 
-- 完整的 Agent 观察；
-- 由 Runtime 绑定的命令；
-- 引擎结果和全局 `apply_sequence`；
-- 观察哈希；以及
-- 任何明确的协议错误。
+每个稳定虚拟时间 bucket 结束后，新 Journal 条目与替换后的 `RunCheckpoint` 在同一
+事务中提交。Checkpoint 包含强类型经济状态、订单簿与冻结资产、待完成作业与到货、
+Scheduler、企业可用时间、事件、快照、记忆、游标和固定策略指纹。
 
-每个稳定的时间 bucket 结束后，新的 Journal 记录和替换后的
-`RunCheckpoint` 会在同一个事务中提交。checkpoint 包含经济状态、
-Scheduler、待处理事件、公司可用时间、固定策略元数据、Agent 记忆、游标、
-事件、快照和 episode 最初的开始时间。
-
-恢复操作从该原子边界继续执行。它会拒绝 provider、模型、prompt 或配置指纹
-漂移，而不是在同一个运行中混用不同策略。
-
-Replay 会验证每一个观察哈希，重现源命令或源协议拒绝，并比较每一个结果。
-随后，它会验证源数据流已经耗尽，而且最终事件、快照和分数完全相等。Replay
-不会创建 provider Gateway，模型调用次数为零。
-
-`source_run_id` 会保留在策略元数据和时间线来源信息中。Operations Replay
-UI 可以展示导出的源 trace 和源 token 使用量，但会把它们标记为源证据，
-而不是 Replay 活动。
+恢复只能从该原子边界继续，并拒绝 Provider、模型、Prompt、场景或配置漂移。精确
+Replay 不创建 Provider Gateway：它校验每次观察哈希，重现记录的命令或协议拒绝，
+比较每个结果与 System Step，并最终要求事件、快照和得分完全相同。
 
 ## 运行 Codex Agent
 
 从仓库根目录运行：
 
 ```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench"
 .\start.cmd
 ```
 
-启动器设置 `CODEX_HOME=.dairy-bench/codex`，与用户个人的
-`%USERPROFILE%\.codex` 隔离。第一次启动时可能会要求单独登录。后端验证会
-拒绝直接使用个人 Codex home。
+启动器设置 `CODEX_HOME=.dairy-bench/codex`，与个人
+`%USERPROFILE%\.codex` 隔离。十二家公司各有独立的 `AsyncCodex` Runtime，每个
+Turn 使用隔离 thread。Benchmark Runtime 为只读模式，并关闭 shell、搜索、插件、
+Codex memory 和多 Agent 功能。
 
-十二家公司都会获得独立的 `AsyncCodex` Runtime，而且每个 Turn 都使用一个
-隔离 thread。Runtime 为只读模式，使用 `deny_all` 审批，并禁用 shell、
-搜索、插件、Codex memory 和多 Agent 功能。
-
-一个 Turn 完成后，Dairy Bench 会：
-
-1. 从 `CODEX_HOME/sessions` 读取原始 session JSONL；
-2. 导出公开推理摘要和最终结构化输出；以及
-3. 仅在成功导出后归档 session。
+每个 Turn 完成后，Dairy Bench 导出公开推理摘要和最终结构化输出；仅在导出成功后
+归档源 session：
 
 ```text
 run_artifacts/<run_id>/
-├── reasoning/day-001__farm_a__turn-0001.md
-└── final_outputs/day-001__farm_a__turn-0001.json
+|-- reasoning/day-001__farm_a__turn-0001.md
+`-- final_outputs/day-001__farm_a__turn-0001.json
 ```
 
-项目绝不会读取、复制或存储 `auth.json`。它不会暴露隐藏的思维链，也不会
-解密 `encrypted_content`。
-
-归档的源 session 默认保留 60 天，同时至少保留最近三次运行。清理操作只会
-删除满足以下条件的 session：位于隔离归档内、具有严格的 Dairy Bench 标题、
-超过 `DAIRY_BENCH_CODEX_SESSION_RETENTION_DAYS`，并且不在
-`DAIRY_BENCH_CODEX_SESSION_MIN_RUNS` 的保护范围内。导出的
-`run_artifacts` 是长期审计记录，不受源 session 保留规则约束。
+项目不会读取或存储 `auth.json`、隐藏思维链或加密推理内容。
 
 ## 运行 OpenAI Agent
 
 ```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench\backend"
+cd backend
 $env:OPENAI_API_KEY="your OpenAI API key"
 
 # 可选
@@ -152,34 +174,23 @@ $env:DAIRY_BENCH_OPENAI_MAX_ATTEMPTS="3"
 python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-只有后端会读取 `OPENAI_API_KEY`；它绝不会进入浏览器、Journal 或数据库。
-可以使用 `DAIRY_BENCH_OPENAI_BASE_URL` 配置与 OpenAI 兼容的服务。
+只有后端读取 `OPENAI_API_KEY`；密钥不会进入浏览器、Journal 或数据库。可用
+`DAIRY_BENCH_OPENAI_BASE_URL` 指向兼容服务。
 
-## Runtime 和失败语义
-
-```text
-React
-  → FastAPI / RunCoordinator
-  → EpisodeRuntime
-  → 并发执行 CompanyAgent.act()
-  → 按确定性顺序执行 EconomyEngine.apply_batch()
-  → Turn Journal + Checkpoint
-  → Evaluator
-```
+## 失败语义
 
 | 情况 | 结果 |
 |---|---|
-| 模型命令缺失或无效 | 协议拒绝；经济状态不变；正常命令时长后触发 `CONTINUE` |
-| 角色、现金、库存或状态规则验证失败 | 强类型引擎拒绝；运行继续 |
-| 认证失败、重试耗尽的网络故障、限流或 provider 中断 | 整个运行失败；不生成分数 |
-| Journal 故障或 Runtime 不变量遭到破坏 | 当前事务回滚，运行失败 |
-
-同一分钟的所有 Agent 都观察同一个基础 `state_version`。它们的请求可以按
-任意顺序完成，但命令会按照由 seed 决定的稳定顺序应用。
+| 模型命令缺失或无效 | 协议拒绝；经济状态不变；可在下一虚拟分钟尝试修正 |
+| 角色、担保、所有权、产能或时间规则失败 | 强类型引擎拒绝；运行继续 |
+| 认证失败或重试耗尽的 Provider 故障 | 整个运行失败，不产生误导性分数 |
+| Journal 故障或 Runtime 不变量被破坏 | 当前事务回滚，运行失败 |
 
 ## 审计接口
 
 ```text
+GET /api/run-jobs
+GET /api/run-jobs/{run_id}
 GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
@@ -187,18 +198,14 @@ GET /api/runs/{run_id}/invocations
 GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts
 ```
 
-`turns` 是权威业务 Journal。`invocations` 审计 provider 调用、token 和
-延迟。`timeline` 投影具有因果关系且便于人类阅读的时刻。`artifacts` 返回
-之前导出的 Codex 公开文件，绝不会调用模型。
+`turns` 是权威业务 Journal；`invocations` 审计 Provider 调用、延迟和 token；
+`timeline` 是可读的因果投影；导出的 `artifacts` 只是源证据，不会触发模型调用。
+Run History 对所有生命周期状态开放；即使没有最终 Episode 或得分，也不会隐藏已经提交
+的 Journal、错误和 Checkpoint。Exact Replay 仍是独立的 completed Run 确定性验证。
 
-`invocation_id` 标识一次真实的 provider 调用；`domain_turn_id` 标识一个
-确定性的经济 Turn。如果进程在收到 provider 响应之后、提交 checkpoint
-之前停止，恢复操作会创建新的 invocation ID，同时保留先前的调用及其审计
-数据。
+## 添加其他 Provider
 
-## 添加其他 provider
-
-V2 Adapter 需要实现：
+V3 Adapter 实现：
 
 ```python
 class CommandGateway(Protocol):
@@ -210,25 +217,6 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`PolicyFactory` 会为每家公司创建一个新的 Gateway。Adapter 将 provider
-输出验证为经过授权的 `CompanyCommand`，把内容错误映射为
-`ModelOutputError`，并把网络、认证和服务故障映射为
-`ModelInfrastructureError`。它不能访问 `EconomyEngine` 或其他公司的
-状态。
-
-## 验证
-
-测试不需要访问真实模型：
-
-```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench\backend"
-python -m pytest --basetemp "..\.tmp\pytest"
-python -m ruff check .
-
-cd "..\frontend"
-npm.cmd run build
-```
-
-测试覆盖范围包括：唤醒合并、冷却、单工具协议、协议拒绝 Replay、provider
-完成顺序无关性、信息隔离、SQLite 原子写入、精确 checkpoint 恢复、零调用
-Replay、时间线来源信息以及强类型 API 解析。
+`PolicyFactory` 为每家公司创建独立 Gateway。Adapter 把输出校验为已授权的
+`CompanyCommand`，将内容错误映射为 `ModelOutputError`，将基础设施错误映射为
+`ModelInfrastructureError`。它不能访问 `EconomyEngine` 或其他公司的状态。

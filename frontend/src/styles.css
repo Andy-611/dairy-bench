@@ -293,6 +293,154 @@ button:disabled {
   margin-top: 22px;
 }
 
+.run-history {
+  margin-top: 22px;
+}
+
+.run-history-picker {
+  display: grid;
+  grid-template-columns: minmax(250px, 1fr) minmax(300px, 1.35fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding: 20px 24px;
+}
+
+.run-history-picker h2 {
+  margin: 5px 0 3px;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.run-history-picker p,
+.run-history-error {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.run-history-picker select {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  color: var(--ink);
+  border: 1px solid #cdd6cf;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.run-history-picker button {
+  height: 42px;
+  padding: 0 15px;
+  color: var(--green-dark);
+  border: 1px solid #c9d9d1;
+  border-radius: 10px;
+  background: #f3f8f5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.run-history-error {
+  padding: 0 24px 16px;
+  color: var(--red);
+}
+
+.run-job-status {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 14px 20px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--line);
+  background: #fafcf9;
+}
+
+.run-job-status dl {
+  display: grid;
+  grid-template-columns: 1.5fr 0.7fr 0.7fr 1fr;
+  gap: 18px;
+  min-width: 0;
+  margin: 0;
+}
+
+.run-job-status dl div {
+  min-width: 0;
+}
+
+.run-job-status dt {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.run-job-status dd {
+  overflow: hidden;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.run-status {
+  padding: 7px 10px;
+  color: #4f5e56;
+  border-radius: 999px;
+  background: #e8ece9;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.run-status.completed {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.run-status.failed {
+  color: var(--red);
+  background: #f8e7e4;
+}
+
+.run-status.running,
+.run-status.queued {
+  color: #2d579a;
+  background: #e2e9f7;
+}
+
+.run-status.interrupted {
+  color: #91601f;
+  background: #faecd8;
+}
+
+.run-job-status > progress {
+  grid-column: 2;
+  width: 100%;
+  height: 5px;
+  accent-color: var(--green);
+}
+
+.run-job-error {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 12px 14px;
+  color: #7b2e29;
+  border: 1px solid #efd0cc;
+  border-radius: 9px;
+  background: #fff2ef;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -1012,6 +1160,29 @@ footer {
     text-align: left;
   }
 
+  .run-history-picker {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 18px;
+  }
+
+  .run-history-picker button {
+    width: 100%;
+  }
+
+  .run-job-status {
+    grid-template-columns: 1fr;
+    padding: 16px 18px;
+  }
+
+  .run-job-status dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .run-job-status > progress {
+    grid-column: 1;
+  }
+
   .hero {
     gap: 28px;
     padding: 30px 24px;
@@ -1342,6 +1513,442 @@ footer {
   border-left: 1px solid #dfe7e2;
 }
 
+.minute-lanes {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(430px, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+
+.company-activity-lane {
+  min-width: 0;
+}
+
+.market-display {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #d8e1dc;
+  border-radius: 11px;
+  background: #fff;
+  box-shadow: 0 7px 24px rgb(28 72 58 / 6%);
+}
+
+.market-display-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 2px 12px;
+  padding: 13px 15px;
+  border-bottom: 1px solid #e5ebe7;
+  background: #f7faf8;
+}
+
+.market-display-header > span {
+  grid-column: 1 / -1;
+  color: #557d6e;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.09em;
+}
+
+.market-display-header strong {
+  color: #24443a;
+  font-size: 13px;
+}
+
+.market-display-header small {
+  color: var(--muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.market-order-flow,
+.trade-tape,
+.market-book {
+  padding: 14px 15px;
+}
+
+.market-order-flow,
+.trade-tape {
+  border-bottom: 1px solid #e5ebe7;
+}
+
+.market-order-flow > header,
+.trade-tape > header,
+.market-book-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.market-order-flow > header,
+.trade-tape > header {
+  align-items: baseline;
+}
+
+.market-order-flow > header span,
+.trade-tape > header span,
+.market-book-header > div:first-child > span {
+  color: var(--green);
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.market-order-flow > header strong,
+.trade-tape > header strong,
+.market-book-header > div:first-child > strong {
+  color: #314b42;
+  font-size: 10px;
+}
+
+.market-book-header > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.market-order-flow > p,
+.trade-tape > p {
+  margin: 11px 0 0;
+  padding: 10px;
+  color: #829088;
+  border-radius: 7px;
+  background: #f7f9f7;
+  font-size: 9px;
+  text-align: center;
+}
+
+.market-order-flow ol {
+  display: grid;
+  gap: 5px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.market-order-flow li > button {
+  display: grid;
+  grid-template-columns: auto auto minmax(145px, 1fr) minmax(68px, auto) minmax(72px, auto);
+  align-items: center;
+  width: 100%;
+  gap: 8px;
+  padding: 8px 9px;
+  color: #304b42;
+  border: 1px solid #e7ece9;
+  border-radius: 7px;
+  background: #fbfcfb;
+  font-size: 8px;
+  text-align: left;
+}
+
+.market-order-flow li > button:hover,
+.market-order-flow li > button.selected {
+  border-color: #a9c7bb;
+  background: #f2f8f5;
+}
+
+.market-flow-sequence,
+.market-flow-contract code {
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+
+.market-flow-sequence {
+  color: #5f766d;
+}
+
+.market-flow-action {
+  padding: 3px 5px;
+  border-radius: 4px;
+  font-size: 6px;
+  font-weight: 900;
+  letter-spacing: 0.05em;
+}
+
+.market-flow-action.place {
+  color: #176c57;
+  background: #e9f5ef;
+}
+
+.market-flow-action.replace {
+  color: #765b22;
+  background: #f8f0dc;
+}
+
+.market-flow-action.cancel {
+  color: #8c4a43;
+  background: #faecea;
+}
+
+.market-flow-contract {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.market-flow-contract strong,
+.market-flow-contract code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.market-flow-contract code {
+  color: #718078;
+  font-size: 7px;
+}
+
+.market-flow-owner,
+.market-flow-result {
+  text-align: right;
+}
+
+.market-flow-owner {
+  overflow: hidden;
+  color: #67766e;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.market-flow-result {
+  color: #315c4e;
+  font-weight: 800;
+}
+
+.trade-tape ol {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.trade-tape li {
+  display: grid;
+  grid-template-columns: auto minmax(90px, 0.8fr) minmax(130px, 1.2fr);
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid #edf1ee;
+  border-radius: 7px;
+  background: #fbfcfb;
+  font-size: 9px;
+}
+
+.trade-sequence {
+  color: #56746a;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 8px;
+}
+
+.trade-contract,
+.trade-route {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.trade-contract span,
+.trade-route span {
+  color: var(--muted);
+}
+
+.trade-route {
+  text-align: right;
+}
+
+.trade-route strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.market-product-tabs {
+  display: flex;
+  gap: 3px;
+  padding: 2px;
+  border-radius: 7px;
+  background: #edf2ef;
+}
+
+.market-product-tabs button {
+  padding: 5px 7px;
+  color: #68776f;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.market-product-tabs button.selected {
+  color: var(--green-dark);
+  background: #fff;
+  box-shadow: 0 1px 4px rgb(29 64 52 / 10%);
+}
+
+.market-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin: 11px 0;
+  overflow: hidden;
+  border: 1px solid #e8eeea;
+  border-radius: 7px;
+  background: #e8eeea;
+}
+
+.market-summary > div {
+  min-width: 0;
+  padding: 7px 8px;
+  background: #f9fbfa;
+  text-align: center;
+}
+
+.market-summary dt {
+  color: #7a8880;
+  font-size: 7px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.market-summary dd {
+  margin: 3px 0 0;
+  color: #2e463e;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+.market-book-scroll {
+  overflow-x: auto;
+}
+
+.market-book-ladder {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  min-width: 580px;
+  overflow: hidden;
+  border: 1px solid #e5ebe7;
+  border-radius: 8px;
+}
+
+.order-book-side {
+  min-width: 0;
+}
+
+.order-book-side + .order-book-side {
+  border-left: 1px solid #dfe7e2;
+}
+
+.order-book-side h4 {
+  margin: 0;
+  padding: 7px 9px;
+  font-size: 8px;
+  letter-spacing: 0.09em;
+  text-align: center;
+}
+
+.order-book-side.bid h4 {
+  color: #176c57;
+  background: #edf7f2;
+}
+
+.order-book-side.ask h4 {
+  color: #a44c43;
+  background: #fcf1ef;
+}
+
+.order-book-columns,
+.price-level-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: center;
+}
+
+.order-book-columns {
+  min-height: 25px;
+  padding: 0 8px;
+  color: #849087;
+  border-bottom: 1px solid #edf1ee;
+  background: #fbfcfb;
+  font-size: 7px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.order-book-columns span,
+.price-level-summary span {
+  text-align: right;
+}
+
+.ask .order-book-columns span:first-child,
+.ask .price-level-summary span:first-child {
+  text-align: left;
+}
+
+.price-level {
+  border-bottom: 1px solid #eff3f0;
+}
+
+.price-level:last-child {
+  border-bottom: 0;
+}
+
+.price-level-summary {
+  min-height: 30px;
+  width: 100%;
+  padding: 0 8px;
+  color: inherit;
+  border: 0;
+  cursor: pointer;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  text-align: inherit;
+}
+
+.bid .price-level-summary {
+  background: linear-gradient(
+    to left,
+    rgb(23 108 87 / 10%) 0 var(--depth),
+    transparent var(--depth) 100%
+  );
+}
+
+.ask .price-level-summary {
+  background: linear-gradient(
+    to right,
+    rgb(176 77 66 / 10%) 0 var(--depth),
+    transparent var(--depth) 100%
+  );
+}
+
+.bid .price-level-summary span:last-child {
+  color: #176c57;
+  font-weight: 800;
+}
+
+.ask .price-level-summary span:first-child {
+  color: #a44c43;
+  font-weight: 800;
+}
+
+.price-level-summary:hover,
+.price-level-summary.selected {
+  box-shadow: inset 0 0 0 1px rgb(50 87 73 / 12%);
+}
+
+.empty-book-side {
+  display: grid;
+  min-height: 54px;
+  color: #929d97;
+  font-size: 8px;
+  place-items: center;
+}
+
 .system-step-card {
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr) auto;
@@ -1621,7 +2228,7 @@ footer {
   inset: 0;
 }
 
-.decision-drawer {
+.detail-drawer {
   position: absolute;
   top: 0;
   right: 0;
@@ -1711,6 +2318,132 @@ footer {
 
 .drawer-section > div {
   padding: 15px;
+}
+
+.market-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #e6ece8;
+  border-radius: 8px;
+  background: #e6ece8;
+}
+
+.market-detail-grid.compact {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.market-detail-grid > div {
+  min-width: 0;
+  padding: 11px 12px;
+  background: #f9fbfa;
+}
+
+.market-detail-grid dt {
+  color: #7c8b83;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.market-detail-grid dd {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.market-replacement-note,
+.market-result-copy {
+  margin: 12px 1px 0;
+  color: #607069;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.market-replacement-note code {
+  color: #315c4e;
+}
+
+.market-match-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.market-match-list li {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid #e4ebe7;
+  border-radius: 8px;
+  background: #fbfcfb;
+}
+
+.market-match-list header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.market-match-list header code,
+.market-match-list small code {
+  color: #315c4e;
+}
+
+.market-match-list span,
+.market-match-list small {
+  color: #68776f;
+  font-size: 10px;
+}
+
+.market-order-detail-table {
+  overflow-x: auto;
+  border: 1px solid #e4ebe7;
+  border-radius: 8px;
+}
+
+.market-order-detail-head,
+.market-order-detail-row {
+  display: grid;
+  grid-template-columns: minmax(190px, 1.7fr) minmax(110px, 1fr) 0.8fr 0.65fr;
+  min-width: 570px;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 12px;
+}
+
+.market-order-detail-head {
+  color: #7c8b83;
+  background: #f4f7f5;
+  font-size: 8px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.market-order-detail-row {
+  border-top: 1px solid #e9eeeb;
+  background: #fff;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.market-order-detail-row code {
+  color: #315c4e;
+  overflow-wrap: anywhere;
+}
+
+.market-order-detail-head span:nth-last-child(-n + 2),
+.market-order-detail-row span:nth-last-child(-n + 2) {
+  text-align: right;
 }
 
 .detail-list,
@@ -2046,6 +2779,12 @@ footer {
   }
 }
 
+@media (max-width: 1280px) {
+  .minute-lanes {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 680px) {
   .trace-provenance {
     align-items: flex-start;
@@ -2089,6 +2828,25 @@ footer {
     border-left: 0;
   }
 
+  .trade-tape li {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .market-order-flow li > button {
+    grid-template-columns: auto auto minmax(0, 1fr);
+  }
+
+  .market-flow-owner,
+  .market-flow-result {
+    grid-column: 3;
+    text-align: left;
+  }
+
+  .trade-route {
+    grid-column: 2;
+    text-align: left;
+  }
+
   .timeline-filters label {
     flex: 1 1 135px;
   }
@@ -2111,6 +2869,8 @@ footer {
   .delta-grid,
   .inventory-deltas,
   .command-outcome-detail,
+  .market-detail-grid,
+  .market-detail-grid.compact,
   .trace-copy-grid {
     grid-template-columns: 1fr;
   }

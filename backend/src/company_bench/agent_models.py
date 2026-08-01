@@ -22,6 +22,7 @@ type CommandName = Literal[
     "produce",
     "transform",
     "place_order",
+    "replace_order",
     "cancel_order",
     "set_retail_price",
     "wait",
@@ -148,7 +149,7 @@ class CommandGateway(Protocol):
 
 
 class CompanyModelGateway(ModelGateway, CommandGateway, Protocol):
-    """Provider adapter supporting both preserved V1 and V2 protocols."""
+    """Provider adapter supporting daily and event-driven protocols."""
 
 
 type DecisionFactory = Callable[[ModelRequest], CompanyDecision]

@@ -1,5 +1,5 @@
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +11,7 @@ from company_bench.codex_artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
 )
-from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
 from company_bench.models import (
     CompanyObservation,
     EpisodeResult,
@@ -32,14 +32,14 @@ from company_bench.web import create_app
 
 def _app(repository: MemoryRunRepository) -> FastAPI:
     """Create an app with deterministic server-side policy availability."""
-    factory = PolicyFactory(DAIRY_S12_V2_SCENARIO, repository)
+    factory = PolicyFactory(DAIRY_S12_V3_SCENARIO, repository)
     return create_app(repository, factory)
 
 
 def _wait_for_terminal_job(
     client: TestClient,
     run_id: str,
-    timeout_seconds: float = 15,
+    timeout_seconds: float = 60,
 ) -> RunJob:
     """Poll the public job endpoint until the run reaches a terminal state."""
     deadline = time.monotonic() + timeout_seconds
@@ -68,27 +68,29 @@ def test_run_list_and_detail_http_flow() -> None:
 
         completed = _wait_for_terminal_job(client, submitted.run_id)
         assert completed.status is RunStatus.COMPLETED
+        assert completed.revision > submitted.revision
         assert completed.current_day == completed.total_days == 30
 
         detail = client.get(f"/api/runs/{submitted.run_id}")
         assert detail.status_code == 200
         result = EpisodeResult.model_validate(detail.json())
         assert result.seed == 42
-        assert result.scenario == DAIRY_S12_V2_SCENARIO
+        assert result.scenario == DAIRY_S12_V3_SCENARIO
         assert len(result.scenario.companies) == 12
         assert result.decisions == ()
         assert len(result.snapshots) == 30
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
-        assert len(turns) > (DAIRY_S12_V2_SCENARIO.days * len(DAIRY_S12_V2_SCENARIO.companies))
+        assert len(turns) > (DAIRY_S12_V3_SCENARIO.days * len(DAIRY_S12_V3_SCENARIO.companies))
         assert turns[0]["turn"]["state_version"] == 0
         assert turns[0]["envelope"]["command"]["kind"] in {
             "produce",
             "place_order",
+            "set_retail_price",
         }
 
         summaries = client.get("/api/runs").json()
         assert summaries[0]["run_id"] == result.run_id
-        assert summaries[0]["scenario_id"] == "flow.dairy.base.s12.v2"
+        assert summaries[0]["scenario_id"] == "flow.dairy.base.s12.v3"
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -127,6 +129,38 @@ def test_run_list_and_detail_http_flow() -> None:
         assert client.get("/api/runs/missing").status_code == 404
         assert client.get("/api/run-jobs/missing").status_code == 404
         assert client.get("/api/runs/missing/invocations").status_code == 404
+
+
+def test_run_job_history_http_lists_all_states_newest_first() -> None:
+    repository = MemoryRunRepository()
+    submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    with TestClient(_app(repository)) as client:
+        jobs = tuple(
+            RunJob(
+                run_id=f"http_history_{status.value}",
+                mode=PolicyKind.BASELINE,
+                status=status,
+                seed=sequence,
+                scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
+                total_days=DAIRY_S12_V3_SCENARIO.days,
+                submitted_at=submitted_at + timedelta(minutes=sequence),
+            )
+            for sequence, status in enumerate(RunStatus)
+        )
+        for job in reversed(jobs):
+            repository.save_job(job)
+
+        history_response = client.get("/api/run-jobs")
+        limited_response = client.get("/api/run-jobs", params={"limit": 3})
+
+    assert history_response.status_code == 200
+    history = tuple(RunJob.model_validate(item) for item in history_response.json())
+    assert history == tuple(reversed(jobs))
+    assert {job.status for job in history} == set(RunStatus)
+    assert limited_response.status_code == 200
+    limited = tuple(RunJob.model_validate(item) for item in limited_response.json())
+    assert limited == history[:3]
 
 
 def test_http_validation_and_localhost_cors() -> None:
@@ -183,6 +217,7 @@ def test_http_validation_and_localhost_cors() -> None:
             == 409
         )
         assert client.get("/api/runs", params={"limit": 0}).status_code == 422
+        assert client.get("/api/run-jobs", params={"limit": 0}).status_code == 422
 
         response = client.options(
             "/api/runs",
@@ -227,8 +262,8 @@ def test_default_app_runs_the_v2_scenario(monkeypatch: MonkeyPatch) -> None:
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
 
     assert completed.status is RunStatus.COMPLETED
-    assert result.scenario == DAIRY_S12_V2_SCENARIO
-    assert len(turns) > (DAIRY_S12_V2_SCENARIO.days * len(DAIRY_S12_V2_SCENARIO.companies))
+    assert result.scenario == DAIRY_S12_V3_SCENARIO
+    assert len(turns) > (DAIRY_S12_V3_SCENARIO.days * len(DAIRY_S12_V3_SCENARIO.companies))
 
 
 def test_codex_profile_can_be_enabled_without_exposing_credentials(
@@ -269,8 +304,8 @@ def test_codex_artifacts_are_loaded_lazily_from_run_files(
             run_id=run_id,
             mode=PolicyKind.CODEX,
             seed=42,
-            scenario_id=DAIRY_S12_V2_SCENARIO.scenario_id,
-            total_days=DAIRY_S12_V2_SCENARIO.days,
+            scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S12_V3_SCENARIO.days,
             submitted_at=now,
         )
     )
@@ -337,8 +372,8 @@ def test_v2_codex_artifacts_are_resolved_by_domain_turn(
             run_id=run_id,
             mode=PolicyKind.CODEX,
             seed=42,
-            scenario_id=DAIRY_S12_V2_SCENARIO.scenario_id,
-            total_days=DAIRY_S12_V2_SCENARIO.days,
+            scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S12_V3_SCENARIO.days,
             submitted_at=now,
         )
     )

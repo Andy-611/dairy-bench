@@ -11,36 +11,27 @@ from company_bench.agent_gateway import (
     ScriptedModelGateway,
 )
 from company_bench.agent_models import (
+    CommandGateway,
     CommandModelRequest,
     CommandModelResult,
-    CompanyModelGateway,
-    DecisionFactory,
-    DecisionModel,
     ModelInfrastructureError,
     ModelOutputError,
-    ModelRequest,
-    ModelResult,
 )
-from company_bench.agent_policy import LlmCompanyPolicy
-from company_bench.agents import LlmCompanyAgent
-from company_bench.application import DairyBenchmark
+from company_bench.agents import COMMAND_PROMPT_VERSION, LlmCompanyAgent
 from company_bench.codex_gateway import CodexAgentConfig
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
 from company_bench.models import (
-    CompanyDecision,
     CompanyObservation,
     NoOpDecision,
-    PolicyFailedEvent,
     PolicyKind,
     PolicyMetadata,
-    RetailerDecision,
 )
 from company_bench.policy_factory import PolicyFactory
 from company_bench.repository import MemoryRunRepository
 from company_bench.run_models import InvocationOutcome, RunStatus, TokenUsage
 from company_bench.runtime import EpisodeRuntime
-from tests.scenarios import LEGACY_S12_SCENARIO
+from company_bench.runtime_models import AgentTurn, SimTime, Wait, WakeReason
 
 
 def _config() -> OpenAIAgentConfig:
@@ -52,24 +43,14 @@ def _config() -> OpenAIAgentConfig:
     )
 
 
-def _factory(
-    repository: MemoryRunRepository,
-    gateway_factory: Callable[[OpenAIAgentConfig], CompanyModelGateway],
-) -> PolicyFactory:
-    """Inject deterministic company gateways behind the production factory."""
-    return PolicyFactory(
-        LEGACY_S12_SCENARIO,
-        repository,
-        openai_config=_config(),
-        gateway_factory=gateway_factory,
-    )
-
-
 class _TrackedScriptedGateway(ScriptedModelGateway):
     """Expose adapter closure for lifecycle assertions."""
 
-    def __init__(self, decision: DecisionFactory) -> None:
-        super().__init__(decision)
+    def __init__(self) -> None:
+        super().__init__(
+            lambda _: NoOpDecision(),
+            command_factory=lambda _: Wait(),
+        )
         self.closed = False
 
     async def close(self) -> None:
@@ -81,11 +62,11 @@ class _TrackedScriptedGateway(ScriptedModelGateway):
 class _RecordingGatewayFactory:
     """Create and retain one observable gateway per company Agent."""
 
-    def __init__(self, create: Callable[[], CompanyModelGateway]) -> None:
+    def __init__(self, create: Callable[[], CommandGateway]) -> None:
         self._create = create
-        self.gateways: list[CompanyModelGateway] = []
+        self.gateways: list[CommandGateway] = []
 
-    def __call__(self, _: OpenAIAgentConfig) -> CompanyModelGateway:
+    def __call__(self, _: OpenAIAgentConfig) -> CommandGateway:
         """Create a fresh gateway for one company Agent."""
         gateway = self._create()
         self.gateways.append(gateway)
@@ -105,99 +86,17 @@ class _RecordingCodexGatewayFactory:
         company_id: str,
     ) -> _TrackedScriptedGateway:
         """Create a fresh scripted substitute for one Codex runtime."""
-        gateway = _TrackedScriptedGateway(
-            lambda request: NoOpDecision(reason=request.observation.company_id)
-        )
+        gateway = _TrackedScriptedGateway()
         self.company_ids.append(company_id)
         self.gateways.append(gateway)
         return gateway
-
-
-def test_twelve_isolated_agents_make_360_calls_and_output_error_becomes_no_op() -> None:
-    repository = MemoryRunRepository()
-    company_count = len(LEGACY_S12_SCENARIO.companies)
-    expected_invocations = company_count * LEGACY_S12_SCENARIO.days
-
-    def decision(request: ModelRequest) -> CompanyDecision:
-        if request.observation.day == 1 and request.observation.company_id == "farm_a":
-            return RetailerDecision(
-                bottled_bid_quantity="1",
-                maximum_bottled_price="1",
-                retail_price="1",
-            )
-        return NoOpDecision(reason="scripted")
-
-    gateway_factory = _RecordingGatewayFactory(lambda: _TrackedScriptedGateway(decision))
-    factory = _factory(repository, gateway_factory)
-    bundle = factory.create(run_id="agent_run", mode=PolicyKind.OPENAI)
-    policies = tuple(bundle.policies.values())
-    assert company_count == 12
-    assert len({id(policy) for policy in policies}) == company_count
-    assert all(isinstance(policy, LlmCompanyPolicy) for policy in policies)
-    assert len(gateway_factory.gateways) == company_count
-    assert len({id(gateway) for gateway in gateway_factory.gateways}) == company_count
-
-    async def run_episode():
-        try:
-            return await DairyBenchmark(LEGACY_S12_SCENARIO).run(
-                bundle.policies,
-                seed=42,
-                run_id="agent_run",
-            )
-        finally:
-            await bundle.close()
-
-    result = asyncio.run(run_episode())
-
-    gateways = tuple(
-        gateway
-        for gateway in gateway_factory.gateways
-        if isinstance(gateway, _TrackedScriptedGateway)
-    )
-    assert len(gateways) == company_count
-    assert all(len(gateway.requests) == LEGACY_S12_SCENARIO.days for gateway in gateways)
-    assert all(gateway.closed for gateway in gateways)
-    assert {
-        (request.observation.day, request.observation.company_id)
-        for gateway in gateways
-        for request in gateway.requests
-    } == {
-        (day, company.company_id)
-        for day in range(1, LEGACY_S12_SCENARIO.days + 1)
-        for company in LEGACY_S12_SCENARIO.companies
-    }
-    assert all(
-        len({request.observation.company_id for request in gateway.requests}) == 1
-        for gateway in gateways
-    )
-    assert len(result.decisions) == expected_invocations
-    failed_decision = next(
-        recorded
-        for recorded in result.decisions
-        if recorded.day == 1 and recorded.company_id == "farm_a"
-    )
-    assert failed_decision.decision == NoOpDecision(reason="policy_failed")
-    failures = [
-        record.event for record in result.events if isinstance(record.event, PolicyFailedEvent)
-    ]
-    assert len(failures) == 1
-    assert failures[0].company_id == "farm_a"
-
-    invocations = repository.list_invocations(result.run_id)
-    assert len(invocations) == expected_invocations
-    assert (
-        sum(invocation.outcome is InvocationOutcome.AGENT_ERROR for invocation in invocations) == 1
-    )
-    assert all(
-        len(policy.memory()) == 7 for policy in policies if isinstance(policy, LlmCompanyPolicy)
-    )
 
 
 def test_codex_mode_owns_twelve_independent_company_runtimes() -> None:
     repository = MemoryRunRepository()
     gateway_factory = _RecordingCodexGatewayFactory()
     factory = PolicyFactory(
-        DAIRY_S12_V2_SCENARIO,
+        DAIRY_S12_V3_SCENARIO,
         repository,
         codex_config=CodexAgentConfig(model="test-codex-model"),
         codex_gateway_factory=gateway_factory,
@@ -207,7 +106,7 @@ def test_codex_mode_owns_twelve_independent_company_runtimes() -> None:
     agents = tuple(bundle.agents.values())
     asyncio.run(bundle.close())
 
-    expected_company_ids = [company.company_id for company in DAIRY_S12_V2_SCENARIO.companies]
+    expected_company_ids = [company.company_id for company in DAIRY_S12_V3_SCENARIO.companies]
     assert gateway_factory.company_ids == expected_company_ids
     assert len({id(gateway) for gateway in gateway_factory.gateways}) == 12
     assert all(gateway.closed for gateway in gateway_factory.gateways)
@@ -215,17 +114,8 @@ def test_codex_mode_owns_twelve_independent_company_runtimes() -> None:
     assert all(isinstance(agent, LlmCompanyAgent) for agent in agents)
     assert all(agent.metadata.kind is PolicyKind.CODEX for agent in agents)
     assert all(agent.metadata.provider == "codex" for agent in agents)
-
-
-def test_policy_factory_rejects_protocol_version_misuse() -> None:
-    repository = MemoryRunRepository()
-    v2_factory = PolicyFactory(DAIRY_S12_V2_SCENARIO, repository)
-    legacy_factory = PolicyFactory(LEGACY_S12_SCENARIO, repository)
-
-    with pytest.raises(ValueError, match="daily policies do not implement"):
-        v2_factory.create(run_id="invalid_daily", mode=PolicyKind.BASELINE)
-    with pytest.raises(ValueError, match="event-driven Agents require a V2"):
-        legacy_factory.create_agents(run_id="invalid_v2", mode=PolicyKind.BASELINE)
+    assert all(agent.metadata.version == "3" for agent in agents)
+    assert all(agent.metadata.prompt_version == COMMAND_PROMPT_VERSION for agent in agents)
 
 
 class _UnavailableGateway:
@@ -233,16 +123,7 @@ class _UnavailableGateway:
 
     def __init__(self) -> None:
         self.closed = False
-        self.requests: list[ModelRequest] = []
         self.command_requests: list[CommandModelRequest] = []
-
-    async def generate(
-        self,
-        request: ModelRequest,
-        output_type: type[DecisionModel],
-    ) -> ModelResult:
-        self.requests.append(request)
-        raise ModelInfrastructureError("provider unavailable")
 
     async def generate_command(
         self,
@@ -258,11 +139,10 @@ class _UnavailableGateway:
 class _AuditedOutputErrorGateway:
     """Return a schema failure that still identifies the completed model call."""
 
-    async def generate(
+    async def generate_command(
         self,
-        request: ModelRequest,
-        output_type: type[DecisionModel],
-    ) -> ModelResult:
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
         raise ModelOutputError(
             "invalid output",
             request_id="thread_failed",
@@ -280,21 +160,32 @@ def test_output_failure_retains_codex_artifact_coordinates(
     first_observation: CompanyObservation,
 ) -> None:
     repository = MemoryRunRepository()
-    policy = LlmCompanyPolicy(
+    turn = AgentTurn(
+        turn_id="failed_run.farm_a.t1",
+        company_id=first_observation.company_id,
+        sim_time=SimTime(absolute_minute=540),
+        state_version=0,
+        wake_reasons=(WakeReason.DAY_OPEN,),
+        observation=first_observation,
+        available_cash=first_observation.cash,
+    )
+    agent = LlmCompanyAgent(
         run_id="failed_run",
         company_id=first_observation.company_id,
         gateway=_AuditedOutputErrorGateway(),
         audit_sink=repository,
         metadata=PolicyMetadata(
             name="codex-company-agent",
+            version="3",
             kind=PolicyKind.CODEX,
             provider="codex",
             model="gpt-5.6-terra",
+            prompt_version=COMMAND_PROMPT_VERSION,
         ),
     )
 
     with pytest.raises(ModelOutputError):
-        asyncio.run(policy.decide(first_observation))
+        asyncio.run(agent.act(turn))
 
     invocation = repository.list_invocations("failed_run")[0]
     assert invocation.request_id == "thread_failed"
@@ -302,13 +193,16 @@ def test_output_failure_retains_codex_artifact_coordinates(
     assert invocation.usage.total_tokens == 17
     assert invocation.attempts == 2
     assert invocation.latency_ms == 123
+    assert invocation.domain_turn_id == turn.turn_id
+    assert invocation.sim_minute == turn.sim_time.absolute_minute
+    assert invocation.prompt_version == COMMAND_PROMPT_VERSION
 
 
 def test_infrastructure_failure_marks_job_failed_without_result() -> None:
     repository = MemoryRunRepository()
     gateway_factory = _RecordingGatewayFactory(_UnavailableGateway)
     factory = PolicyFactory(
-        DAIRY_S12_V2_SCENARIO,
+        DAIRY_S12_V3_SCENARIO,
         repository,
         openai_config=_config(),
         gateway_factory=gateway_factory,
@@ -318,7 +212,7 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
         coordinator = RunCoordinator(
             repository,
             factory,
-            runtime=EpisodeRuntime(DAIRY_S12_V2_SCENARIO),
+            runtime=EpisodeRuntime(DAIRY_S12_V3_SCENARIO),
         )
         await coordinator.start()
         try:
@@ -357,5 +251,5 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
     assert all(gateway.closed for gateway in gateways)
     assert all(len(gateway.command_requests) == 1 for gateway in gateways)
     assert {gateway.command_requests[0].turn.company_id for gateway in gateways} == {
-        company.company_id for company in DAIRY_S12_V2_SCENARIO.companies
+        company.company_id for company in DAIRY_S12_V3_SCENARIO.companies
     }

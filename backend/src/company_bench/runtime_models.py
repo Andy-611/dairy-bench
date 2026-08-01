@@ -8,14 +8,18 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import Field, model_validator
 
 from company_bench.models import (
+    ZERO,
     CompanyId,
     CompanyObservation,
     DomainEvent,
     EventRecord,
     Identifier,
+    InventoryPosition,
+    Money,
     PositiveMoney,
     PositiveQuantity,
     ProductId,
+    Quantity,
     StrictModel,
 )
 
@@ -27,12 +31,19 @@ __all__ = [
     "CommandOutcome",
     "CommandStatus",
     "CompanyCommand",
+    "DeliveryExpiryBucket",
+    "IncomingDeliveryView",
     "JournalEntryKind",
     "JournalEntryReference",
     "MarketSide",
+    "MarketView",
     "OpenOrderView",
+    "OperationJobView",
     "PlaceOrder",
+    "PriceLevel",
     "Produce",
+    "ReplaceOrder",
+    "ScheduledCompletion",
     "SetRetailPrice",
     "SimTime",
     "SystemEventKind",
@@ -100,14 +111,14 @@ class WakeReason(StrEnum):
     CONTINUE = "continue"
     WAIT_EXPIRED = "wait_expired"
     ORDER_UPDATED = "order_updated"
-    PRODUCTION_COMPLETED = "production_completed"
-    TRANSFORMATION_COMPLETED = "transformation_completed"
-    MARKET_CLEARED = "market_cleared"
+    OPERATION_COMPLETED = "operation_completed"
+    DELIVERY_COMPLETED = "delivery_completed"
+    MARKET_CHANGED = "market_changed"
     EXTERNAL_EVENT = "external_event"
 
 
 class JournalEntryKind(StrEnum):
-    """Kinds that can own causal links in the V2 journal."""
+    """Kinds that can own causal links in the turn journal."""
 
     TURN = "turn"
     SYSTEM_STEP = "system_step"
@@ -141,16 +152,23 @@ class SystemEventKind(StrEnum):
     DAY_OPEN = "day_open"
     DAY_CLOSE = "day_close"
     COMPANY_WAKE = "company_wake"
-    MARKET_CLEAR = "market_clear"
-    PRODUCTION_COMPLETED = "production_completed"
-    TRANSFORMATION_COMPLETED = "transformation_completed"
+    OPERATION_COMPLETED = "operation_completed"
+    DELIVERY_COMPLETED = "delivery_completed"
+    MARKET_CLOSE = "market_close"
     CONSUMER_SALES = "consumer_sales"
-    RUN_END = "run_end"
 
     @property
     def priority(self) -> int:
-        """Run system mechanics before company wakes at the same minute."""
-        return 100 if self is self.COMPANY_WAKE else 0
+        """Define economic ordering for events sharing one virtual minute."""
+        return {
+            self.DAY_OPEN: 10,
+            self.OPERATION_COMPLETED: 20,
+            self.DELIVERY_COMPLETED: 20,
+            self.MARKET_CLOSE: 30,
+            self.CONSUMER_SALES: 40,
+            self.DAY_CLOSE: 50,
+            self.COMPANY_WAKE: 100,
+        }[self]
 
 
 class MarketSide(StrEnum):
@@ -201,6 +219,15 @@ class CancelOrder(StrictModel):
     order_id: Identifier
 
 
+class ReplaceOrder(StrictModel):
+    """Atomically replace one owned order and lose its former priority."""
+
+    kind: Literal["replace_order"] = "replace_order"
+    order_id: Identifier
+    quantity: PositiveQuantity
+    limit_price: PositiveMoney
+
+
 class SetRetailPrice(StrictModel):
     """Set one consumer-facing unit price."""
 
@@ -217,7 +244,7 @@ class Wait(StrictModel):
 
 
 type CompanyCommand = Annotated[
-    Produce | Transform | PlaceOrder | CancelOrder | SetRetailPrice | Wait,
+    Produce | Transform | PlaceOrder | ReplaceOrder | CancelOrder | SetRetailPrice | Wait,
     Field(discriminator="kind"),
 ]
 
@@ -240,6 +267,27 @@ class CommandStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class ScheduledCompletion(StrictModel):
+    """A future economic completion requested by the engine."""
+
+    event_id: Identifier
+    kind: SystemEventKind
+    at: SimTime
+    reference_id: Identifier
+    company_id: CompanyId
+
+    @model_validator(mode="after")
+    def validate_kind(self) -> Self:
+        """Only asynchronous completions may be scheduled by commands."""
+        allowed = {
+            SystemEventKind.OPERATION_COMPLETED,
+            SystemEventKind.DELIVERY_COMPLETED,
+        }
+        if self.kind not in allowed:
+            raise ValueError("command schedules must be operation or delivery completions")
+        return self
+
+
 class CommandOutcome(StrictModel):
     """Auditable immediate result of applying one command."""
 
@@ -253,7 +301,9 @@ class CommandOutcome(StrictModel):
     resulting_state_version: int = Field(ge=0)
     apply_sequence: int = Field(ge=1)
     order_id: Identifier | None = None
+    job_id: Identifier | None = None
     events: tuple[DomainEvent, ...] = ()
+    scheduled_completions: tuple[ScheduledCompletion, ...] = ()
     next_available_at: SimTime | None = None
 
     @model_validator(mode="after")
@@ -281,6 +331,65 @@ class OpenOrderView(StrictModel):
     remaining_quantity: PositiveQuantity
     limit_price: PositiveMoney
     placed_at: SimTime
+    priority_sequence: int = Field(ge=1)
+
+
+class PriceLevel(StrictModel):
+    """Anonymous aggregate quantity resting at one price."""
+
+    unit_price: PositiveMoney
+    quantity: PositiveQuantity
+
+
+class MarketView(StrictModel):
+    """Anonymous continuous-market facts visible to one Agent."""
+
+    product: ProductId
+    best_bid: PositiveMoney | None = None
+    best_ask: PositiveMoney | None = None
+    top_bids: tuple[PriceLevel, ...] = ()
+    top_asks: tuple[PriceLevel, ...] = ()
+    last_trade_price: PositiveMoney | None = None
+    daily_volume: Quantity = ZERO
+
+
+class DeliveryExpiryBucket(StrictModel):
+    """Quantity within one incoming delivery sharing an expiry day."""
+
+    quantity: PositiveQuantity
+    expires_end_of_day: int = Field(ge=1)
+
+
+class IncomingDeliveryView(StrictModel):
+    """One buyer-visible delivery already guaranteed by a trade."""
+
+    trade_id: Identifier
+    product: ProductId
+    quantity: PositiveQuantity
+    arrives_at: SimTime
+    expiry_buckets: tuple[DeliveryExpiryBucket, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_expiry_buckets(self) -> Self:
+        """Keep expiry detail ordered, unique, and quantity preserving."""
+        days = tuple(bucket.expires_end_of_day for bucket in self.expiry_buckets)
+        if days != tuple(sorted(set(days))):
+            raise ValueError("delivery expiry buckets must be unique and ordered")
+        if sum((bucket.quantity for bucket in self.expiry_buckets), start=ZERO) != (
+            self.quantity
+        ):
+            raise ValueError("delivery expiry buckets must sum to quantity")
+        return self
+
+
+class OperationJobView(StrictModel):
+    """The company's currently active production resource."""
+
+    job_id: Identifier
+    kind: Literal["production", "transformation"]
+    completes_at: SimTime
+    output_product: ProductId
+    output_quantity: PositiveQuantity
 
 
 class AgentTurn(StrictModel):
@@ -293,7 +402,14 @@ class AgentTurn(StrictModel):
     wake_reasons: tuple[WakeReason, ...] = Field(min_length=1)
     wake_signals: tuple[WakeSignal, ...] = ()
     observation: CompanyObservation
+    available_cash: Money
+    reserved_cash: Money = ZERO
+    reserved_inventory: tuple[InventoryPosition, ...] = ()
     open_orders: tuple[OpenOrderView, ...] = ()
+    market_views: tuple[MarketView, ...] = ()
+    pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
+    active_operation: OperationJobView | None = None
+    remaining_operation_capacity: Quantity | None = None
     visible_events: tuple[DomainEvent, ...] = ()
     previous_outcome: CommandOutcome | None = None
 
@@ -303,11 +419,15 @@ class AgentTurn(StrictModel):
         if len(self.wake_reasons) != len(set(self.wake_reasons)):
             raise ValueError("wake_reasons must be unique")
         if self.wake_signals:
-            signal_reasons = tuple(signal.reason for signal in self.wake_signals)
+            signal_reasons = tuple(
+                dict.fromkeys(signal.reason for signal in self.wake_signals)
+            )
             if signal_reasons != self.wake_reasons:
-                raise ValueError("wake_signals must follow wake_reasons exactly")
+                raise ValueError("wake_signals must cover wake_reasons in order")
         if self.observation.company_id != self.company_id:
             raise ValueError("observation company_id must match the turn")
+        if self.observation.cash != self.available_cash:
+            raise ValueError("available_cash must match the observed cash")
         if self.previous_outcome is not None:
             if self.previous_outcome.company_id != self.company_id:
                 raise ValueError("previous outcome company_id must match the turn")
@@ -334,6 +454,7 @@ class SystemStepRecord(StrictModel):
     scheduled_event_id: Identifier
     occurred_at: SimTime
     kind: SystemEventKind
+    reference_ids: tuple[Identifier, ...] = ()
     state_version_before: int = Field(ge=0)
     state_version_after: int = Field(ge=0)
     effects: tuple[EventRecord, ...] = ()

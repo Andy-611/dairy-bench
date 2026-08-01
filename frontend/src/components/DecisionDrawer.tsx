@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
@@ -7,7 +7,11 @@ import {
   humanizeIdentifier,
   productLabel,
 } from "../domainLabels";
-import { formatSignedValue, formatValue } from "../format";
+import {
+  formatExactDecimal,
+  formatSignedExactDecimal,
+  formatValue,
+} from "../format";
 import { isAbortError, requestErrorMessage } from "../requestErrors";
 import {
   clockTime,
@@ -29,6 +33,7 @@ import type {
   TimelineDetailView,
   TurnTimelineItemView,
 } from "../types";
+import { DetailDrawer } from "./DetailDrawer";
 import { TimelineError, TimelineNotice } from "./TimelineFeedback";
 
 type DetailLoader = (
@@ -54,19 +59,11 @@ export function DecisionDrawer({
 }: DecisionDrawerProps) {
   const [detail, setDetail] = useState<TimelineDetailView | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const closeButton = useRef<HTMLButtonElement | null>(null);
-  const dialog = useRef<HTMLElement | null>(null);
-  const closeAction = useRef(onClose);
-
-  useEffect(() => {
-    closeAction.current = onClose;
-  }, [onClose]);
 
   useEffect(() => {
     const controller = new AbortController();
     setDetail(null);
     setError(null);
-    closeButton.current?.focus();
     void loadDetail(runId, entryId, controller.signal)
       .then(setDetail)
       .catch((reason: unknown) => {
@@ -81,101 +78,27 @@ export function DecisionDrawer({
     return () => controller.abort();
   }, [entryId, loadDetail, runId]);
 
-  useEffect(() => {
-    const previousFocus =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    closeButton.current?.focus();
-
-    function containFocus(event: KeyboardEvent): void {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeAction.current();
-        return;
-      }
-      if (event.key !== "Tab" || dialog.current === null) {
-        return;
-      }
-      const focusable = focusableElements(dialog.current);
-      if (focusable.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (first === undefined || last === undefined) {
-        return;
-      }
-      const active = document.activeElement;
-      if (
-        event.shiftKey &&
-        (active === first || !dialog.current.contains(active))
-      ) {
-        event.preventDefault();
-        last.focus();
-      } else if (
-        !event.shiftKey &&
-        (active === last || !dialog.current.contains(active))
-      ) {
-        event.preventDefault();
-        first.focus();
-      }
-    }
-
-    document.addEventListener("keydown", containFocus);
-    return () => {
-      document.removeEventListener("keydown", containFocus);
-      if (previousFocus?.isConnected) {
-        previousFocus.focus();
-      }
-    };
-  }, []);
-
   return (
-    <div className="drawer-layer" role="presentation">
-      <button
-        aria-label="Close timeline detail"
-        className="drawer-backdrop"
-        onClick={onClose}
-        type="button"
-      />
-      <aside
-        aria-label="Timeline entry detail"
-        aria-modal="true"
-        className="decision-drawer"
-        ref={dialog}
-        role="dialog"
-      >
-        <header className="drawer-header">
-          <div>
-            <span className="eyebrow">AUDITABLE DECISION LOOP</span>
-            <h2>{detail ? detailTitle(detail) : "Loading detail…"}</h2>
-          </div>
-          <button
-            aria-label="Close"
-            onClick={onClose}
-            ref={closeButton}
-            type="button"
-          >
-            ×
-          </button>
-        </header>
-        {error ? (
-          <TimelineError message={error} />
-        ) : detail === null ? (
-          <TimelineNotice label="Loading observation and trace provenance…" />
-        ) : detail.entry.entryType === "turn" ? (
-          <TurnDetail
-            detail={detail}
-            onSelectEntry={onSelectEntry}
-            turn={detail.entry}
-          />
-        ) : (
-          <SystemDetail detail={detail} step={detail.entry} />
-        )}
-      </aside>
-    </div>
+    <DetailDrawer
+      ariaLabel="Timeline entry detail"
+      eyebrow="AUDITABLE DECISION LOOP"
+      onClose={onClose}
+      title={detail ? detailTitle(detail) : "Loading detail…"}
+    >
+      {error ? (
+        <TimelineError message={error} />
+      ) : detail === null ? (
+        <TimelineNotice label="Loading observation and trace provenance…" />
+      ) : detail.entry.entryType === "turn" ? (
+        <TurnDetail
+          detail={detail}
+          onSelectEntry={onSelectEntry}
+          turn={detail.entry}
+        />
+      ) : (
+        <SystemDetail detail={detail} step={detail.entry} />
+      )}
+    </DetailDrawer>
   );
 }
 
@@ -293,17 +216,19 @@ function SystemDetail({
                 : "No direct economic impact"
             }
           />
+          <Meta
+            label="References"
+            value={
+              step.referenceIds.length > 0
+                ? step.referenceIds.map(shortId).join(", ")
+                : "None"
+            }
+          />
         </dl>
       </DrawerSection>
       <DrawerSection number="FX" title="Economic effects">
         <EffectList effects={step.effects} />
       </DrawerSection>
-      {step.reconstructed && (
-        <p className="reconstruction-note">
-          This system milestone was deterministically reconstructed for a run
-          created before the unified system journal was introduced.
-        </p>
-      )}
       <RawAudit
         data={detail.systemStepRecord}
         label="Complete SystemStepRecord journal payload"
@@ -318,16 +243,18 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
     <>
       <div className="delta-grid">
         <DeltaMetric
-          after={formatValue(delta.cashAfter)}
+          after={formatExactDecimal(delta.cashAfter)}
           before={
             delta.cashBefore === null
               ? "First observation"
-              : formatValue(delta.cashBefore)
+              : formatExactDecimal(delta.cashBefore)
           }
           change={
-            delta.cashChange === null ? null : formatSignedValue(delta.cashChange)
+            delta.cashChange === null
+              ? null
+              : formatSignedExactDecimal(delta.cashChange)
           }
-          label="Cash"
+          label="Available cash"
         />
         <DeltaMetric
           after={String(delta.openOrderCountAfter)}
@@ -341,11 +268,11 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
         />
         {delta.retailPriceAfter !== null && (
           <DeltaMetric
-            after={formatValue(delta.retailPriceAfter)}
+            after={formatExactDecimal(delta.retailPriceAfter)}
             before={
               delta.retailPriceBefore === null
                 ? "Not set"
-                : formatValue(delta.retailPriceBefore)
+                : formatExactDecimal(delta.retailPriceBefore)
             }
             change={null}
             label="Retail price"
@@ -359,19 +286,23 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
             <strong>
               {inventory.before === null
                 ? "First observation"
-                : formatValue(inventory.before)}
+                : formatExactDecimal(inventory.before)}
               {" → "}
-              {formatValue(inventory.after)}
+              {formatExactDecimal(inventory.after)}
             </strong>
             {inventory.change !== null && (
-              <small>{formatSignedValue(inventory.change)}</small>
+              <small>{formatSignedExactDecimal(inventory.change)}</small>
             )}
           </div>
         ))}
       </div>
       <p className="observation-footnote">
-        {turn.observation.visibleEventCount} visible economic{" "}
+        {formatExactDecimal(turn.observation.reservedCash)} reserved cash;{" "}
+        {reservedInventorySummary(turn.observation.reservedInventory)} reserved
+        inventory. {turn.observation.visibleEventCount} visible economic{" "}
         {plural(turn.observation.visibleEventCount, "event")} at this turn.
+        {turn.observation.remainingOperationCapacity !== null &&
+          ` Remaining daily operation capacity: ${formatExactDecimal(turn.observation.remainingOperationCapacity)}.`}
       </p>
       {turn.observation.openOrders.length > 0 && (
         <div className="observed-facts">
@@ -381,13 +312,63 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
               <li key={order.orderId}>
                 <span>{order.side} order</span>
                 <strong>
-                  {formatValue(order.remainingQuantity)}{" "}
+                  {formatExactDecimal(order.remainingQuantity)}{" "}
                   {productLabel(order.product)} at{" "}
-                  {formatValue(order.limitPrice)} · {shortId(order.orderId)}
+                  {formatExactDecimal(order.limitPrice)} · {shortId(order.orderId)}
                 </strong>
               </li>
             ))}
           </ul>
+        </div>
+      )}
+      {turn.observation.marketViews.length > 0 && (
+        <div className="observed-facts">
+          <h4>Continuous markets</h4>
+          <ul className="effect-list">
+            {turn.observation.marketViews.map((market) => (
+              <li key={market.product}>
+                <span>{productLabel(market.product)}</span>
+                <strong>
+                  Bid {market.bestBid === null ? "none" : formatExactDecimal(market.bestBid)} / ask{" "}
+                  {market.bestAsk === null ? "none" : formatExactDecimal(market.bestAsk)};{" "}
+                  {formatExactDecimal(market.dailyVolume)} traded
+                </strong>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {turn.observation.pendingDeliveries.length > 0 && (
+        <div className="observed-facts">
+          <h4>Incoming deliveries</h4>
+          <ul className="effect-list">
+            {turn.observation.pendingDeliveries.map((delivery) => (
+              <li key={delivery.tradeId}>
+                <span>{clockTime(delivery.arrivesAtMinute)}</span>
+                <strong>
+                  {formatExactDecimal(delivery.quantity)} {productLabel(delivery.product)}
+                  {"; expiry "}
+                  {delivery.expiryBuckets
+                    .map(
+                      (bucket) =>
+                        `D${bucket.expiresEndOfDay}: ${formatExactDecimal(bucket.quantity)}`,
+                    )
+                    .join(", ")}
+                </strong>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {turn.observation.activeOperation !== null && (
+        <div className="observed-facts">
+          <h4>Active operation</h4>
+          <p>
+            {humanizeIdentifier(turn.observation.activeOperation.kind)} completes at{" "}
+            {clockTime(turn.observation.activeOperation.completesAtMinute)}, yielding{" "}
+            {formatExactDecimal(turn.observation.activeOperation.outputQuantity)}{" "}
+            {productLabel(turn.observation.activeOperation.outputProduct)}.
+          </p>
         </div>
       )}
       {turn.observation.visibleEvents.length > 0 && (
@@ -398,6 +379,20 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
       )}
     </>
   );
+}
+
+function reservedInventorySummary(
+  inventory: TurnTimelineItemView["observation"]["reservedInventory"],
+): string {
+  const entries = Object.entries(inventory);
+  return entries.length === 0
+    ? "no"
+    : entries
+        .map(
+          ([product, quantity]) =>
+            `${formatExactDecimal(quantity)} ${productLabel(product)}`,
+        )
+        .join(", ");
 }
 
 function DeltaMetric({
@@ -652,12 +647,4 @@ function artifactUnavailableReasonLabel(
     default:
       return "no reason was recorded";
   }
-}
-
-function focusableElements(container: HTMLElement): readonly HTMLElement[] {
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-    ),
-  ).filter((element) => element.getAttribute("aria-hidden") !== "true");
 }

@@ -43,12 +43,15 @@ from company_bench.run_models import (
 from company_bench.runtime_models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
+    CancelOrder,
     CommandEnvelope,
     CommandOutcome,
     CommandStatus,
     CompanyCommand,
     JournalEntryKind,
     JournalEntryReference,
+    PlaceOrder,
+    ReplaceOrder,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
@@ -56,7 +59,6 @@ from company_bench.runtime_models import (
     TurnReplayOrigin,
     Wait,
     WakeReason,
-    WakeSignal,
     system_step_id,
 )
 from company_bench.scheduler import ScheduledEvent, Scheduler
@@ -103,7 +105,7 @@ class _PendingTurn:
 
 
 class EpisodeRuntime:
-    """Run one V2 episode with deterministic scheduling and atomic commands."""
+    """Run one V3 episode with deterministic scheduling and atomic commands."""
 
     def __init__(
         self,
@@ -113,8 +115,8 @@ class EpisodeRuntime:
         evaluator: Evaluator | None = None,
         agent_timeout_seconds: float = 180.0,
     ) -> None:
-        if scenario.version < 2:
-            raise ValueError("EpisodeRuntime requires a V2 scenario")
+        if scenario.version != 3:
+            raise ValueError("EpisodeRuntime requires a V3 scenario")
         if agent_timeout_seconds <= 0:
             raise ValueError("agent_timeout_seconds must be positive")
         self.scenario = scenario
@@ -378,6 +380,7 @@ class EpisodeRuntime:
                 next_apply_sequence,
             )
             next_apply_sequence += len(ordered)
+            self._schedule_completions(scheduler, outcomes)
             self._append_events(
                 event_records,
                 economy.events[before_event_count:],
@@ -423,6 +426,8 @@ class EpisodeRuntime:
                     record,
                     turn_counts[(economy.day, company_id)],
                 )
+                self._schedule_market_change(scheduler, economy, record)
+                self._schedule_order_review(scheduler, economy, record)
             self._save_progress(
                 store,
                 tuple(new_records),
@@ -493,12 +498,9 @@ class EpisodeRuntime:
                 continue
             merged[company_id] = existing.model_copy(
                 update={
-                    "wake_reasons": tuple(
-                        dict.fromkeys((*existing.wake_reasons, *event.wake_reasons))
-                    ),
-                    "reference_ids": tuple(
-                        dict.fromkeys((*existing.reference_ids, *event.reference_ids))
-                    ),
+                    "wake_signals": tuple(
+                        dict.fromkeys((*existing.wake_signals, *event.wake_signals))
+                    )
                 }
             )
         return tuple(merged.values())
@@ -522,12 +524,13 @@ class EpisodeRuntime:
             target = self._next_business_time(available_at)
             if target is None:
                 continue
-            for reason in event.wake_reasons:
+            for signal in event.wake_signals:
                 scheduler.schedule_wake(
                     company_id,
                     target,
-                    reason,
-                    reference_ids=event.reference_ids,
+                    signal.reason,
+                    source=signal.source,
+                    reference_ids=signal.reference_ids,
                 )
         return tuple(ready)
 
@@ -585,23 +588,52 @@ class EpisodeRuntime:
                         company.company_id,
                         event.at,
                         WakeReason.DAY_OPEN,
-                        reference_ids=(entry_id,),
+                        source=JournalEntryReference(
+                            entry_id=entry_id,
+                            entry_type=JournalEntryKind.SYSTEM_STEP,
+                        ),
                     )
-            if event.kind is SystemEventKind.MARKET_CLEAR:
-                product = ProductId(event.reference_ids[0])
+            elif event.kind in {
+                SystemEventKind.OPERATION_COMPLETED,
+                SystemEventKind.DELIVERY_COMPLETED,
+            }:
+                reference_id = self._completion_reference(event)
                 before = len(economy.events)
-                economy = self._engine.clear_active_market(economy, product)
-                self._append_events(event_records, economy.events[before:])
-                self._wake_market_participants(
-                    scheduler,
-                    economy,
-                    product,
-                    source_step_id=entry_id,
+                economy = (
+                    self._engine.complete_operation(economy, reference_id, event.at)
+                    if event.kind is SystemEventKind.OPERATION_COMPLETED
+                    else self._engine.complete_delivery(economy, reference_id, event.at)
                 )
-            elif event.kind is SystemEventKind.DAY_CLOSE:
+                self._append_events(event_records, economy.events[before:])
+                if event.at.minute_of_day < self.scenario.runtime.close_minute:
+                    if event.company_id is None:
+                        raise ValueError("completion event is missing company_id")
+                    scheduler.schedule_wake(
+                        event.company_id,
+                        event.at,
+                        (
+                            WakeReason.OPERATION_COMPLETED
+                            if event.kind is SystemEventKind.OPERATION_COMPLETED
+                            else WakeReason.DELIVERY_COMPLETED
+                        ),
+                        source=JournalEntryReference(
+                            entry_id=entry_id,
+                            entry_type=JournalEntryKind.SYSTEM_STEP,
+                        ),
+                        reference_ids=(reference_id,),
+                    )
+            elif event.kind is SystemEventKind.MARKET_CLOSE:
+                economy = self._engine.close_markets(economy, event.at)
+            elif event.kind is SystemEventKind.CONSUMER_SALES:
                 before = len(economy.events)
-                result = self._engine.close_day(economy)
-                self._append_events(event_records, result.events[before:])
+                economy = self._engine.settle_consumer_sales(economy, event.at)
+                self._append_events(event_records, economy.events[before:])
+            elif event.kind is SystemEventKind.DAY_CLOSE:
+                result = self._engine.close_day(economy, event.at)
+                self._append_events(
+                    event_records,
+                    result.events[len(economy.events) :],
+                )
                 snapshots.append(result.snapshot)
                 snapshot_day = result.snapshot.day
                 completed_days.append(result.state.day)
@@ -609,6 +641,8 @@ class EpisodeRuntime:
                     economy = economy.model_copy(
                         update={
                             "base_state": result.state,
+                            "companies": result.state.companies,
+                            "events": result.events,
                             "state_version": economy.state_version + 1,
                         }
                     )
@@ -619,6 +653,8 @@ class EpisodeRuntime:
                         state_version=economy.state_version + 1,
                     )
                     self._schedule_day(scheduler, economy.day)
+            else:
+                raise RuntimeError(f"unsupported system event: {event.kind.value}")
             effects = tuple(event_records[before_event_count:])
             step = SystemStepRecord(
                 run_id=run_id,
@@ -627,6 +663,7 @@ class EpisodeRuntime:
                 scheduled_event_id=event.event_id,
                 occurred_at=event.at,
                 kind=event.kind,
+                reference_ids=event.reference_ids,
                 state_version_before=before_version,
                 state_version_after=economy.state_version,
                 effects=effects,
@@ -644,6 +681,13 @@ class EpisodeRuntime:
             next_journal_sequence,
             tuple(completed_days),
         )
+
+    @staticmethod
+    def _completion_reference(event: ScheduledEvent) -> str:
+        """Return the sole economic entity completed by a system event."""
+        if len(event.reference_ids) != 1:
+            raise ValueError("completion event requires exactly one reference_id")
+        return event.reference_ids[0]
 
     async def _query_bucket(
         self,
@@ -698,65 +742,32 @@ class EpisodeRuntime:
             if self._event_is_visible(record.event, company_id)
         )
         cursor.last_visible_event_sequence = len(event_records)
+        observation = self._engine.observe_active(economy, company_id)
         return AgentTurn(
             turn_id=f"{run_id}.{company_id}.t{sequence}",
             company_id=company_id,
             sim_time=wake_event.at,
             state_version=economy.state_version,
             wake_reasons=wake_event.wake_reasons,
-            wake_signals=self._wake_signals(wake_event),
-            observation=self._engine.observe_active(economy, company_id),
+            wake_signals=wake_event.wake_signals,
+            observation=observation,
+            available_cash=observation.cash,
+            reserved_cash=self._engine.reserved_cash(economy, company_id),
+            reserved_inventory=self._engine.reserved_inventory(economy, company_id),
             open_orders=self._engine.company_orders(economy, company_id),
+            market_views=self._engine.market_views(economy, company_id),
+            pending_deliveries=self._engine.pending_delivery_views(
+                economy,
+                company_id,
+            ),
+            active_operation=self._engine.operation_view(economy, company_id),
+            remaining_operation_capacity=self._engine.remaining_operation_capacity(
+                economy,
+                company_id,
+            ),
             visible_events=visible,
             previous_outcome=previous_outcome,
         )
-
-    @staticmethod
-    def _wake_signals(event: ScheduledEvent) -> tuple[WakeSignal, ...]:
-        """Bind scheduler metadata to causal journal references."""
-        system_source = next(
-            (reference for reference in event.reference_ids if ".system." in reference),
-            None,
-        )
-        turn_source = next(
-            (
-                reference
-                for reference in event.reference_ids
-                if ".system." not in reference and ".t" in reference
-            ),
-            None,
-        )
-        signals: list[WakeSignal] = []
-        for reason in event.wake_reasons:
-            source_id = (
-                system_source
-                if reason in {WakeReason.DAY_OPEN, WakeReason.MARKET_CLEARED}
-                else turn_source
-                if reason in {WakeReason.CONTINUE, WakeReason.WAIT_EXPIRED}
-                else None
-            )
-            source = (
-                JournalEntryReference(
-                    entry_id=source_id,
-                    entry_type=(
-                        JournalEntryKind.SYSTEM_STEP
-                        if source_id == system_source
-                        else JournalEntryKind.TURN
-                    ),
-                )
-                if source_id is not None
-                else None
-            )
-            signals.append(
-                WakeSignal(
-                    reason=reason,
-                    source=source,
-                    reference_ids=tuple(
-                        reference for reference in event.reference_ids if reference != source_id
-                    ),
-                )
-            )
-        return tuple(signals)
 
     @staticmethod
     def _replay_origin(
@@ -820,12 +831,16 @@ class EpisodeRuntime:
         seed: int,
         at: SimTime,
     ) -> tuple[_PendingTurn, ...]:
-        ordered = sorted(pending, key=lambda item: item.turn.company_id)
-        if not ordered:
-            return ()
-        digest = hashlib.sha256(f"{seed}|apply_order|{at.absolute_minute}".encode()).digest()
-        offset = int.from_bytes(digest[:8], "big") % len(ordered)
-        return tuple((*ordered[offset:], *ordered[:offset]))
+        """Create a full seed-derived arrival permutation for one minute."""
+
+        def priority(item: _PendingTurn) -> tuple[bytes, str]:
+            company_id = item.turn.company_id
+            digest = hashlib.sha256(
+                f"{seed}|{at.absolute_minute}|{company_id}".encode()
+            ).digest()
+            return digest, company_id
+
+        return tuple(sorted(pending, key=priority))
 
     @staticmethod
     def _merge_outcomes(
@@ -855,7 +870,7 @@ class EpisodeRuntime:
                     resulting_state_version=state_version,
                     apply_sequence=first_apply_sequence + offset,
                     next_available_at=envelope.issued_at.plus(
-                        item.turn.observation.runtime.command_duration_minutes
+                        item.turn.observation.runtime.decision_interval_minutes
                     ),
                 )
             )
@@ -876,7 +891,10 @@ class EpisodeRuntime:
                     record.turn.company_id,
                     command.until,
                     WakeReason.WAIT_EXPIRED,
-                    reference_ids=(record.turn.turn_id,),
+                    source=JournalEntryReference(
+                        entry_id=record.turn.turn_id,
+                        entry_type=JournalEntryKind.TURN,
+                    ),
                 )
             return
         available = record.outcome.next_available_at
@@ -889,7 +907,10 @@ class EpisodeRuntime:
                 record.turn.company_id,
                 available,
                 WakeReason.CONTINUE,
-                reference_ids=(record.turn.turn_id,),
+                source=JournalEntryReference(
+                    entry_id=record.turn.turn_id,
+                    entry_type=JournalEntryKind.TURN,
+                ),
             )
 
     def _schedule_day(self, scheduler: Scheduler, day: int) -> None:
@@ -901,44 +922,111 @@ class EpisodeRuntime:
             event_id=f"d{day}.open",
         )
         scheduler.schedule_system(
-            SystemEventKind.MARKET_CLEAR,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.raw_market_clear_minute),
-            event_id=f"d{day}.raw.clear",
-            reference_ids=(ProductId.RAW_MILK.value,),
+            SystemEventKind.MARKET_CLOSE,
+            SimTime(absolute_minute=day_index * 24 * 60 + runtime.close_minute),
+            event_id=f"d{day}.market_close",
         )
         scheduler.schedule_system(
-            SystemEventKind.MARKET_CLEAR,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.bottled_market_clear_minute),
-            event_id=f"d{day}.bottled.clear",
-            reference_ids=(ProductId.BOTTLED_MILK.value,),
+            SystemEventKind.CONSUMER_SALES,
+            SimTime(absolute_minute=day_index * 24 * 60 + runtime.close_minute),
+            event_id=f"d{day}.consumer_sales",
         )
         scheduler.schedule_system(
             SystemEventKind.DAY_CLOSE,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.close_minute),
+            SimTime(absolute_minute=day_index * 24 * 60 + runtime.day_close_minute),
             event_id=f"d{day}.close",
         )
 
-    def _wake_market_participants(
+    @staticmethod
+    def _schedule_completions(
+        scheduler: Scheduler,
+        outcomes: tuple[CommandOutcome, ...],
+    ) -> None:
+        """Persist every accepted asynchronous economic commitment."""
+        for outcome in outcomes:
+            for completion in outcome.scheduled_completions:
+                scheduler.schedule_system(
+                    completion.kind,
+                    completion.at,
+                    event_id=completion.event_id,
+                    company_id=completion.company_id,
+                    reference_ids=(completion.reference_id,),
+                )
+
+    def _schedule_market_change(
         self,
         scheduler: Scheduler,
         economy: EconomyState,
-        product: ProductId,
-        *,
-        source_step_id: str,
+        record: TurnRecord,
     ) -> None:
+        """Notify relevant companies one minute after a committed book mutation."""
+        product = self._order_product(record)
+        if not record.outcome.accepted or product is None:
+            return
+        at = record.turn.sim_time.plus(self.scenario.runtime.decision_interval_minutes)
+        if not self._can_wake_on_day(at, record.turn.sim_time.day):
+            return
         tiers = (
             {CompanyTier.FARM, CompanyTier.PROCESSOR}
             if product is ProductId.RAW_MILK
             else {CompanyTier.PROCESSOR, CompanyTier.RETAILER}
         )
+        change_id = (
+            f"market_change.{record.turn.sim_time.absolute_minute}.{product.value}"
+        )
         for company in economy.scenario.companies:
             if company.tier in tiers:
                 scheduler.schedule_wake(
                     company.company_id,
-                    scheduler.now,
-                    WakeReason.MARKET_CLEARED,
-                    reference_ids=(source_step_id, product.value),
+                    at,
+                    WakeReason.MARKET_CHANGED,
+                    reference_ids=(change_id, product.value),
                 )
+
+    def _schedule_order_review(
+        self,
+        scheduler: Scheduler,
+        economy: EconomyState,
+        record: TurnRecord,
+    ) -> None:
+        """Revisit resting commitments on a bounded deterministic cadence."""
+        orders = self._engine.company_orders(economy, record.turn.company_id)
+        if not orders:
+            return
+        at = record.turn.sim_time.plus(self.scenario.runtime.order_review_interval_minutes)
+        if not self._can_wake_on_day(at, record.turn.sim_time.day):
+            return
+        scheduler.schedule_wake(
+            record.turn.company_id,
+            at,
+            WakeReason.ORDER_UPDATED,
+            source=JournalEntryReference(
+                entry_id=record.turn.turn_id,
+                entry_type=JournalEntryKind.TURN,
+            ),
+            reference_ids=tuple(order.order_id for order in orders),
+        )
+
+    def _can_wake_on_day(self, at: SimTime, day: int) -> bool:
+        """Return whether Agents may still act on this simulation day."""
+        return at.day == day and at.minute_of_day < self.scenario.runtime.close_minute
+
+    @staticmethod
+    def _order_product(record: TurnRecord) -> ProductId | None:
+        """Resolve the book changed by an accepted order command."""
+        command = record.envelope.command
+        if isinstance(command, PlaceOrder):
+            return command.product
+        if isinstance(command, (ReplaceOrder, CancelOrder)):
+            return next(
+                (
+                    order.product
+                    for order in record.turn.open_orders
+                    if order.order_id == command.order_id
+                ),
+                None,
+            )
+        return None
 
     def _within_turn_budget(
         self,

@@ -15,15 +15,21 @@ from company_bench.models import (
     Identifier,
     InventoryPosition,
     Money,
+    PositiveMoney,
+    PositiveQuantity,
     ProductId,
+    Quantity,
     StrictModel,
 )
 from company_bench.run_models import InvocationOutcome, TokenUsage
 from company_bench.runtime_models import (
     CommandOutcome,
     CompanyCommand,
+    IncomingDeliveryView,
     MarketSide,
+    MarketView,
     OpenOrderView,
+    OperationJobView,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
@@ -48,6 +54,15 @@ class TimelineRunContext(StrictModel):
     source_model_call_count: int = Field(ge=0)
     current_usage: TokenUsage
     source_usage: TokenUsage
+    checkpoint_at: SimTime | None = None
+    checkpoint_state_version: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_checkpoint_reference(self) -> Self:
+        """Keep checkpoint time and state version present or absent together."""
+        if (self.checkpoint_at is None) != (self.checkpoint_state_version is None):
+            raise ValueError("checkpoint time and state version must be paired")
+        return self
 
 
 class DayTimelineSummary(StrictModel):
@@ -78,9 +93,15 @@ class ObservationFacts(StrictModel):
     """Decision-relevant current facts without opaque dictionaries."""
 
     cash: Money
+    reserved_cash: Money
     inventory: tuple[InventoryPosition, ...]
+    reserved_inventory: tuple[InventoryPosition, ...] = ()
     retail_price: Money | None = None
     open_orders: tuple[OpenOrderView, ...] = ()
+    market_views: tuple[MarketView, ...] = ()
+    pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
+    active_operation: OperationJobView | None = None
+    remaining_operation_capacity: Decimal | None = Field(default=None, ge=0)
     visible_events: tuple[DomainEvent, ...] = ()
     visible_event_count: int = Field(ge=0)
 
@@ -131,6 +152,16 @@ class OrderCancelledChange(StrictModel):
     order_id: Identifier
 
 
+class OrderReplacedChange(StrictModel):
+    """Atomic replacement of one standing order."""
+
+    change_type: Literal["order_replaced"] = "order_replaced"
+    replaced_order_id: Identifier
+    order_id: Identifier
+    quantity: Decimal = Field(gt=0)
+    limit_price: Decimal = Field(gt=0)
+
+
 class RetailPriceChanged(StrictModel):
     """Accepted consumer-price mutation."""
 
@@ -141,7 +172,7 @@ class RetailPriceChanged(StrictModel):
 
 
 type CommandStateChange = Annotated[
-    OrderPlacedChange | OrderCancelledChange | RetailPriceChanged,
+    OrderPlacedChange | OrderCancelledChange | OrderReplacedChange | RetailPriceChanged,
     Field(discriminator="change_type"),
 ]
 
@@ -183,11 +214,247 @@ class SystemTimelineItem(StrictModel):
     journal_sequence: int | None = Field(default=None, ge=1)
     state_version_before: int | None = Field(default=None, ge=0)
     state_version_after: int | None = Field(default=None, ge=0)
+    reference_ids: tuple[Identifier, ...] = ()
     effects: tuple[DomainEvent, ...] = ()
     affected_company_ids: tuple[CompanyId, ...] = ()
-    reconstructed: bool = False
     title: str
     summary: str
+
+
+class MarketPriceLevel(StrictModel):
+    """One aggregated Bid or Ask price with its active orders."""
+
+    unit_price: PositiveMoney
+    size: PositiveQuantity
+    orders: tuple[OpenOrderView, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_aggregation(self) -> Self:
+        """Keep every displayed level exact and internally homogeneous."""
+        if any(order.limit_price != self.unit_price for order in self.orders):
+            raise ValueError("price-level orders must share its unit price")
+        if sum((order.remaining_quantity for order in self.orders), Decimal()) != self.size:
+            raise ValueError("price-level size must equal its remaining order quantities")
+        return self
+
+
+class MarketOrderBook(StrictModel):
+    """Observer-only end-of-minute Bid and Ask book for one product."""
+
+    product: ProductId
+    bids: tuple[MarketPriceLevel, ...] = ()
+    asks: tuple[MarketPriceLevel, ...] = ()
+    last_trade_price: PositiveMoney | None = None
+    best_bid: PositiveMoney | None = None
+    best_ask: PositiveMoney | None = None
+    spread: Money | None = None
+
+    @model_validator(mode="after")
+    def validate_book(self) -> Self:
+        """Require sorted, uncrossed levels and exact market summary values."""
+        bid_prices = tuple(level.unit_price for level in self.bids)
+        ask_prices = tuple(level.unit_price for level in self.asks)
+        if bid_prices != tuple(sorted(bid_prices, reverse=True)):
+            raise ValueError("Bid levels must be ordered from highest to lowest")
+        if ask_prices != tuple(sorted(ask_prices)):
+            raise ValueError("Ask levels must be ordered from lowest to highest")
+        if any(
+            order.side is not MarketSide.BUY or order.product is not self.product
+            for level in self.bids
+            for order in level.orders
+        ):
+            raise ValueError("Bid levels must contain only matching buy orders")
+        if any(
+            order.side is not MarketSide.SELL or order.product is not self.product
+            for level in self.asks
+            for order in level.orders
+        ):
+            raise ValueError("Ask levels must contain only matching sell orders")
+
+        expected_bid = bid_prices[0] if bid_prices else None
+        expected_ask = ask_prices[0] if ask_prices else None
+        if self.best_bid != expected_bid or self.best_ask != expected_ask:
+            raise ValueError("best prices must match the first Bid and Ask levels")
+        if expected_bid is not None and expected_ask is not None and expected_bid >= expected_ask:
+            raise ValueError("an end-state continuous order book cannot remain crossed")
+        expected_spread = (
+            expected_ask - expected_bid
+            if expected_bid is not None and expected_ask is not None
+            else None
+        )
+        if self.spread != expected_spread:
+            raise ValueError("spread must equal best Ask minus best Bid")
+        return self
+
+
+class MarketMatchLeg(StrictModel):
+    """One maker-priced fill against an incoming market order."""
+
+    trade_id: Identifier
+    maker_order: OpenOrderView
+    quantity: PositiveQuantity
+    unit_price: PositiveMoney
+
+    @model_validator(mode="after")
+    def validate_maker_fill(self) -> Self:
+        """Keep each match within its persisted maker commitment."""
+        if self.unit_price != self.maker_order.limit_price:
+            raise ValueError("match price must equal the maker order price")
+        if self.quantity > self.maker_order.remaining_quantity:
+            raise ValueError("match quantity cannot exceed the maker order")
+        return self
+
+
+class _AppliedMarketOrder(StrictModel):
+    """Shared trace for Place and Replace commands entering the matcher."""
+
+    apply_sequence: int = Field(ge=1)
+    incoming_order: OpenOrderView
+    matches: tuple[MarketMatchLeg, ...] = ()
+    matched_quantity: Quantity
+    remaining_quantity: Quantity
+
+    @model_validator(mode="after")
+    def validate_application(self) -> Self:
+        """Require exact submitted, matched, and resting quantities."""
+        incoming = self.incoming_order
+        if incoming.priority_sequence != self.apply_sequence:
+            raise ValueError("incoming order priority must equal its apply sequence")
+        matched = sum((match.quantity for match in self.matches), Decimal())
+        if matched != self.matched_quantity:
+            raise ValueError("matched quantity must equal the matching trace")
+        if matched + self.remaining_quantity != incoming.remaining_quantity:
+            raise ValueError("submitted quantity must equal matched plus remaining")
+        trade_ids = [match.trade_id for match in self.matches]
+        if len(trade_ids) != len(set(trade_ids)):
+            raise ValueError("matching trace trade ids must be unique")
+        for match in self.matches:
+            maker = match.maker_order
+            if maker.product is not incoming.product or maker.side is incoming.side:
+                raise ValueError("maker order must be from the opposite product book side")
+            if maker.owner_id == incoming.owner_id:
+                raise ValueError("matching trace cannot contain a self trade")
+            crosses = (
+                incoming.limit_price >= maker.limit_price
+                if incoming.side is MarketSide.BUY
+                else incoming.limit_price <= maker.limit_price
+            )
+            if not crosses:
+                raise ValueError("matching trace orders must cross")
+        return self
+
+
+class MarketOrderPlaced(_AppliedMarketOrder):
+    """One accepted PlaceOrder and every immediate maker match."""
+
+    action: Literal["place"] = "place"
+
+
+class MarketOrderReplaced(_AppliedMarketOrder):
+    """One accepted atomic ReplaceOrder and every immediate maker match."""
+
+    action: Literal["replace"] = "replace"
+    replaced_order: OpenOrderView
+
+    @model_validator(mode="after")
+    def validate_replacement(self) -> Self:
+        """Keep the old and new orders within one owner and product book."""
+        incoming = self.incoming_order
+        replaced = self.replaced_order
+        if incoming.order_id == replaced.order_id:
+            raise ValueError("replacement must receive a new order id")
+        if (
+            incoming.owner_id != replaced.owner_id
+            or incoming.product is not replaced.product
+            or incoming.side is not replaced.side
+        ):
+            raise ValueError("replacement must preserve owner, product, and side")
+        return self
+
+
+class MarketOrderCancelled(StrictModel):
+    """One accepted CancelOrder and the active order it removed."""
+
+    action: Literal["cancel"] = "cancel"
+    apply_sequence: int = Field(ge=1)
+    cancelled_order: OpenOrderView
+
+
+type MarketOrderFlowItem = Annotated[
+    MarketOrderPlaced | MarketOrderReplaced | MarketOrderCancelled,
+    Field(discriminator="action"),
+]
+
+
+class TimelineTrade(StrictModel):
+    """One persisted trade displayed in the minute that applied it."""
+
+    apply_sequence: int = Field(ge=1)
+    trade_id: Identifier
+    maker_order_id: Identifier
+    taker_order_id: Identifier
+    product: ProductId
+    seller_id: CompanyId
+    buyer_id: CompanyId
+    quantity: PositiveQuantity
+    unit_price: PositiveMoney
+    arrives_at: SimTime
+
+
+class MarketFrame(StrictModel):
+    """Accepted order flow, trade tape, and the exact closing order books."""
+
+    state_version: int = Field(ge=0)
+    order_flow: tuple[MarketOrderFlowItem, ...] = ()
+    trades: tuple[TimelineTrade, ...] = ()
+    closing_order_books: tuple[MarketOrderBook, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_audit_flow(self) -> Self:
+        """Require order flow and trade tape to describe the same matches."""
+        sequences = tuple(item.apply_sequence for item in self.order_flow)
+        if sequences != tuple(sorted(sequences)) or len(sequences) != len(set(sequences)):
+            raise ValueError("order flow must have unique ascending apply sequences")
+
+        projected: list[tuple[object, ...]] = []
+        for item in self.order_flow:
+            if isinstance(item, MarketOrderCancelled):
+                continue
+            taker = item.incoming_order
+            for match in item.matches:
+                maker = match.maker_order
+                seller_id = taker.owner_id if taker.side is MarketSide.SELL else maker.owner_id
+                buyer_id = taker.owner_id if taker.side is MarketSide.BUY else maker.owner_id
+                projected.append(
+                    (
+                        item.apply_sequence,
+                        match.trade_id,
+                        maker.order_id,
+                        taker.order_id,
+                        taker.product,
+                        seller_id,
+                        buyer_id,
+                        match.quantity,
+                        match.unit_price,
+                    )
+                )
+        actual = [
+            (
+                trade.apply_sequence,
+                trade.trade_id,
+                trade.maker_order_id,
+                trade.taker_order_id,
+                trade.product,
+                trade.seller_id,
+                trade.buyer_id,
+                trade.quantity,
+                trade.unit_price,
+            )
+            for trade in self.trades
+        ]
+        if projected != actual:
+            raise ValueError("matching trace must exactly equal the trade tape")
+        return self
 
 
 type TimelineItem = Annotated[
@@ -202,6 +469,7 @@ class TimelineMoment(StrictModel):
     sim_time: SimTime
     system_steps: tuple[SystemTimelineItem, ...] = ()
     turns: tuple[TurnTimelineItem, ...] = ()
+    market: MarketFrame
 
 
 class TimelineDay(StrictModel):

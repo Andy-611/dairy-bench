@@ -11,6 +11,9 @@ export type RunStatus =
   | "completed"
   | "failed";
 
+declare const decimalTextBrand: unique symbol;
+export type DecimalText = string & { readonly [decimalTextBrand]: true };
+
 export type JsonValue =
   | boolean
   | number
@@ -95,6 +98,17 @@ export interface RunProgressView {
   readonly errorMessage: string | null;
 }
 
+export interface RunJobView extends RunProgressView {
+  readonly revision: number;
+  readonly mode: PolicyMode;
+  readonly seed: number;
+  readonly sourceRunId: string | null;
+  readonly scenarioId: string;
+  readonly submittedAt: string;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+}
+
 export interface TimelineContextView {
   readonly currentRunId: string;
   readonly scenarioId: string;
@@ -108,6 +122,8 @@ export interface TimelineContextView {
   readonly sourceModelCallCount: number;
   readonly currentUsage: TokenUsageView;
   readonly sourceUsage: TokenUsageView;
+  readonly checkpointMinute: number | null;
+  readonly checkpointStateVersion: number | null;
 }
 
 export interface TimelineDaySummaryView {
@@ -118,9 +134,9 @@ export interface TimelineDaySummaryView {
   readonly waitCount: number;
   readonly systemStepCount: number;
   readonly eventCount: number;
-  readonly tradeQuantity: number;
-  readonly consumerSales: number;
-  readonly expiredQuantity: number;
+  readonly tradeQuantity: DecimalText;
+  readonly consumerSales: DecimalText;
+  readonly expiredQuantity: DecimalText;
 }
 
 export interface WakeSignalView {
@@ -134,43 +150,51 @@ export type EconomicEffectView =
   | {
       readonly kind: "milk_produced";
       readonly companyId: string;
-      readonly requestedQuantity: number;
-      readonly actualQuantity: number;
-      readonly unitCost: number;
-      readonly cashCost: number;
+      readonly requestedQuantity: DecimalText;
+      readonly actualQuantity: DecimalText;
+      readonly unitCost: DecimalText;
+      readonly cashCost: DecimalText;
     }
   | {
       readonly kind: "trade_executed";
+      readonly tradeId: string;
       readonly sellerId: string;
       readonly buyerId: string;
       readonly product: string;
-      readonly quantity: number;
-      readonly unitPrice: number;
-      readonly totalValue: number;
+      readonly quantity: DecimalText;
+      readonly unitPrice: DecimalText;
+      readonly totalValue: DecimalText;
+    }
+  | {
+      readonly kind: "delivery_completed";
+      readonly tradeId: string;
+      readonly companyId: string;
+      readonly product: string;
+      readonly quantity: DecimalText;
     }
   | {
       readonly kind: "milk_processed";
       readonly companyId: string;
-      readonly requestedInput: number;
-      readonly actualInput: number;
-      readonly outputQuantity: number;
-      readonly cashCost: number;
+      readonly requestedInput: DecimalText;
+      readonly actualInput: DecimalText;
+      readonly outputQuantity: DecimalText;
+      readonly cashCost: DecimalText;
     }
   | {
       readonly kind: "consumer_sale";
       readonly companyId: string;
-      readonly potentialDemand: number;
-      readonly demandQuantity: number;
-      readonly soldQuantity: number;
-      readonly retailPrice: number | null;
-      readonly revenue: number;
+      readonly potentialDemand: DecimalText;
+      readonly demandQuantity: DecimalText;
+      readonly soldQuantity: DecimalText;
+      readonly retailPrice: DecimalText | null;
+      readonly revenue: DecimalText;
     }
   | {
       readonly kind: "inventory_expired";
       readonly companyId: string;
       readonly product: string;
-      readonly quantity: number;
-      readonly valueLoss: number;
+      readonly quantity: DecimalText;
+      readonly valueLoss: DecimalText;
     }
   | {
       readonly kind: "decision_rejected" | "policy_failed";
@@ -182,29 +206,35 @@ export type TimelineCommandView =
   | {
       readonly kind: "produce";
       readonly product: string;
-      readonly quantity: number;
+      readonly quantity: DecimalText;
     }
   | {
       readonly kind: "transform";
       readonly inputProduct: string;
       readonly outputProduct: string;
-      readonly inputQuantity: number;
+      readonly inputQuantity: DecimalText;
     }
   | {
       readonly kind: "place_order";
       readonly side: "buy" | "sell";
       readonly product: string;
-      readonly quantity: number;
-      readonly limitPrice: number;
+      readonly quantity: DecimalText;
+      readonly limitPrice: DecimalText;
     }
   | {
       readonly kind: "cancel_order";
       readonly orderId: string;
     }
   | {
+      readonly kind: "replace_order";
+      readonly orderId: string;
+      readonly quantity: DecimalText;
+      readonly limitPrice: DecimalText;
+    }
+  | {
       readonly kind: "set_retail_price";
       readonly product: string;
-      readonly unitPrice: number;
+      readonly unitPrice: DecimalText;
     }
   | {
       readonly kind: "wait";
@@ -217,25 +247,38 @@ export type CommandStateChangeView =
       readonly orderId: string;
       readonly side: "buy" | "sell";
       readonly product: string;
-      readonly quantity: number;
-      readonly limitPrice: number;
+      readonly quantity: DecimalText;
+      readonly limitPrice: DecimalText;
     }
   | {
       readonly changeType: "order_cancelled";
       readonly orderId: string;
     }
   | {
+      readonly changeType: "order_replaced";
+      readonly replacedOrderId: string;
+      readonly orderId: string;
+      readonly quantity: DecimalText;
+      readonly limitPrice: DecimalText;
+    }
+  | {
       readonly changeType: "retail_price_changed";
       readonly product: string;
-      readonly before: number | null;
-      readonly after: number;
+      readonly before: DecimalText | null;
+      readonly after: DecimalText;
     };
 
 export interface ObservationFactsView {
-  readonly cash: number;
-  readonly inventory: Readonly<Record<string, number>>;
-  readonly retailPrice: number | null;
+  readonly cash: DecimalText;
+  readonly reservedCash: DecimalText;
+  readonly inventory: Readonly<Record<string, DecimalText>>;
+  readonly reservedInventory: Readonly<Record<string, DecimalText>>;
+  readonly retailPrice: DecimalText | null;
   readonly openOrders: readonly OpenOrderView[];
+  readonly marketViews: readonly MarketView[];
+  readonly pendingDeliveries: readonly IncomingDeliveryView[];
+  readonly activeOperation: OperationJobView | null;
+  readonly remainingOperationCapacity: DecimalText | null;
   readonly visibleEventCount: number;
   readonly visibleEvents: readonly EconomicEffectView[];
 }
@@ -245,25 +288,133 @@ export interface OpenOrderView {
   readonly ownerId: string;
   readonly side: "buy" | "sell";
   readonly product: string;
-  readonly remainingQuantity: number;
-  readonly limitPrice: number;
+  readonly remainingQuantity: DecimalText;
+  readonly limitPrice: DecimalText;
   readonly placedAtMinute: number;
+  readonly prioritySequence: number;
+}
+
+export interface PriceLevelView {
+  readonly unitPrice: DecimalText;
+  readonly quantity: DecimalText;
+}
+
+export interface MarketView {
+  readonly product: string;
+  readonly bestBid: DecimalText | null;
+  readonly bestAsk: DecimalText | null;
+  readonly topBids: readonly PriceLevelView[];
+  readonly topAsks: readonly PriceLevelView[];
+  readonly lastTradePrice: DecimalText | null;
+  readonly dailyVolume: DecimalText;
+}
+
+export interface MarketPriceLevelView {
+  readonly unitPrice: DecimalText;
+  readonly size: DecimalText;
+  readonly orders: readonly OpenOrderView[];
+}
+
+export interface ObserverOrderBookView {
+  readonly product: string;
+  readonly bids: readonly MarketPriceLevelView[];
+  readonly asks: readonly MarketPriceLevelView[];
+  readonly lastTradePrice: DecimalText | null;
+  readonly bestBid: DecimalText | null;
+  readonly bestAsk: DecimalText | null;
+  readonly spread: DecimalText | null;
+}
+
+export interface MarketMatchLegView {
+  readonly tradeId: string;
+  readonly makerOrder: OpenOrderView;
+  readonly quantity: DecimalText;
+  readonly unitPrice: DecimalText;
+}
+
+interface AppliedMarketOrderView {
+  readonly applySequence: number;
+  readonly incomingOrder: OpenOrderView;
+  readonly matches: readonly MarketMatchLegView[];
+  readonly matchedQuantity: DecimalText;
+  readonly remainingQuantity: DecimalText;
+}
+
+export interface MarketOrderPlacedView extends AppliedMarketOrderView {
+  readonly action: "place";
+}
+
+export interface MarketOrderReplacedView extends AppliedMarketOrderView {
+  readonly action: "replace";
+  readonly replacedOrder: OpenOrderView;
+}
+
+export interface MarketOrderCancelledView {
+  readonly action: "cancel";
+  readonly applySequence: number;
+  readonly cancelledOrder: OpenOrderView;
+}
+
+export type MarketOrderFlowItemView =
+  | MarketOrderPlacedView
+  | MarketOrderReplacedView
+  | MarketOrderCancelledView;
+
+export interface TimelineTradeView {
+  readonly applySequence: number;
+  readonly tradeId: string;
+  readonly makerOrderId: string;
+  readonly takerOrderId: string;
+  readonly product: string;
+  readonly sellerId: string;
+  readonly buyerId: string;
+  readonly quantity: DecimalText;
+  readonly unitPrice: DecimalText;
+  readonly arrivesAtMinute: number;
+}
+
+export interface MarketFrameView {
+  readonly stateVersion: number;
+  readonly orderFlow: readonly MarketOrderFlowItemView[];
+  readonly trades: readonly TimelineTradeView[];
+  readonly closingOrderBooks: readonly ObserverOrderBookView[];
+}
+
+export interface IncomingDeliveryView {
+  readonly tradeId: string;
+  readonly product: string;
+  readonly quantity: DecimalText;
+  readonly arrivesAtMinute: number;
+  readonly expiryBuckets: readonly DeliveryExpiryBucketView[];
+}
+
+export interface DeliveryExpiryBucketView {
+  readonly quantity: DecimalText;
+  readonly expiresEndOfDay: number;
+}
+
+export interface OperationJobView {
+  readonly jobId: string;
+  readonly kind: "production" | "transformation";
+  readonly completesAtMinute: number;
+  readonly outputProduct: string;
+  readonly outputQuantity: DecimalText;
 }
 
 export interface InventoryDeltaView {
   readonly product: string;
-  readonly before: number | null;
-  readonly after: number;
-  readonly change: number | null;
+  readonly before: DecimalText | null;
+  readonly after: DecimalText;
+  readonly change: DecimalText | null;
 }
 
 export interface ObservationDeltaView {
-  readonly cashBefore: number | null;
-  readonly cashAfter: number;
-  readonly cashChange: number | null;
+  readonly cashBefore: DecimalText | null;
+  readonly cashAfter: DecimalText;
+  readonly cashChange: DecimalText | null;
   readonly inventory: readonly InventoryDeltaView[];
-  readonly retailPriceBefore: number | null;
-  readonly retailPriceAfter: number | null;
+  readonly retailPriceBefore: DecimalText | null;
+  readonly retailPriceAfter: DecimalText | null;
   readonly openOrderCountBefore: number | null;
   readonly openOrderCountAfter: number;
 }
@@ -297,6 +448,8 @@ export interface TurnTimelineItemView {
   readonly command: TimelineCommandView;
   readonly accepted: boolean;
   readonly reason: string | null;
+  readonly outcomeOrderId: string | null;
+  readonly outcomeJobId: string | null;
   readonly effects: readonly EconomicEffectView[];
   readonly stateChanges: readonly CommandStateChangeView[];
   readonly nextAvailableMinute: number | null;
@@ -316,9 +469,10 @@ export interface SystemTimelineItemView {
   readonly journalSequence: number | null;
   readonly stateVersionBefore: number | null;
   readonly stateVersionAfter: number | null;
+  readonly referenceIds: readonly string[];
   readonly effects: readonly EconomicEffectView[];
   readonly affectedCompanyIds: readonly string[];
-  readonly reconstructed: boolean;
+  readonly reconstructed: false;
   readonly title: string;
   readonly summary: string;
 }
@@ -328,6 +482,7 @@ export interface TimelineMomentView {
   readonly totalTurnCount: number;
   readonly systemSteps: readonly SystemTimelineItemView[];
   readonly turns: readonly TurnTimelineItemView[];
+  readonly market: MarketFrameView;
 }
 
 export interface TimelineDayView {

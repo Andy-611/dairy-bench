@@ -1,5 +1,5 @@
 import { companyLabel, humanizeIdentifier, productLabel } from "./domainLabels";
-import { formatValue } from "./format";
+import { formatExactDecimal } from "./format";
 import type {
   CommandStateChangeView,
   EconomicEffectView,
@@ -10,16 +10,20 @@ const COMMAND_LABELS: Readonly<Record<TimelineCommandView["kind"], string>> = {
   cancel_order: "Cancel order",
   place_order: "Place order",
   produce: "Produce",
+  replace_order: "Replace order",
   set_retail_price: "Set retail price",
   transform: "Transform",
   wait: "Wait",
 };
 
 const WAKE_LABELS: Readonly<Record<string, string>> = {
-  continue: "Previous action completed",
+  continue: "Decision interval elapsed",
   day_open: "Market day opened",
+  delivery_completed: "Delivery arrived",
   external_event: "Relevant external event",
-  market_cleared: "Spot market cleared",
+  market_changed: "Market quote changed",
+  operation_completed: "Operation completed",
+  order_updated: "Own order updated",
   wait_expired: "Requested wait expired",
 };
 
@@ -27,10 +31,9 @@ const SYSTEM_LABELS: Readonly<Record<string, string>> = {
   consumer_sales: "Consumer sales",
   day_close: "Day close",
   day_open: "Day open",
-  market_clear: "Spot-market clearing",
-  production_completed: "Production completed",
-  run_end: "Run completed",
-  transformation_completed: "Transformation completed",
+  delivery_completed: "Delivery completed",
+  market_close: "Continuous-market close",
+  operation_completed: "Operation completed",
 };
 
 export function commandLabel(kind: TimelineCommandView["kind"]): string {
@@ -48,15 +51,17 @@ export function systemLabel(kind: string): string {
 export function commandSummary(command: TimelineCommandView): string {
   switch (command.kind) {
     case "produce":
-      return `Produce ${formatValue(command.quantity)} ${productLabel(command.product)}`;
+      return `Produce ${formatExactDecimal(command.quantity)} ${productLabel(command.product)}`;
     case "transform":
-      return `Transform ${formatValue(command.inputQuantity)} ${productLabel(command.inputProduct)} into ${productLabel(command.outputProduct)}`;
+      return `Transform ${formatExactDecimal(command.inputQuantity)} ${productLabel(command.inputProduct)} into ${productLabel(command.outputProduct)}`;
     case "place_order":
-      return `${capitalize(command.side)} ${formatValue(command.quantity)} ${productLabel(command.product)} at a ${formatValue(command.limitPrice)} limit`;
+      return `${capitalize(command.side)} ${formatExactDecimal(command.quantity)} ${productLabel(command.product)} at a ${formatExactDecimal(command.limitPrice)} limit`;
     case "cancel_order":
       return `Cancel order ${command.orderId}`;
+    case "replace_order":
+      return `Replace order ${shortId(command.orderId)} with ${formatExactDecimal(command.quantity)} units at a ${formatExactDecimal(command.limitPrice)} limit`;
     case "set_retail_price":
-      return `Set ${productLabel(command.product)} retail price to ${formatValue(command.unitPrice)}`;
+      return `Set ${productLabel(command.product)} retail price to ${formatExactDecimal(command.unitPrice)}`;
     case "wait":
       return command.untilMinute === null
         ? "Wait for the next relevant event"
@@ -67,15 +72,17 @@ export function commandSummary(command: TimelineCommandView): string {
 export function effectSummary(effect: EconomicEffectView): string {
   switch (effect.kind) {
     case "milk_produced":
-      return `${companyLabel(effect.companyId)} produced ${formatValue(effect.actualQuantity)} raw milk`;
+      return `${companyLabel(effect.companyId)} produced ${formatExactDecimal(effect.actualQuantity)} raw milk`;
     case "milk_processed":
-      return `${companyLabel(effect.companyId)} converted ${formatValue(effect.actualInput)} raw milk into ${formatValue(effect.outputQuantity)} bottled milk`;
+      return `${companyLabel(effect.companyId)} converted ${formatExactDecimal(effect.actualInput)} raw milk into ${formatExactDecimal(effect.outputQuantity)} bottled milk`;
     case "trade_executed":
-      return `${companyLabel(effect.sellerId)} sold ${formatValue(effect.quantity)} ${productLabel(effect.product)} to ${companyLabel(effect.buyerId)} at ${formatValue(effect.unitPrice)}`;
+      return `${companyLabel(effect.sellerId)} sold ${formatExactDecimal(effect.quantity)} ${productLabel(effect.product)} to ${companyLabel(effect.buyerId)} at ${formatExactDecimal(effect.unitPrice)}`;
+    case "delivery_completed":
+      return `${companyLabel(effect.companyId)} received ${formatExactDecimal(effect.quantity)} ${productLabel(effect.product)}`;
     case "consumer_sale":
-      return `${companyLabel(effect.companyId)} sold ${formatValue(effect.soldQuantity)} to consumers for ${formatValue(effect.revenue)}`;
+      return `${companyLabel(effect.companyId)} sold ${formatExactDecimal(effect.soldQuantity)} to consumers for ${formatExactDecimal(effect.revenue)}`;
     case "inventory_expired":
-      return `${companyLabel(effect.companyId)} discarded ${formatValue(effect.quantity)} ${productLabel(effect.product)}`;
+      return `${companyLabel(effect.companyId)} discarded ${formatExactDecimal(effect.quantity)} ${productLabel(effect.product)}`;
     case "decision_rejected":
     case "policy_failed":
       return effect.reason;
@@ -85,11 +92,13 @@ export function effectSummary(effect: EconomicEffectView): string {
 export function stateChangeSummary(change: CommandStateChangeView): string {
   switch (change.changeType) {
     case "order_placed":
-      return `${capitalize(change.side)} order ${shortId(change.orderId)} · ${formatValue(change.quantity)} ${productLabel(change.product)} at ${formatValue(change.limitPrice)}`;
+      return `${capitalize(change.side)} order ${shortId(change.orderId)} · ${formatExactDecimal(change.quantity)} ${productLabel(change.product)} at ${formatExactDecimal(change.limitPrice)}`;
     case "order_cancelled":
       return `Order ${shortId(change.orderId)} was cancelled`;
+    case "order_replaced":
+      return `Order ${shortId(change.replacedOrderId)} was replaced by ${shortId(change.orderId)} for ${formatExactDecimal(change.quantity)} units at ${formatExactDecimal(change.limitPrice)}`;
     case "retail_price_changed":
-      return `${productLabel(change.product)} price ${change.before === null ? "not set" : formatValue(change.before)} → ${formatValue(change.after)}`;
+      return `${productLabel(change.product)} price ${change.before === null ? "not set" : formatExactDecimal(change.before)} → ${formatExactDecimal(change.after)}`;
   }
 }
 

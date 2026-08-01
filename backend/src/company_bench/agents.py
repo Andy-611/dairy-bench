@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Final, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -20,9 +20,9 @@ from company_bench.agent_models import (
 from company_bench.diagnostics import bounded_error
 from company_bench.memory import AgentCheckpoint, ConversationMemory, MemoryExchange
 from company_bench.models import (
+    QUANTITY_QUANTUM,
     CompanyId,
     FarmOperation,
-    MilkProcessedEvent,
     PolicyKind,
     PolicyMetadata,
     ProcessorOperation,
@@ -49,7 +49,7 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v2"
+COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.1"
 
 
 class CompanyAgent(Protocol):
@@ -105,7 +105,7 @@ class AgentCommandInput(StrictModel):
 
 
 class LlmCompanyAgent:
-    """Use one isolated provider gateway and Agent-owned V2 memory."""
+    """Use one isolated provider gateway and Agent-owned V3 memory."""
 
     metadata: PolicyMetadata
 
@@ -300,40 +300,42 @@ class FixedCommandAgent:
 
 
 class BaselineCompanyAgent:
-    """Transparent V2 actor that follows the scenario's market phases."""
+    """Transparent V3 actor for the continuous dairy market."""
 
     metadata = PolicyMetadata(
         name="event-baseline",
-        version="2",
+        version="3",
         kind=PolicyKind.BASELINE,
     )
 
     async def act(self, turn: AgentTurn) -> CompanyCommand:
         """Choose a feasible atomic command from fresh current facts."""
         operation = turn.observation.operation
-        minute = turn.sim_time.minute_of_day
         if isinstance(operation, FarmOperation):
-            return self._farm_command(turn, minute)
+            return self._farm_command(turn)
         if isinstance(operation, ProcessorOperation):
-            return self._processor_command(turn, minute)
+            return self._processor_command(turn)
         if isinstance(operation, RetailerOperation):
-            return self._retailer_command(turn, minute)
+            return self._retailer_command(turn)
         raise TypeError(f"unsupported operation: {type(operation).__name__}")
 
     @staticmethod
-    def _farm_command(turn: AgentTurn, minute: int) -> CompanyCommand:
+    def _farm_command(turn: AgentTurn) -> CompanyCommand:
         operation = turn.observation.operation
         assert isinstance(operation, FarmOperation)
-        if minute >= turn.observation.runtime.raw_market_clear_minute:
-            return Wait()
         if WakeReason.DAY_OPEN in turn.wake_reasons:
+            capacity = _remaining_capacity(turn, operation.daily_capacity)
+            if capacity <= 0:
+                return Wait()
             return Produce(
                 product=operation.output_product,
-                quantity=min(operation.daily_capacity, Decimal("50")),
+                quantity=min(capacity, Decimal("50")),
             )
         if _has_order(turn, MarketSide.SELL, operation.output_product):
             return Wait()
-        quantity = min(turn.observation.quantity(operation.output_product), Decimal("50"))
+        quantity = _floor_order_quantity(
+            min(turn.observation.quantity(operation.output_product), Decimal("50"))
+        )
         return (
             PlaceOrder(
                 side=MarketSide.SELL,
@@ -346,77 +348,91 @@ class BaselineCompanyAgent:
         )
 
     @staticmethod
-    def _processor_command(turn: AgentTurn, minute: int) -> CompanyCommand:
+    def _processor_command(turn: AgentTurn) -> CompanyCommand:
         operation = turn.observation.operation
         assert isinstance(operation, ProcessorOperation)
-        runtime = turn.observation.runtime
-        if minute < runtime.raw_market_clear_minute:
-            return (
-                Wait()
-                if _has_order(turn, MarketSide.BUY, operation.input_product)
-                else PlaceOrder(
-                    side=MarketSide.BUY,
-                    product=operation.input_product,
-                    quantity=min(operation.daily_input_capacity, Decimal("50")),
-                    limit_price=Decimal("1.60"),
-                )
-            )
-        if minute >= runtime.bottled_market_clear_minute:
-            return Wait()
-        if _has_order(turn, MarketSide.SELL, operation.output_product):
-            return Wait()
+        capacity = _remaining_capacity(turn, operation.daily_input_capacity)
         raw_quantity = turn.observation.quantity(operation.input_product)
-        transformed_now = (
-            any(isinstance(event, MilkProcessedEvent) for event in turn.previous_outcome.events)
-            if turn.previous_outcome is not None
-            else False
-        )
-        if raw_quantity > 0 and not transformed_now:
+        if raw_quantity > 0 and capacity > 0 and turn.active_operation is None:
             return Transform(
                 input_product=operation.input_product,
                 output_product=operation.output_product,
                 input_quantity=min(
-                    operation.daily_input_capacity,
+                    capacity,
                     raw_quantity,
                     Decimal("50"),
                 ),
             )
-        bottled = min(
-            turn.observation.quantity(operation.output_product),
-            Decimal("40"),
+        bottled = _floor_order_quantity(
+            min(
+                turn.observation.quantity(operation.output_product),
+                Decimal("40"),
+            )
         )
-        return (
-            PlaceOrder(
+        if bottled > 0 and not _has_order(
+            turn,
+            MarketSide.SELL,
+            operation.output_product,
+        ):
+            return PlaceOrder(
                 side=MarketSide.SELL,
                 product=operation.output_product,
                 quantity=bottled,
                 limit_price=Decimal("2.50"),
             )
-            if bottled > 0
-            else Wait()
+        order_quantity = _floor_order_quantity(
+            min(
+                Decimal("50"),
+                max(
+                    Decimal("0"),
+                    capacity
+                    - raw_quantity
+                    - _pending_quantity(turn, operation.input_product),
+                ),
+            )
         )
+        if order_quantity > 0 and not _has_order(
+            turn,
+            MarketSide.BUY,
+            operation.input_product,
+        ):
+            return PlaceOrder(
+                side=MarketSide.BUY,
+                product=operation.input_product,
+                quantity=order_quantity,
+                limit_price=Decimal("1.60"),
+            )
+        return Wait()
 
     @staticmethod
-    def _retailer_command(turn: AgentTurn, minute: int) -> CompanyCommand:
+    def _retailer_command(turn: AgentTurn) -> CompanyCommand:
         operation = turn.observation.operation
         assert isinstance(operation, RetailerOperation)
-        if minute < turn.observation.runtime.bottled_market_clear_minute:
-            return (
-                Wait()
-                if _has_order(turn, MarketSide.BUY, operation.input_product)
-                else PlaceOrder(
-                    side=MarketSide.BUY,
-                    product=operation.input_product,
-                    quantity=Decimal("40"),
-                    limit_price=Decimal("2.80"),
-                )
+        if turn.observation.retail_price is None:
+            return SetRetailPrice(
+                product=operation.input_product,
+                unit_price=Decimal("3.50"),
             )
-        if turn.observation.retail_price is not None:
-            return Wait()
-        return SetRetailPrice(
-            product=operation.input_product,
-            unit_price=Decimal("3.50"),
+        order_quantity = _floor_order_quantity(
+            max(
+                Decimal("0"),
+                Decimal("40")
+                - turn.observation.quantity(operation.input_product)
+                - _pending_quantity(turn, operation.input_product),
+            )
         )
+        if order_quantity > 0 and not _has_order(
+            turn,
+            MarketSide.BUY,
+            operation.input_product,
+        ):
+            return PlaceOrder(
+                side=MarketSide.BUY,
+                product=operation.input_product,
+                quantity=order_quantity,
+                limit_price=Decimal("2.80"),
+            )
+        return Wait()
 
 
 class ReplayCompanyAgent:
@@ -436,7 +452,7 @@ class ReplayCompanyAgent:
             raise ValueError("replay requires one nonempty source run journal")
         self.metadata = PolicyMetadata(
             name="turn-replay",
-            version="2",
+            version="3",
             kind=PolicyKind.REPLAY,
             source_run_id=source_run_ids.pop(),
         )
@@ -513,25 +529,40 @@ def _allowed_commands(turn: AgentTurn) -> tuple[CommandName, ...]:
     """Expose only commands authorized for the observed company role."""
     operation = turn.observation.operation
     if isinstance(operation, FarmOperation):
-        return ("produce", "place_order", "cancel_order", "wait")
+        return ("produce", "place_order", "replace_order", "cancel_order", "wait")
     if isinstance(operation, ProcessorOperation):
-        return ("transform", "place_order", "cancel_order", "wait")
+        return ("transform", "place_order", "replace_order", "cancel_order", "wait")
     if isinstance(operation, RetailerOperation):
-        return ("place_order", "cancel_order", "set_retail_price", "wait")
+        return (
+            "place_order",
+            "replace_order",
+            "cancel_order",
+            "set_retail_price",
+            "wait",
+        )
     raise TypeError(f"unsupported operation: {type(operation).__name__}")
 
 
 def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
-    """Build the stable provider-neutral V2 command prompt."""
+    """Build the stable provider-neutral V3 command prompt."""
     commands = ", ".join(allowed)
     return (
-        "You are the sole Agent for one dairy company in an event-driven benchmark. "
-        "Use only the supplied current observation, visible events, active orders, "
-        "previous outcome, and your own private memory. Submit exactly one atomic "
-        "command; never submit a daily plan or invent identity, time, or state version. "
-        "The economic engine alone decides feasibility and effects. Use wait when no "
-        f"action is justified. Authorized commands: {commands}."
+        "You are the sole Agent for one dairy company in a continuous spot market. "
+        "Orders lock real cash or FEFO inventory, crossing quotes trade immediately at "
+        "the resting price, and purchases arrive after 30 virtual minutes. Production "
+        "and transformation also complete asynchronously while market commands remain "
+        "available. Use only supplied facts and submit exactly one atomic command; never "
+        "invent identity, time, or state version. Every order quantity must be at least "
+        f"{QUANTITY_QUANTUM} and use at most four decimal places (an exact multiple of "
+        f"{QUANTITY_QUANTUM}); never submit a dust quantity. Use wait when no action is "
+        "justified. "
+        f"Authorized commands: {commands}."
     )
+
+
+def _floor_order_quantity(value: Decimal) -> Decimal:
+    """Floor a feasible baseline order to the market quantum."""
+    return value.quantize(QUANTITY_QUANTUM, rounding=ROUND_DOWN)
 
 
 def _has_order(
@@ -540,6 +571,22 @@ def _has_order(
     product: ProductId,
 ) -> bool:
     return any(order.side is side and order.product is product for order in turn.open_orders)
+
+
+def _pending_quantity(turn: AgentTurn, product: ProductId) -> Decimal:
+    return sum(
+        (
+            delivery.quantity
+            for delivery in turn.pending_deliveries
+            if delivery.product is product
+        ),
+        start=Decimal("0"),
+    )
+
+
+def _remaining_capacity(turn: AgentTurn, configured: Decimal) -> Decimal:
+    remaining = turn.remaining_operation_capacity
+    return configured if remaining is None else remaining
 
 
 def _estimated_tokens(*parts: str) -> int:

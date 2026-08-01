@@ -31,7 +31,7 @@ _DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 
 
 class DairyBenchmark:
-    """Run one explicit pre-V2 daily-decision scenario."""
+    """Run one explicit legacy daily-decision scenario."""
 
     def __init__(
         self,
@@ -42,7 +42,7 @@ class DairyBenchmark:
         policy_timeout_seconds: float = 5.0,
     ) -> None:
         if scenario.version >= 2:
-            raise ValueError("DairyBenchmark does not implement event-driven V2 scenarios")
+            raise ValueError("DairyBenchmark does not implement event-driven V3 scenarios")
         if policy_timeout_seconds <= 0:
             raise ValueError("policy_timeout_seconds must be positive")
         self.scenario = scenario
@@ -185,7 +185,7 @@ class DairyBenchmark:
 
 
 class RunService:
-    """Persist episodes produced by an explicit pre-V2 benchmark."""
+    """Persist episodes produced by an explicit legacy benchmark."""
 
     def __init__(
         self,

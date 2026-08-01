@@ -4,6 +4,12 @@ A single-page React and TypeScript dashboard. It creates runs, polls progress,
 and renders backend projections. Economic settlement and model credentials stay
 on the backend.
 
+V3 displays the continuous, fully collateralized spot market and its intraday
+lifecycle: markets open at 09:00, close before consumer sales at 19:00, and the
+day closes at 19:30. Operation and delivery completions appear as distinct
+system transitions; Agent detail includes reserved assets, live market depth,
+incoming deliveries, and the active operation.
+
 ## Local development
 
 Requires Node.js 20.19 or newer. Start FastAPI from `backend/` (default:
@@ -26,8 +32,13 @@ The dashboard supports four policy modes:
   making model calls.
 
 After submission, the page polls `RunJob` and reports the current day. Full
-results are loaded only after completion. `/api/policy-profiles` remains the
-source of truth for policy availability and model configuration.
+results are loaded only after completion. Run History reads completed, failed,
+interrupted, running, and queued jobs without starting a new run. A failed or
+partial run can still open its persisted operations timeline. The selected run
+and day live in the `run` and `day` URL parameters, so refresh and browser
+navigation restore the same view; deep links outside the first history page are
+resolved by ID. `/api/policy-profiles` remains the source of truth for policy
+availability and model configuration.
 
 ## Production build
 

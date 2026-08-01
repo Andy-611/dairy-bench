@@ -149,7 +149,7 @@ class CodexArtifactStore:
 
 
 def _artifact_stem(identity: CodexArtifactIdentity) -> str:
-    """Keep V1 paths stable while making every V2 domain turn unique."""
+    """Keep daily paths stable while making every event-driven turn unique."""
     base = f"day-{identity.day:03d}__{identity.company_id}"
     if identity.domain_turn_id is None:
         return base

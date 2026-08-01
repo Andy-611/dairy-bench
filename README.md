@@ -1,57 +1,75 @@
 # Dairy Bench
 
-Dairy Bench is an event-driven multi-agent benchmark in which four farms, four
-processors, and four retailers operate a shared perishable dairy supply chain.
-Each company is controlled by one independent agent.
+Dairy Bench is an event-driven multi-agent benchmark for a perishable dairy
+supply chain. Four farms, four processors, and four retailers share two spot
+markets; each of the twelve companies is controlled by an independent agent.
 
-An episode lasts 30 simulated days. The decision unit is not a daily plan; it
-is an atomic company turn:
-
-```text
-Wake → AgentTurn → one CompanyCommand → Engine Outcome → Journal → next Wake
-```
-
-Only the deterministic economy engine may change cash, inventory, orders, or
-trade results. Agents can only submit strongly typed business commands.
-
-## What is implemented
-
-- Twelve heterogeneous companies, raw and bottled milk, FEFO inventory, and two
-  spot markets.
-- Independent rule, Codex, OpenAI, or exact-replay agents for every company.
-- A virtual-minute clock, fixed market-clearing times, event-driven wakes,
-  concurrent same-time inference, and deterministic serial command commits.
-- Exactly one strongly typed atomic command per turn. OpenAI uses native
-  function tools; Codex uses an equivalent strict structured adapter.
-- Independent token-budget memory, model gateway, and model client lifecycles
-  for all twelve agents.
-- An immutable turn journal, atomic checkpoints, crash recovery, and replay
-  without model calls.
-- Background execution, 30-day progress polling, explicit failures, and full
-  provider-call auditing.
-- Efficiency, fairness, fulfillment, and waste metrics over a deterministic
-  economy.
-- SQLite persistence, a FastAPI backend, and an English React dashboard.
-- A turn-first Operations Replay that joins wakes, observations, commands,
-  outcomes, economic effects, system steps, and source-run traces.
+The default scenario is `flow.dairy.base.s12.v3`. An episode lasts 30 simulated
+days, and every decision is one strongly typed atomic command:
 
 ```text
-React → FastAPI → RunCoordinator → EpisodeRuntime → Scheduler + EconomyEngine
-                         │                 └─ Evaluator
-                         ├─ PolicyFactory
-                         │   ├─ BaselineCompanyAgent
-                         │   ├─ LlmCompanyAgent × 12 → Gateway × 12
-                         │   └─ ReplayCompanyAgent × 12
-                         └─ LifecycleRepository → Journal + Checkpoint + SQLite
+Wake -> AgentTurn -> one CompanyCommand -> EconomyEngine -> Journal -> next Wake
 ```
 
-## Requirements
+Only the deterministic economy engine may mutate cash, inventory, orders, jobs,
+deliveries, or trade results. Natural-language text never settles a transaction.
+
+## V3 at a glance
+
+- Continuous fully collateralized limit-order books for raw and bottled milk.
+  Crossing orders trade immediately with price-time priority, the maker's price,
+  and partial fills. Agents may place, replace, or cancel resting orders.
+- Bids reserve their full limit-price cash commitment; asks reserve exact FEFO
+  inventory lots. Rejected orders never create phantom liquidity.
+- Order quantities use a fixed `0.0001` market tick. Non-positive, dust, or
+  over-precision place/replace requests are rejected without rounding.
+- Same-minute agent calls run concurrently, then commands commit in a persisted
+  `SHA256(seed | minute | company)` order. Provider response latency is audited
+  but cannot change the economic result.
+- `produce` and `transform` occupy the company's physical resource for 30 virtual
+  minutes. Market and retail-price commands remain instantaneous, subject to the
+  one-decision-per-virtual-minute throttle.
+- A trade pays the seller immediately and schedules automatic buyer delivery 30
+  minutes later. There is no manual dispatch, route, carrier, or escrow workflow.
+- Each agent sees anonymous top-of-book depth, its own orders, available and
+  reserved assets, inbound deliveries, its active operation, and remaining daily
+  operation capacity.
+- Every company has private token-budgeted memory. Immutable journals, atomic
+  checkpoints, crash recovery, and exact replay remain the durable authority.
+
+The daily clock is:
+
+| Time | Event |
+|---|---|
+| 09:00 | Open both markets and wake all companies |
+| 09:00-18:59 | Accept company decisions and continuously match orders |
+| 19:00 | Complete due jobs and deliveries, close books, release DAY-order holds, then run consumer sales |
+| 19:00-19:29 | Process only previously committed completions and deliveries |
+| 19:30 | Expire inventory and commit the end-of-day snapshot |
+
+See [V3 architecture and invariants](docs/V3_ARCHITECTURE.md) and
+[Agent integration](docs/AGENT_INTEGRATION.md) for the full contract.
+
+## System outline
+
+```text
+React -> FastAPI -> RunCoordinator -> EpisodeRuntime -> Scheduler + EconomyEngine
+                         |                 `-> Evaluator
+                         |-> PolicyFactory -> CompanyAgent x 12
+                         `-> LifecycleRepository -> Journal + Checkpoint + SQLite
+```
+
+Agents may use the rule baseline, Codex, OpenAI, or exact replay. OpenAI uses
+native function tools; Codex uses an equivalent strict structured-output
+adapter. Every provider path validates into the same Pydantic command union.
+
+## Requirements and startup
 
 - Python 3.12+
 - Node.js 20.19+
-- Codex login or an OpenAI API key only when using the corresponding agent
+- Codex login or an OpenAI API key only for the corresponding agent mode
 
-From the repository root, install dependencies once:
+Install once from the repository root:
 
 ```powershell
 cd backend
@@ -62,40 +80,35 @@ npm.cmd install
 cd ..
 ```
 
-Start both applications from the repository root:
+Start FastAPI and Vite:
 
 ```powershell
 .\start.cmd
 ```
 
-The launcher starts FastAPI and Vite, then opens
-`http://127.0.0.1:5173`. The rule baseline works without model credentials.
+The launcher opens `http://127.0.0.1:5173`. The rule baseline needs no model
+credentials.
 
-## Codex agents
+`Run History` opens the persisted timeline, error, and latest checkpoint for
+completed, failed, interrupted, or active runs. The selected run and day live in
+`?run=...&day=...`, so refresh and browser navigation preserve the view.
+`Exact Replay` is separate: it re-executes a completed source run without model
+calls and verifies deterministic equality.
 
-`start.cmd` uses the repository-owned `.dairy-bench/codex` directory and does
-not write benchmark sessions into `%USERPROFILE%\.codex`. The first launch may
-ask you to complete `codex login` for this isolated Codex home.
+## Model-backed agents
 
-Each company receives an independent Codex runtime and each company turn uses
-an isolated thread. Context consists of a deterministic summary plus recent
-complete Turn/Command/Outcome cycles under a fixed token budget.
-
-Every readable public reasoning summary and final structured output is exported
-to:
+`start.cmd` uses the repository-owned `.dairy-bench/codex` directory instead
+of `%USERPROFILE%\.codex`. Each company receives an independent runtime and
+private memory; every Codex turn uses an isolated thread. Public reasoning
+summaries and final structured outputs are exported under:
 
 ```text
 run_artifacts/<run_id>/
-├── reasoning/
-└── final_outputs/
+|-- reasoning/
+`-- final_outputs/
 ```
 
-Source traces remain auditable during replay. They are labelled as source-run
-usage and are never counted as model calls made by the replay itself.
-
-## OpenAI agents
-
-Set the API key in the same PowerShell session that starts the backend:
+For OpenAI agents, set the key in the shell that starts the backend:
 
 ```powershell
 $env:OPENAI_API_KEY="your-key"
@@ -104,28 +117,15 @@ $env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"  # optional
 python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-The key is read only by the backend. It is never sent to the browser or stored
-in the benchmark database.
-
-Model-call volume depends on wakes and each agent's `wait` decisions, subject
-to the configured per-company daily turn limit. Invalid model output becomes
-an explicit protocol rejection without changing the economy, then receives a
-`CONTINUE` wake after the normal command duration so it can be corrected.
-Exhausted authentication, network, or provider failures fail the run instead
-of producing a misleading score.
+Keys never enter the browser, journal, or benchmark database. Provider
+infrastructure failure fails the run rather than fabricating an economic action.
+Invalid structured output becomes an explicit protocol rejection with no
+economic mutation.
 
 ## Data and verification
 
-The default database is:
-
-```text
-backend/data/dairy_bench.sqlite3
-```
-
-Override it with `DAIRY_BENCH_DB`. Override the artifact directory with
-`DAIRY_BENCH_ARTIFACTS_DIR`.
-
-From the repository root, run verification:
+The default database is `backend/data/dairy_bench.sqlite3`. Override it with
+`DAIRY_BENCH_DB`; override artifacts with `DAIRY_BENCH_ARTIFACTS_DIR`.
 
 ```powershell
 cd backend
@@ -134,27 +134,26 @@ python -m ruff check .
 
 cd "..\frontend"
 npm.cmd run build
-cd ..
 ```
 
 ## Main HTTP interfaces
 
-- `GET /api/policy-profiles` — list available policy modes and model profiles.
-- `POST /api/runs` — create a background run and return a `202 RunJob`.
-- `GET /api/run-jobs/{run_id}` — read lifecycle status and day progress.
-- `GET /api/runs/{run_id}` — read a completed episode.
-- `GET /api/runs/{run_id}/timeline?day={day}` — read one Operations Replay day.
-- `GET /api/runs/{run_id}/timeline/{entry_id}` — read one detailed turn or
-  system-step entry.
-- `GET /api/runs/{run_id}/turns` — read the immutable raw turn journal.
-- `GET /api/runs/{run_id}/invocations` — read provider-call audits.
-- `GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts` — read an
-  exported Codex public reasoning summary and final output.
-- `GET /api/runs` — list completed runs.
+- `GET /api/policy-profiles`
+- `POST /api/runs`
+- `GET /api/run-jobs`
+- `GET /api/run-jobs/{run_id}`
+- `GET /api/runs/{run_id}`
+- `GET /api/runs/{run_id}/timeline?day={day}`
+- `GET /api/runs/{run_id}/timeline/{entry_id}`
+- `GET /api/runs/{run_id}/turns`
+- `GET /api/runs/{run_id}/invocations`
+- `GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts`
+- `GET /api/runs`
 
 ## Design documentation
 
-- [Agent integration](docs/AGENT_INTEGRATION.md)
-- [V2 architecture and invariants](docs/V2_ARCHITECTURE.md)
+- [V3 architecture and invariants](docs/V3_ARCHITECTURE.md)
+- [V3 Agent integration](docs/AGENT_INTEGRATION.md)
+- [Historical V2 architecture](docs/V2_ARCHITECTURE.md)
 - [Historical V1 MVP framework](docs/MVP_FRAMEWORK.md)
 - [Historical V1 scenario catalog](docs/SCENARIO_CATALOG_V1.md)

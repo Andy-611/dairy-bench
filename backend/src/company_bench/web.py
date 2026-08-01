@@ -22,7 +22,7 @@ from company_bench.codex_artifacts import (
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
 from company_bench.codex_sessions import CodexSessionManager
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
 from company_bench.models import (
     MAX_SEED,
     EpisodeResult,
@@ -96,7 +96,7 @@ def create_app(
             else None
         )
         active_factory = PolicyFactory(
-            scenario=DAIRY_S12_V2_SCENARIO,
+            scenario=DAIRY_S12_V3_SCENARIO,
             audit_sink=active_repository,
             codex_config=codex_config,
             codex_gateway_factory=partial(
@@ -109,8 +109,8 @@ def create_app(
     else:
         active_factory = policy_factory
     active_scenario = active_factory.scenario
-    if active_scenario.version < 2:
-        raise ValueError("the web application requires an event-driven V2 scenario")
+    if active_scenario.version != 3:
+        raise ValueError("the web application requires an event-driven V3 scenario")
     runtime = EpisodeRuntime(
         active_scenario,
         agent_timeout_seconds=active_factory.policy_timeout_seconds,
@@ -132,7 +132,7 @@ def create_app(
 
     app = FastAPI(
         title="Dairy Bench API",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -178,6 +178,16 @@ def create_app(
                 status_code=422,
                 detail=str(error),
             ) from error
+
+    @app.get(
+        "/api/run-jobs",
+        response_model=tuple[RunJob, ...],
+        tags=["runs"],
+    )
+    def list_jobs(
+        limit: Annotated[int, Query(ge=1, le=500)] = 50,
+    ) -> tuple[RunJob, ...]:
+        return active_repository.list_jobs(limit)
 
     @app.get(
         "/api/run-jobs/{run_id}",

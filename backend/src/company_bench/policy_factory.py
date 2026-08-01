@@ -57,7 +57,7 @@ class PolicyBundle:
 
 @dataclass(slots=True)
 class AgentBundle:
-    """V2 company actors and their independently owned provider gateways."""
+    """V3 company actors and their independently owned provider gateways."""
 
     agents: Mapping[str, CompanyAgent]
     _gateways: tuple[CompanyModelGateway, ...] = ()
@@ -160,7 +160,7 @@ class PolicyFactory:
     ) -> PolicyBundle:
         """Create daily policies for an explicit pre-V2 scenario."""
         if self._scenario.version >= 2:
-            raise ValueError("daily policies do not implement event-driven V2 scenarios")
+            raise ValueError("daily policies do not implement event-driven V3 scenarios")
         if mode is PolicyKind.BASELINE:
             return PolicyBundle(
                 {company.company_id: BaselinePolicy() for company in self._scenario.companies}
@@ -198,16 +198,16 @@ class PolicyFactory:
         checkpoints: tuple[AgentCheckpoint, ...] = (),
         completed_turns: tuple[TurnRecord, ...] = (),
     ) -> AgentBundle:
-        """Create fresh event-driven company actors for one V2 episode."""
-        if self._scenario.version < 2:
-            raise ValueError("event-driven Agents require a V2 scenario")
+        """Create fresh event-driven company actors for one V3 episode."""
+        if self._scenario.version != 3:
+            raise ValueError("event-driven Agents require a V3 scenario")
         if mode is PolicyKind.BASELINE:
             return AgentBundle(
                 {company.company_id: BaselineCompanyAgent() for company in self._scenario.companies}
             )
         if mode is PolicyKind.REPLAY:
             if not source_turns:
-                raise ValueError("V2 replay requires a source turn journal")
+                raise ValueError("V3 replay requires a source turn journal")
             completed_by_company = {
                 company.company_id: sum(
                     record.turn.company_id == company.company_id for record in completed_turns
@@ -244,7 +244,7 @@ class PolicyFactory:
                 return self._codex_gateway_factory(config, company_id)
 
         else:
-            raise ValueError(f"unsupported V2 policy mode: {mode.value}")
+            raise ValueError(f"unsupported V3 policy mode: {mode.value}")
 
         agents: dict[str, CompanyAgent] = {}
         gateways: list[CompanyModelGateway] = []
@@ -264,12 +264,12 @@ class PolicyFactory:
         return AgentBundle(agents, tuple(gateways))
 
     def _agent_metadata(self, mode: PolicyKind) -> PolicyMetadata:
-        """Build provider metadata shared by equivalent V2 company Agents."""
+        """Build provider metadata shared by equivalent V3 company Agents."""
         if mode is PolicyKind.OPENAI and self._openai_config is not None:
             config = self._openai_config
             return PolicyMetadata(
                 name="llm-company-agent",
-                version="2",
+                version="3",
                 kind=mode,
                 provider="openai",
                 model=config.model,
@@ -280,7 +280,7 @@ class PolicyFactory:
             config = self._codex_config
             return PolicyMetadata(
                 name="codex-company-agent",
-                version="2",
+                version="3",
                 kind=mode,
                 provider="codex",
                 model=config.model,

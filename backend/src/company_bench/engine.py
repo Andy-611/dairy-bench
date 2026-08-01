@@ -1,17 +1,27 @@
+"""Deterministic V3 economy engine for continuous dairy-market episodes."""
+
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
-from typing import Self
+from decimal import ROUND_HALF_UP, Decimal, DecimalException
+from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
+from company_bench.market import (
+    AssetLedger,
+    BuyOrder,
+    ContinuousSpotMarket,
+    MarketError,
+    MarketState,
+    SellOrder,
+    TradeFill,
+)
 from company_bench.models import (
     MAX_SEED,
-    QUANTITY_QUANTUM,
     ZERO,
-    CompanyDecision,
     CompanyId,
     CompanyObservation,
     CompanySnapshot,
@@ -20,332 +30,298 @@ from company_bench.models import (
     ConsumerSaleEvent,
     DayResult,
     DaySnapshot,
-    DecisionRejectedEvent,
+    DeliveryCompletedEvent,
     DomainEvent,
-    FarmDecision,
     FarmOperation,
+    Identifier,
+    InvalidOrderQuantity,
     InventoryExpiredEvent,
     InventoryLot,
     InventoryPosition,
     MarketSummary,
     MilkProcessedEvent,
     MilkProducedEvent,
-    NoOpDecision,
-    ProcessorDecision,
+    Money,
+    OrderQuantity,
     ProcessorOperation,
     ProductId,
     PublicCompany,
-    RecordedDecision,
-    RetailerDecision,
+    Quantity,
     RetailerOperation,
     ScenarioSpec,
     StrictModel,
     TradeExecutedEvent,
     WorldState,
+    require_order_quantity,
 )
 from company_bench.runtime_models import (
     CancelOrder,
     CommandEnvelope,
     CommandOutcome,
     CommandStatus,
+    DeliveryExpiryBucket,
+    IncomingDeliveryView,
     MarketSide,
+    MarketView,
     OpenOrderView,
+    OperationJobView,
     PlaceOrder,
     Produce,
+    ReplaceOrder,
+    ScheduledCompletion,
     SetRetailPrice,
+    SimTime,
+    SystemEventKind,
     Transform,
     Wait,
 )
 
-
-@dataclass(slots=True)
-class _Account:
-    """Mutable account used only inside one atomic engine step."""
-
-    company_id: str
-    cash: Decimal
-    inventory: list[InventoryLot]
-
-    def quantity(self, product: ProductId) -> Decimal:
-        """Return available inventory for one product."""
-        return sum(
-            (lot.quantity for lot in self.inventory if lot.product == product),
-            start=ZERO,
-        )
-
-    def remove_fefo(
-        self,
-        product: ProductId,
-        requested: Decimal,
-    ) -> tuple[InventoryLot, ...]:
-        """Remove up to the requested quantity, earliest expiry first."""
-        remaining = requested
-        removed: list[InventoryLot] = []
-        retained: list[InventoryLot] = []
-        ordered = sorted(
-            self.inventory,
-            key=lambda lot: (
-                lot.expires_end_of_day,
-                lot.produced_day,
-                lot.lot_id,
-            ),
-        )
-        for lot in ordered:
-            if lot.product != product or remaining <= ZERO:
-                retained.append(lot)
-                continue
-
-            taken = min(lot.quantity, remaining)
-            removed.append(lot.model_copy(update={"quantity": taken}))
-            remaining -= taken
-            leftover = lot.quantity - taken
-            if leftover > ZERO:
-                retained.append(lot.model_copy(update={"quantity": leftover}))
-
-        self.inventory = retained
-        return tuple(removed)
+__all__ = [
+    "CompanyQuantity",
+    "ConsumerSettlement",
+    "EconomyEngine",
+    "EconomyState",
+    "OperationJob",
+    "PendingDelivery",
+    "ProductionJob",
+    "RetailPriceState",
+    "TransformationJob",
+]
 
 
-class _Ledger:
-    """Centralizes every cash and inventory write within an engine step."""
+class ProductionJob(StrictModel):
+    """One fully funded farm operation awaiting physical completion."""
 
-    def __init__(
-        self,
-        state: WorldState,
-        day: int,
-        *,
-        lot_sequence: int = 0,
-    ) -> None:
-        self._day = day
-        self._lot_sequence = lot_sequence
-        self._accounts = {
-            company.company_id: _Account(
-                company_id=company.company_id,
-                cash=company.cash,
-                inventory=list(company.inventory),
-            )
-            for company in state.companies
-        }
+    kind: Literal["production"] = "production"
+    job_id: Identifier
+    company_id: CompanyId
+    started_at: SimTime
+    completes_at: SimTime
+    product: ProductId
+    quantity: Quantity = Field(gt=ZERO)
+    unit_cost: Money = Field(gt=ZERO)
+    cash_cost: Money = Field(gt=ZERO)
 
-    def account(self, company_id: str) -> _Account:
-        """Return one internal account."""
-        return self._accounts[company_id]
+    @model_validator(mode="after")
+    def validate_job(self) -> Self:
+        """Require exact cost and a same-day future completion."""
+        _validate_job_time(self.started_at, self.completes_at)
+        if self.cash_cost != self.quantity * self.unit_cost:
+            raise ValueError("production cash cost must equal quantity times unit cost")
+        return self
 
-    def quantity(self, company_id: str, product: ProductId) -> Decimal:
-        """Return one company's available product quantity."""
-        return self.account(company_id).quantity(product)
 
-    def affordable_quantity(
-        self,
-        company_id: str,
-        unit_price: Decimal,
-    ) -> Decimal:
-        """Return the most a company can buy without negative cash."""
-        return (self.account(company_id).cash / unit_price).quantize(
-            QUANTITY_QUANTUM, rounding=ROUND_DOWN
-        )
+class TransformationJob(StrictModel):
+    """One funded conversion whose inputs have already entered work in process."""
 
-    def charge(self, company_id: str, amount: Decimal) -> None:
-        """Deduct a known-affordable amount."""
-        account = self.account(company_id)
-        if amount < ZERO or amount > account.cash:
-            raise ValueError("charge would violate nonnegative cash")
-        account.cash -= amount
+    kind: Literal["transformation"] = "transformation"
+    job_id: Identifier
+    company_id: CompanyId
+    started_at: SimTime
+    completes_at: SimTime
+    input_product: ProductId
+    output_product: ProductId
+    input_quantity: Quantity = Field(gt=ZERO)
+    output_quantity: Quantity = Field(gt=ZERO)
+    processing_cost_per_input: Money
+    cash_cost: Money
 
-    def credit(self, company_id: str, amount: Decimal) -> None:
-        """Credit nonnegative cash."""
-        if amount < ZERO:
-            raise ValueError("credit must be nonnegative")
-        self.account(company_id).cash += amount
+    @model_validator(mode="after")
+    def validate_job(self) -> Self:
+        """Require exact cost, different products, and a future completion."""
+        _validate_job_time(self.started_at, self.completes_at)
+        if self.input_product is self.output_product:
+            raise ValueError("transformation input and output products must differ")
+        if self.cash_cost != self.input_quantity * self.processing_cost_per_input:
+            raise ValueError("transformation cash cost must match its input cost")
+        return self
 
-    def add_new_lot(
-        self,
-        company_id: str,
-        product: ProductId,
-        quantity: Decimal,
-        shelf_life_days: int,
-        source: str,
-    ) -> str | None:
-        """Create a fresh product lot and return its stable identity."""
-        if quantity <= ZERO:
-            return None
-        lot_id = self._next_lot_id(company_id, source)
-        self.account(company_id).inventory.append(
-            InventoryLot(
-                lot_id=lot_id,
-                product=product,
-                quantity=quantity,
-                produced_day=self._day,
-                expires_end_of_day=self._day + shelf_life_days - 1,
-            )
-        )
-        return lot_id
 
-    def transfer(
-        self,
-        seller_id: str,
-        buyer_id: str,
-        product: ProductId,
-        quantity: Decimal,
-        unit_price: Decimal,
-    ) -> None:
-        """Atomically transfer exact cash and FEFO inventory."""
-        total_value = quantity * unit_price
-        seller = self.account(seller_id)
-        buyer = self.account(buyer_id)
-        if seller.quantity(product) < quantity:
-            raise ValueError("seller lacks inventory")
-        if buyer.cash < total_value:
-            raise ValueError("buyer lacks cash")
+type OperationJob = Annotated[
+    ProductionJob | TransformationJob,
+    Field(discriminator="kind"),
+]
 
-        moved_lots = seller.remove_fefo(product, quantity)
-        self.charge(buyer_id, total_value)
-        self.credit(seller_id, total_value)
-        for moved in moved_lots:
-            buyer.inventory.append(
-                moved.model_copy(
-                    update={
-                        "lot_id": self._next_lot_id(
-                            buyer_id,
-                            f"trade_{product.value}",
-                        )
-                    }
-                )
-            )
 
-    def consume(
-        self,
-        company_id: str,
-        product: ProductId,
-        quantity: Decimal,
-    ) -> None:
-        """Consume exact FEFO inventory after feasibility is checked."""
-        if self.quantity(company_id, product) < quantity:
-            raise ValueError("consumption exceeds inventory")
-        self.account(company_id).remove_fefo(product, quantity)
+class PendingDelivery(StrictModel):
+    """One guaranteed trade transfer waiting to become buyer-usable inventory."""
 
-    def expire(
-        self,
-    ) -> tuple[tuple[str, InventoryLot], ...]:
-        """Remove all lots whose final usable day has completed."""
-        expired: list[tuple[str, InventoryLot]] = []
-        for company_id, account in self._accounts.items():
-            retained: list[InventoryLot] = []
-            for lot in account.inventory:
-                if lot.expires_end_of_day <= self._day:
-                    expired.append((company_id, lot))
-                else:
-                    retained.append(lot)
-            account.inventory = retained
-        return tuple(
-            sorted(
-                expired,
-                key=lambda item: (
-                    item[0],
-                    item[1].expires_end_of_day,
-                    item[1].lot_id,
-                ),
-            )
-        )
+    delivery_id: Identifier
+    trade_id: Identifier
+    buyer_id: CompanyId
+    arrives_at: SimTime
+    lots: tuple[InventoryLot, ...] = Field(min_length=1)
 
-    def states(
-        self,
-        scenario: ScenarioSpec,
-    ) -> tuple[CompanyState, ...]:
-        """Freeze internal accounts in scenario order."""
-        return tuple(
-            CompanyState(
-                company_id=company.company_id,
-                cash=self.account(company.company_id).cash,
-                inventory=tuple(
-                    sorted(
-                        self.account(company.company_id).inventory,
-                        key=lambda lot: (
-                            lot.expires_end_of_day,
-                            lot.product.value,
-                            lot.lot_id,
-                        ),
-                    )
-                ),
-            )
-            for company in scenario.companies
-        )
+    @model_validator(mode="after")
+    def validate_lots(self) -> Self:
+        """Keep one delivery homogeneous and free of duplicate lot identities."""
+        products = {lot.product for lot in self.lots}
+        lot_ids = [lot.lot_id for lot in self.lots]
+        if len(products) != 1:
+            raise ValueError("a delivery must contain exactly one product")
+        if len(lot_ids) != len(set(lot_ids)):
+            raise ValueError("delivery lot ids must be unique")
+        return self
 
     @property
-    def lot_sequence(self) -> int:
-        """Return the next checkpoint's deterministic lot counter."""
-        return self._lot_sequence
+    def product(self) -> ProductId:
+        """Return the single delivered product."""
+        return self.lots[0].product
 
-    def _next_lot_id(self, company_id: str, source: str) -> str:
-        """Allocate a stable lot identity within this deterministic day."""
-        self._lot_sequence += 1
-        return f"d{self._day}_{source}_{company_id}_{self._lot_sequence}"
+    @property
+    def quantity(self) -> Quantity:
+        """Return the exact delivered quantity."""
+        return sum((lot.quantity for lot in self.lots), start=ZERO)
+
+    def view(self) -> IncomingDeliveryView:
+        """Project exact arrival and expiry buckets for the buyer."""
+        expiry_days = sorted({lot.expires_end_of_day for lot in self.lots})
+        return IncomingDeliveryView(
+            trade_id=self.trade_id,
+            product=self.product,
+            quantity=self.quantity,
+            arrives_at=self.arrives_at,
+            expiry_buckets=tuple(
+                DeliveryExpiryBucket(
+                    quantity=sum(
+                        (
+                            lot.quantity
+                            for lot in self.lots
+                            if lot.expires_end_of_day == expiry_day
+                        ),
+                        start=ZERO,
+                    ),
+                    expires_end_of_day=expiry_day,
+                )
+                for expiry_day in expiry_days
+            ),
+        )
 
 
-@dataclass(slots=True)
-class _Order:
-    """Internal mutable remainder of a market order."""
+class ConsumerSettlement(StrictModel):
+    """The immutable 19:00 consumer-market totals for one business day."""
 
-    company_id: str
-    quantity: Decimal
-    unit_price: Decimal
-
-
-class _CommandRejected(ValueError):
-    """Internal control flow for a typed economic rejection."""
+    day: int = Field(ge=1)
+    potential_demand: Quantity
+    demand: Quantity
+    sold_quantity: Quantity
 
 
 class CompanyQuantity(StrictModel):
-    """One company's used daily operating capacity."""
+    """One company's consumed daily operating capacity."""
 
     company_id: CompanyId
-    quantity: Decimal = Field(ge=ZERO)
+    quantity: Quantity
 
 
 class RetailPriceState(StrictModel):
-    """One retailer's current consumer price."""
+    """One retailer's active consumer price."""
 
     company_id: CompanyId
     product: ProductId
-    unit_price: Decimal = Field(gt=ZERO)
+    unit_price: Money = Field(gt=ZERO)
 
 
 class EconomyState(StrictModel):
-    """Checkpointable state for one active event-driven business day."""
+    """Complete checkpointable state of one active V3 business day."""
 
     base_state: WorldState
     day: int = Field(ge=1)
     state_version: int = Field(ge=0)
     companies: tuple[CompanyState, ...]
-    orders: tuple[OpenOrderView, ...] = ()
+    markets: tuple[MarketState, ...]
+    jobs: tuple[OperationJob, ...] = ()
+    deliveries: tuple[PendingDelivery, ...] = ()
     retail_prices: tuple[RetailPriceState, ...] = ()
     production_used: tuple[CompanyQuantity, ...] = ()
     transformation_used: tuple[CompanyQuantity, ...] = ()
+    consumer_settlement: ConsumerSettlement | None = None
     events: tuple[DomainEvent, ...] = ()
-    raw_market: MarketSummary | None = None
-    bottled_market: MarketSummary | None = None
-    lot_sequence: int = Field(default=0, ge=0)
-    order_sequence: int = Field(default=0, ge=0)
+    next_lot_sequence: int = Field(default=1, ge=1)
+    next_order_sequence: int = Field(default=1, ge=1)
+    next_job_sequence: int = Field(default=1, ge=1)
+    next_delivery_sequence: int = Field(default=1, ge=1)
+    next_trade_sequence: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def validate_active_day(self) -> Self:
-        """Keep active or terminal checkpoint counters internally consistent."""
+        """Protect identities, ownership, and one-resource-per-company invariants."""
         active = self.day == self.base_state.day + 1
         terminal = (
-            self.base_state.day == self.base_state.scenario.days and self.day == self.base_state.day
+            self.base_state.day == self.base_state.scenario.days
+            and self.day == self.base_state.day
         )
         if not (active or terminal):
             raise ValueError("economy day must be active or terminal")
-        expected = {company.company_id for company in self.base_state.scenario.companies}
-        actual = [company.company_id for company in self.companies]
-        if len(actual) != len(set(actual)) or set(actual) != expected:
-            raise ValueError("economy state must match the scenario company set")
-        order_ids = [order.order_id for order in self.orders]
-        if len(order_ids) != len(set(order_ids)):
-            raise ValueError("open order ids must be unique")
-        price_keys = [(price.company_id, price.product) for price in self.retail_prices]
-        if len(price_keys) != len(set(price_keys)):
-            raise ValueError("retail prices must be unique per company and product")
+
+        company_ids = tuple(company.company_id for company in self.companies)
+        expected_ids = tuple(company.company_id for company in self.scenario.companies)
+        if company_ids != expected_ids:
+            raise ValueError("economy companies must follow scenario order")
+
+        products = tuple(market.product for market in self.markets)
+        expected_products = tuple(product.product for product in self.scenario.products)
+        if products != expected_products:
+            raise ValueError("economy markets must follow scenario product order")
+
+        _require_unique((job.job_id for job in self.jobs), "operation job ids")
+        _require_unique((job.company_id for job in self.jobs), "active operation companies")
+        _require_unique(
+            (delivery.delivery_id for delivery in self.deliveries),
+            "pending delivery ids",
+        )
+        _require_unique((delivery.trade_id for delivery in self.deliveries), "delivery trade ids")
+        _require_unique(
+            ((price.company_id, price.product) for price in self.retail_prices),
+            "retail price keys",
+        )
+        _require_unique(
+            (entry.company_id for entry in self.production_used),
+            "production usage companies",
+        )
+        _require_unique(
+            (entry.company_id for entry in self.transformation_used),
+            "transformation usage companies",
+        )
+        _require_unique(
+            (lot.lot_id for lot in _persisted_lots(self)),
+            "global inventory lot ids",
+        )
+
+        known = set(company_ids)
+        orders = tuple(order for market in self.markets for order in market.orders)
+        _require_unique((order.order_id for order in orders), "global market order ids")
+        _require_unique(
+            (order.priority_sequence for order in orders),
+            "global market priority sequences",
+        )
+        if any(order.owner_id not in known for order in orders):
+            raise ValueError("market order belongs to an unknown company")
+        if any(job.company_id not in known for job in self.jobs):
+            raise ValueError("operation job belongs to an unknown company")
+        if any(delivery.buyer_id not in known for delivery in self.deliveries):
+            raise ValueError("pending delivery belongs to an unknown buyer")
+        if any(price.company_id not in known for price in self.retail_prices):
+            raise ValueError("retail price belongs to an unknown company")
+        if any(entry.company_id not in known for entry in self.production_used):
+            raise ValueError("production usage belongs to an unknown company")
+        if any(entry.company_id not in known for entry in self.transformation_used):
+            raise ValueError("transformation usage belongs to an unknown company")
+        if len({market.is_open for market in self.markets}) != 1:
+            raise ValueError("product markets must open and close together")
+        simulation_day = self.day - 1
+        if any(job.completes_at.day != simulation_day for job in self.jobs):
+            raise ValueError("operation job must complete on the active day")
+        if any(delivery.arrives_at.day != simulation_day for delivery in self.deliveries):
+            raise ValueError("delivery must arrive on the active day")
+        if any(event.day != self.day for event in self.events):
+            raise ValueError("active economy events must belong to its day")
+        if self.consumer_settlement is not None and self.consumer_settlement.day != self.day:
+            raise ValueError("consumer settlement must belong to the active day")
+        if self.consumer_settlement is not None and any(
+            market.is_open for market in self.markets
+        ):
+            raise ValueError("consumer settlement requires closed markets")
         return self
 
     @property
@@ -358,16 +334,117 @@ class EconomyState(StrictModel):
         """Return the episode seed."""
         return self.base_state.seed
 
+    def _with_market_session(self, snapshot: _SessionSnapshot) -> Self:
+        """Commit common ledger and order-book fields from one transaction."""
+        return self.model_copy(
+            update={
+                "state_version": self.state_version + 1,
+                "companies": snapshot.companies,
+                "markets": snapshot.markets,
+                "next_lot_sequence": snapshot.next_lot_sequence,
+            }
+        )
+
+
+class _CommandRejected(ValueError):
+    """Expected command rejection that never commits transaction-local state."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionSnapshot:
+    companies: tuple[CompanyState, ...]
+    markets: tuple[MarketState, ...]
+    next_lot_sequence: int
+
+
+@dataclass(slots=True)
+class _MarketSession:
+    """Share one transaction-local asset ledger across every product market."""
+
+    assets: AssetLedger
+    markets: dict[ProductId, ContinuousSpotMarket]
+    product_order: tuple[ProductId, ...]
+
+    @classmethod
+    def from_economy(cls, economy: EconomyState) -> Self:
+        """Restore available assets and every collateralized order atomically."""
+        assets = AssetLedger.from_companies(
+            economy.companies,
+            next_lot_sequence=economy.next_lot_sequence,
+        )
+        assets.track_lots(
+            lot for delivery in economy.deliveries for lot in delivery.lots
+        )
+        markets = {
+            state.product: ContinuousSpotMarket(state, assets) for state in economy.markets
+        }
+        return cls(
+            assets=assets,
+            markets=markets,
+            product_order=tuple(state.product for state in economy.markets),
+        )
+
+    def market(self, product: ProductId) -> ContinuousSpotMarket:
+        """Return one configured product market."""
+        try:
+            return self.markets[product]
+        except KeyError as error:
+            raise MarketError(f"unknown market product: {product.value}") from error
+
+    def containing(self, order_id: Identifier) -> ContinuousSpotMarket:
+        """Find the sole market containing an active order."""
+        matches = tuple(
+            market
+            for market in self.markets.values()
+            if any(order.order_id == order_id for order in market.state.orders)
+        )
+        if not matches:
+            raise MarketError("order does not exist")
+        if len(matches) != 1:
+            raise RuntimeError("order identity is duplicated across markets")
+        return matches[0]
+
+    def freeze(self, *, next_lot_sequence: int | None = None) -> _SessionSnapshot:
+        """Freeze a successful transaction back into checkpoint-safe values."""
+        return _SessionSnapshot(
+            companies=self.assets.freeze_states(),
+            markets=tuple(self.markets[product].state for product in self.product_order),
+            next_lot_sequence=max(
+                self.assets.next_lot_sequence,
+                next_lot_sequence or self.assets.next_lot_sequence,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandEffect:
+    """One successfully applied command and its immediate audit output."""
+
+    economy: EconomyState
+    order_id: Identifier | None = None
+    job_id: Identifier | None = None
+    events: tuple[DomainEvent, ...] = ()
+    completions: tuple[ScheduledCompletion, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _TradeEffects:
+    """Domain and scheduling records derived from one matching operation."""
+
+    events: tuple[TradeExecutedEvent, ...]
+    deliveries: tuple[PendingDelivery, ...]
+    completions: tuple[ScheduledCompletion, ...]
+    next_delivery_sequence: int
+    next_trade_sequence: int
+
 
 class EconomyEngine:
-    """Deterministic owner of all Dairy Bench economic transitions."""
+    """Own every V3 cash, inventory, market, operation, and delivery transition."""
 
-    def initial_state(
-        self,
-        scenario: ScenarioSpec,
-        seed: int,
-    ) -> WorldState:
-        """Create an empty-inventory world from immutable scenario rules."""
+    def initial_state(self, scenario: ScenarioSpec, seed: int) -> WorldState:
+        """Create an empty-inventory V3 world."""
+        if scenario.version != 3:
+            raise ValueError("EconomyEngine requires a V3 scenario")
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
             raise ValueError(f"seed must be an integer from 0 to {MAX_SEED}")
         return WorldState(
@@ -375,28 +452,46 @@ class EconomyEngine:
             seed=seed,
             day=0,
             companies=tuple(
-                CompanyState(
-                    company_id=company.company_id,
-                    cash=company.initial_cash,
-                )
+                CompanyState(company_id=company.company_id, cash=company.initial_cash)
                 for company in scenario.companies
             ),
         )
 
-    def open_day(
-        self,
-        state: WorldState,
-        *,
-        state_version: int = 0,
-    ) -> EconomyState:
-        """Open the next event-driven day without changing economic value."""
+    def open_day(self, state: WorldState, *, state_version: int = 0) -> EconomyState:
+        """Open fresh product books and daily operating resources."""
+        if state.scenario.version != 3:
+            raise ValueError("EconomyEngine requires a V3 scenario")
         if state.day >= state.scenario.days:
             raise ValueError("the episode is already complete")
+        assets = AssetLedger.from_world(
+            state,
+            next_lot_sequence=state.next_lot_sequence,
+        )
         return EconomyState(
             base_state=state,
             day=state.day + 1,
             state_version=state_version,
             companies=state.companies,
+            markets=tuple(
+                ContinuousSpotMarket.open(product.product, assets).state
+                for product in state.scenario.products
+            ),
+            next_lot_sequence=state.next_lot_sequence,
+        )
+
+    def observe(self, state: WorldState) -> tuple[CompanyObservation, ...]:
+        """Project next-day morning facts without opening mutable runtime state."""
+        if state.day >= state.scenario.days:
+            return ()
+        return tuple(
+            self._observation(
+                state=state,
+                day=state.day + 1,
+                company_id=company.company_id,
+                company_state=_company_state(state.companies, company.company_id),
+                retail_price=None,
+            )
+            for company in state.scenario.companies
         )
 
     def observe_active(
@@ -404,26 +499,148 @@ class EconomyEngine:
         economy: EconomyState,
         company_id: CompanyId,
     ) -> CompanyObservation:
-        """Project one private-safe observation from current intraday facts."""
-        current = economy.base_state.model_copy(update={"companies": economy.companies})
-        observation = next(
-            observation
-            for observation in self.observe(current)
-            if observation.company_id == company_id
-        )
-        retail_price = next(
-            (price.unit_price for price in economy.retail_prices if price.company_id == company_id),
+        """Project only currently available assets for one active company."""
+        price = next(
+            (
+                item.unit_price
+                for item in economy.retail_prices
+                if item.company_id == company_id
+            ),
             None,
         )
-        return observation.model_copy(update={"retail_price": retail_price})
+        return self._observation(
+            state=economy.base_state,
+            day=economy.day,
+            company_id=company_id,
+            company_state=_company_state(economy.companies, company_id),
+            retail_price=price,
+        )
 
     @staticmethod
     def company_orders(
         economy: EconomyState,
         company_id: CompanyId,
     ) -> tuple[OpenOrderView, ...]:
-        """Return only the active commitments owned by one company."""
-        return tuple(order for order in economy.orders if order.owner_id == company_id)
+        """Return only active orders owned by one company."""
+        return tuple(
+            OpenOrderView(
+                order_id=order.order_id,
+                owner_id=order.owner_id,
+                side=order.side,
+                product=order.product,
+                remaining_quantity=order.remaining_quantity,
+                limit_price=order.limit_price,
+                placed_at=order.placed_at,
+                priority_sequence=order.priority_sequence,
+            )
+            for market in economy.markets
+            for order in market.orders
+            if order.owner_id == company_id
+        )
+
+    @staticmethod
+    def market_views(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> tuple[MarketView, ...]:
+        """Return anonymous books relevant to one company's value-chain role."""
+        company = economy.scenario.company(company_id)
+        relevant = _relevant_products(company)
+        markets = {market.product: market for market in economy.markets}
+        return tuple(markets[product].view() for product in relevant)
+
+    @staticmethod
+    def reserved_cash(economy: EconomyState, company_id: CompanyId) -> Money:
+        """Return full cash collateral held by the company's open bids."""
+        return sum(
+            (
+                order.reserved_cash
+                for market in economy.markets
+                for order in market.orders
+                if isinstance(order, BuyOrder) and order.owner_id == company_id
+            ),
+            start=ZERO,
+        )
+
+    @staticmethod
+    def reserved_inventory(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> tuple[InventoryPosition, ...]:
+        """Aggregate inventory collateral held by the company's asks."""
+        quantities = {
+            product.product: sum(
+                (
+                    lot.quantity
+                    for market in economy.markets
+                    for order in market.orders
+                    if isinstance(order, SellOrder) and order.owner_id == company_id
+                    for lot in order.reserved_lots
+                    if lot.product is product.product
+                ),
+                start=ZERO,
+            )
+            for product in economy.scenario.products
+        }
+        return tuple(
+            InventoryPosition(product=product, quantity=quantity)
+            for product, quantity in quantities.items()
+            if quantity > ZERO
+        )
+
+    @staticmethod
+    def pending_delivery_views(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> tuple[IncomingDeliveryView, ...]:
+        """Return guaranteed inbound inventory and its exact arrival time."""
+        return tuple(
+            delivery.view()
+            for delivery in economy.deliveries
+            if delivery.buyer_id == company_id
+        )
+
+    @staticmethod
+    def operation_view(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> OperationJobView | None:
+        """Return the company's sole active physical operation."""
+        job = next((job for job in economy.jobs if job.company_id == company_id), None)
+        if job is None:
+            return None
+        if isinstance(job, ProductionJob):
+            product = job.product
+            quantity = job.quantity
+        else:
+            product = job.output_product
+            quantity = job.output_quantity
+        return OperationJobView(
+            job_id=job.job_id,
+            kind=job.kind,
+            completes_at=job.completes_at,
+            output_product=product,
+            output_quantity=quantity,
+        )
+
+    @staticmethod
+    def remaining_operation_capacity(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> Quantity | None:
+        """Return today's unused production input capacity for an operator."""
+        operation = economy.scenario.company(company_id).operation
+        if isinstance(operation, FarmOperation):
+            return operation.daily_capacity - _used(
+                economy.production_used,
+                company_id,
+            )
+        if isinstance(operation, ProcessorOperation):
+            return operation.daily_input_capacity - _used(
+                economy.transformation_used,
+                company_id,
+            )
+        return None
 
     def apply_batch(
         self,
@@ -433,244 +650,261 @@ class EconomyEngine:
         first_apply_sequence: int,
         apply_sequences: tuple[int, ...] | None = None,
     ) -> tuple[EconomyState, tuple[CommandOutcome, ...]]:
-        """Apply same-snapshot commands in caller-supplied deterministic order."""
+        """Apply one deterministic same-minute command batch serially."""
         if first_apply_sequence < 1:
             raise ValueError("first_apply_sequence must be positive")
-        company_ids = [envelope.company_id for envelope in envelopes]
-        if len(company_ids) != len(set(company_ids)):
+        companies = [envelope.company_id for envelope in envelopes]
+        if len(companies) != len(set(companies)):
             raise ValueError("a company may submit at most one command per batch")
         if any(envelope.state_version != economy.state_version for envelope in envelopes):
-            raise ValueError("every batch command must target the shared base state version")
-        sequences = apply_sequences or tuple(
-            range(first_apply_sequence, first_apply_sequence + len(envelopes))
+            raise ValueError("every batch command must target the shared state version")
+        issued_minutes = {envelope.issued_at.absolute_minute for envelope in envelopes}
+        if len(issued_minutes) > 1:
+            raise ValueError("one command batch must share a virtual minute")
+        sequences = (
+            tuple(range(first_apply_sequence, first_apply_sequence + len(envelopes)))
+            if apply_sequences is None
+            else apply_sequences
         )
-        if len(sequences) != len(envelopes) or any(
-            sequence < first_apply_sequence for sequence in sequences
-        ):
-            raise ValueError("apply_sequences must align with the submitted envelopes")
+        if len(sequences) != len(envelopes):
+            raise ValueError("apply_sequences must align with submitted commands")
         if tuple(sorted(set(sequences))) != sequences:
             raise ValueError("apply_sequences must be unique and increasing")
+        if sequences and sequences[0] < first_apply_sequence:
+            raise ValueError("apply_sequences cannot precede first_apply_sequence")
 
         current = economy
         outcomes: list[CommandOutcome] = []
-        for envelope, apply_sequence in zip(envelopes, sequences, strict=True):
-            current, outcome = self._apply_command(
-                current,
-                envelope,
-                apply_sequence,
-            )
+        for envelope, sequence in zip(envelopes, sequences, strict=True):
+            current, outcome = self._apply_command(current, envelope, sequence)
             outcomes.append(outcome)
         return current, tuple(outcomes)
 
-    def clear_active_market(
+    def complete_operation(
         self,
         economy: EconomyState,
-        product: ProductId,
+        job_id: Identifier,
+        at: SimTime,
     ) -> EconomyState:
-        """Clear one standing-order market at its configured system event."""
-        market_field = "raw_market" if product is ProductId.RAW_MILK else "bottled_market"
-        if getattr(economy, market_field) is not None:
-            raise ValueError(f"{product.value} market already cleared")
+        """Complete one scheduled physical operation exactly once."""
+        job = next((candidate for candidate in economy.jobs if candidate.job_id == job_id), None)
+        if job is None:
+            raise ValueError("operation job does not exist")
+        if at != job.completes_at:
+            raise ValueError("operation must complete at its scheduled time")
+        self._validate_system_time(economy, at)
 
-        ledger = self._active_ledger(economy)
-        orders = tuple(order for order in economy.orders if order.product is product)
-        sellers = [
-            _Order(
-                company_id=order.owner_id,
-                quantity=order.remaining_quantity,
-                unit_price=order.limit_price,
-            )
-            for order in orders
-            if order.side is MarketSide.SELL
-        ]
-        buyers = [
-            _Order(
-                company_id=order.owner_id,
-                quantity=order.remaining_quantity,
-                unit_price=order.limit_price,
-            )
-            for order in orders
-            if order.side is MarketSide.BUY
-        ]
-        events = list(economy.events)
-        market = self._clear_market(
-            economy.day,
-            product,
-            ledger,
-            sellers,
-            buyers,
-            events,
+        session = _MarketSession.from_economy(economy)
+        next_lot_sequence = economy.next_lot_sequence + 1
+        if isinstance(job, ProductionJob):
+            product = job.product
+            quantity = job.quantity
+            source = "produce"
+        else:
+            product = job.output_product
+            quantity = job.output_quantity
+            source = "transform"
+        lot = InventoryLot(
+            lot_id=f"d{economy.day}.{source}.{job.company_id}.l{economy.next_lot_sequence}",
+            product=product,
+            quantity=quantity,
+            produced_day=economy.day,
+            expires_end_of_day=(
+                economy.day + economy.scenario.product(product).shelf_life_days - 1
+            ),
         )
-        return economy.model_copy(
+        session.assets.restore_inventory(job.company_id, (lot,))
+        event: DomainEvent = (
+            MilkProducedEvent(
+                day=economy.day,
+                company_id=job.company_id,
+                requested_quantity=job.quantity,
+                actual_quantity=job.quantity,
+                unit_cost=job.unit_cost,
+                cash_cost=job.cash_cost,
+                lot_id=lot.lot_id,
+            )
+            if isinstance(job, ProductionJob)
+            else MilkProcessedEvent(
+                day=economy.day,
+                company_id=job.company_id,
+                requested_input=job.input_quantity,
+                actual_input=job.input_quantity,
+                output_quantity=job.output_quantity,
+                cash_cost=job.cash_cost,
+                output_lot_id=lot.lot_id,
+            )
+        )
+        return economy._with_market_session(
+            session.freeze(next_lot_sequence=next_lot_sequence)
+        ).model_copy(
             update={
-                "state_version": economy.state_version + 1,
-                "companies": ledger.states(economy.scenario),
-                "orders": tuple(order for order in economy.orders if order.product is not product),
-                "events": tuple(events),
-                "lot_sequence": ledger.lot_sequence,
-                market_field: market,
+                "jobs": tuple(
+                    candidate
+                    for candidate in economy.jobs
+                    if candidate.job_id != job_id
+                ),
+                "events": (*economy.events, event),
             }
         )
 
-    def close_day(self, economy: EconomyState) -> DayResult:
-        """Settle consumer sales and expiry, then freeze a completed day."""
-        if economy.raw_market is None or economy.bottled_market is None:
-            raise ValueError("both markets must clear before day close")
+    def complete_delivery(
+        self,
+        economy: EconomyState,
+        delivery_id: Identifier,
+        at: SimTime,
+    ) -> EconomyState:
+        """Move one guaranteed delivery into the buyer's available inventory."""
+        delivery = next(
+            (candidate for candidate in economy.deliveries if candidate.delivery_id == delivery_id),
+            None,
+        )
+        if delivery is None:
+            raise ValueError("pending delivery does not exist")
+        if at != delivery.arrives_at:
+            raise ValueError("delivery must complete at its scheduled time")
+        self._validate_system_time(economy, at)
+        session = _MarketSession.from_economy(economy)
+        session.assets.restore_inventory(delivery.buyer_id, delivery.lots)
+        event = DeliveryCompletedEvent(
+            day=economy.day,
+            company_id=delivery.buyer_id,
+            trade_id=delivery.trade_id,
+            product=delivery.product,
+            quantity=delivery.quantity,
+        )
+        return economy._with_market_session(session.freeze()).model_copy(
+            update={
+                "deliveries": tuple(
+                    candidate
+                    for candidate in economy.deliveries
+                    if candidate.delivery_id != delivery_id
+                ),
+                "events": (*economy.events, event),
+            }
+        )
 
-        ledger = self._active_ledger(economy)
-        events = list(economy.events)
-        decisions = self._retail_decisions(economy)
-        consumer_demand, consumer_sales = self._sell_to_consumers(
-            economy.scenario,
-            economy.seed,
-            economy.day,
-            ledger,
-            decisions,
-            events,
+    def close_markets(self, economy: EconomyState, at: SimTime) -> EconomyState:
+        """Expire every DAY order and release its remaining collateral."""
+        self._require_clock_event(economy, at, economy.scenario.runtime.close_minute)
+        if not all(market.is_open for market in economy.markets):
+            raise ValueError("markets are already closed")
+        session = _MarketSession.from_economy(economy)
+        for market in session.markets.values():
+            market.close()
+        return economy._with_market_session(session.freeze())
+
+    def settle_consumer_sales(self, economy: EconomyState, at: SimTime) -> EconomyState:
+        """Execute the sole 19:00 consumer purchase event."""
+        self._require_clock_event(economy, at, economy.scenario.runtime.close_minute)
+        if economy.consumer_settlement is not None:
+            raise ValueError("consumer sales are already settled")
+        if any(market.is_open for market in economy.markets):
+            raise ValueError("markets must close before consumer sales")
+
+        session = _MarketSession.from_economy(economy)
+        events: list[ConsumerSaleEvent] = []
+        potential_total = ZERO
+        demand_total = ZERO
+        sold_total = ZERO
+        prices = {
+            (price.company_id, price.product): price.unit_price
+            for price in economy.retail_prices
+        }
+        for company in economy.scenario.companies:
+            operation = company.operation
+            if not isinstance(operation, RetailerOperation):
+                continue
+            potential = self._consumer_potential(economy, company.company_id)
+            price = prices.get((company.company_id, operation.input_product))
+            if price is None:
+                demand = potential
+                sold = ZERO
+                revenue = ZERO
+            else:
+                adjustment = economy.scenario.demand.price_sensitivity * (
+                    price - economy.scenario.demand.reference_price
+                )
+                demand = max(
+                    ZERO,
+                    (potential - adjustment).quantize(Decimal("1"), rounding=ROUND_HALF_UP),
+                )
+                sold = min(
+                    demand,
+                    session.assets.quantity(company.company_id, operation.input_product),
+                )
+                if sold > ZERO:
+                    session.assets.reserve_inventory(
+                        company.company_id,
+                        operation.input_product,
+                        sold,
+                    )
+                    revenue = sold * price
+                    session.assets.credit_cash(company.company_id, revenue)
+                else:
+                    revenue = ZERO
+            events.append(
+                ConsumerSaleEvent(
+                    day=economy.day,
+                    company_id=company.company_id,
+                    potential_demand_quantity=potential,
+                    demand_quantity=demand,
+                    sold_quantity=sold,
+                    retail_price=price,
+                    revenue=revenue,
+                )
+            )
+            potential_total += potential
+            demand_total += demand
+            sold_total += sold
+
+        return economy._with_market_session(session.freeze()).model_copy(
+            update={
+                "consumer_settlement": ConsumerSettlement(
+                    day=economy.day,
+                    potential_demand=potential_total,
+                    demand=demand_total,
+                    sold_quantity=sold_total,
+                ),
+                "events": (*economy.events, *events),
+            }
         )
-        expired_quantity = self._expire(
-            economy.scenario,
-            economy.day,
-            ledger,
-            events,
-        )
-        markets = (economy.raw_market, economy.bottled_market)
+
+    def close_day(self, economy: EconomyState, at: SimTime) -> DayResult:
+        """Assert a drained runtime, expire inventory, and freeze the daily result."""
+        self._require_clock_event(economy, at, economy.scenario.runtime.day_close_minute)
+        if any(market.is_open or market.orders for market in economy.markets):
+            raise ValueError("day close requires closed empty markets")
+        if economy.jobs:
+            raise ValueError("day close requires every operation to complete")
+        if economy.deliveries:
+            raise ValueError("day close requires every delivery to complete")
+        if economy.consumer_settlement is None:
+            raise ValueError("consumer sales must settle before day close")
+
+        companies, expiry_events = self._expire_inventory(economy)
+        events = (*economy.events, *expiry_events)
+        markets = tuple(_market_summary(market) for market in economy.markets)
         state = WorldState(
             scenario=economy.scenario,
             seed=economy.seed,
             day=economy.day,
-            companies=ledger.states(economy.scenario),
+            companies=companies,
             previous_markets=markets,
+            next_lot_sequence=economy.next_lot_sequence,
         )
+        settlement = economy.consumer_settlement
         return DayResult(
             state=state,
-            events=tuple(events),
+            events=events,
             snapshot=self._snapshot(
                 state,
                 events,
                 markets,
-                consumer_demand,
-                consumer_sales,
-                expired_quantity,
+                settlement.potential_demand,
+                settlement.sold_quantity,
+                sum((event.quantity for event in expiry_events), start=ZERO),
             ),
-        )
-
-    def observe(
-        self,
-        state: WorldState,
-    ) -> tuple[CompanyObservation, ...]:
-        """Produce private-safe morning observations for every company."""
-        if state.day >= state.scenario.days:
-            return ()
-        scenario = state.scenario
-        next_day = state.day + 1
-        states = {company.company_id: company for company in state.companies}
-        public_companies = tuple(
-            PublicCompany(
-                company_id=company.company_id,
-                name=company.name,
-                tier=company.tier,
-            )
-            for company in scenario.companies
-        )
-        return tuple(
-            CompanyObservation(
-                observation_id=self._observation_id(
-                    state,
-                    next_day,
-                    company.company_id,
-                ),
-                scenario_id=scenario.scenario_id,
-                scenario_days=scenario.days,
-                day=next_day,
-                company_id=company.company_id,
-                operation=company.operation,
-                products=scenario.products,
-                demand=scenario.demand,
-                scoring=scenario.scoring,
-                cash=states[company.company_id].cash,
-                inventory=tuple(
-                    InventoryPosition(
-                        product=product.product,
-                        quantity=self._inventory_quantity(
-                            states[company.company_id],
-                            product.product,
-                        ),
-                    )
-                    for product in scenario.products
-                ),
-                public_companies=public_companies,
-                previous_markets=state.previous_markets,
-                runtime=scenario.runtime,
-            )
-            for company in scenario.companies
-        )
-
-    def step(
-        self,
-        state: WorldState,
-        decisions: tuple[RecordedDecision, ...],
-    ) -> DayResult:
-        """Settle one complete day and return a new immutable state."""
-        scenario = state.scenario
-        if state.day >= scenario.days:
-            raise ValueError("the episode is already complete")
-
-        day = state.day + 1
-        ledger = _Ledger(state, day)
-        events: list[DomainEvent] = []
-        accepted = self._accepted_decisions(state, decisions, events)
-
-        self._produce(scenario, day, ledger, accepted, events)
-        raw_market = self._clear_raw_market(
-            scenario,
-            day,
-            ledger,
-            accepted,
-            events,
-        )
-        self._process(scenario, day, ledger, accepted, events)
-        bottled_market = self._clear_bottled_market(
-            scenario,
-            day,
-            ledger,
-            accepted,
-            events,
-        )
-        consumer_demand, consumer_sales = self._sell_to_consumers(
-            scenario,
-            state.seed,
-            day,
-            ledger,
-            accepted,
-            events,
-        )
-        expired_quantity = self._expire(
-            scenario,
-            day,
-            ledger,
-            events,
-        )
-        markets = (raw_market, bottled_market)
-        next_state = WorldState(
-            scenario=scenario,
-            seed=state.seed,
-            day=day,
-            companies=ledger.states(scenario),
-            previous_markets=markets,
-        )
-        snapshot = self._snapshot(
-            next_state,
-            events,
-            markets,
-            consumer_demand,
-            consumer_sales,
-            expired_quantity,
-        )
-        return DayResult(
-            state=next_state,
-            events=tuple(events),
-            snapshot=snapshot,
         )
 
     def _apply_command(
@@ -679,48 +913,61 @@ class EconomyEngine:
         envelope: CommandEnvelope,
         apply_sequence: int,
     ) -> tuple[EconomyState, CommandOutcome]:
-        """Authorize and apply one command without exposing mutable internals."""
-        command = envelope.command
+        """Apply one command transaction or return an unchanged rejection."""
         try:
             self._validate_command_time(economy, envelope)
-            if isinstance(command, Produce):
-                updated, order_id = self._apply_produce(economy, envelope)
-            elif isinstance(command, Transform):
-                updated, order_id = self._apply_transform(economy, envelope)
-            elif isinstance(command, PlaceOrder):
-                updated, order_id = self._apply_order(economy, envelope)
-            elif isinstance(command, CancelOrder):
-                updated, order_id = self._apply_cancel(economy, envelope)
-            elif isinstance(command, SetRetailPrice):
-                updated, order_id = self._apply_retail_price(economy, envelope)
-            elif isinstance(command, Wait):
-                updated, order_id = self._apply_wait(economy, envelope)
-            else:
-                raise TypeError(f"unsupported command: {type(command).__name__}")
-        except _CommandRejected as error:
-            return economy, self._command_outcome(
+            effect = self._dispatch(economy, envelope, apply_sequence)
+        except (_CommandRejected, MarketError) as error:
+            return economy, self._outcome(
                 economy,
                 envelope,
                 apply_sequence,
                 accepted=False,
                 reason=str(error),
             )
-
-        new_events = updated.events[len(economy.events) :]
-        return updated, self._command_outcome(
-            updated,
+        except DecimalException as error:
+            return economy, self._outcome(
+                economy,
+                envelope,
+                apply_sequence,
+                accepted=False,
+                reason=f"numeric value exceeds the supported range: {type(error).__name__}",
+            )
+        return effect.economy, self._outcome(
+            effect.economy,
             envelope,
             apply_sequence,
             accepted=True,
-            order_id=order_id,
-            events=new_events,
+            order_id=effect.order_id,
+            job_id=effect.job_id,
+            events=effect.events,
+            completions=effect.completions,
         )
 
-    def _apply_produce(
+    def _dispatch(
         self,
         economy: EconomyState,
         envelope: CommandEnvelope,
-    ) -> tuple[EconomyState, None]:
+        apply_sequence: int,
+    ) -> _CommandEffect:
+        command = envelope.command
+        if isinstance(command, Produce):
+            return self._produce(economy, envelope)
+        if isinstance(command, Transform):
+            return self._transform(economy, envelope)
+        if isinstance(command, PlaceOrder):
+            return self._place(economy, envelope, apply_sequence)
+        if isinstance(command, ReplaceOrder):
+            return self._replace(economy, envelope, apply_sequence)
+        if isinstance(command, CancelOrder):
+            return self._cancel(economy, envelope)
+        if isinstance(command, SetRetailPrice):
+            return self._set_retail_price(economy, envelope)
+        if isinstance(command, Wait):
+            return self._wait(economy, envelope)
+        raise TypeError(f"unsupported command: {type(command).__name__}")
+
+    def _produce(self, economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
         command = envelope.command
         company = economy.scenario.company(envelope.company_id)
         operation = company.operation
@@ -728,48 +975,54 @@ class EconomyEngine:
             raise _CommandRejected("produce is only available to farms")
         if command.product is not operation.output_product:
             raise _CommandRejected("farm cannot produce the requested product")
-
-        used = self._used(economy.production_used, company.company_id)
-        # Calculate the remaining daily capacity.
-        remaining_capacity = max(ZERO, operation.daily_capacity - used)
-
-        ledger = self._active_ledger(economy)
-        # Settle cash, inventory, and the production event atomically.
-        event = self._settle_production(
-            economy.scenario,
-            economy.day,
-            ledger,
-            company.company_id,
-            operation,
-            command.quantity,
-            remaining_capacity,
-        )
-        if event.actual_quantity <= ZERO:
-            raise _CommandRejected("production has no available capacity or cash")
-
-        # 返回新的 EconomyState
-        return (
-            economy.model_copy(
-                update={
-                    "state_version": economy.state_version + 1,
-                    "companies": ledger.states(economy.scenario),
-                    "production_used": self._set_used(
-                        economy.production_used,
-                        company.company_id,
-                        used + event.actual_quantity,
-                    ),
-                    "events": (*economy.events, event),
-                    "lot_sequence": ledger.lot_sequence,
-                }
+        self._require_idle(economy, company.company_id)
+        used = _used(economy.production_used, company.company_id)
+        available_capacity = operation.daily_capacity - used
+        if command.quantity > available_capacity:
+            raise _CommandRejected(
+                f"insufficient production capacity: requested {command.quantity}, "
+                f"available {available_capacity}"
+            )
+        cost = command.quantity * operation.unit_cost
+        session = _MarketSession.from_economy(economy)
+        if cost > session.assets.cash(company.company_id):
+            raise _CommandRejected(
+                f"insufficient cash: required {cost}, "
+                f"available {session.assets.cash(company.company_id)}"
+            )
+        session.assets.debit_cash(company.company_id, cost)
+        sequence = economy.next_job_sequence
+        job = ProductionJob(
+            job_id=f"d{economy.day}.job{sequence}.{company.company_id}",
+            company_id=company.company_id,
+            started_at=envelope.issued_at,
+            completes_at=envelope.issued_at.plus(
+                economy.scenario.runtime.operation_duration_minutes
             ),
-            None,
+            product=command.product,
+            quantity=command.quantity,
+            unit_cost=operation.unit_cost,
+            cash_cost=cost,
+        )
+        updated = economy._with_market_session(session.freeze()).model_copy(
+            update={
+                "jobs": (*economy.jobs, job),
+                "production_used": _set_used(
+                    economy.production_used,
+                    company.company_id,
+                    used + command.quantity,
+                ),
+                "next_job_sequence": sequence + 1,
+            }
+        )
+        completion = _operation_completion(job)
+        return _CommandEffect(
+            economy=updated,
+            job_id=job.job_id,
+            completions=(completion,),
         )
 
-    def _apply_transform(
-        self,
-        economy: EconomyState,
-        envelope: CommandEnvelope,
-    ) -> tuple[EconomyState, None]:
+    def _transform(self, economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
         command = envelope.command
         company = economy.scenario.company(envelope.company_id)
         operation = company.operation
@@ -783,112 +1036,152 @@ class EconomyEngine:
             or command.output_product is not operation.output_product
         ):
             raise _CommandRejected("processor cannot perform the requested transformation")
-
-        used = self._used(economy.transformation_used, company.company_id)
-        remaining_capacity = max(ZERO, operation.daily_input_capacity - used)
-        ledger = self._active_ledger(economy)
-        event = self._settle_transformation(
-            economy.scenario,
-            economy.day,
-            ledger,
+        self._require_idle(economy, company.company_id)
+        used = _used(economy.transformation_used, company.company_id)
+        available_capacity = operation.daily_input_capacity - used
+        if command.input_quantity > available_capacity:
+            raise _CommandRejected(
+                f"insufficient transformation capacity: requested {command.input_quantity}, "
+                f"available {available_capacity}"
+            )
+        session = _MarketSession.from_economy(economy)
+        available_input = session.assets.quantity(company.company_id, command.input_product)
+        if command.input_quantity > available_input:
+            raise _CommandRejected(
+                f"insufficient inventory: requested {command.input_quantity}, "
+                f"available {available_input}"
+            )
+        cost = command.input_quantity * operation.processing_cost_per_input
+        if cost > session.assets.cash(company.company_id):
+            raise _CommandRejected(
+                f"insufficient cash: required {cost}, "
+                f"available {session.assets.cash(company.company_id)}"
+            )
+        session.assets.reserve_inventory(
             company.company_id,
-            operation,
+            command.input_product,
             command.input_quantity,
-            remaining_capacity,
         )
-        if event.actual_input <= ZERO:
-            raise _CommandRejected("transformation has no available inventory, capacity, or cash")
-
-        return (
-            economy.model_copy(
-                update={
-                    "state_version": economy.state_version + 1,
-                    "companies": ledger.states(economy.scenario),
-                    "transformation_used": self._set_used(
-                        economy.transformation_used,
-                        company.company_id,
-                        used + event.actual_input,
-                    ),
-                    "events": (*economy.events, event),
-                    "lot_sequence": ledger.lot_sequence,
-                }
+        session.assets.debit_cash(company.company_id, cost)
+        sequence = economy.next_job_sequence
+        job = TransformationJob(
+            job_id=f"d{economy.day}.job{sequence}.{company.company_id}",
+            company_id=company.company_id,
+            started_at=envelope.issued_at,
+            completes_at=envelope.issued_at.plus(
+                economy.scenario.runtime.operation_duration_minutes
             ),
-            None,
+            input_product=command.input_product,
+            output_product=command.output_product,
+            input_quantity=command.input_quantity,
+            output_quantity=command.input_quantity * operation.yield_rate,
+            processing_cost_per_input=operation.processing_cost_per_input,
+            cash_cost=cost,
+        )
+        updated = economy._with_market_session(session.freeze()).model_copy(
+            update={
+                "jobs": (*economy.jobs, job),
+                "transformation_used": _set_used(
+                    economy.transformation_used,
+                    company.company_id,
+                    used + command.input_quantity,
+                ),
+                "next_job_sequence": sequence + 1,
+            }
+        )
+        return _CommandEffect(
+            economy=updated,
+            job_id=job.job_id,
+            completions=(_operation_completion(job),),
         )
 
-    def _apply_order(
+    def _place(
         self,
         economy: EconomyState,
         envelope: CommandEnvelope,
-    ) -> tuple[EconomyState, str]:
+        apply_sequence: int,
+    ) -> _CommandEffect:
         command = envelope.command
         if not isinstance(command, PlaceOrder):
-            raise TypeError("order handler requires PlaceOrder")
+            raise TypeError("place handler requires PlaceOrder")
+        quantity = _validated_order_quantity(command.quantity)
         company = economy.scenario.company(envelope.company_id)
-        if not self._order_is_authorized(company, command):
+        if not _order_is_authorized(company, command.side, command.product):
             raise _CommandRejected("order side or product is not authorized for this company")
-        if (command.product is ProductId.RAW_MILK and economy.raw_market is not None) or (
-            command.product is ProductId.BOTTLED_MILK and economy.bottled_market is not None
-        ):
-            raise _CommandRejected("the requested market has already cleared")
-
-        sequence = economy.order_sequence + 1
+        session = _MarketSession.from_economy(economy)
+        sequence = economy.next_order_sequence
         order_id = f"d{economy.day}.o{sequence}.{company.company_id}"
-        order = OpenOrderView(
+        fills = session.market(command.product).place(
             order_id=order_id,
             owner_id=company.company_id,
             side=command.side,
-            product=command.product,
-            remaining_quantity=command.quantity,
+            quantity=quantity,
             limit_price=command.limit_price,
             placed_at=envelope.issued_at,
+            priority_sequence=apply_sequence,
+            trade_id_factory=self._trade_id_factory(economy),
         )
-        return (
-            economy.model_copy(
-                update={
-                    "state_version": economy.state_version + 1,
-                    "orders": (*economy.orders, order),
-                    "order_sequence": sequence,
-                }
-            ),
+        return self._commit_order(
+            economy,
+            session,
+            envelope.issued_at,
+            fills,
             order_id,
+            sequence + 1,
         )
 
-    @staticmethod
-    def _apply_cancel(
+    def _replace(
+        self,
         economy: EconomyState,
         envelope: CommandEnvelope,
-    ) -> tuple[EconomyState, str]:
+        apply_sequence: int,
+    ) -> _CommandEffect:
+        command = envelope.command
+        if not isinstance(command, ReplaceOrder):
+            raise TypeError("replace handler requires ReplaceOrder")
+        quantity = _validated_order_quantity(command.quantity)
+        session = _MarketSession.from_economy(economy)
+        market = session.containing(command.order_id)
+        sequence = economy.next_order_sequence
+        order_id = f"d{economy.day}.o{sequence}.{envelope.company_id}"
+        fills = market.replace(
+            old_order_id=command.order_id,
+            owner_id=envelope.company_id,
+            new_order_id=order_id,
+            quantity=quantity,
+            limit_price=command.limit_price,
+            placed_at=envelope.issued_at,
+            priority_sequence=apply_sequence,
+            trade_id_factory=self._trade_id_factory(economy),
+        )
+        return self._commit_order(
+            economy,
+            session,
+            envelope.issued_at,
+            fills,
+            order_id,
+            sequence + 1,
+        )
+
+    def _cancel(self, economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
         command = envelope.command
         if not isinstance(command, CancelOrder):
             raise TypeError("cancel handler requires CancelOrder")
-        order = next(
-            (candidate for candidate in economy.orders if candidate.order_id == command.order_id),
-            None,
+        session = _MarketSession.from_economy(economy)
+        session.containing(command.order_id).cancel(
+            order_id=command.order_id,
+            owner_id=envelope.company_id,
         )
-        if order is None:
-            raise _CommandRejected("order does not exist or has already cleared")
-        if order.owner_id != envelope.company_id:
-            raise _CommandRejected("a company cannot cancel another company's order")
-        return (
-            economy.model_copy(
-                update={
-                    "state_version": economy.state_version + 1,
-                    "orders": tuple(
-                        candidate
-                        for candidate in economy.orders
-                        if candidate.order_id != command.order_id
-                    ),
-                }
-            ),
-            order.order_id,
+        return _CommandEffect(
+            economy=economy._with_market_session(session.freeze()),
+            order_id=command.order_id,
         )
 
     @staticmethod
-    def _apply_retail_price(
+    def _set_retail_price(
         economy: EconomyState,
         envelope: CommandEnvelope,
-    ) -> tuple[EconomyState, None]:
+    ) -> _CommandEffect:
         command = envelope.command
         company = economy.scenario.company(envelope.company_id)
         operation = company.operation
@@ -899,7 +1192,7 @@ class EconomyEngine:
             raise _CommandRejected("set_retail_price is only available to retailers")
         if command.product is not operation.input_product:
             raise _CommandRejected("retailer cannot price the requested product")
-        retained = tuple(
+        prices = tuple(
             price
             for price in economy.retail_prices
             if (price.company_id, price.product) != (company.company_id, command.product)
@@ -909,35 +1202,117 @@ class EconomyEngine:
             product=command.product,
             unit_price=command.unit_price,
         )
-        return (
-            economy.model_copy(
+        return _CommandEffect(
+            economy=economy.model_copy(
                 update={
                     "state_version": economy.state_version + 1,
-                    "retail_prices": (*retained, price),
+                    "retail_prices": (*prices, price),
                 }
-            ),
-            None,
+            )
         )
 
     @staticmethod
-    def _apply_wait(
-        economy: EconomyState,
-        envelope: CommandEnvelope,
-    ) -> tuple[EconomyState, None]:
+    def _wait(economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
         command = envelope.command
         if not isinstance(command, Wait):
             raise TypeError("wait handler requires Wait")
         if command.until is not None:
             if command.until.absolute_minute <= envelope.issued_at.absolute_minute:
-                raise _CommandRejected("wait deadline must be later than the current time")
-            runtime = economy.scenario.runtime
+                raise _CommandRejected("wait deadline must be later than current time")
             if command.until.day >= economy.scenario.days:
                 raise _CommandRejected("wait deadline exceeds the scenario")
+            runtime = economy.scenario.runtime
             if not runtime.open_minute <= command.until.minute_of_day < runtime.close_minute:
                 raise _CommandRejected("wait deadline must be inside business hours")
-        return economy, None
+        return _CommandEffect(economy=economy)
 
-    def _command_outcome(
+    def _commit_order(
+        self,
+        economy: EconomyState,
+        session: _MarketSession,
+        at: SimTime,
+        fills: tuple[TradeFill, ...],
+        order_id: Identifier,
+        next_order_sequence: int,
+    ) -> _CommandEffect:
+        trade_effects = self._trade_effects(economy, fills, at)
+        updated = economy._with_market_session(session.freeze()).model_copy(
+            update={
+                "deliveries": (*economy.deliveries, *trade_effects.deliveries),
+                "events": (*economy.events, *trade_effects.events),
+                "next_order_sequence": next_order_sequence,
+                "next_delivery_sequence": trade_effects.next_delivery_sequence,
+                "next_trade_sequence": trade_effects.next_trade_sequence,
+            }
+        )
+        return _CommandEffect(
+            economy=updated,
+            order_id=order_id,
+            events=trade_effects.events,
+            completions=trade_effects.completions,
+        )
+
+    def _trade_effects(
+        self,
+        economy: EconomyState,
+        fills: tuple[TradeFill, ...],
+        at: SimTime,
+    ) -> _TradeEffects:
+        events: list[TradeExecutedEvent] = []
+        deliveries: list[PendingDelivery] = []
+        completions: list[ScheduledCompletion] = []
+        for offset, fill in enumerate(fills):
+            delivery_sequence = economy.next_delivery_sequence + offset
+            delivery_id = f"d{economy.day}.delivery{delivery_sequence}"
+            delivery = PendingDelivery(
+                delivery_id=delivery_id,
+                trade_id=fill.trade_id,
+                buyer_id=fill.buyer_id,
+                arrives_at=at.plus(economy.scenario.runtime.delivery_duration_minutes),
+                lots=fill.delivery_lots,
+            )
+            deliveries.append(delivery)
+            events.append(
+                TradeExecutedEvent(
+                    day=economy.day,
+                    trade_id=fill.trade_id,
+                    maker_order_id=fill.maker_order_id,
+                    taker_order_id=fill.taker_order_id,
+                    product=fill.product,
+                    seller_id=fill.seller_id,
+                    buyer_id=fill.buyer_id,
+                    quantity=fill.quantity,
+                    unit_price=fill.unit_price,
+                    total_value=fill.total_value,
+                )
+            )
+            completions.append(
+                ScheduledCompletion(
+                    event_id=f"{delivery_id}.complete",
+                    kind=SystemEventKind.DELIVERY_COMPLETED,
+                    at=delivery.arrives_at,
+                    reference_id=delivery.delivery_id,
+                    company_id=delivery.buyer_id,
+                )
+            )
+        return _TradeEffects(
+            events=tuple(events),
+            deliveries=tuple(deliveries),
+            completions=tuple(completions),
+            next_delivery_sequence=economy.next_delivery_sequence + len(fills),
+            next_trade_sequence=economy.next_trade_sequence + len(fills),
+        )
+
+    @staticmethod
+    def _trade_id_factory(
+        economy: EconomyState,
+    ) -> Callable[[int], Identifier]:
+        """Return a deterministic per-command trade identity factory."""
+        return lambda offset: (
+            f"d{economy.day}.trade{economy.next_trade_sequence + offset - 1}"
+        )
+
+    def _outcome(
         self,
         economy: EconomyState,
         envelope: CommandEnvelope,
@@ -945,14 +1320,16 @@ class EconomyEngine:
         *,
         accepted: bool,
         reason: str | None = None,
-        order_id: str | None = None,
+        order_id: Identifier | None = None,
+        job_id: Identifier | None = None,
         events: tuple[DomainEvent, ...] = (),
+        completions: tuple[ScheduledCompletion, ...] = (),
     ) -> CommandOutcome:
         command = envelope.command
         next_available = (
             command.until
             if accepted and isinstance(command, Wait)
-            else envelope.issued_at.plus(economy.scenario.runtime.command_duration_minutes)
+            else envelope.issued_at.plus(economy.scenario.runtime.decision_interval_minutes)
         )
         return CommandOutcome(
             turn_id=envelope.turn_id,
@@ -965,15 +1342,14 @@ class EconomyEngine:
             resulting_state_version=economy.state_version,
             apply_sequence=apply_sequence,
             order_id=order_id,
+            job_id=job_id,
             events=events,
+            scheduled_completions=completions,
             next_available_at=next_available,
         )
 
     @staticmethod
-    def _validate_command_time(
-        economy: EconomyState,
-        envelope: CommandEnvelope,
-    ) -> None:
+    def _validate_command_time(economy: EconomyState, envelope: CommandEnvelope) -> None:
         runtime = economy.scenario.runtime
         if envelope.issued_at.day != economy.day - 1:
             raise _CommandRejected("command targets a different business day")
@@ -981,600 +1357,124 @@ class EconomyEngine:
             raise _CommandRejected("command is outside business hours")
 
     @staticmethod
-    def _order_is_authorized(
-        company: CompanySpec,
-        command: PlaceOrder,
-    ) -> bool:
-        operation = company.operation
-        return (
-            (
-                isinstance(operation, FarmOperation)
-                and command.side is MarketSide.SELL
-                and command.product is operation.output_product
-            )
-            or (
-                isinstance(operation, ProcessorOperation)
-                and (
-                    (command.side is MarketSide.BUY and command.product is operation.input_product)
-                    or (
-                        command.side is MarketSide.SELL
-                        and command.product is operation.output_product
-                    )
-                )
-            )
-            or (
-                isinstance(operation, RetailerOperation)
-                and command.side is MarketSide.BUY
-                and command.product is operation.input_product
-            )
-        )
+    def _validate_system_time(economy: EconomyState, at: SimTime) -> None:
+        if at.day != economy.day - 1:
+            raise ValueError("system event targets a different business day")
 
-    @staticmethod
-    def _used(
-        usage: tuple[CompanyQuantity, ...],
-        company_id: CompanyId,
-    ) -> Decimal:
-        return next(
-            (entry.quantity for entry in usage if entry.company_id == company_id),
-            ZERO,
-        )
-
-    @staticmethod
-    def _set_used(
-        usage: tuple[CompanyQuantity, ...],
-        company_id: CompanyId,
-        quantity: Decimal,
-    ) -> tuple[CompanyQuantity, ...]:
-        retained = tuple(entry for entry in usage if entry.company_id != company_id)
-        return (*retained, CompanyQuantity(company_id=company_id, quantity=quantity))
-
-    @staticmethod
-    def _settle_production(
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        company_id: CompanyId,
-        operation: FarmOperation,
-        requested: Decimal,
-        capacity: Decimal,
-    ) -> MilkProducedEvent:
-        """Apply the shared V1/V2 farm production formula."""
-        actual = min(
-            requested,
-            capacity,
-            ledger.affordable_quantity(company_id, operation.unit_cost),
-        )
-        cost = actual * operation.unit_cost
-        ledger.charge(company_id, cost)
-        lot_id = ledger.add_new_lot(
-            company_id,
-            operation.output_product,
-            actual,
-            scenario.product(operation.output_product).shelf_life_days,
-            "produce",
-        )
-        return MilkProducedEvent(
-            day=day,
-            company_id=company_id,
-            requested_quantity=requested,
-            actual_quantity=actual,
-            unit_cost=operation.unit_cost,
-            cash_cost=cost,
-            lot_id=lot_id,
-        )
-
-    @staticmethod
-    def _settle_transformation(
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        company_id: CompanyId,
-        operation: ProcessorOperation,
-        requested: Decimal,
-        capacity: Decimal,
-    ) -> MilkProcessedEvent:
-        """Apply the shared V1/V2 processing formula."""
-        cash_limit = (
-            ledger.affordable_quantity(
-                company_id,
-                operation.processing_cost_per_input,
-            )
-            if operation.processing_cost_per_input > ZERO
-            else requested
-        )
-        actual = min(
-            requested,
-            capacity,
-            ledger.quantity(company_id, operation.input_product),
-            cash_limit,
-        )
-        cost = actual * operation.processing_cost_per_input
-        ledger.consume(company_id, operation.input_product, actual)
-        ledger.charge(company_id, cost)
-        output = actual * operation.yield_rate
-        lot_id = ledger.add_new_lot(
-            company_id,
-            operation.output_product,
-            output,
-            scenario.product(operation.output_product).shelf_life_days,
-            "process",
-        )
-        return MilkProcessedEvent(
-            day=day,
-            company_id=company_id,
-            requested_input=requested,
-            actual_input=actual,
-            output_quantity=output,
-            cash_cost=cost,
-            output_lot_id=lot_id,
-        )
-
-    @staticmethod
-    def _active_ledger(economy: EconomyState) -> _Ledger:
-        current = economy.base_state.model_copy(update={"companies": economy.companies})
-        return _Ledger(
-            current,
-            economy.day,
-            lot_sequence=economy.lot_sequence,
-        )
-
-    @staticmethod
-    def _retail_decisions(
+    def _require_clock_event(
+        self,
         economy: EconomyState,
-    ) -> dict[str, CompanyDecision]:
-        prices = {
-            (price.company_id, price.product): price.unit_price for price in economy.retail_prices
-        }
-        decisions: dict[str, CompanyDecision] = {}
-        for company in economy.scenario.companies:
-            operation = company.operation
-            if not isinstance(operation, RetailerOperation):
-                decisions[company.company_id] = NoOpDecision(reason="not_a_retailer")
-                continue
-            price = prices.get((company.company_id, operation.input_product))
-            decisions[company.company_id] = (
-                RetailerDecision(
-                    bottled_bid_quantity=ZERO,
-                    maximum_bottled_price=economy.scenario.demand.reference_price,
-                    retail_price=price,
-                )
-                if price is not None
-                else NoOpDecision(reason="retail_price_not_set")
-            )
-        return decisions
-
-    def _accepted_decisions(
-        self,
-        state: WorldState,
-        recorded: tuple[RecordedDecision, ...],
-        events: list[DomainEvent],
-    ) -> dict[str, CompanyDecision]:
-        """Validate identity, day, observation, uniqueness, and authority."""
-        day = state.day + 1
-        grouped: dict[str, list[RecordedDecision]] = {}
-        for item in recorded:
-            grouped.setdefault(item.company_id, []).append(item)
-
-        configured = {company.company_id: company for company in state.scenario.companies}
-        accepted: dict[str, CompanyDecision] = {}
-        for company in state.scenario.companies:
-            entries = grouped.get(company.company_id, [])
-            reason = self._rejection_reason(state, company, entries)
-            if reason is not None:
-                events.append(
-                    DecisionRejectedEvent(
-                        day=day,
-                        company_id=company.company_id,
-                        reason=reason,
-                    )
-                )
-                accepted[company.company_id] = NoOpDecision(reason=reason)
-            else:
-                accepted[company.company_id] = entries[0].decision
-
-        for unknown_id in sorted(set(grouped) - set(configured)):
-            events.append(
-                DecisionRejectedEvent(
-                    day=day,
-                    company_id=unknown_id,
-                    reason="company is not part of this scenario",
-                )
-            )
-        return accepted
-
-    def _rejection_reason(
-        self,
-        state: WorldState,
-        company: CompanySpec,
-        entries: list[RecordedDecision],
-    ) -> str | None:
-        """Return why a decision cannot be authorized, if applicable."""
-        if not entries:
-            return "decision is missing"
-        if len(entries) > 1:
-            return "multiple decisions were submitted"
-
-        recorded = entries[0]
-        day = state.day + 1
-        if recorded.day != day:
-            return f"decision day must be {day}"
-        expected_observation = self._observation_id(
-            state,
-            day,
-            company.company_id,
-        )
-        if recorded.observation_id != expected_observation:
-            return "decision does not match the morning observation"
-        if isinstance(recorded.decision, NoOpDecision):
-            return None
-
-        allowed = (
-            (
-                isinstance(company.operation, FarmOperation)
-                and isinstance(recorded.decision, FarmDecision)
-            )
-            or (
-                isinstance(company.operation, ProcessorOperation)
-                and isinstance(recorded.decision, ProcessorDecision)
-            )
-            or (
-                isinstance(company.operation, RetailerOperation)
-                and isinstance(recorded.decision, RetailerDecision)
-            )
-        )
-        return None if allowed else "decision type is not authorized"
-
-    def _produce(
-        self,
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        decisions: dict[str, CompanyDecision],
-        events: list[DomainEvent],
+        at: SimTime,
+        minute_of_day: int,
     ) -> None:
-        """Settle farm production in stable company order."""
-        for company in scenario.companies:
-            operation = company.operation
-            decision = decisions[company.company_id]
-            if not (isinstance(operation, FarmOperation) and isinstance(decision, FarmDecision)):
-                continue
-
-            events.append(
-                self._settle_production(
-                    scenario,
-                    day,
-                    ledger,
-                    company.company_id,
-                    operation,
-                    decision.produce_quantity,
-                    operation.daily_capacity,
-                )
-            )
-
-    def _clear_raw_market(
-        self,
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        decisions: dict[str, CompanyDecision],
-        events: list[DomainEvent],
-    ) -> MarketSummary:
-        """Match farms to processors on the raw-milk spot market."""
-        sellers = [
-            _Order(
-                company_id=company.company_id,
-                quantity=decision.raw_offer_quantity,
-                unit_price=decision.minimum_raw_price,
-            )
-            for company in scenario.companies
-            if isinstance(company.operation, FarmOperation)
-            and isinstance(
-                decision := decisions[company.company_id],
-                FarmDecision,
-            )
-        ]
-        buyers = [
-            _Order(
-                company_id=company.company_id,
-                quantity=decision.raw_bid_quantity,
-                unit_price=decision.maximum_raw_price,
-            )
-            for company in scenario.companies
-            if isinstance(company.operation, ProcessorOperation)
-            and isinstance(
-                decision := decisions[company.company_id],
-                ProcessorDecision,
-            )
-        ]
-        return self._clear_market(
-            day,
-            ProductId.RAW_MILK,
-            ledger,
-            sellers,
-            buyers,
-            events,
-        )
-
-    def _process(
-        self,
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        decisions: dict[str, CompanyDecision],
-        events: list[DomainEvent],
-    ) -> None:
-        """Convert raw milk using cash, inventory, and capacity limits."""
-        for company in scenario.companies:
-            operation = company.operation
-            decision = decisions[company.company_id]
-            if not (
-                isinstance(operation, ProcessorOperation)
-                and isinstance(decision, ProcessorDecision)
-            ):
-                continue
-
-            events.append(
-                self._settle_transformation(
-                    scenario,
-                    day,
-                    ledger,
-                    company.company_id,
-                    operation,
-                    decision.process_quantity,
-                    operation.daily_input_capacity,
-                )
-            )
-
-    def _clear_bottled_market(
-        self,
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        decisions: dict[str, CompanyDecision],
-        events: list[DomainEvent],
-    ) -> MarketSummary:
-        """Match processors to retailers on the bottled-milk market."""
-        sellers = [
-            _Order(
-                company_id=company.company_id,
-                quantity=decision.bottled_offer_quantity,
-                unit_price=decision.minimum_bottled_price,
-            )
-            for company in scenario.companies
-            if isinstance(company.operation, ProcessorOperation)
-            and isinstance(
-                decision := decisions[company.company_id],
-                ProcessorDecision,
-            )
-        ]
-        buyers = [
-            _Order(
-                company_id=company.company_id,
-                quantity=decision.bottled_bid_quantity,
-                unit_price=decision.maximum_bottled_price,
-            )
-            for company in scenario.companies
-            if isinstance(company.operation, RetailerOperation)
-            and isinstance(
-                decision := decisions[company.company_id],
-                RetailerDecision,
-            )
-        ]
-        return self._clear_market(
-            day,
-            ProductId.BOTTLED_MILK,
-            ledger,
-            sellers,
-            buyers,
-            events,
-        )
-
-    def _clear_market(
-        self,
-        day: int,
-        product: ProductId,
-        ledger: _Ledger,
-        sellers: list[_Order],
-        buyers: list[_Order],
-        events: list[DomainEvent],
-    ) -> MarketSummary:
-        """Run deterministic price-time-free spot matching."""
-        seller_priority = self._rotating_priority(sellers, day)
-        buyer_priority = self._rotating_priority(buyers, day)
-        sellers.sort(
-            key=lambda order: (
-                order.unit_price,
-                seller_priority[order.company_id],
-            )
-        )
-        buyers.sort(
-            key=lambda order: (
-                -order.unit_price,
-                buyer_priority[order.company_id],
-            )
-        )
-        seller_index = 0
-        buyer_index = 0
-        volume = ZERO
-        traded_value = ZERO
-
-        while seller_index < len(sellers) and buyer_index < len(buyers):
-            seller = sellers[seller_index]
-            buyer = buyers[buyer_index]
-            if buyer.unit_price < seller.unit_price:
-                break
-
-            available = min(
-                seller.quantity,
-                ledger.quantity(seller.company_id, product),
-            )
-            affordable = ledger.affordable_quantity(
-                buyer.company_id,
-                seller.unit_price,
-            )
-            quantity = min(available, buyer.quantity, affordable)
-            if quantity > ZERO:
-                value = quantity * seller.unit_price
-                ledger.transfer(
-                    seller.company_id,
-                    buyer.company_id,
-                    product,
-                    quantity,
-                    seller.unit_price,
-                )
-                seller.quantity -= quantity
-                buyer.quantity -= quantity
-                volume += quantity
-                traded_value += value
-                events.append(
-                    TradeExecutedEvent(
-                        day=day,
-                        product=product,
-                        seller_id=seller.company_id,
-                        buyer_id=buyer.company_id,
-                        quantity=quantity,
-                        unit_price=seller.unit_price,
-                        total_value=value,
-                    )
-                )
-
-            if seller.quantity <= ZERO or available <= ZERO:
-                seller_index += 1
-            if buyer.quantity <= ZERO or affordable <= ZERO:
-                buyer_index += 1
-
-        return MarketSummary(
-            product=product,
-            volume=volume,
-            average_price=traded_value / volume if volume > ZERO else None,
-        )
+        self._validate_system_time(economy, at)
+        if at.minute_of_day != minute_of_day:
+            raise ValueError("system event occurred at the wrong configured minute")
 
     @staticmethod
-    def _rotating_priority(
-        orders: list[_Order],
-        day: int,
-    ) -> dict[str, int]:
-        """Rotate equal-price priority so one ID is not always first."""
-        company_ids = sorted(order.company_id for order in orders)
-        if not company_ids:
-            return {}
-        offset = (day - 1) % len(company_ids)
-        rotated = company_ids[offset:] + company_ids[:offset]
-        return {company_id: rank for rank, company_id in enumerate(rotated)}
+    def _require_idle(economy: EconomyState, company_id: CompanyId) -> None:
+        if any(job.company_id == company_id for job in economy.jobs):
+            raise _CommandRejected("company operation resource is busy")
 
-    def _sell_to_consumers(
+    def _consumer_potential(
         self,
-        scenario: ScenarioSpec,
-        seed: int,
-        day: int,
-        ledger: _Ledger,
-        decisions: dict[str, CompanyDecision],
-        events: list[DomainEvent],
-    ) -> tuple[Decimal, Decimal]:
-        """Settle independent local consumer demand for each retailer."""
-        total_demand = ZERO
-        total_sales = ZERO
-        for company in scenario.companies:
-            operation = company.operation
-            decision = decisions[company.company_id]
-            if not isinstance(operation, RetailerOperation):
-                continue
+        economy: EconomyState,
+        retailer_id: CompanyId,
+    ) -> Quantity:
+        shock = self._named_demand_shock(
+            economy.seed,
+            economy.day,
+            retailer_id,
+            economy.scenario.demand.shock_min,
+            economy.scenario.demand.shock_max,
+        )
+        return max(
+            ZERO,
+            (economy.scenario.demand.base_demand + Decimal(shock)).quantize(
+                Decimal("1"),
+                rounding=ROUND_HALF_UP,
+            ),
+        )
 
-            shock = self._named_demand_shock(
-                seed,
-                day,
-                company.company_id,
-                scenario.demand.shock_min,
-                scenario.demand.shock_max,
-            )
-            potential_demand = max(
-                ZERO,
-                (scenario.demand.base_demand + Decimal(shock)).quantize(
-                    Decimal("1"), rounding=ROUND_HALF_UP
-                ),
-            )
-            if isinstance(decision, RetailerDecision):
-                price_adjustment = scenario.demand.price_sensitivity * (
-                    decision.retail_price - scenario.demand.reference_price
-                )
-                demand = max(
-                    ZERO,
-                    (potential_demand - price_adjustment).quantize(
-                        Decimal("1"),
-                        rounding=ROUND_HALF_UP,
-                    ),
-                )
-                sold = min(
-                    demand,
-                    ledger.quantity(
-                        company.company_id,
-                        operation.input_product,
-                    ),
-                )
-                ledger.consume(
-                    company.company_id,
-                    operation.input_product,
-                    sold,
-                )
-                retail_price = decision.retail_price
-                revenue = sold * retail_price
-                ledger.credit(company.company_id, revenue)
-            else:
-                demand = potential_demand
-                sold = ZERO
-                retail_price = None
-                revenue = ZERO
-
-            total_demand += potential_demand
-            total_sales += sold
-            events.append(
-                ConsumerSaleEvent(
-                    day=day,
-                    company_id=company.company_id,
-                    potential_demand_quantity=potential_demand,
-                    demand_quantity=demand,
-                    sold_quantity=sold,
-                    retail_price=retail_price,
-                    revenue=revenue,
-                )
-            )
-        return total_demand, total_sales
-
-    def _expire(
+    def _observation(
         self,
-        scenario: ScenarioSpec,
-        day: int,
-        ledger: _Ledger,
-        events: list[DomainEvent],
-    ) -> Decimal:
-        """Remove expired inventory and expose its fixed-value loss."""
-        total = ZERO
-        for company_id, lot in ledger.expire():
-            total += lot.quantity
-            events.append(
-                InventoryExpiredEvent(
-                    day=day,
-                    company_id=company_id,
-                    lot_id=lot.lot_id,
-                    product=lot.product,
-                    quantity=lot.quantity,
-                    reference_value_loss=(
-                        lot.quantity * scenario.product(lot.product).reference_value
-                    ),
-                )
-            )
-        return total
-
-    def _snapshot(
-        self,
+        *,
         state: WorldState,
-        events: list[DomainEvent],
+        day: int,
+        company_id: CompanyId,
+        company_state: CompanyState,
+        retail_price: Money | None,
+    ) -> CompanyObservation:
+        scenario = state.scenario
+        company = scenario.company(company_id)
+        return CompanyObservation(
+            observation_id=f"{scenario.scenario_id}|{day}|{company_id}",
+            scenario_id=scenario.scenario_id,
+            scenario_days=scenario.days,
+            day=day,
+            company_id=company_id,
+            operation=company.operation,
+            products=scenario.products,
+            demand=scenario.demand,
+            scoring=scenario.scoring,
+            cash=company_state.cash,
+            inventory=tuple(
+                InventoryPosition(
+                    product=product.product,
+                    quantity=_inventory_quantity(company_state, product.product),
+                )
+                for product in scenario.products
+            ),
+            public_companies=tuple(
+                PublicCompany(
+                    company_id=public.company_id,
+                    name=public.name,
+                    tier=public.tier,
+                )
+                for public in scenario.companies
+            ),
+            previous_markets=state.previous_markets,
+            runtime=scenario.runtime,
+            retail_price=retail_price,
+        )
+
+    def _expire_inventory(
+        self,
+        economy: EconomyState,
+    ) -> tuple[tuple[CompanyState, ...], tuple[InventoryExpiredEvent, ...]]:
+        companies: list[CompanyState] = []
+        events: list[InventoryExpiredEvent] = []
+        for company in economy.companies:
+            retained: list[InventoryLot] = []
+            for lot in company.inventory:
+                if lot.expires_end_of_day <= economy.day:
+                    events.append(
+                        InventoryExpiredEvent(
+                            day=economy.day,
+                            company_id=company.company_id,
+                            lot_id=lot.lot_id,
+                            product=lot.product,
+                            quantity=lot.quantity,
+                            reference_value_loss=(
+                                lot.quantity
+                                * economy.scenario.product(lot.product).reference_value
+                            ),
+                        )
+                    )
+                else:
+                    retained.append(lot)
+            companies.append(company.model_copy(update={"inventory": tuple(retained)}))
+        return tuple(companies), tuple(events)
+
+    @staticmethod
+    def _snapshot(
+        state: WorldState,
+        events: tuple[DomainEvent, ...],
         markets: tuple[MarketSummary, ...],
-        consumer_demand: Decimal,
-        consumer_sales: Decimal,
-        expired_quantity: Decimal,
+        consumer_demand: Quantity,
+        consumer_sales: Quantity,
+        expired_quantity: Quantity,
     ) -> DaySnapshot:
-        """Create an accounting projection without changing state."""
         daily_sales = {company.company_id: ZERO for company in state.scenario.companies}
         daily_expired = dict(daily_sales)
         for event in events:
@@ -1582,29 +1482,23 @@ class EconomyEngine:
                 daily_sales[event.company_id] += event.sold_quantity
             elif isinstance(event, InventoryExpiredEvent):
                 daily_expired[event.company_id] += event.quantity
-
         states = {company.company_id: company for company in state.companies}
-        snapshots: list[CompanySnapshot] = []
+        companies: list[CompanySnapshot] = []
         for company in state.scenario.companies:
-            company_state = states[company.company_id]
-            raw_quantity = self._inventory_quantity(
-                company_state,
-                ProductId.RAW_MILK,
-            )
-            bottled_quantity = self._inventory_quantity(
-                company_state,
-                ProductId.BOTTLED_MILK,
-            )
-            inventory_value = state.scenario.inventory_value(company_state.inventory)
-            net_worth = company_state.cash + inventory_value
-            snapshots.append(
+            current = states[company.company_id]
+            inventory_value = state.scenario.inventory_value(current.inventory)
+            net_worth = current.cash + inventory_value
+            companies.append(
                 CompanySnapshot(
                     day=state.day,
                     company_id=company.company_id,
                     tier=company.tier,
-                    cash=company_state.cash,
-                    raw_milk_quantity=raw_quantity,
-                    bottled_milk_quantity=bottled_quantity,
+                    cash=current.cash,
+                    raw_milk_quantity=_inventory_quantity(current, ProductId.RAW_MILK),
+                    bottled_milk_quantity=_inventory_quantity(
+                        current,
+                        ProductId.BOTTLED_MILK,
+                    ),
                     inventory_value=inventory_value,
                     net_worth=net_worth,
                     surplus=net_worth - company.initial_cash,
@@ -1614,32 +1508,12 @@ class EconomyEngine:
             )
         return DaySnapshot(
             day=state.day,
-            companies=tuple(snapshots),
+            companies=tuple(companies),
             markets=markets,
             consumer_demand=consumer_demand,
             consumer_sales=consumer_sales,
             expired_quantity=expired_quantity,
         )
-
-    @staticmethod
-    def _inventory_quantity(
-        state: CompanyState,
-        product: ProductId,
-    ) -> Decimal:
-        """Aggregate one product without exposing private lots."""
-        return sum(
-            (lot.quantity for lot in state.inventory if lot.product == product),
-            start=ZERO,
-        )
-
-    @staticmethod
-    def _observation_id(
-        state: WorldState,
-        day: int,
-        company_id: str,
-    ) -> str:
-        """Create a reproducible binding without exposing the hidden seed."""
-        return f"{state.scenario.scenario_id}|{day}|{company_id}"
 
     @staticmethod
     def _named_demand_shock(
@@ -1649,7 +1523,131 @@ class EconomyEngine:
         minimum: int,
         maximum: int,
     ) -> int:
-        """Derive a stable named random value independent of call order."""
+        """Derive stable demand without coupling it to call order."""
         stream = f"{seed}|consumer_demand|{day}|{retailer_id}".encode()
         value = int.from_bytes(hashlib.sha256(stream).digest()[:8], "big")
         return minimum + value % (maximum - minimum + 1)
+
+
+def _validate_job_time(started_at: SimTime, completes_at: SimTime) -> None:
+    if completes_at.absolute_minute <= started_at.absolute_minute:
+        raise ValueError("operation completion must follow its start")
+    if completes_at.day != started_at.day:
+        raise ValueError("operation must complete within its business day")
+
+
+def _persisted_lots(economy: EconomyState) -> Iterable[InventoryLot]:
+    """Yield every on-hand, reserved, and in-transit inventory lot."""
+    for company in economy.companies:
+        yield from company.inventory
+    for market in economy.markets:
+        for order in market.orders:
+            if isinstance(order, SellOrder):
+                yield from order.reserved_lots
+    for delivery in economy.deliveries:
+        yield from delivery.lots
+
+
+def _require_unique(values: Iterable[Hashable], label: str) -> None:
+    items = tuple(values)
+    if len(items) != len(set(items)):
+        raise ValueError(f"{label} must be unique")
+
+
+def _company_state(
+    companies: tuple[CompanyState, ...],
+    company_id: CompanyId,
+) -> CompanyState:
+    try:
+        return next(company for company in companies if company.company_id == company_id)
+    except StopIteration as error:
+        raise ValueError(f"unknown company: {company_id}") from error
+
+
+def _inventory_quantity(state: CompanyState, product: ProductId) -> Quantity:
+    return sum(
+        (lot.quantity for lot in state.inventory if lot.product is product),
+        start=ZERO,
+    )
+
+
+def _used(entries: tuple[CompanyQuantity, ...], company_id: CompanyId) -> Quantity:
+    return next(
+        (entry.quantity for entry in entries if entry.company_id == company_id),
+        ZERO,
+    )
+
+
+def _set_used(
+    entries: tuple[CompanyQuantity, ...],
+    company_id: CompanyId,
+    quantity: Quantity,
+) -> tuple[CompanyQuantity, ...]:
+    retained = tuple(entry for entry in entries if entry.company_id != company_id)
+    return (*retained, CompanyQuantity(company_id=company_id, quantity=quantity))
+
+
+def _operation_completion(job: OperationJob) -> ScheduledCompletion:
+    return ScheduledCompletion(
+        event_id=f"{job.job_id}.complete",
+        kind=SystemEventKind.OPERATION_COMPLETED,
+        at=job.completes_at,
+        reference_id=job.job_id,
+        company_id=job.company_id,
+    )
+
+
+def _validated_order_quantity(value: Decimal) -> OrderQuantity:
+    """Translate the public command value into the market's exact quantity type."""
+    try:
+        return require_order_quantity(value)
+    except InvalidOrderQuantity as error:
+        raise _CommandRejected(str(error)) from error
+
+
+def _order_is_authorized(
+    company: CompanySpec,
+    side: MarketSide,
+    product: ProductId,
+) -> bool:
+    operation = company.operation
+    return (
+        (
+            isinstance(operation, FarmOperation)
+            and side is MarketSide.SELL
+            and product is operation.output_product
+        )
+        or (
+            isinstance(operation, ProcessorOperation)
+            and (
+                (side is MarketSide.BUY and product is operation.input_product)
+                or (side is MarketSide.SELL and product is operation.output_product)
+            )
+        )
+        or (
+            isinstance(operation, RetailerOperation)
+            and side is MarketSide.BUY
+            and product is operation.input_product
+        )
+    )
+
+
+def _relevant_products(company: CompanySpec) -> tuple[ProductId, ...]:
+    operation = company.operation
+    if isinstance(operation, FarmOperation):
+        return (operation.output_product,)
+    if isinstance(operation, ProcessorOperation):
+        return (operation.input_product, operation.output_product)
+    if isinstance(operation, RetailerOperation):
+        return (operation.input_product,)
+    raise TypeError(f"unsupported company operation: {type(operation).__name__}")
+
+
+def _market_summary(market: MarketState) -> MarketSummary:
+    return MarketSummary(
+        product=market.product,
+        volume=market.volume,
+        average_price=(
+            market.traded_value / market.volume if market.volume > ZERO else None
+        ),
+    )

@@ -9,7 +9,13 @@ from typing import Self
 from pydantic import Field, model_validator
 
 from company_bench.models import CompanyId, Identifier, StrictModel
-from company_bench.runtime_models import SimTime, SystemEventKind, WakeReason
+from company_bench.runtime_models import (
+    JournalEntryReference,
+    SimTime,
+    SystemEventKind,
+    WakeReason,
+    WakeSignal,
+)
 
 __all__ = ["ScheduledEvent", "Scheduler", "SchedulerCheckpoint"]
 
@@ -22,19 +28,24 @@ class ScheduledEvent(StrictModel):
     sequence: int = Field(ge=1)
     kind: SystemEventKind
     company_id: CompanyId | None = None
-    wake_reasons: tuple[WakeReason, ...] = ()
+    wake_signals: tuple[WakeSignal, ...] = ()
     reference_ids: tuple[Identifier, ...] = ()
+
+    @property
+    def wake_reasons(self) -> tuple[WakeReason, ...]:
+        """Return unique reasons in causal-signal order."""
+        return tuple(dict.fromkeys(signal.reason for signal in self.wake_signals))
 
     @model_validator(mode="after")
     def validate_shape(self) -> Self:
         """Keep wake-only fields exclusive to company wake events."""
         is_wake = self.kind is SystemEventKind.COMPANY_WAKE
-        if is_wake and (self.company_id is None or not self.wake_reasons):
-            raise ValueError("company wake events require company_id and wake_reasons")
-        if not is_wake and self.wake_reasons:
-            raise ValueError("wake_reasons are only valid on company wake events")
-        if len(self.wake_reasons) != len(set(self.wake_reasons)):
-            raise ValueError("wake_reasons must be unique")
+        if is_wake and (self.company_id is None or not self.wake_signals):
+            raise ValueError("company wake events require company_id and wake_signals")
+        if not is_wake and self.wake_signals:
+            raise ValueError("wake_signals are only valid on company wake events")
+        if is_wake and self.reference_ids:
+            raise ValueError("company wake references belong to their wake_signals")
         if len(self.reference_ids) != len(set(self.reference_ids)):
             raise ValueError("reference_ids must be unique")
         return self
@@ -124,25 +135,32 @@ class Scheduler:
         at: SimTime,
         reason: WakeReason,
         *,
+        source: JournalEntryReference | None = None,
         reference_ids: Iterable[Identifier] = (),
     ) -> ScheduledEvent:
         """Schedule or merge one company's wake at an absolute minute."""
         clamped = self._clamp(at)
         key = (clamped.absolute_minute, company_id)
         existing_id = self._wake_event_ids.get(key)
-        references = self._unique(reference_ids)
+        signal = WakeSignal(
+            reason=reason,
+            source=source,
+            reference_ids=self._unique(reference_ids),
+        )
         if existing_id is not None:
             existing = self._events[existing_id]
-            reasons = self._unique((*existing.wake_reasons, reason))
-            merged_references = self._unique((*existing.reference_ids, *references))
+            signals = (
+                existing.wake_signals
+                if signal in existing.wake_signals
+                else (*existing.wake_signals, signal)
+            )
             merged = ScheduledEvent(
                 event_id=existing.event_id,
                 at=existing.at,
                 sequence=existing.sequence,
                 kind=existing.kind,
                 company_id=existing.company_id,
-                wake_reasons=reasons,
-                reference_ids=merged_references,
+                wake_signals=signals,
             )
             self._events[existing_id] = merged
             return merged
@@ -154,8 +172,7 @@ class Scheduler:
             sequence=sequence,
             kind=SystemEventKind.COMPANY_WAKE,
             company_id=company_id,
-            wake_reasons=(reason,),
-            reference_ids=references,
+            wake_signals=(signal,),
         )
         self._insert_new(event)
         self._wake_event_ids[key] = event.event_id

@@ -4,7 +4,7 @@ import pytest
 
 from company_bench.agents import BaselineCompanyAgent
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
 from company_bench.models import PolicyKind
 from company_bench.policy_factory import PolicyFactory
 from company_bench.repository import MemoryRunRepository
@@ -28,8 +28,8 @@ async def _wait_for_terminal(
 
 def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
     repository = MemoryRunRepository()
-    factory = PolicyFactory(DAIRY_S12_V2_SCENARIO, repository)
-    runtime = EpisodeRuntime(DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1}))
+    factory = PolicyFactory(DAIRY_S12_V3_SCENARIO, repository)
+    runtime = EpisodeRuntime(DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1}))
 
     with pytest.raises(ValueError, match="factory scenarios must match"):
         RunCoordinator(repository, factory, runtime)
@@ -37,7 +37,7 @@ def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
-    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -88,7 +88,7 @@ class _InterruptAfterCheckpoint:
 
 @pytest.mark.asyncio
 async def test_start_resumes_a_v2_checkpoint_to_completion() -> None:
-    scenario = DAIRY_S12_V2_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
     runtime = EpisodeRuntime(scenario)
     seed = 18
     run_id = "restart_resume"

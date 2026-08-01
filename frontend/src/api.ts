@@ -5,13 +5,15 @@ import type {
   CompanyResultView,
   CompanyRole,
   DailySnapshotView,
+  DecimalText,
   EconomicEffectView,
   EpisodeView,
   InvocationOutcome,
   JsonValue,
+  MarketMatchLegView,
   PolicyMode,
   PolicyProfileView,
-  RunProgressView,
+  RunJobView,
   RunRequest,
   RunStatus,
   SystemTimelineItemView,
@@ -29,7 +31,7 @@ import type {
 import { companyLabel } from "./domainLabels";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
-type ProgressListener = (progress: RunProgressView) => void;
+type ProgressListener = (progress: RunJobView) => void;
 
 interface InvocationUsageView {
   readonly model: string;
@@ -44,6 +46,8 @@ const ACTIVE_STATUSES: readonly RunStatus[] = [
   "running",
   "interrupted",
 ];
+const DECIMAL_TEXT_PATTERN =
+  /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
 export class ApiError extends Error {
   public constructor(
@@ -71,7 +75,7 @@ export class DairyBenchApi {
     request: RunRequest,
     onProgress: ProgressListener,
     signal?: AbortSignal,
-  ): Promise<EpisodeView> {
+  ): Promise<RunJobView> {
     const response = await fetch(`${this.baseUrl}/api/runs`, {
       body: JSON.stringify(runRequestPayload(request)),
       headers: { "Content-Type": "application/json" },
@@ -84,11 +88,11 @@ export class DairyBenchApi {
       throw new ApiError(errorMessage(payload, response.status), response.status);
     }
 
-    let progress = parseRunProgress(payload);
+    let progress = parseRunJob(payload);
     onProgress(progress);
     while (ACTIVE_STATUSES.includes(progress.status)) {
       await delay(POLL_INTERVAL_MS, signal);
-      progress = parseRunProgress(
+      progress = parseRunJob(
         await this.getJson(`/api/run-jobs/${progress.runId}`, signal),
       );
       onProgress(progress);
@@ -101,9 +105,36 @@ export class DairyBenchApi {
       );
     }
 
+    return progress;
+  }
+
+  public async runJobs(
+    limit = 100,
+    signal?: AbortSignal,
+  ): Promise<readonly RunJobView[]> {
+    const payload = await this.getJson(`/api/run-jobs?limit=${limit}`, signal);
+    return array(payload, "RunJob[]").map(parseRunJob);
+  }
+
+  public async runJob(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    const payload = await this.getJson(
+      `/api/run-jobs/${encodeURIComponent(runId)}`,
+      signal,
+    );
+    return parseRunJob(payload);
+  }
+
+  public async episode(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<EpisodeView> {
+    const encodedRunId = encodeURIComponent(runId);
     const [episode, invocations] = await Promise.all([
-      this.getJson(`/api/runs/${progress.runId}`, signal),
-      this.getJson(`/api/runs/${progress.runId}/invocations`, signal),
+      this.getJson(`/api/runs/${encodedRunId}`, signal),
+      this.getJson(`/api/runs/${encodedRunId}/invocations`, signal),
     ]);
     return parseEpisode(episode, parseInvocations(invocations));
   }
@@ -168,13 +199,21 @@ function parsePolicyProfile(
   };
 }
 
-function parseRunProgress(payload: unknown): RunProgressView {
+function parseRunJob(payload: unknown): RunJobView {
   const job = record(payload, "RunJob");
   return {
     runId: text(job.run_id, "run_id"),
+    revision: number(job.revision, "revision"),
+    mode: policyMode(job.mode, "mode"),
     status: runStatus(job.status, "status"),
+    seed: number(job.seed, "seed"),
+    sourceRunId: nullableText(job.source_run_id, "source_run_id"),
+    scenarioId: text(job.scenario_id, "scenario_id"),
     currentDay: number(job.current_day ?? 0, "current_day"),
     totalDays: number(job.total_days ?? 30, "total_days"),
+    submittedAt: dateTime(job.submitted_at, "submitted_at"),
+    startedAt: nullableDateTime(job.started_at, "started_at"),
+    finishedAt: nullableDateTime(job.finished_at, "finished_at"),
     errorMessage: optionalText(job.error_message) ?? optionalText(job.error),
   };
 }
@@ -479,6 +518,14 @@ function parseTimelineContext(
       context.source_usage,
       `${path}.source_usage`,
     ),
+    checkpointMinute:
+      context.checkpoint_at === null
+        ? null
+        : simMinute(context.checkpoint_at, `${path}.checkpoint_at`),
+    checkpointStateVersion: nullableNumber(
+      context.checkpoint_state_version,
+      `${path}.checkpoint_state_version`,
+    ),
   };
 }
 
@@ -498,9 +545,15 @@ function parseTimelineDaySummary(
       `${path}.system_step_count`,
     ),
     eventCount: number(summary.event_count, `${path}.event_count`),
-    tradeQuantity: number(summary.trade_quantity, `${path}.trade_quantity`),
-    consumerSales: number(summary.consumer_sales, `${path}.consumer_sales`),
-    expiredQuantity: number(
+    tradeQuantity: decimalText(
+      summary.trade_quantity,
+      `${path}.trade_quantity`,
+    ),
+    consumerSales: decimalText(
+      summary.consumer_sales,
+      `${path}.consumer_sales`,
+    ),
+    expiredQuantity: decimalText(
       summary.expired_quantity,
       `${path}.expired_quantity`,
     ),
@@ -522,6 +575,136 @@ function parseTimelineMoment(
     ),
     turns: rawTurns.map((value, index) =>
       parseTurnTimelineItem(value, `${path}.turns[${index}]`),
+    ),
+    market: parseMarketFrame(moment.market, `${path}.market`),
+  };
+}
+
+function parseMarketFrame(
+  payload: unknown,
+  path: string,
+): TimelineMomentView["market"] {
+  const frame = record(payload, path);
+  return {
+    stateVersion: number(frame.state_version, `${path}.state_version`),
+    orderFlow: array(frame.order_flow, `${path}.order_flow`).map((value, index) =>
+      parseMarketOrderFlow(value, `${path}.order_flow[${index}]`),
+    ),
+    trades: array(frame.trades, `${path}.trades`).map((value, index) =>
+      parseTimelineTrade(value, `${path}.trades[${index}]`),
+    ),
+    closingOrderBooks: array(
+      frame.closing_order_books,
+      `${path}.closing_order_books`,
+    ).map((value, index) =>
+      parseObserverOrderBook(value, `${path}.closing_order_books[${index}]`),
+    ),
+  };
+}
+
+function parseMarketOrderFlow(
+  payload: unknown,
+  path: string,
+): TimelineMomentView["market"]["orderFlow"][number] {
+  const flow = record(payload, path);
+  const action = text(flow.action, `${path}.action`);
+  const applySequence = number(flow.apply_sequence, `${path}.apply_sequence`);
+  if (action === "cancel") {
+    return {
+      action,
+      applySequence,
+      cancelledOrder: parseOpenOrder(flow.cancelled_order, `${path}.cancelled_order`),
+    };
+  }
+  if (action !== "place" && action !== "replace") {
+    throw new Error(`Backend field ${path}.action is not a market order action.`);
+  }
+  const applied = {
+    applySequence,
+    incomingOrder: parseOpenOrder(flow.incoming_order, `${path}.incoming_order`),
+    matches: array(flow.matches, `${path}.matches`).map((value, index) =>
+      parseMarketMatch(value, `${path}.matches[${index}]`),
+    ),
+    matchedQuantity: decimalText(flow.matched_quantity, `${path}.matched_quantity`),
+    remainingQuantity: decimalText(
+      flow.remaining_quantity,
+      `${path}.remaining_quantity`,
+    ),
+  };
+  return action === "place"
+    ? { action, ...applied }
+    : {
+        action,
+        ...applied,
+        replacedOrder: parseOpenOrder(flow.replaced_order, `${path}.replaced_order`),
+      };
+}
+
+function parseMarketMatch(
+  payload: unknown,
+  path: string,
+): MarketMatchLegView {
+  const match = record(payload, path);
+  return {
+    tradeId: text(match.trade_id, `${path}.trade_id`),
+    makerOrder: parseOpenOrder(match.maker_order, `${path}.maker_order`),
+    quantity: decimalText(match.quantity, `${path}.quantity`),
+    unitPrice: decimalText(match.unit_price, `${path}.unit_price`),
+  };
+}
+
+function parseTimelineTrade(
+  payload: unknown,
+  path: string,
+): TimelineMomentView["market"]["trades"][number] {
+  const trade = record(payload, path);
+  return {
+    applySequence: number(trade.apply_sequence, `${path}.apply_sequence`),
+    tradeId: text(trade.trade_id, `${path}.trade_id`),
+    makerOrderId: text(trade.maker_order_id, `${path}.maker_order_id`),
+    takerOrderId: text(trade.taker_order_id, `${path}.taker_order_id`),
+    product: text(trade.product, `${path}.product`),
+    sellerId: text(trade.seller_id, `${path}.seller_id`),
+    buyerId: text(trade.buyer_id, `${path}.buyer_id`),
+    quantity: decimalText(trade.quantity, `${path}.quantity`),
+    unitPrice: decimalText(trade.unit_price, `${path}.unit_price`),
+    arrivesAtMinute: simMinute(trade.arrives_at, `${path}.arrives_at`),
+  };
+}
+
+function parseObserverOrderBook(
+  payload: unknown,
+  path: string,
+): TimelineMomentView["market"]["closingOrderBooks"][number] {
+  const book = record(payload, path);
+  return {
+    product: text(book.product, `${path}.product`),
+    bids: array(book.bids, `${path}.bids`).map((value, index) =>
+      parseMarketPriceLevel(value, `${path}.bids[${index}]`),
+    ),
+    asks: array(book.asks, `${path}.asks`).map((value, index) =>
+      parseMarketPriceLevel(value, `${path}.asks[${index}]`),
+    ),
+    lastTradePrice: nullableDecimalText(
+      book.last_trade_price,
+      `${path}.last_trade_price`,
+    ),
+    bestBid: nullableDecimalText(book.best_bid, `${path}.best_bid`),
+    bestAsk: nullableDecimalText(book.best_ask, `${path}.best_ask`),
+    spread: nullableDecimalText(book.spread, `${path}.spread`),
+  };
+}
+
+function parseMarketPriceLevel(
+  payload: unknown,
+  path: string,
+): TimelineMomentView["market"]["closingOrderBooks"][number]["bids"][number] {
+  const level = record(payload, path);
+  return {
+    unitPrice: decimalText(level.unit_price, `${path}.unit_price`),
+    size: decimalText(level.size, `${path}.size`),
+    orders: array(level.orders, `${path}.orders`).map((value, index) =>
+      parseOpenOrder(value, `${path}.orders[${index}]`),
     ),
   };
 }
@@ -578,6 +761,8 @@ function parseTurnTimelineItem(
     command: parseTimelineCommand(item.command, `${path}.command`),
     accepted: boolean(outcome.accepted, `${path}.outcome.accepted`),
     reason: nullableText(outcome.reason, `${path}.outcome.reason`),
+    outcomeOrderId: nullableText(outcome.order_id, `${path}.outcome.order_id`),
+    outcomeJobId: nullableText(outcome.job_id, `${path}.outcome.job_id`),
     effects: parseTimelineEffects(item.effects, `${path}.effects`),
     stateChanges: array(item.state_changes, `${path}.state_changes`).map(
       (value, index) =>
@@ -635,6 +820,9 @@ function parseSystemTimelineItem(
       item.state_version_after,
       `${path}.state_version_after`,
     ),
+    referenceIds: array(item.reference_ids, `${path}.reference_ids`).map(
+      (value, index) => text(value, `${path}.reference_ids[${index}]`),
+    ),
     effects: parseTimelineEffects(item.effects, `${path}.effects`),
     affectedCompanyIds: array(
       item.affected_company_ids,
@@ -642,7 +830,7 @@ function parseSystemTimelineItem(
     ).map((value, index) =>
       text(value, `${path}.affected_company_ids[${index}]`),
     ),
-    reconstructed: boolean(item.reconstructed, `${path}.reconstructed`),
+    reconstructed: false,
     title: text(item.title, `${path}.title`),
     summary: text(item.summary, `${path}.summary`),
   };
@@ -684,23 +872,43 @@ function parseObservation(
 ): TurnTimelineItemView["observation"] {
   const observation = record(payload, path);
   return {
-    cash: number(observation.cash, `${path}.cash`),
-    inventory: Object.fromEntries(
-      array(observation.inventory, `${path}.inventory`).map((value, index) => {
-        const position = record(value, `${path}.inventory[${index}]`);
-        return [
-          text(position.product, `${path}.inventory[${index}].product`),
-          number(position.quantity, `${path}.inventory[${index}].quantity`),
-        ];
-      }),
+    cash: decimalText(observation.cash, `${path}.cash`),
+    reservedCash: decimalText(
+      observation.reserved_cash,
+      `${path}.reserved_cash`,
     ),
-    retailPrice: nullableNumber(
+    inventory: parseInventoryPositions(observation.inventory, `${path}.inventory`),
+    reservedInventory: parseInventoryPositions(
+      observation.reserved_inventory,
+      `${path}.reserved_inventory`,
+    ),
+    retailPrice: nullableDecimalText(
       observation.retail_price,
       `${path}.retail_price`,
     ),
     openOrders: array(observation.open_orders, `${path}.open_orders`).map(
       (value, index) =>
         parseOpenOrder(value, `${path}.open_orders[${index}]`),
+    ),
+    marketViews: array(observation.market_views, `${path}.market_views`).map(
+      (value, index) => parseMarketView(value, `${path}.market_views[${index}]`),
+    ),
+    pendingDeliveries: array(
+      observation.pending_deliveries,
+      `${path}.pending_deliveries`,
+    ).map((value, index) =>
+      parseIncomingDelivery(value, `${path}.pending_deliveries[${index}]`),
+    ),
+    activeOperation:
+      observation.active_operation === null
+        ? null
+        : parseOperationJob(
+            observation.active_operation,
+            `${path}.active_operation`,
+          ),
+    remainingOperationCapacity: nullableDecimalText(
+      observation.remaining_operation_capacity,
+      `${path}.remaining_operation_capacity`,
     ),
     visibleEventCount: number(
       observation.visible_event_count,
@@ -727,12 +935,112 @@ function parseOpenOrder(
     ownerId: text(order.owner_id, `${path}.owner_id`),
     side,
     product: text(order.product, `${path}.product`),
-    remainingQuantity: number(
+    remainingQuantity: decimalText(
       order.remaining_quantity,
       `${path}.remaining_quantity`,
     ),
-    limitPrice: number(order.limit_price, `${path}.limit_price`),
+    limitPrice: decimalText(order.limit_price, `${path}.limit_price`),
     placedAtMinute: simMinute(order.placed_at, `${path}.placed_at`),
+    prioritySequence: number(
+      order.priority_sequence,
+      `${path}.priority_sequence`,
+    ),
+  };
+}
+
+function parseInventoryPositions(
+  payload: unknown,
+  path: string,
+): Readonly<Record<string, DecimalText>> {
+  return Object.fromEntries(
+    array(payload, path).map((value, index) => {
+      const itemPath = `${path}[${index}]`;
+      const position = record(value, itemPath);
+      return [
+        text(position.product, `${itemPath}.product`),
+        decimalText(position.quantity, `${itemPath}.quantity`),
+      ];
+    }),
+  );
+}
+
+function parseMarketView(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["marketViews"][number] {
+  const market = record(payload, path);
+  return {
+    product: text(market.product, `${path}.product`),
+    bestBid: nullableDecimalText(market.best_bid, `${path}.best_bid`),
+    bestAsk: nullableDecimalText(market.best_ask, `${path}.best_ask`),
+    topBids: parsePriceLevels(market.top_bids, `${path}.top_bids`),
+    topAsks: parsePriceLevels(market.top_asks, `${path}.top_asks`),
+    lastTradePrice: nullableDecimalText(
+      market.last_trade_price,
+      `${path}.last_trade_price`,
+    ),
+    dailyVolume: decimalText(market.daily_volume, `${path}.daily_volume`),
+  };
+}
+
+function parsePriceLevels(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["marketViews"][number]["topBids"] {
+  return array(payload, path).map((value, index) => {
+    const itemPath = `${path}[${index}]`;
+    const level = record(value, itemPath);
+    return {
+      unitPrice: decimalText(level.unit_price, `${itemPath}.unit_price`),
+      quantity: decimalText(level.quantity, `${itemPath}.quantity`),
+    };
+  });
+}
+
+function parseIncomingDelivery(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["pendingDeliveries"][number] {
+  const delivery = record(payload, path);
+  return {
+    tradeId: text(delivery.trade_id, `${path}.trade_id`),
+    product: text(delivery.product, `${path}.product`),
+    quantity: decimalText(delivery.quantity, `${path}.quantity`),
+    arrivesAtMinute: simMinute(delivery.arrives_at, `${path}.arrives_at`),
+    expiryBuckets: array(delivery.expiry_buckets, `${path}.expiry_buckets`).map(
+      (value, index) => {
+        const bucketPath = `${path}.expiry_buckets[${index}]`;
+        const bucket = record(value, bucketPath);
+        return {
+          quantity: decimalText(bucket.quantity, `${bucketPath}.quantity`),
+          expiresEndOfDay: number(
+            bucket.expires_end_of_day,
+            `${bucketPath}.expires_end_of_day`,
+          ),
+        };
+      },
+    ),
+  };
+}
+
+function parseOperationJob(
+  payload: unknown,
+  path: string,
+): NonNullable<TurnTimelineItemView["observation"]["activeOperation"]> {
+  const operation = record(payload, path);
+  const kind = text(operation.kind, `${path}.kind`);
+  if (kind !== "production" && kind !== "transformation") {
+    throw new Error(`Backend field ${path}.kind is not an operation kind.`);
+  }
+  return {
+    jobId: text(operation.job_id, `${path}.job_id`),
+    kind,
+    completesAtMinute: simMinute(operation.completes_at, `${path}.completes_at`),
+    outputProduct: text(operation.output_product, `${path}.output_product`),
+    outputQuantity: decimalText(
+      operation.output_quantity,
+      `${path}.output_quantity`,
+    ),
   };
 }
 
@@ -742,26 +1050,26 @@ function parseObservationDelta(
 ): TurnTimelineItemView["observationDelta"] {
   const delta = record(payload, path);
   return {
-    cashBefore: nullableNumber(delta.cash_before, `${path}.cash_before`),
-    cashAfter: number(delta.cash_after, `${path}.cash_after`),
-    cashChange: nullableNumber(delta.cash_change, `${path}.cash_change`),
+    cashBefore: nullableDecimalText(delta.cash_before, `${path}.cash_before`),
+    cashAfter: decimalText(delta.cash_after, `${path}.cash_after`),
+    cashChange: nullableDecimalText(delta.cash_change, `${path}.cash_change`),
     inventory: array(delta.inventory, `${path}.inventory`).map(
       (value, index) => {
         const itemPath = `${path}.inventory[${index}]`;
         const item = record(value, itemPath);
         return {
           product: text(item.product, `${itemPath}.product`),
-          before: nullableNumber(item.before, `${itemPath}.before`),
-          after: number(item.after, `${itemPath}.after`),
-          change: nullableNumber(item.change, `${itemPath}.change`),
+          before: nullableDecimalText(item.before, `${itemPath}.before`),
+          after: decimalText(item.after, `${itemPath}.after`),
+          change: nullableDecimalText(item.change, `${itemPath}.change`),
         };
       },
     ),
-    retailPriceBefore: nullableNumber(
+    retailPriceBefore: nullableDecimalText(
       delta.retail_price_before,
       `${path}.retail_price_before`,
     ),
-    retailPriceAfter: nullableNumber(
+    retailPriceAfter: nullableDecimalText(
       delta.retail_price_after,
       `${path}.retail_price_after`,
     ),
@@ -788,69 +1096,82 @@ function parseTimelineEffects(
       return {
         kind,
         companyId: text(effect.company_id, `${effectPath}.company_id`),
-        requestedQuantity: number(
+        requestedQuantity: decimalText(
           effect.requested_quantity,
           `${effectPath}.requested_quantity`,
         ),
-        actualQuantity: number(
+        actualQuantity: decimalText(
           effect.actual_quantity,
           `${effectPath}.actual_quantity`,
         ),
-        unitCost: number(effect.unit_cost, `${effectPath}.unit_cost`),
-        cashCost: number(effect.cash_cost, `${effectPath}.cash_cost`),
+        unitCost: decimalText(effect.unit_cost, `${effectPath}.unit_cost`),
+        cashCost: decimalText(effect.cash_cost, `${effectPath}.cash_cost`),
       };
     }
     if (kind === "trade_executed") {
       return {
         kind,
+        tradeId: text(effect.trade_id, `${effectPath}.trade_id`),
         sellerId: text(effect.seller_id, `${effectPath}.seller_id`),
         buyerId: text(effect.buyer_id, `${effectPath}.buyer_id`),
         product: text(effect.product, `${effectPath}.product`),
-        quantity: number(effect.quantity, `${effectPath}.quantity`),
-        unitPrice: number(effect.unit_price, `${effectPath}.unit_price`),
-        totalValue: number(effect.total_value, `${effectPath}.total_value`),
+        quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
+        unitPrice: decimalText(effect.unit_price, `${effectPath}.unit_price`),
+        totalValue: decimalText(
+          effect.total_value,
+          `${effectPath}.total_value`,
+        ),
+      };
+    }
+    if (kind === "delivery_completed") {
+      return {
+        kind,
+        tradeId: text(effect.trade_id, `${effectPath}.trade_id`),
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        product: text(effect.product, `${effectPath}.product`),
+        quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
       };
     }
     if (kind === "milk_processed") {
       return {
         kind,
         companyId: text(effect.company_id, `${effectPath}.company_id`),
-        requestedInput: number(
+        requestedInput: decimalText(
           effect.requested_input,
           `${effectPath}.requested_input`,
         ),
-        actualInput: number(
+        actualInput: decimalText(
           effect.actual_input,
           `${effectPath}.actual_input`,
         ),
-        outputQuantity: number(
+        outputQuantity: decimalText(
           effect.output_quantity,
           `${effectPath}.output_quantity`,
         ),
-        cashCost: number(effect.cash_cost, `${effectPath}.cash_cost`),
+        cashCost: decimalText(effect.cash_cost, `${effectPath}.cash_cost`),
       };
     }
     if (kind === "consumer_sale") {
       return {
         kind,
         companyId: text(effect.company_id, `${effectPath}.company_id`),
-        potentialDemand: number(
+        potentialDemand: decimalText(
           effect.potential_demand_quantity,
           `${effectPath}.potential_demand_quantity`,
         ),
-        demandQuantity: number(
+        demandQuantity: decimalText(
           effect.demand_quantity,
           `${effectPath}.demand_quantity`,
         ),
-        soldQuantity: number(
+        soldQuantity: decimalText(
           effect.sold_quantity,
           `${effectPath}.sold_quantity`,
         ),
-        retailPrice: nullableNumber(
+        retailPrice: nullableDecimalText(
           effect.retail_price,
           `${effectPath}.retail_price`,
         ),
-        revenue: number(effect.revenue, `${effectPath}.revenue`),
+        revenue: decimalText(effect.revenue, `${effectPath}.revenue`),
       };
     }
     if (kind === "inventory_expired") {
@@ -858,8 +1179,8 @@ function parseTimelineEffects(
         kind,
         companyId: text(effect.company_id, `${effectPath}.company_id`),
         product: text(effect.product, `${effectPath}.product`),
-        quantity: number(effect.quantity, `${effectPath}.quantity`),
-        valueLoss: number(
+        quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
+        valueLoss: decimalText(
           effect.reference_value_loss,
           `${effectPath}.reference_value_loss`,
         ),
@@ -886,7 +1207,7 @@ function parseTimelineCommand(
     return {
       kind,
       product: text(command.product, `${path}.product`),
-      quantity: number(command.quantity, `${path}.quantity`),
+      quantity: decimalText(command.quantity, `${path}.quantity`),
     };
   }
   if (kind === "transform") {
@@ -894,7 +1215,7 @@ function parseTimelineCommand(
       kind,
       inputProduct: text(command.input_product, `${path}.input_product`),
       outputProduct: text(command.output_product, `${path}.output_product`),
-      inputQuantity: number(
+      inputQuantity: decimalText(
         command.input_quantity,
         `${path}.input_quantity`,
       ),
@@ -909,8 +1230,8 @@ function parseTimelineCommand(
       kind,
       side,
       product: text(command.product, `${path}.product`),
-      quantity: number(command.quantity, `${path}.quantity`),
-      limitPrice: number(command.limit_price, `${path}.limit_price`),
+      quantity: decimalText(command.quantity, `${path}.quantity`),
+      limitPrice: decimalText(command.limit_price, `${path}.limit_price`),
     };
   }
   if (kind === "cancel_order") {
@@ -919,11 +1240,19 @@ function parseTimelineCommand(
       orderId: text(command.order_id, `${path}.order_id`),
     };
   }
+  if (kind === "replace_order") {
+    return {
+      kind,
+      orderId: text(command.order_id, `${path}.order_id`),
+      quantity: decimalText(command.quantity, `${path}.quantity`),
+      limitPrice: decimalText(command.limit_price, `${path}.limit_price`),
+    };
+  }
   if (kind === "set_retail_price") {
     return {
       kind,
       product: text(command.product, `${path}.product`),
-      unitPrice: number(command.unit_price, `${path}.unit_price`),
+      unitPrice: decimalText(command.unit_price, `${path}.unit_price`),
     };
   }
   if (kind === "wait") {
@@ -976,8 +1305,8 @@ function parseCommandStateChange(
       orderId: text(change.order_id, `${path}.order_id`),
       side,
       product: text(change.product, `${path}.product`),
-      quantity: number(change.quantity, `${path}.quantity`),
-      limitPrice: number(change.limit_price, `${path}.limit_price`),
+      quantity: decimalText(change.quantity, `${path}.quantity`),
+      limitPrice: decimalText(change.limit_price, `${path}.limit_price`),
     };
   }
   if (changeType === "order_cancelled") {
@@ -986,12 +1315,27 @@ function parseCommandStateChange(
       orderId: text(change.order_id, `${path}.order_id`),
     };
   }
+  if (changeType === "order_replaced") {
+    return {
+      changeType,
+      replacedOrderId: text(
+        change.replaced_order_id,
+        `${path}.replaced_order_id`,
+      ),
+      orderId: text(change.order_id, `${path}.order_id`),
+      quantity: decimalText(change.quantity, `${path}.quantity`),
+      limitPrice: decimalText(change.limit_price, `${path}.limit_price`),
+    };
+  }
   if (changeType === "retail_price_changed") {
     return {
       changeType,
       product: text(change.product, `${path}.product`),
-      before: nullableNumber(change.before, `${path}.before`),
-      after: number(change.after, `${path}.after`),
+      before:
+        change.before === null
+          ? null
+          : decimalText(change.before, `${path}.before`),
+      after: decimalText(change.after, `${path}.after`),
     };
   }
   throw new Error(`Backend field ${path}.change_type is not a state change.`);
@@ -1138,6 +1482,14 @@ function number(value: unknown, path: string): number {
   return parsed;
 }
 
+function decimalText(value: unknown, path: string): DecimalText {
+  const parsed = plainText(value, path);
+  if (parsed.trim() !== parsed || !DECIMAL_TEXT_PATTERN.test(parsed)) {
+    throw new Error(`Backend field ${path} must be finite decimal text.`);
+  }
+  return parsed as DecimalText;
+}
+
 function boolean(value: unknown, path: string): boolean {
   if (typeof value !== "boolean") {
     throw new Error(`Backend field ${path} must be a boolean.`);
@@ -1200,6 +1552,27 @@ function nullableText(value: unknown, path: string): string | null {
 
 function nullableNumber(value: unknown, path: string): number | null {
   return value === null || value === undefined ? null : number(value, path);
+}
+
+function nullableDecimalText(
+  value: unknown,
+  path: string,
+): DecimalText | null {
+  return value === null || value === undefined
+    ? null
+    : decimalText(value, path);
+}
+
+function dateTime(value: unknown, path: string): string {
+  const parsed = text(value, path);
+  if (Number.isNaN(Date.parse(parsed))) {
+    throw new Error(`Backend field ${path} is not a valid date-time.`);
+  }
+  return parsed;
+}
+
+function nullableDateTime(value: unknown, path: string): string | null {
+  return value === null || value === undefined ? null : dateTime(value, path);
 }
 
 function plainText(value: unknown, path: string): string {

@@ -1,13 +1,13 @@
 import asyncio
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from company_bench.application import DairyBenchmark, RunService
-from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
+from company_bench.agents import BaselineCompanyAgent
+from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.memory import AgentCheckpoint
 from company_bench.models import (
@@ -30,6 +30,7 @@ from company_bench.run_models import (
     RunJob,
     RunStatus,
 )
+from company_bench.runtime import EpisodeRuntime
 from company_bench.runtime_models import (
     AgentTurn,
     CommandEnvelope,
@@ -41,17 +42,22 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 from company_bench.scheduler import SchedulerCheckpoint
-from tests.scenarios import LEGACY_S12_SCENARIO
 
 
 def run_episode(seed: int = 42) -> EpisodeResult:
-    """Create one real episode through the public application service."""
-    repository = MemoryRunRepository()
-    service = RunService(
-        repository,
-        DairyBenchmark(LEGACY_S12_SCENARIO),
+    """Create one real V3 episode through the public runtime interface."""
+    agents = {
+        company.company_id: BaselineCompanyAgent()
+        for company in DAIRY_S12_V3_SCENARIO.companies
+    }
+    execution = asyncio.run(
+        EpisodeRuntime(DAIRY_S12_V3_SCENARIO).run(
+            agents,
+            seed,
+            run_id=f"repository_{seed}",
+        )
     )
-    return asyncio.run(service.run(seed))
+    return execution.episode
 
 
 def test_memory_repository_round_trip_and_summary() -> None:
@@ -64,6 +70,25 @@ def test_memory_repository_round_trip_and_summary() -> None:
     assert repository.get("missing") is None
     assert repository.list()[0].run_id == result.run_id
     assert repository.list(0) == ()
+
+
+def test_memory_repository_lists_every_job_status_newest_first() -> None:
+    repository = MemoryRunRepository()
+    jobs = _history_jobs()
+
+    _assert_job_history(repository, jobs)
+
+
+def test_sqlite_repository_job_history_survives_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "job-history.sqlite3"
+    jobs = _history_jobs()
+
+    with SQLiteRunRepository(database) as repository:
+        _assert_job_history(repository, jobs)
+
+    with SQLiteRunRepository(database) as reopened:
+        assert reopened.list_jobs() == tuple(reversed(jobs))
+        assert reopened.list_jobs(2) == tuple(reversed(jobs[-2:]))
 
 
 def test_memory_repository_turn_journal_and_checkpoint_contract(
@@ -242,6 +267,38 @@ def _assert_turn_contract(
     assert repository.list_turns("missing") == ()
 
 
+def _assert_job_history(
+    repository: LifecycleRepository,
+    jobs: tuple[RunJob, ...],
+) -> None:
+    """Exercise all-state discovery, ordering, and limit semantics."""
+    for job in reversed(jobs):
+        repository.save_job(job)
+
+    expected = tuple(reversed(jobs))
+    assert repository.list_jobs() == expected
+    assert repository.list_jobs(2) == expected[:2]
+    assert repository.list_jobs(0) == ()
+    assert {job.status for job in repository.list_jobs()} == set(RunStatus)
+
+
+def _history_jobs() -> tuple[RunJob, ...]:
+    """Build one lifecycle record for every status in submission order."""
+    submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
+    return tuple(
+        RunJob(
+            run_id=f"history_{status.value}",
+            mode=PolicyKind.BASELINE,
+            status=status,
+            seed=sequence,
+            scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S12_V3_SCENARIO.days,
+            submitted_at=submitted_at + timedelta(minutes=sequence),
+        )
+        for sequence, status in enumerate(RunStatus)
+    )
+
+
 def _assert_checkpoint_contract(
     repository: LifecycleRepository,
     checkpoint: RunCheckpoint,
@@ -342,6 +399,7 @@ def _turn_for(
         state_version=sequence - 1,
         wake_reasons=(WakeReason.DAY_OPEN if sequence == 1 else WakeReason.CONTINUE,),
         observation=observation,
+        available_cash=observation.cash,
     )
     envelope = CommandEnvelope(
         turn_id=turn_id,
@@ -377,7 +435,7 @@ def _checkpoint_for(
 ) -> RunCheckpoint:
     """Build a complete, versioned recovery payload around one turn."""
     engine = EconomyEngine()
-    world = engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42)
+    world = engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=42)
     return RunCheckpoint(
         run_id=record.run_id,
         episode_started_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -396,7 +454,7 @@ def _checkpoint_for(
                     else PolicyKind.BASELINE
                 ),
             )
-            for company in DAIRY_S12_V2_SCENARIO.companies
+            for company in DAIRY_S12_V3_SCENARIO.companies
         ),
         agent_states=(
             AgentCheckpoint(
@@ -413,7 +471,7 @@ def _checkpoint_for(
                 company_id=company.company_id,
                 next_turn_sequence=(2 if company.company_id == observation.company_id else 1),
             )
-            for company in DAIRY_S12_V2_SCENARIO.companies
+            for company in DAIRY_S12_V3_SCENARIO.companies
         ),
     )
 

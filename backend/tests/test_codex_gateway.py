@@ -200,6 +200,7 @@ def _command_request(observation: CompanyObservation) -> CommandModelRequest:
         state_version=0,
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=observation,
+        available_cash=observation.cash,
     )
     return CommandModelRequest(
         invocation_id="codex_test.farm_a.t1.provider",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -13,6 +13,7 @@ from company_bench.codex_artifacts import (
     CodexArtifactStore,
     CodexArtifactView,
 )
+from company_bench.market_timeline import MarketTimelineProjector
 from company_bench.models import (
     CompanyEvent,
     CompanyId,
@@ -21,7 +22,6 @@ from company_bench.models import (
     EpisodeResult,
     EventRecord,
     InventoryExpiredEvent,
-    ProductId,
     ScenarioSpec,
     TradeExecutedEvent,
 )
@@ -35,6 +35,7 @@ from company_bench.runtime_models import (
     CancelOrder,
     PlaceOrder,
     Produce,
+    ReplaceOrder,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -44,7 +45,6 @@ from company_bench.runtime_models import (
     TurnReplayOrigin,
     Wait,
     WakeSignal,
-    system_step_id,
 )
 from company_bench.timeline_models import (
     AgentTraceDetail,
@@ -57,6 +57,7 @@ from company_bench.timeline_models import (
     ObservationFacts,
     OrderCancelledChange,
     OrderPlacedChange,
+    OrderReplacedChange,
     RetailPriceChanged,
     SystemTimelineItem,
     TimelineDay,
@@ -72,7 +73,7 @@ class TimelineNotFoundError(LookupError):
 
 
 class TimelineUnsupportedError(ValueError):
-    """Raised when a pre-V2 run has no Turn-first semantics."""
+    """Raised when a run predates V3 continuous-market semantics."""
 
 
 class TimelineSource(Protocol):
@@ -85,7 +86,7 @@ class TimelineSource(Protocol):
         """Return one lifecycle record."""
 
     def get_checkpoint(self, run_id: str) -> RunCheckpoint | None:
-        """Return one in-progress V2 checkpoint."""
+        """Return one in-progress V3 checkpoint."""
 
     def list_turns(self, run_id: str) -> tuple[TurnRecord, ...]:
         """Return one immutable Turn journal."""
@@ -105,7 +106,6 @@ class _TimelineData:
     result: EpisodeResult | None
     turns: tuple[TurnRecord, ...]
     system_steps: tuple[SystemStepRecord, ...]
-    reconstructed_step_ids: frozenset[str]
     current_invocations: tuple[PolicyInvocation, ...]
     trace_invocations: tuple[PolicyInvocation, ...]
     trace_by_turn: dict[str, tuple[PolicyInvocation, ...]]
@@ -144,25 +144,36 @@ class RunTimelineProjector:
     ) -> None:
         self._source = source
         self._artifacts = artifacts
+        self._market = MarketTimelineProjector()
 
     def read_day(self, run_id: str, day: int) -> TimelineDay:
         """Return one 1-based simulation day with run-wide summaries."""
         data = self._load(run_id)
         if not 1 <= day <= data.scenario.days:
             raise ValueError(f"day must be between 1 and {data.scenario.days}")
+        selected_turn_records = tuple(
+            record for record in data.turns if record.turn.sim_time.day + 1 == day
+        )
+        selected_step_records = tuple(
+            record for record in data.system_steps if record.occurred_at.day + 1 == day
+        )
         selected_turns = self._turn_items(
             data,
-            tuple(record for record in data.turns if record.turn.sim_time.day + 1 == day),
+            selected_turn_records,
         )
-        selected_steps = self._system_items(
-            data,
-            tuple(record for record in data.system_steps if record.occurred_at.day + 1 == day),
-        )
-        minutes = sorted(
+        selected_steps = self._system_items(selected_step_records)
+        minutes = tuple(sorted(
             {
                 *(item.sim_time.absolute_minute for item in selected_turns),
                 *(item.sim_time.absolute_minute for item in selected_steps),
             }
+        ))
+        market_by_minute = self._market.project_day(
+            data.scenario,
+            day,
+            selected_turn_records,
+            selected_step_records,
+            minutes,
         )
         return TimelineDay(
             context=data.context,
@@ -177,6 +188,7 @@ class RunTimelineProjector:
                     turns=tuple(
                         item for item in selected_turns if item.sim_time.absolute_minute == minute
                     ),
+                    market=market_by_minute[minute],
                 )
                 for minute in minutes
             ),
@@ -206,7 +218,7 @@ class RunTimelineProjector:
             (candidate for candidate in data.system_steps if candidate.entry_id == entry_id),
             None,
         )
-        system_item = self._system_item(data, step) if step is not None else None
+        system_item = self._system_item(step) if step is not None else None
         if system_item is None:
             raise TimelineNotFoundError(
                 f"timeline entry '{entry_id}' was not found in run '{run_id}'"
@@ -232,37 +244,13 @@ class RunTimelineProjector:
         )
         if scenario is None:
             raise TimelineNotFoundError(f"run '{run_id}' has no readable scenario")
-        if scenario.version < 2:
-            raise TimelineUnsupportedError("Turn-first timeline is available for V2 runs only")
+        if scenario.version < 3:
+            raise TimelineUnsupportedError("The operations timeline is available for V3 runs only")
 
         turns = self._source.list_turns(run_id)
-        persisted_steps = self._source.list_system_steps(run_id)
-        historical_events = (
-            result.events
-            if result is not None
-            else checkpoint.events
-            if checkpoint is not None
-            else ()
-        )
-        through_minute = (
-            (scenario.days - 1) * 24 * 60 + scenario.runtime.close_minute
-            if result is not None
-            else checkpoint.scheduler.now.absolute_minute
-            if checkpoint is not None
-            else -1
-        )
-        reconstructed = self._reconstruct_system_steps(
-            run_id,
-            scenario,
-            historical_events,
-            turns,
-            through_minute,
-        )
-        persisted_by_id = {step.entry_id: step for step in persisted_steps}
-        missing = tuple(step for step in reconstructed if step.entry_id not in persisted_by_id)
         system_steps = tuple(
             sorted(
-                (*persisted_steps, *missing),
+                self._source.list_system_steps(run_id),
                 key=lambda step: (
                     step.occurred_at.absolute_minute,
                     step.journal_sequence,
@@ -270,7 +258,6 @@ class RunTimelineProjector:
                 ),
             )
         )
-        reconstructed_ids = frozenset(step.entry_id for step in missing)
 
         source_run_id = (
             job.source_run_id
@@ -323,13 +310,16 @@ class RunTimelineProjector:
             source_model_call_count=len(trace_invocations),
             current_usage=_sum_usage(current_invocations),
             source_usage=_sum_usage(trace_invocations),
+            checkpoint_at=checkpoint.scheduler.now if checkpoint is not None else None,
+            checkpoint_state_version=(
+                checkpoint.economy.state_version if checkpoint is not None else None
+            ),
         )
         return _TimelineData(
             scenario=scenario,
             result=result,
             turns=turns,
             system_steps=system_steps,
-            reconstructed_step_ids=reconstructed_ids,
             current_invocations=current_invocations,
             trace_invocations=trace_invocations,
             trace_by_turn={
@@ -372,10 +362,16 @@ class RunTimelineProjector:
             journal_sequence=record.journal_sequence,
             wake_signals=signals,
             observation=ObservationFacts(
-                cash=observation.cash,
+                cash=record.turn.available_cash,
+                reserved_cash=record.turn.reserved_cash,
                 inventory=observation.inventory,
+                reserved_inventory=record.turn.reserved_inventory,
                 retail_price=observation.retail_price,
                 open_orders=record.turn.open_orders,
+                market_views=record.turn.market_views,
+                pending_deliveries=record.turn.pending_deliveries,
+                active_operation=record.turn.active_operation,
+                remaining_operation_capacity=record.turn.remaining_operation_capacity,
                 visible_events=record.turn.visible_events,
                 visible_event_count=len(record.turn.visible_events),
             ),
@@ -394,27 +390,24 @@ class RunTimelineProjector:
 
     def _system_items(
         self,
-        data: _TimelineData,
         records: tuple[SystemStepRecord, ...],
     ) -> tuple[SystemTimelineItem, ...]:
-        return tuple(self._system_item(data, step) for step in records)
+        return tuple(self._system_item(step) for step in records)
 
     @staticmethod
     def _system_item(
-        data: _TimelineData,
         step: SystemStepRecord,
     ) -> SystemTimelineItem:
-        reconstructed = step.entry_id in data.reconstructed_step_ids
         return SystemTimelineItem(
             entry_id=step.entry_id,
             sim_time=step.occurred_at,
             kind=step.kind,
-            journal_sequence=None if reconstructed else step.journal_sequence,
-            state_version_before=None if reconstructed else step.state_version_before,
-            state_version_after=None if reconstructed else step.state_version_after,
+            journal_sequence=step.journal_sequence,
+            state_version_before=step.state_version_before,
+            state_version_after=step.state_version_after,
+            reference_ids=step.reference_ids,
             effects=tuple(record.event for record in step.effects),
             affected_company_ids=_affected_companies(step.effects),
-            reconstructed=reconstructed,
             title=_system_title(step),
             summary=_system_summary(step),
         )
@@ -666,87 +659,6 @@ class RunTimelineProjector:
             raise ValueError("run policies disagree on replay source")
         return next(iter(source_ids), None)
 
-    @staticmethod
-    def _reconstruct_system_steps(
-        run_id: str,
-        scenario: ScenarioSpec,
-        event_records: tuple[EventRecord, ...],
-        turns: tuple[TurnRecord, ...],
-        through_minute: int,
-    ) -> tuple[SystemStepRecord, ...]:
-        if through_minute < 0:
-            return ()
-        turn_effects = Counter(
-            event.model_dump_json() for record in turns for event in record.outcome.events
-        )
-        system_events: list[EventRecord] = []
-        for record in event_records:
-            key = record.event.model_dump_json()
-            if turn_effects[key]:
-                turn_effects[key] -= 1
-            else:
-                system_events.append(record)
-        by_key: dict[tuple[int, str], list[EventRecord]] = defaultdict(list)
-        for record in system_events:
-            event = record.event
-            if isinstance(event, TradeExecutedEvent):
-                key = (
-                    event.day,
-                    "raw" if event.product is ProductId.RAW_MILK else "bottled",
-                )
-            else:
-                key = (event.day, "close")
-            by_key[key].append(record)
-
-        steps: list[SystemStepRecord] = []
-        sequence = 1
-        runtime = scenario.runtime
-        for day in range(1, scenario.days + 1):
-            day_index = day - 1
-            definitions = (
-                ("open", SystemEventKind.DAY_OPEN, runtime.open_minute, ()),
-                (
-                    "raw.clear",
-                    SystemEventKind.MARKET_CLEAR,
-                    runtime.raw_market_clear_minute,
-                    tuple(by_key[(day, "raw")]),
-                ),
-                (
-                    "bottled.clear",
-                    SystemEventKind.MARKET_CLEAR,
-                    runtime.bottled_market_clear_minute,
-                    tuple(by_key[(day, "bottled")]),
-                ),
-                (
-                    "close",
-                    SystemEventKind.DAY_CLOSE,
-                    runtime.close_minute,
-                    tuple(by_key[(day, "close")]),
-                ),
-            )
-            for suffix, kind, minute, effects in definitions:
-                absolute_minute = day_index * 24 * 60 + minute
-                if absolute_minute > through_minute:
-                    continue
-                scheduled_id = f"d{day}.{suffix}"
-                steps.append(
-                    SystemStepRecord(
-                        run_id=run_id,
-                        entry_id=system_step_id(run_id, scheduled_id),
-                        journal_sequence=sequence,
-                        scheduled_event_id=scheduled_id,
-                        occurred_at=SimTime(absolute_minute=absolute_minute),
-                        kind=kind,
-                        state_version_before=0,
-                        state_version_after=0,
-                        effects=effects,
-                        snapshot_day=day if kind is SystemEventKind.DAY_CLOSE else None,
-                    )
-                )
-                sequence += 1
-        return tuple(steps)
-
-
 def _sum_usage(invocations: Iterable[PolicyInvocation]) -> TokenUsage:
     """Aggregate physical-call counters without estimating money."""
     usages = tuple(invocation.usage for invocation in invocations)
@@ -842,6 +754,8 @@ def _command_title(record: TurnRecord) -> str:
         )
     if isinstance(command, PlaceOrder):
         return f"Place {command.side.value} order for {command.product.value.replace('_', ' ')}"
+    if isinstance(command, ReplaceOrder):
+        return "Replace market order"
     if isinstance(command, CancelOrder):
         return "Cancel market order"
     if isinstance(command, SetRetailPrice):
@@ -866,7 +780,10 @@ def _turn_summary(record: TurnRecord) -> str:
 
 def _state_changes(
     record: TurnRecord,
-) -> tuple[OrderPlacedChange | OrderCancelledChange | RetailPriceChanged, ...]:
+) -> tuple[
+    OrderPlacedChange | OrderCancelledChange | OrderReplacedChange | RetailPriceChanged,
+    ...,
+]:
     """Project accepted non-event mutations from the committed command."""
     if not record.outcome.accepted:
         return ()
@@ -883,6 +800,15 @@ def _state_changes(
         )
     if isinstance(command, CancelOrder):
         return (OrderCancelledChange(order_id=command.order_id),)
+    if isinstance(command, ReplaceOrder) and record.outcome.order_id is not None:
+        return (
+            OrderReplacedChange(
+                replaced_order_id=command.order_id,
+                order_id=record.outcome.order_id,
+                quantity=command.quantity,
+                limit_price=command.limit_price,
+            ),
+        )
     if isinstance(command, SetRetailPrice):
         return (
             RetailPriceChanged(
@@ -895,27 +821,25 @@ def _state_changes(
 
 
 def _system_title(step: SystemStepRecord) -> str:
-    if step.kind is SystemEventKind.DAY_OPEN:
-        return "Market day opened"
-    if step.kind is SystemEventKind.DAY_CLOSE:
-        return "Market day closed"
-    if step.kind is SystemEventKind.MARKET_CLEAR:
-        market = (
-            "Raw milk"
-            if "raw" in step.scheduled_event_id
-            else "Bottled milk"
-            if "bottled" in step.scheduled_event_id
-            else "Spot"
-        )
-        return f"{market} market cleared"
-    return step.kind.value.replace("_", " ").title()
+    return {
+        SystemEventKind.DAY_OPEN: "Continuous markets opened",
+        SystemEventKind.OPERATION_COMPLETED: "Operation completed",
+        SystemEventKind.DELIVERY_COMPLETED: "Delivery completed",
+        SystemEventKind.MARKET_CLOSE: "Continuous markets closed",
+        SystemEventKind.CONSUMER_SALES: "Consumer sales settled",
+        SystemEventKind.DAY_CLOSE: "Simulation day closed",
+    }[step.kind]
 
 
 def _system_summary(step: SystemStepRecord) -> str:
     effect_count = len(step.effects)
-    if step.kind is SystemEventKind.MARKET_CLEAR:
-        trades = sum(isinstance(record.event, TradeExecutedEvent) for record in step.effects)
-        return f"{trades} executed trade{'s' if trades != 1 else ''}"
+    if step.kind is SystemEventKind.DAY_OPEN:
+        return "Companies may trade and start operations from 09:00"
+    if step.kind is SystemEventKind.MARKET_CLOSE:
+        return "Resting DAY orders were cancelled and reserved assets released"
+    if step.kind is SystemEventKind.CONSUMER_SALES:
+        return f"{effect_count} consumer settlement effect{'s' if effect_count != 1 else ''}"
     if step.kind is SystemEventKind.DAY_CLOSE:
-        return f"{effect_count} settlement effect{'s' if effect_count != 1 else ''}"
-    return "Companies may act from the same observed state"
+        return f"{effect_count} expiry effect{'s' if effect_count != 1 else ''}"
+    reference = "" if not step.reference_ids else f" for {', '.join(step.reference_ids)}"
+    return f"{effect_count} economic effect{'s' if effect_count != 1 else ''}{reference}"

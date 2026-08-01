@@ -10,7 +10,7 @@ from company_bench.diagnostics import bounded_error
 from company_bench.models import MAX_SEED, PolicyKind
 from company_bench.policy_factory import PolicyFactory
 from company_bench.repository import LifecycleRepository
-from company_bench.run_models import PolicyProfileView, RunJob, RunStatus
+from company_bench.run_models import PolicyProfileView, RunJob
 from company_bench.runtime import EpisodeRuntime
 
 
@@ -71,7 +71,7 @@ class RunCoordinator:
         if source is not None and source.scenario != scenario:
             raise ValueError("replay source uses a different scenario")
         if source_run_id is not None and not self._repository.list_turns(source_run_id):
-            raise ValueError("replay source has no V2 turn journal")
+            raise ValueError("replay source has no event-driven turn journal")
         run_id = f"run_{uuid4().hex}"
         self._policy_factory.ensure_available(mode)
         job = RunJob(
@@ -115,20 +115,13 @@ class RunCoordinator:
                 scenario = self._runtime.scenario
                 if job.scenario_id != scenario.scenario_id or job.total_days != scenario.days:
                     raise ValueError("persisted job scenario does not match the active runtime")
-                job = job.model_copy(
-                    update={
-                        "status": RunStatus.RUNNING,
-                        "started_at": job.started_at or datetime.now(UTC),
-                        "finished_at": None,
-                        "error_message": None,
-                    }
-                )
+                job = job.mark_running(datetime.now(UTC))
                 self._repository.save_job(job)
                 source = self._repository.get(job.source_run_id) if job.source_run_id else None
 
                 async def report_progress(day: int) -> None:
                     nonlocal job
-                    job = job.model_copy(update={"current_day": day})
+                    job = job.report_progress(day)
                     self._repository.save_job(job)
 
                 checkpoint = self._repository.get_checkpoint(job.run_id)
@@ -157,32 +150,20 @@ class RunCoordinator:
                     result = execution.episode
                 finally:
                     await agent_bundle.close()
-                job = job.model_copy(
-                    update={
-                        "status": RunStatus.COMPLETED,
-                        "current_day": job.total_days,
-                        "finished_at": datetime.now(UTC),
-                    }
-                )
+                job = job.mark_completed(datetime.now(UTC))
                 self._repository.complete_job(result, job)
         except asyncio.CancelledError:
             self._repository.save_job(
-                job.model_copy(
-                    update={
-                        "status": RunStatus.INTERRUPTED,
-                        "finished_at": datetime.now(UTC),
-                        "error_message": "backend stopped before completion",
-                    }
+                job.mark_interrupted(
+                    datetime.now(UTC),
+                    "backend stopped before completion",
                 )
             )
             raise
         except Exception as error:
             self._repository.save_job(
-                job.model_copy(
-                    update={
-                        "status": RunStatus.FAILED,
-                        "finished_at": datetime.now(UTC),
-                        "error_message": bounded_error(error),
-                    }
+                job.mark_failed(
+                    datetime.now(UTC),
+                    bounded_error(error),
                 )
             )

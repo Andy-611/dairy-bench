@@ -1,20 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { companyLabel } from "../domainLabels";
-import { formatValue } from "../format";
+import { formatExactDecimal, formatValue } from "../format";
 import { isAbortError, requestErrorMessage } from "../requestErrors";
 import {
   clockTime,
   commandLabel,
   commandSummary,
-  effectSummary,
   plural,
-  stateChangeSummary,
   systemLabel,
   wakeLabel,
 } from "../timelineFormatters";
 import type {
-  CompanyResultView,
   SystemTimelineItemView,
   TimelineCommandView,
   TimelineContextView,
@@ -24,6 +21,7 @@ import type {
   TurnTimelineItemView,
 } from "../types";
 import { DecisionDrawer } from "./DecisionDrawer";
+import { MarketDisplay } from "./MarketDisplay";
 import { TimelineError, TimelineNotice } from "./TimelineFeedback";
 
 type TimelineLoader = (
@@ -39,11 +37,19 @@ type DetailLoader = (
 type StatusFilter = "accepted" | "all" | "rejected";
 
 interface OperationsReplayProps {
-  readonly companies: readonly CompanyResultView[];
+  readonly day: number;
   readonly days: number;
   readonly loadDetail: DetailLoader;
   readonly loadTimeline: TimelineLoader;
+  readonly onDayChange: (day: number) => void;
+  readonly revision: string;
   readonly runId: string;
+  readonly timelinePending?: boolean;
+}
+
+interface CompanyOption {
+  readonly companyId: string;
+  readonly companyName: string;
 }
 
 interface TimelineFilters {
@@ -62,48 +68,60 @@ const INITIAL_FILTERS: TimelineFilters = {
 };
 
 export function OperationsReplay({
-  companies,
+  day,
   days,
   loadDetail,
   loadTimeline,
+  onDayChange,
+  revision,
   runId,
+  timelinePending = false,
 }: OperationsReplayProps) {
-  const [selectedDay, setSelectedDay] = useState(1);
   const [timeline, setTimeline] = useState<TimelineDayView | null>(null);
   const [filters, setFilters] = useState<TimelineFilters>(INITIAL_FILTERS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
-  const dayCache = useRef(new Map<number, TimelineDayView>());
+  const dayCache = useRef(new Map<string, TimelineDayView>());
 
   useEffect(() => {
     dayCache.current.clear();
-    setSelectedDay(1);
+    setTimeline(null);
     setSelectedEntryId(null);
     setFilters(INITIAL_FILTERS);
   }, [runId]);
 
   useEffect(() => {
-    const cached = dayCache.current.get(selectedDay);
+    if (timelinePending) {
+      setTimeline(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    const cacheKey = `${revision}:${day}`;
+    const cached = dayCache.current.get(cacheKey);
     if (cached) {
       setTimeline(cached);
       setLoading(false);
+      setError(null);
       return;
     }
 
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    void loadTimeline(runId, selectedDay, controller.signal)
+    void loadTimeline(runId, day, controller.signal)
       .then((nextTimeline) => {
-        dayCache.current.set(selectedDay, nextTimeline);
+        dayCache.current.set(cacheKey, nextTimeline);
         setTimeline(nextTimeline);
       })
       .catch((reason: unknown) => {
         if (!isAbortError(reason)) {
           setError(
             requestErrorMessage(reason, {
-              fallback: "The operations timeline could not be loaded.",
+              fallback:
+                "This run has not produced a readable operations timeline yet.",
             }),
           );
         }
@@ -114,7 +132,12 @@ export function OperationsReplay({
         }
       });
     return () => controller.abort();
-  }, [loadTimeline, runId, selectedDay]);
+  }, [day, loadTimeline, revision, runId, timelinePending]);
+
+  const companies = useMemo<readonly CompanyOption[]>(
+    () => timelineCompanies(timeline),
+    [timeline],
+  );
 
   const commandKinds = useMemo<readonly TimelineCommandView["kind"][]>(
     () =>
@@ -144,7 +167,7 @@ export function OperationsReplay({
     <section aria-labelledby="operations-title" className="panel operations-panel">
       <OperationsHeader
         context={timeline?.context ?? null}
-        day={selectedDay}
+        day={day}
         days={days}
         hiddenWaitCount={hiddenWaitCount}
       />
@@ -153,8 +176,8 @@ export function OperationsReplay({
         <>
           <RunProvenanceBanner context={timeline.context} />
           <DayNavigator
-            day={selectedDay}
-            onSelect={setSelectedDay}
+            day={day}
+            onSelect={onDayChange}
             summaries={timeline.daySummaries}
           />
           <TimelineFilterBar
@@ -166,7 +189,9 @@ export function OperationsReplay({
         </>
       )}
 
-      {loading ? (
+      {timelinePending ? (
+        <TimelineNotice label="This run is queued and has not produced timeline data yet." />
+      ) : loading ? (
         <TimelineNotice label="Loading this simulation day…" />
       ) : error ? (
         <TimelineError message={error} />
@@ -219,9 +244,19 @@ function OperationsHeader({
         {hiddenWaitCount > 0
           ? ` · ${hiddenWaitCount} no-effect waits collapsed`
           : " · every matching turn is visible"}
+        {context ? checkpointSummary(context) : ""}
       </p>
     </div>
   );
+}
+
+function checkpointSummary(context: TimelineContextView): string {
+  const minute = context.checkpointMinute;
+  if (minute === null) {
+    return "";
+  }
+  const day = Math.floor(minute / (24 * 60)) + 1;
+  return ` · last checkpoint Day ${day} ${clockTime(minute)} · state v${context.checkpointStateVersion}`;
 }
 
 function RunProvenanceBanner({ context }: { readonly context: TimelineContextView }) {
@@ -295,7 +330,7 @@ function DayNavigator({
             style={{
               "--activity": activityOpacity(summary.turnCount, summaries),
             } as React.CSSProperties}
-            title={`Day ${summary.day}: ${summary.turnCount} turns, ${summary.rejectedCount} rejected, ${formatValue(summary.tradeQuantity)} traded`}
+            title={`Day ${summary.day}: ${summary.turnCount} turns, ${summary.rejectedCount} rejected, ${formatExactDecimal(summary.tradeQuantity)} traded`}
             type="button"
           >
             <span>{summary.day}</span>
@@ -321,7 +356,7 @@ function TimelineFilterBar({
   onChange,
 }: {
   readonly commandKinds: readonly TimelineCommandView["kind"][];
-  readonly companies: readonly CompanyResultView[];
+  readonly companies: readonly CompanyOption[];
   readonly filters: TimelineFilters;
   readonly onChange: (filters: TimelineFilters) => void;
 }) {
@@ -415,28 +450,33 @@ function MinuteBucket({
         </span>
       </header>
       <div className="minute-content">
-        {moment.systemSteps.map((step) => (
-          <SystemStepCard
-            key={step.entryId}
-            onSelect={() => onSelectEntry(step.entryId)}
-            step={step}
-          />
-        ))}
-        {moment.totalTurnCount > 1 && (
-          <div className="concurrency-note">
-            <span>CONCURRENT OBSERVATION</span>
-            Agents saw the same pre-apply state. Cards below follow deterministic
-            apply order.
-          </div>
-        )}
-        <div className="turn-card-grid">
-          {moment.turns.map((turn) => (
-            <TurnCard
-              key={turn.entryId}
-              onSelect={() => onSelectEntry(turn.entryId)}
-              turn={turn}
-            />
-          ))}
+        <div className="minute-lanes">
+          <section className="company-activity-lane" aria-label="Company activity">
+            {moment.systemSteps.map((step) => (
+              <SystemStepCard
+                key={step.entryId}
+                onSelect={() => onSelectEntry(step.entryId)}
+                step={step}
+              />
+            ))}
+            {moment.totalTurnCount > 1 && (
+              <div className="concurrency-note">
+                <span>CONCURRENT OBSERVATION</span>
+                Agents saw the same pre-apply state. Cards below follow the persisted
+                seed-derived apply order.
+              </div>
+            )}
+            <div className="turn-card-grid">
+              {moment.turns.map((turn) => (
+                <TurnCard
+                  key={turn.entryId}
+                  onSelect={() => onSelectEntry(turn.entryId)}
+                  turn={turn}
+                />
+              ))}
+            </div>
+          </section>
+          <MarketDisplay frame={moment.market} minute={moment.simMinute} />
         </div>
       </div>
     </article>
@@ -479,8 +519,6 @@ function TurnCard({
   readonly onSelect: () => void;
   readonly turn: TurnTimelineItemView;
 }) {
-  const effects = turn.effects.map(effectSummary);
-  const changes = turn.stateChanges.map(stateChangeSummary);
   return (
     <article
       aria-label={`${turn.companyName} turn at ${clockTime(turn.simMinute)}`}
@@ -512,19 +550,14 @@ function TurnCard({
         <DecisionStage
           label="Outcome"
           tone={turn.accepted ? "positive" : "negative"}
-          value={
-            turn.reason ??
-            (effects.length + changes.length > 0
-              ? [...changes, ...effects].join(" · ")
-              : "No immediate economic change")
-          }
+          value={commandResult(turn)}
         />
         <DecisionStage
           label="Next"
           value={
             turn.nextAvailableMinute === null
               ? "No scheduled continuation"
-              : `Available at ${clockTime(turn.nextAvailableMinute)}`
+              : `Next decision at ${clockTime(turn.nextAvailableMinute)}`
           }
         />
       </ol>
@@ -542,6 +575,19 @@ function TurnCard({
       </footer>
     </article>
   );
+}
+
+function commandResult(turn: TurnTimelineItemView): string {
+  if (!turn.accepted) {
+    return turn.reason ?? "Rejected";
+  }
+  if (turn.outcomeOrderId !== null) {
+    return `Accepted · Order ${turn.outcomeOrderId}`;
+  }
+  if (turn.outcomeJobId !== null) {
+    return `Accepted · Job ${turn.outcomeJobId}`;
+  }
+  return "Accepted";
 }
 
 function DecisionStage({
@@ -581,6 +627,23 @@ function filterMoments(
     }
     return [{ ...moment, turns }];
   });
+}
+
+function timelineCompanies(
+  timeline: TimelineDayView | null,
+): readonly CompanyOption[] {
+  const companies = new Map<string, CompanyOption>();
+  timeline?.moments.forEach((moment) =>
+    moment.turns.forEach((turn) =>
+      companies.set(turn.companyId, {
+        companyId: turn.companyId,
+        companyName: turn.companyName,
+      }),
+    ),
+  );
+  return [...companies.values()].sort((left, right) =>
+    left.companyName.localeCompare(right.companyName),
+  );
 }
 
 function activityOpacity(

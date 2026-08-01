@@ -52,6 +52,9 @@ class LifecycleRepository(RunRepository, PolicyAuditSink, Protocol):
     def get_job(self, run_id: str) -> RunJob | None:
         """Return one lifecycle record when present."""
 
+    def list_jobs(self, limit: int = 50) -> tuple[RunJob, ...]:
+        """Return the most recently submitted lifecycle records first."""
+
     def list_resumable_jobs(self) -> tuple[RunJob, ...]:
         """Return jobs that may safely be scheduled after startup."""
 
@@ -134,6 +137,19 @@ class MemoryRunRepository:
         """Return one lifecycle record when present."""
         with self._lock:
             return self._jobs.get(run_id)
+
+    def list_jobs(self, limit: int = 50) -> tuple[RunJob, ...]:
+        """Return all lifecycle states from newest submission to oldest."""
+        if limit <= 0:
+            return ()
+        with self._lock:
+            newest_first = reversed(self._jobs.values())
+            jobs = sorted(
+                newest_first,
+                key=lambda job: job.submitted_at,
+                reverse=True,
+            )
+            return tuple(jobs[:limit])
 
     def list_resumable_jobs(self) -> tuple[RunJob, ...]:
         """Return resumable jobs from oldest to newest."""
@@ -353,6 +369,22 @@ class SQLiteRunRepository:
                 (run_id,),
             ).fetchone()
         return RunJob.model_validate_json(row["payload_json"]) if row is not None else None
+
+    def list_jobs(self, limit: int = 50) -> tuple[RunJob, ...]:
+        """Return all lifecycle states from newest submission to oldest."""
+        if limit <= 0:
+            return ()
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM run_jobs
+                ORDER BY submitted_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(RunJob.model_validate_json(row["payload_json"]) for row in rows)
 
     def list_resumable_jobs(self) -> tuple[RunJob, ...]:
         """Return resumable jobs from oldest to newest."""
@@ -1058,7 +1090,7 @@ def _system_step_order(record: SystemStepRecord) -> tuple[int, int, str]:
 def _invocation_order(
     invocation: PolicyInvocation,
 ) -> tuple[int, int, bool, int, str, str]:
-    """Order V1 calls by company and V2 calls by time and application."""
+    """Order daily calls by company and event-driven calls by time and application."""
     return (
         invocation.day,
         invocation.sim_minute if invocation.sim_minute is not None else -1,

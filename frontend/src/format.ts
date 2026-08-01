@@ -1,4 +1,4 @@
-import type { CompanyRole } from "./types";
+import type { CompanyRole, DecimalText } from "./types";
 
 const valueFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
@@ -19,6 +19,37 @@ export const ROLE_LABELS: Readonly<Record<CompanyRole, string>> = {
 
 export function formatValue(value: number): string {
   return valueFormatter.format(value);
+}
+
+export function formatExactDecimal(value: DecimalText): string {
+  return value;
+}
+
+export function formatMarketPrice(value: DecimalText): string {
+  const plainDecimal = /^([+-]?)(\d+)(?:\.(\d*))?$/.exec(value);
+  if (plainDecimal === null) {
+    return value;
+  }
+  const [, sign, integer, rawFraction = ""] = plainDecimal;
+  const fraction = rawFraction.replace(/0+$/, "").padEnd(2, "0");
+  return `${sign}${integer}.${fraction}`;
+}
+
+export function isZeroDecimal(value: string): boolean {
+  const mantissa = value.split(/[eE]/, 1)[0] ?? value;
+  return !/[1-9]/.test(mantissa);
+}
+
+export function formatSignedExactDecimal(value: DecimalText): string {
+  const unsigned = /^[+-]/.test(value) ? value.slice(1) : value;
+  if (
+    value.startsWith("-") ||
+    value.startsWith("+") ||
+    isZeroDecimal(unsigned)
+  ) {
+    return value;
+  }
+  return `+${value}`;
 }
 
 export function formatSignedValue(value: number): string {

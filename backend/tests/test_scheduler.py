@@ -5,7 +5,11 @@ from decimal import Decimal
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from company_bench.models import CompanyObservation
+from company_bench.models import (
+    CompanyObservation,
+    InvalidOrderQuantity,
+    require_order_quantity,
+)
 from company_bench.runtime_models import (
     AgentTurn,
     CancelOrder,
@@ -23,6 +27,7 @@ from company_bench.runtime_models import (
     TurnRecord,
     Wait,
     WakeReason,
+    WakeSignal,
 )
 from company_bench.scheduler import Scheduler, SchedulerCheckpoint
 
@@ -64,6 +69,49 @@ def test_company_command_is_discriminated_and_identity_free() -> None:
                 "quantity": "10",
             }
         )
+
+
+@pytest.mark.parametrize("quantity", ("0.0001", "12.3456"))
+def test_order_quantity_accepts_exact_four_decimal_precision(quantity: str) -> None:
+    assert require_order_quantity(Decimal(quantity)) == Decimal(quantity)
+
+
+@pytest.mark.parametrize("quantity", ("1E+24", "1E+999999"))
+def test_order_quantity_accepts_large_tick_aligned_decimals(quantity: str) -> None:
+    assert require_order_quantity(Decimal(quantity)) == Decimal(quantity)
+
+
+@pytest.mark.parametrize("quantity", ("8.9E-91", "59.999999999999999"))
+def test_order_quantity_rejects_dust_and_excess_precision(quantity: str) -> None:
+    with pytest.raises(InvalidOrderQuantity, match=r"exact multiple of 0\.0001"):
+        require_order_quantity(Decimal(quantity))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "kind": "place_order",
+            "side": "buy",
+            "product": "raw_milk",
+            "quantity": "59.98181",
+            "limit_price": "1.50",
+        },
+        {
+            "kind": "replace_order",
+            "order_id": "order_1",
+            "quantity": "0.00019",
+            "limit_price": "1.50",
+        },
+    ),
+)
+def test_historical_unquantized_commands_remain_deserializable(
+    payload: dict[str, str],
+) -> None:
+    """Raw audit commands stay readable; execution applies the new invariant."""
+    command = TypeAdapter(CompanyCommand).validate_python(payload)
+
+    assert command.quantity == Decimal(payload["quantity"])
 
 
 @pytest.mark.parametrize(
@@ -124,6 +172,7 @@ def test_turn_record_requires_runtime_identity_consistency(
         state_version=0,
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=first_observation.model_copy(update={"company_id": "farm_a"}),
+        available_cash=first_observation.cash,
     )
     envelope = CommandEnvelope(
         turn_id="turn_1",
@@ -178,7 +227,7 @@ def test_scheduler_clamps_past_events_and_pops_a_stable_bucket() -> None:
         event_id="first",
     )
     second = scheduler.schedule_system(
-        SystemEventKind.MARKET_CLEAR,
+        SystemEventKind.OPERATION_COMPLETED,
         SimTime(absolute_minute=100),
         event_id="second",
     )
@@ -206,10 +255,16 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
         WakeReason.ORDER_UPDATED,
         reference_ids=("order_1",),
     )
-    scheduler.schedule_system(
-        SystemEventKind.MARKET_CLEAR,
-        at,
-        event_id="market_clear",
+    system_kinds = (
+        SystemEventKind.DELIVERY_COMPLETED,
+        SystemEventKind.OPERATION_COMPLETED,
+        SystemEventKind.MARKET_CLOSE,
+        SystemEventKind.CONSUMER_SALES,
+        SystemEventKind.DAY_CLOSE,
+    )
+    system_events = tuple(
+        scheduler.schedule_system(kind, at, event_id=kind.value)
+        for kind in system_kinds
     )
     merged = scheduler.schedule_wake(
         "processor_a",
@@ -219,20 +274,35 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
     )
     other = scheduler.schedule_wake("processor_b", at, WakeReason.DAY_OPEN)
 
-    assert len(scheduler) == 3
+    assert len(scheduler) == 7
     assert merged.sequence == first.sequence
     assert merged.wake_reasons == (
         WakeReason.ORDER_UPDATED,
         WakeReason.EXTERNAL_EVENT,
     )
-    assert merged.reference_ids == ("order_1", "message_1")
+    assert merged.wake_signals == (
+        WakeSignal(
+            reason=WakeReason.ORDER_UPDATED,
+            reference_ids=("order_1",),
+        ),
+        WakeSignal(
+            reason=WakeReason.EXTERNAL_EVENT,
+            reference_ids=("message_1", "order_1"),
+        ),
+    )
+    assert merged.reference_ids == ()
     bucket = scheduler.pop_bucket()
     assert [event.sequence for event in bucket] == [
-        first.sequence + 1,
+        *(event.sequence for event in system_events),
         first.sequence,
         other.sequence,
     ]
-    assert bucket[1] == merged
+    assert [event.kind for event in bucket] == [
+        *system_kinds,
+        SystemEventKind.COMPANY_WAKE,
+        SystemEventKind.COMPANY_WAKE,
+    ]
+    assert bucket[-2] == merged
 
 
 def test_checkpoint_json_round_trip_preserves_order_and_next_sequence() -> None:
@@ -243,11 +313,18 @@ def test_checkpoint_json_round_trip_preserves_order_and_next_sequence() -> None:
         event_id="day_open",
     )
     scheduler.schedule_wake("farm_a", SimTime(absolute_minute=540), WakeReason.DAY_OPEN)
-    scheduler.schedule_system(
-        SystemEventKind.DAY_CLOSE,
-        SimTime(absolute_minute=1_140),
-        event_id="day_close",
-    )
+    for kind, minute in (
+        (SystemEventKind.OPERATION_COMPLETED, 600),
+        (SystemEventKind.DELIVERY_COMPLETED, 600),
+        (SystemEventKind.MARKET_CLOSE, 1_110),
+        (SystemEventKind.CONSUMER_SALES, 1_140),
+        (SystemEventKind.DAY_CLOSE, 1_170),
+    ):
+        scheduler.schedule_system(
+            kind,
+            SimTime(absolute_minute=minute),
+            event_id=kind.value,
+        )
 
     checkpoint = scheduler.checkpoint()
     restored_checkpoint = SchedulerCheckpoint.model_validate_json(checkpoint.model_dump_json())
@@ -255,10 +332,16 @@ def test_checkpoint_json_round_trip_preserves_order_and_next_sequence() -> None:
 
     assert restored.now == scheduler.now
     assert restored.checkpoint() == checkpoint
-    assert restored.pop_bucket() == scheduler.pop_bucket()
+    restored_buckets = []
+    original_buckets = []
+    while restored:
+        restored_buckets.append(restored.pop_bucket())
+    while scheduler:
+        original_buckets.append(scheduler.pop_bucket())
+    assert restored_buckets == original_buckets
     new_event = restored.schedule_system(
-        SystemEventKind.MARKET_CLEAR,
-        SimTime(absolute_minute=600),
+        SystemEventKind.DELIVERY_COMPLETED,
+        SimTime(absolute_minute=1_200),
     )
     assert new_event.sequence == checkpoint.next_sequence
 

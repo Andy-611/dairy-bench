@@ -14,7 +14,7 @@ from company_bench.models import (
     ScoringSpec,
 )
 
-__all__ = ("DAIRY_S12_V2_SCENARIO",)
+__all__ = ("DAIRY_S12_V3_SCENARIO",)
 
 type _CompanySuffix = Literal["a", "b", "c", "d"]
 type _CompanyTemplate = tuple[str, CompanyOperation]
@@ -69,8 +69,8 @@ def _build_companies() -> tuple[CompanySpec, ...]:
 def _build_dairy_scenario() -> ScenarioSpec:
     """Build the canonical event-driven Dairy Bench scenario."""
     return ScenarioSpec(
-        scenario_id="flow.dairy.base.s12.v2",
-        version=2,
+        scenario_id="flow.dairy.base.s12.v3",
+        version=3,
         days=30,
         products=(
             ProductSpec(
@@ -101,4 +101,4 @@ def _build_dairy_scenario() -> ScenarioSpec:
     )
 
 
-DAIRY_S12_V2_SCENARIO: Final[ScenarioSpec] = _build_dairy_scenario()
+DAIRY_S12_V3_SCENARIO: Final[ScenarioSpec] = _build_dairy_scenario()

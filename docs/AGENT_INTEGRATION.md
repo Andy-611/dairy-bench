@@ -1,112 +1,161 @@
 # Agent Integration
 
-## V2 agent contract
+## V3 agent contract
 
-Dairy Bench runs twelve companies and gives each company one independent agent.
-An agent no longer submits one complete daily plan. It completes a closed cycle
-whenever the scheduler wakes it:
+Dairy Bench runs twelve independent company agents: four farms, four
+processors, and four retailers. The scheduler wakes an agent for one closed,
+auditable decision cycle:
 
 ```text
 Wake
-  → AgentTurn(current facts, visible events, private memory)
-  → one atomic CompanyCommand
-  → EconomyEngine validation and CommandOutcome
-  → immutable TurnRecord
+  -> AgentTurn(authoritative private observation)
+  -> exactly one CompanyCommand
+  -> EconomyEngine validation and CommandOutcome
+  -> immutable TurnRecord
 ```
 
-A day bounds market opening, clearing, consumer sales, expiration, and scoring;
-it does not bound provider calls.
+An agent does not submit a daily plan and never supplies its own identity,
+timestamp, state version, command ID, or turn ID. `EpisodeRuntime` binds those
+fields in `CommandEnvelope`.
 
-The default system schedule is:
+## Structured command format
 
-| Time | Event |
+The model must choose exactly one role-authorized command:
+
+| Command | Purpose |
 |---|---|
-| 09:00 | Open markets and wake all companies |
-| 11:00 | Clear the raw-milk market |
-| 16:00 | Clear the bottled-milk market |
-| 19:00 | Run consumer sales, expiration, and the end-of-day snapshot |
+| `produce(product, quantity)` | Start one farm production job |
+| `transform(input_product, output_product, input_quantity)` | Start one processor conversion job |
+| `place_order(side, product, quantity, limit_price)` | Submit a collateralized limit order |
+| `replace_order(order_id, quantity, limit_price)` | Atomically replace an owned order and lose its old priority |
+| `cancel_order(order_id)` | Cancel an owned resting order and release its remaining hold |
+| `set_retail_price(product, unit_price)` | Set a retailer's consumer price |
+| `wait(until?)` | Yield until a deadline or another relevant event |
 
-A normal command occupies the company for 30 virtual minutes. Wakes received
-during cooldown are delayed to `available_at` and merged, preserving one action
-chain per company. The default daily cap is 20 turns per company.
+Farms may produce and trade raw milk. Processors may transform and trade raw or
+bottled milk. Retailers may trade bottled milk and set its consumer price.
 
-## Model submission format
+For `place_order` and `replace_order`, `quantity` must be positive and an exact
+multiple of `0.0001` (at most four decimal places). The engine rejects the whole
+command rather than rounding it; agents should use `wait` instead of submitting
+dust quantities.
 
-The model must select exactly one command authorized for its company role:
+OpenAI uses Responses API function tools with one required, non-parallel tool
+call. Codex uses a strict structured-output envelope. Both validate against the
+same discriminated Pydantic `CompanyCommand` union. Missing, multiple, unknown,
+unauthorized, or malformed calls become explicit protocol rejections; they do
+not mutate the economy.
 
-- `produce`
-- `transform`
-- `place_order`
-- `cancel_order`
-- `set_retail_price`
-- `wait`
+## What an agent observes
 
-The runtime—not the model—binds `turn_id`, `company_id`, simulation time, and
-`state_version`.
+`AgentTurn` contains only runtime-authorized facts for one company:
 
-The OpenAI adapter uses Responses API function tools with:
+- simulation time, state version, typed wake reasons, and causal references;
+- available cash and inventory, plus retail price where applicable;
+- cash and FEFO inventory reserved by its own resting orders;
+- its own open orders, including remaining quantity and priority sequence;
+- anonymous `MarketView` values for relevant products: best bid and ask, top
+  three aggregated bid/ask levels, last trade price, and daily volume;
+- guaranteed inbound deliveries with product, quantity, exact arrival time, and
+  quantity-preserving expiry buckets;
+- the active production or transformation job, if any, and remaining daily
+  operation capacity;
+- company-visible domain events and the previous command outcome; and
+- that company's private bounded memory context.
+
+An agent never sees another company's identity in the public order book,
+private assets, memory, prompt, or provider trace. The engine, not the prompt,
+is the source of truth.
+
+## Market and time semantics
+
+Both product markets use continuous fully collateralized limit books:
+
+1. Order quantity is a positive exact multiple of `0.0001`; invalid precision
+   rejects the whole place/replace command without rounding.
+2. A bid reserves `quantity * limit_price`; an ask reserves exact FEFO lots.
+3. Insufficient available cash or inventory rejects the whole new order.
+4. A new order crosses while `best_bid >= best_ask`.
+5. Better prices win; equal prices use the persisted arrival priority.
+6. The execution price is the resting maker order's price.
+7. A fill may consume only part of either order. The remainder keeps its
+   priority; an explicit replace receives a new order ID and priority.
+8. Buyer price improvement is released immediately. Cancellation or 19:00
+   market close releases every unfilled hold.
+
+Every fill pays the seller immediately and creates one automatic delivery to
+the buyer 30 virtual minutes later. Until arrival, those lots are visible as
+inbound but cannot be transformed, sold, or reserved again. This is deliberately
+not a logistics workflow: there is no dispatch command, routing, carrier,
+capacity, delay, failure, or escrow state.
+
+`produce` and `transform` also complete after exactly 30 virtual minutes. One
+company may have only one active physical operation, but that job does not block
+market, wait, or retail-price commands. Starting a job consumes its cash and,
+for transformation, input inventory; output becomes available only at completion.
+
+The business window is `[09:00, 19:00)`. Commands have no 30-minute economic
+cooldown; the runtime permits at most one decision per company per virtual
+minute. At 19:00, due operation and delivery completions run first, then markets
+close, then consumer sales run. Previously committed completions may drain until
+19:29; day close occurs at 19:30.
+
+Relevant companies are woken one minute after an accepted book mutation. A
+resting order also gets a deterministic 30-minute review wake. Operation and
+delivery completions wake the owning company when they occur before market
+close. `wait` may request another time inside the current business window.
+
+## Deterministic concurrency
+
+All agents woken in the same virtual minute observe the same base state version
+and their provider calls run concurrently. Completion speed does not establish
+economic priority. Before applying commands, the runtime sorts companies by:
 
 ```text
-tool_choice = required
-parallel_tool_calls = false
-max_tool_calls = 1
+SHA256(seed | absolute_minute | company_id)
 ```
 
-The Codex adapter uses a strict structured-output envelope backed by the same
-Pydantic command union. Both provider paths normalize into
-`CompanyCommand`. Missing calls, multiple calls, unknown tools, and invalid
-arguments become explicit protocol rejections and do not mutate the economy.
-A protocol rejection consumes one turn and the normal 30-minute duration, then
-schedules `CONTINUE` so the agent can see the error and submit a correction.
+It then commits commands serially and persists the global `apply_sequence`.
+Provider latency, retries, and token use remain invocation-audit metrics only.
+This makes a run replayable and comparable without pretending network latency is
+a business decision.
 
-## Agent memory
+## Private memory
 
-Every company owns an independent `ConversationMemory`. Its request context has
-three layers:
+Each company owns one `ConversationMemory`, model client, and gateway lifecycle.
+The provider request combines:
 
-1. current cash, inventory, retail price, and standing orders projected from
-   `EconomyState`;
-2. company-visible events since the previous turn plus the previous outcome;
-3. recent complete Turn/Command/Outcome cycles and a deterministic long-term
-   summary.
+1. current authoritative `AgentTurn` facts;
+2. recent complete Turn/Command/Outcome exchanges; and
+3. a deterministic long-horizon summary of older complete exchanges.
 
-Old cycles compact by estimated token count, never by splitting a command from
-its outcome. The default memory budget begins compaction around 12,288 tokens,
-while the complete request has an independent estimated ceiling of 16,384. If
-current authoritative facts alone exceed the ceiling, the turn fails
-explicitly instead of silently removing business facts.
+Compaction is token-budget driven, not a fixed seven-day window. It never splits
+a command from its outcome and requires no extra model call. The default
+compaction trigger is 12,288 estimated tokens; the full prompt has an independent
+16,384-token ceiling. If authoritative current facts cannot fit, the turn fails
+explicitly rather than hiding business state.
 
-Summaries require no additional model call and are not an economic source of
-truth. Complete `TurnRecord` objects remain in the journal permanently;
-provider threads are not the benchmark's memory authority.
+Memory helps the agent reason but is not the economic authority. Complete
+`TurnRecord` objects stay in the immutable journal even after prompt compaction.
 
-## Journal, recovery, and replay
+## Journal, checkpoint, and replay
 
-The turn journal stores:
+The turn journal records the exact observation, runtime-bound command, outcome,
+`apply_sequence`, observation hash, causal references, and any protocol error.
+System steps record job completion, delivery, market close, consumer sales, and
+day close alongside their economic effects.
 
-- the exact agent observation;
-- the runtime-bound command;
-- the engine outcome and global `apply_sequence`;
-- the observation hash; and
-- any explicit protocol error.
+After each stable virtual-time bucket, new journal entries and the replacement
+`RunCheckpoint` commit atomically. The checkpoint contains the typed economic
+state, open books and collateral, pending jobs and deliveries, scheduler,
+company availability, events, snapshots, memories, cursors, and fixed policy
+fingerprints.
 
-After each stable time bucket, new journal records and the replacement
-`RunCheckpoint` commit in one transaction. The checkpoint contains the
-economic state, scheduler, pending events, company availability, fixed policy
-metadata, agent memories, cursors, events, snapshots, and the original episode
-start time.
-
-Recovery continues at that atomic boundary. It rejects provider, model, prompt,
-or configuration fingerprint drift instead of mixing policies in one run.
-
-Replay verifies each observation hash, reproduces the source command or source
-protocol rejection, and compares every outcome. It then verifies that the
-source stream is exhausted and final events, snapshots, and score are exactly
-equal. Replay creates no provider gateway and makes zero model calls.
-
-`source_run_id` remains in policy metadata and timeline provenance. The
-Operations Replay UI may display exported source traces and source token usage,
-but labels them as source evidence rather than replay activity.
+Recovery resumes only from that boundary and rejects provider, model, prompt,
+scenario, or configuration drift. Exact replay creates no provider gateway: it
+verifies every observation hash, reproduces each recorded command or protocol
+rejection, compares every outcome and system step, and finally requires equal
+events, snapshots, and score.
 
 ## Running Codex agents
 
@@ -117,38 +166,24 @@ From the repository root:
 ```
 
 The launcher sets `CODEX_HOME=.dairy-bench/codex`, isolated from the user's
-personal `%USERPROFILE%\.codex`. First launch may request a separate login.
-Backend validation refuses to use the personal Codex home directly.
+personal `%USERPROFILE%\.codex`. All twelve companies receive independent
+`AsyncCodex` runtimes and each turn uses an isolated thread. The benchmark
+runtime is read-only with shell, search, plugins, Codex memory, and multi-agent
+features disabled.
 
-All twelve companies receive independent `AsyncCodex` runtimes, and each turn uses
-an isolated thread. The runtime is read-only, uses `deny_all` approval, and
-disables shell, search, plugins, Codex memory, and multi-agent features.
-
-After a turn completes, Dairy Bench:
-
-1. reads the original session JSONL from `CODEX_HOME/sessions`;
-2. exports the public reasoning summary and final structured output; and
-3. archives the session only after a successful export.
+After a turn, Dairy Bench exports the public reasoning summary and final
+structured output, then archives the source session only after export succeeds:
 
 ```text
 run_artifacts/<run_id>/
-├── reasoning/day-001__farm_a__turn-0001.md
-└── final_outputs/day-001__farm_a__turn-0001.json
+|-- reasoning/day-001__farm_a__turn-0001.md
+`-- final_outputs/day-001__farm_a__turn-0001.json
 ```
 
-The project never reads, copies, or stores `auth.json`. It does not expose
-hidden chain-of-thought or decrypt `encrypted_content`.
-
-Archived source sessions are retained for 60 days by default, with at least the
-three most recent runs preserved. Cleanup only removes sessions that are inside
-the isolated archive, have a strict Dairy Bench title, exceed
-`DAIRY_BENCH_CODEX_SESSION_RETENTION_DAYS`, and are outside
-`DAIRY_BENCH_CODEX_SESSION_MIN_RUNS`. Exported `run_artifacts` are long-lived
-audit records and are not governed by source-session retention.
+The project never reads or stores `auth.json`, hidden chain-of-thought, or
+encrypted reasoning content.
 
 ## Running OpenAI agents
-
-From the repository root:
 
 ```powershell
 cd backend
@@ -165,34 +200,22 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 ```
 
 Only the backend reads `OPENAI_API_KEY`; it never enters the browser, journal,
-or database. OpenAI-compatible services may be configured with
-`DAIRY_BENCH_OPENAI_BASE_URL`.
+or database. `DAIRY_BENCH_OPENAI_BASE_URL` may target a compatible service.
 
-## Runtime and failure semantics
-
-```text
-React
-  → FastAPI / RunCoordinator
-  → EpisodeRuntime
-  → CompanyAgent.act() concurrently
-  → EconomyEngine.apply_batch() in deterministic order
-  → Turn Journal + Checkpoint
-  → Evaluator
-```
+## Failure semantics
 
 | Condition | Result |
 |---|---|
-| Missing or invalid model command | Protocol rejection; economy unchanged; `CONTINUE` after the normal command duration |
-| Role, cash, inventory, or state rule fails | Typed engine rejection; run continues |
-| Authentication, retry-exhausted network, rate-limit, or provider outage | Entire run fails; no score is emitted |
+| Missing or invalid model command | Protocol rejection; economy unchanged; correction may be attempted on the next virtual minute |
+| Role, collateral, ownership, capacity, or time rule fails | Typed engine rejection; run continues |
+| Authentication or retry-exhausted provider failure | Entire run fails; no misleading score is emitted |
 | Journal failure or runtime invariant violation | Current transaction rolls back and the run fails |
-
-All same-minute agents observe the same base `state_version`. Their requests
-may finish in any order, but commands apply in a seeded stable order.
 
 ## Audit interfaces
 
 ```text
+GET /api/run-jobs
+GET /api/run-jobs/{run_id}
 GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
@@ -201,18 +224,15 @@ GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts
 ```
 
 `turns` is the authoritative business journal. `invocations` audits provider
-calls, tokens, and latency. `timeline` projects causal, human-readable moments.
-`artifacts` returns previously exported public Codex files and never calls a
-model.
-
-`invocation_id` identifies one real provider call; `domain_turn_id` identifies
-one deterministic economic turn. If a process stops after a provider response
-but before checkpoint commit, recovery creates a new invocation ID while
-retaining the earlier call and its audit data.
+calls, latency, and tokens. `timeline` is a causal human-readable projection.
+Exported `artifacts` are source evidence and never trigger another model call.
+Run-history projection is available for every lifecycle status; a missing final
+episode or score never hides already committed journal and checkpoint evidence.
+Exact replay remains a separate completed-run verification operation.
 
 ## Adding another provider
 
-A V2 adapter implements:
+A V3 adapter implements:
 
 ```python
 class CommandGateway(Protocol):
@@ -224,27 +244,8 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`PolicyFactory` creates a new gateway for each company. The adapter validates
-provider output into an authorized `CompanyCommand`, maps content failures to
-`ModelOutputError`, and maps network, authentication, and service failures to
+`PolicyFactory` creates one gateway per company. The adapter validates output
+into an authorized `CompanyCommand`, maps content failures to
+`ModelOutputError`, and maps infrastructure failures to
 `ModelInfrastructureError`. It must not access `EconomyEngine` or another
 company's state.
-
-## Verification
-
-Tests do not require live model access:
-
-```powershell
-cd backend
-python -m pytest --basetemp "..\.tmp\pytest"
-python -m ruff check .
-
-cd "..\frontend"
-npm.cmd run build
-cd ..
-```
-
-Coverage includes merged wakes, cooldown, the one-tool protocol, protocol
-rejection replay, provider completion-order independence, information
-isolation, atomic SQLite writes, exact checkpoint recovery, zero-call replay,
-timeline provenance, and typed API parsing.

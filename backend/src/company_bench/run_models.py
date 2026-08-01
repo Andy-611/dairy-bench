@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Hashable, Iterable
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import Literal, Protocol, Self
 
 from pydantic import Field, model_validator
 
@@ -26,6 +26,7 @@ from company_bench.runtime_models import (
     CommandOutcome,
     CompanyCommand,
     SimTime,
+    SystemEventKind,
     SystemStepRecord,
     TurnRecord,
 )
@@ -53,6 +54,7 @@ class RunJob(StrictModel):
     run_id: Identifier
     mode: PolicyKind
     status: RunStatus = RunStatus.QUEUED
+    revision: int = Field(default=0, ge=0)
     seed: int
     source_run_id: Identifier | None = None
     scenario_id: Identifier
@@ -70,6 +72,51 @@ class RunJob(StrictModel):
             raise ValueError("current_day must not exceed total_days")
         return self
 
+    def mark_running(self, started_at: datetime) -> Self:
+        """Start or resume the job and advance its persistent revision."""
+        return self._advance(
+            status=RunStatus.RUNNING,
+            started_at=self.started_at or started_at,
+            finished_at=None,
+            error_message=None,
+        )
+
+    def report_progress(self, day: int) -> Self:
+        """Record one newly completed simulation day."""
+        return self._advance(current_day=day)
+
+    def mark_completed(self, finished_at: datetime) -> Self:
+        """Finish the full horizon without an error."""
+        return self._advance(
+            status=RunStatus.COMPLETED,
+            current_day=self.total_days,
+            finished_at=finished_at,
+            error_message=None,
+        )
+
+    def mark_interrupted(self, finished_at: datetime, reason: str) -> Self:
+        """Persist a resumable interruption."""
+        return self._advance(
+            status=RunStatus.INTERRUPTED,
+            finished_at=finished_at,
+            error_message=reason,
+        )
+
+    def mark_failed(self, finished_at: datetime, reason: str) -> Self:
+        """Persist a terminal failure without inventing a score."""
+        return self._advance(
+            status=RunStatus.FAILED,
+            finished_at=finished_at,
+            error_message=reason,
+        )
+
+    def _advance(self, **changes: object) -> Self:
+        """Apply one validated lifecycle transition."""
+        candidate = self.model_copy(
+            update={**changes, "revision": self.revision + 1},
+        )
+        return type(self).model_validate_json(candidate.model_dump_json())
+
 
 class CompanyRuntimeCursor(StrictModel):
     """Per-company counters required for deterministic turn restoration."""
@@ -81,9 +128,9 @@ class CompanyRuntimeCursor(StrictModel):
 
 
 class RunCheckpoint(StrictModel):
-    """Complete atomic state needed to resume one V2 episode."""
+    """Complete atomic state needed to resume one V3 episode."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -191,6 +238,7 @@ class RunCheckpoint(StrictModel):
                 raise ValueError("runtime cursor must follow completed company turns")
             if cursor.last_visible_event_sequence > len(self.events):
                 raise ValueError("runtime cursor cannot exceed checkpoint events")
+        _validate_runtime_commitments(self)
         return self
 
 
@@ -226,7 +274,7 @@ class TokenUsage(StrictModel):
 
 
 class PolicyInvocation(StrictModel):
-    """Auditable provider call for a V1 day or V2 atomic turn."""
+    """Auditable provider call for a daily decision or V3 atomic turn."""
 
     invocation_id: Identifier
     run_id: Identifier
@@ -257,14 +305,14 @@ class PolicyInvocation(StrictModel):
     latency_ms: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def validate_v2_turn(self) -> PolicyInvocation:
-        """Keep optional V2 command audit fields complete and consistent."""
+    def validate_event_turn(self) -> PolicyInvocation:
+        """Keep optional event-driven audit fields complete and consistent."""
         if self.domain_turn_id is not None and (
             self.sim_minute is None
             or self.state_version is None
             or (self.outcome is InvocationOutcome.SUCCESS and self.command is None)
         ):
-            raise ValueError("V2 invocation requires time, state, and successful command")
+            raise ValueError("event-driven invocation requires time, state, and command")
         if self.command_outcome is not None:
             if self.domain_turn_id != self.command_outcome.turn_id:
                 raise ValueError("command outcome must match domain_turn_id")
@@ -281,6 +329,54 @@ class PolicyAuditSink(Protocol):
     def record_invocation(self, invocation: PolicyInvocation) -> None:
         """Persist or replace one deterministic invocation record."""
         ...
+
+
+def _validate_runtime_commitments(checkpoint: RunCheckpoint) -> None:
+    """Pair every future economic commitment with exactly one scheduler event."""
+    pending = checkpoint.scheduler.pending_events
+
+    def completion_keys(kind: SystemEventKind) -> tuple[tuple[str, str | None, int], ...]:
+        keys: list[tuple[str, str | None, int]] = []
+        for event in pending:
+            if event.kind is not kind:
+                continue
+            if len(event.reference_ids) != 1:
+                raise ValueError("completion events require exactly one reference_id")
+            keys.append(
+                (
+                    event.reference_ids[0],
+                    event.company_id,
+                    event.at.absolute_minute,
+                )
+            )
+        _require_unique(keys, f"{kind.value} commitments")
+        return tuple(keys)
+
+    expected_jobs = {
+        (job.job_id, job.company_id, job.completes_at.absolute_minute)
+        for job in checkpoint.economy.jobs
+    }
+    if set(completion_keys(SystemEventKind.OPERATION_COMPLETED)) != expected_jobs:
+        raise ValueError("operation jobs and completion events must match")
+
+    expected_deliveries = {
+        (
+            delivery.delivery_id,
+            delivery.buyer_id,
+            delivery.arrives_at.absolute_minute,
+        )
+        for delivery in checkpoint.economy.deliveries
+    }
+    if set(completion_keys(SystemEventKind.DELIVERY_COMPLETED)) != expected_deliveries:
+        raise ValueError("deliveries and completion events must match")
+
+    runtime = checkpoint.economy.scenario.runtime
+    if any(
+        event.kind is SystemEventKind.COMPANY_WAKE
+        and not runtime.open_minute <= event.at.minute_of_day < runtime.close_minute
+        for event in pending
+    ):
+        raise ValueError("company wakes must remain inside business hours")
 
 
 def _require_unique(values: Iterable[Hashable], label: str) -> None:

@@ -5,7 +5,16 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 ZERO = Decimal("0")
 QUANTITY_QUANTUM = Decimal("0.0001")
@@ -28,6 +37,44 @@ type UnitInterval = Annotated[
     Decimal,
     Field(ge=ZERO, le=Decimal("1")),
 ]
+
+
+class InvalidOrderQuantity(ValueError):
+    """An order quantity cannot be represented at the market's fixed precision."""
+
+
+def _validate_order_quantity(value: Decimal) -> Decimal:
+    """Validate the market tick from the Decimal coefficient without arithmetic."""
+    if not value.is_finite() or value <= ZERO:
+        raise ValueError("order quantity must be positive and finite")
+    decimal_tuple = value.as_tuple()
+    digits = decimal_tuple.digits
+    excess_places = QUANTITY_QUANTUM.as_tuple().exponent - decimal_tuple.exponent
+    if excess_places > 0 and (
+        excess_places > len(digits) or any(digits[-excess_places:])
+    ):
+        raise ValueError(f"order quantity must be an exact multiple of {QUANTITY_QUANTUM}")
+    return value
+
+
+type OrderQuantity = Annotated[
+    Decimal,
+    Field(gt=ZERO),
+    AfterValidator(_validate_order_quantity),
+]
+
+_ORDER_QUANTITY_ADAPTER = TypeAdapter(OrderQuantity)
+
+
+def require_order_quantity(value: Decimal) -> OrderQuantity:
+    """Validate an exact positive quantity without rounding it."""
+    try:
+        return _ORDER_QUANTITY_ADAPTER.validate_python(value)
+    except ValidationError as error:
+        raise InvalidOrderQuantity(
+            f"order quantity must be at least {QUANTITY_QUANTUM} and an exact "
+            f"multiple of {QUANTITY_QUANTUM}"
+        ) from error
 
 
 class StrictModel(BaseModel):
@@ -149,10 +196,12 @@ class RuntimeSpec(StrictModel):
     """Event-time and context budgets for one benchmark scenario."""
 
     open_minute: int = Field(default=9 * 60, ge=0, lt=24 * 60)
-    raw_market_clear_minute: int = Field(default=11 * 60, ge=0, lt=24 * 60)
-    bottled_market_clear_minute: int = Field(default=16 * 60, ge=0, lt=24 * 60)
     close_minute: int = Field(default=19 * 60, ge=0, lt=24 * 60)
-    command_duration_minutes: int = Field(default=30, ge=1)
+    day_close_minute: int = Field(default=19 * 60 + 30, ge=0, lt=24 * 60)
+    operation_duration_minutes: int = Field(default=30, ge=1)
+    delivery_duration_minutes: int = Field(default=30, ge=1)
+    decision_interval_minutes: int = Field(default=1, ge=1)
+    order_review_interval_minutes: int = Field(default=30, ge=1)
     max_turns_per_company_day: int = Field(default=20, ge=1)
     max_prompt_tokens: int = Field(default=16_384, ge=1_024)
     compaction_trigger_tokens: int = Field(default=12_288, ge=512)
@@ -160,14 +209,15 @@ class RuntimeSpec(StrictModel):
     @model_validator(mode="after")
     def validate_schedule(self) -> Self:
         """Require ordered market boundaries and a usable context budget."""
-        boundaries = (
-            self.open_minute,
-            self.raw_market_clear_minute,
-            self.bottled_market_clear_minute,
-            self.close_minute,
-        )
+        boundaries = (self.open_minute, self.close_minute, self.day_close_minute)
         if boundaries != tuple(sorted(set(boundaries))):
             raise ValueError("runtime boundaries must be strictly increasing")
+        latest_completion = self.close_minute - 1 + max(
+            self.operation_duration_minutes,
+            self.delivery_duration_minutes,
+        )
+        if latest_completion >= self.day_close_minute:
+            raise ValueError("day close must follow every possible completion")
         if self.compaction_trigger_tokens >= self.max_prompt_tokens:
             raise ValueError("compaction must start below the prompt-token limit")
         return self
@@ -278,6 +328,7 @@ class WorldState(StrictModel):
     day: int = Field(ge=0)
     companies: tuple[CompanyState, ...]
     previous_markets: tuple[MarketSummary, ...] = ()
+    next_lot_sequence: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
     def validate_company_set(self) -> Self:
@@ -417,12 +468,24 @@ class TradeExecutedEvent(DayEvent):
     """One actual spot-market transfer of money and inventory."""
 
     event_type: Literal["trade_executed"] = "trade_executed"
+    trade_id: Identifier
+    maker_order_id: Identifier
+    taker_order_id: Identifier
     product: ProductId
     seller_id: CompanyId
     buyer_id: CompanyId
     quantity: PositiveQuantity
     unit_price: PositiveMoney
     total_value: PositiveMoney
+
+
+class DeliveryCompletedEvent(CompanyEvent):
+    """One guaranteed trade delivery becoming usable inventory."""
+
+    event_type: Literal["delivery_completed"] = "delivery_completed"
+    trade_id: Identifier
+    product: ProductId
+    quantity: PositiveQuantity
 
 
 class MilkProcessedEvent(CompanyEvent):
@@ -472,6 +535,7 @@ class PolicyFailedEvent(CompanyIssueEvent):
 type DomainEvent = Annotated[
     MilkProducedEvent
     | TradeExecutedEvent
+    | DeliveryCompletedEvent
     | MilkProcessedEvent
     | ConsumerSaleEvent
     | InventoryExpiredEvent

@@ -92,6 +92,7 @@ async def _generate_command(
             state_version=0,
             wake_reasons=(WakeReason.DAY_OPEN,),
             observation=observation,
+            available_cash=observation.cash,
         )
         return await gateway.generate_command(
             CommandModelRequest(

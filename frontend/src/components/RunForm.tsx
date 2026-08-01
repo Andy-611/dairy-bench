@@ -6,7 +6,7 @@ const MODE_LABELS: Readonly<Record<PolicyMode, string>> = {
   baseline: "Rule baseline",
   codex: "Codex agents",
   openai: "OpenAI agents",
-  replay: "Historical replay",
+  replay: "Exact replay",
 };
 
 interface RunFormProps {
@@ -69,7 +69,7 @@ export function RunForm({
             disabled={isLoading}
             name="sourceRunId"
             onChange={(event) => onSourceRunIdChange(event.target.value)}
-            placeholder="Paste a completed run ID"
+            placeholder="Completed source run ID"
             required
             type="text"
             value={sourceRunId}
@@ -111,13 +111,15 @@ export function RunForm({
         ) : (
           <>
             <span aria-hidden="true">▶</span>
-            {mode === "replay" ? "Replay run" : "Run 30 days"}
+            {mode === "replay" ? "Start exact replay" : "Run 30 days"}
           </>
         )}
       </button>
       {selectedProfile && (
         <span className="profile-hint" title={selectedProfile.description}>
-          {selectedProfile.model
+          {mode === "replay"
+            ? "Creates a new deterministic run from a completed source; no agents are called."
+            : selectedProfile.model
             ? [selectedProfile.provider, selectedProfile.model]
                 .filter(Boolean)
                 .join(" · ")
