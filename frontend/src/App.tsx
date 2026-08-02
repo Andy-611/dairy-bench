@@ -138,7 +138,7 @@ export function App() {
         <section className="hero">
           <div>
             <span className="eyebrow">
-              {(selectedJob?.scenarioId ?? "flow.dairy.base.s12.v3").toUpperCase()}
+              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v3").toUpperCase()}
             </span>
             <h1>Independent companies. One living dairy economy.</h1>
             <p>

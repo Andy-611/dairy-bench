@@ -20,7 +20,7 @@ from company_bench.agent_models import (
 from company_bench.agents import COMMAND_PROMPT_VERSION, LlmCompanyAgent
 from company_bench.codex_gateway import CodexAgentConfig
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.models import (
     CompanyObservation,
     NoOpDecision,
@@ -92,11 +92,11 @@ class _RecordingCodexGatewayFactory:
         return gateway
 
 
-def test_codex_mode_owns_twelve_independent_company_runtimes() -> None:
+def test_codex_mode_owns_nine_independent_company_runtimes() -> None:
     repository = MemoryRunRepository()
     gateway_factory = _RecordingCodexGatewayFactory()
     factory = PolicyFactory(
-        DAIRY_S12_V3_SCENARIO,
+        DAIRY_S9_V3_SCENARIO,
         repository,
         codex_config=CodexAgentConfig(model="test-codex-model"),
         codex_gateway_factory=gateway_factory,
@@ -106,11 +106,12 @@ def test_codex_mode_owns_twelve_independent_company_runtimes() -> None:
     agents = tuple(bundle.agents.values())
     asyncio.run(bundle.close())
 
-    expected_company_ids = [company.company_id for company in DAIRY_S12_V3_SCENARIO.companies]
+    expected_company_ids = [company.company_id for company in DAIRY_S9_V3_SCENARIO.companies]
+    expected_count = len(expected_company_ids)
     assert gateway_factory.company_ids == expected_company_ids
-    assert len({id(gateway) for gateway in gateway_factory.gateways}) == 12
+    assert len({id(gateway) for gateway in gateway_factory.gateways}) == expected_count
     assert all(gateway.closed for gateway in gateway_factory.gateways)
-    assert len({id(agent) for agent in agents}) == 12
+    assert len({id(agent) for agent in agents}) == expected_count
     assert all(isinstance(agent, LlmCompanyAgent) for agent in agents)
     assert all(agent.metadata.kind is PolicyKind.CODEX for agent in agents)
     assert all(agent.metadata.provider == "codex" for agent in agents)
@@ -204,7 +205,7 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
     repository = MemoryRunRepository()
     gateway_factory = _RecordingGatewayFactory(_UnavailableGateway)
     factory = PolicyFactory(
-        DAIRY_S12_V3_SCENARIO,
+        DAIRY_S9_V3_SCENARIO,
         repository,
         openai_config=_config(),
         gateway_factory=gateway_factory,
@@ -214,7 +215,7 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
         coordinator = RunCoordinator(
             repository,
             factory,
-            runtime=EpisodeRuntime(DAIRY_S12_V3_SCENARIO),
+            runtime=EpisodeRuntime(DAIRY_S9_V3_SCENARIO),
         )
         await coordinator.start()
         try:
@@ -248,10 +249,11 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
     gateways = tuple(
         gateway for gateway in gateway_factory.gateways if isinstance(gateway, _UnavailableGateway)
     )
-    assert len(gateways) == 12
-    assert len({id(gateway) for gateway in gateways}) == 12
+    expected_count = len(DAIRY_S9_V3_SCENARIO.companies)
+    assert len(gateways) == expected_count
+    assert len({id(gateway) for gateway in gateways}) == expected_count
     assert all(gateway.closed for gateway in gateways)
     assert all(len(gateway.command_requests) == 1 for gateway in gateways)
     assert {gateway.command_requests[0].turn.company_id for gateway in gateways} == {
-        company.company_id for company in DAIRY_S12_V3_SCENARIO.companies
+        company.company_id for company in DAIRY_S9_V3_SCENARIO.companies
     }

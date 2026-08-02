@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from company_bench.agents import BaselineCompanyAgent
-from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.memory import AgentCheckpoint
 from company_bench.models import (
@@ -48,10 +48,10 @@ def run_episode(seed: int = 42) -> EpisodeResult:
     """Create one real V3 episode through the public runtime interface."""
     agents = {
         company.company_id: BaselineCompanyAgent()
-        for company in DAIRY_S12_V3_SCENARIO.companies
+        for company in DAIRY_S9_V3_SCENARIO.companies
     }
     execution = asyncio.run(
-        EpisodeRuntime(DAIRY_S12_V3_SCENARIO).run(
+        EpisodeRuntime(DAIRY_S9_V3_SCENARIO).run(
             agents,
             seed,
             run_id=f"repository_{seed}",
@@ -291,8 +291,8 @@ def _history_jobs() -> tuple[RunJob, ...]:
             mode=PolicyKind.BASELINE,
             status=status,
             seed=sequence,
-            scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
-            total_days=DAIRY_S12_V3_SCENARIO.days,
+            scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S9_V3_SCENARIO.days,
             submitted_at=submitted_at + timedelta(minutes=sequence),
         )
         for sequence, status in enumerate(RunStatus)
@@ -437,7 +437,7 @@ def _checkpoint_for(
 ) -> RunCheckpoint:
     """Build a complete, versioned recovery payload around one turn."""
     engine = EconomyEngine()
-    world = engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=42)
+    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=42)
     return RunCheckpoint(
         run_id=record.run_id,
         episode_started_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -456,7 +456,7 @@ def _checkpoint_for(
                     else PolicyKind.BASELINE
                 ),
             )
-            for company in DAIRY_S12_V3_SCENARIO.companies
+            for company in DAIRY_S9_V3_SCENARIO.companies
         ),
         agent_states=(
             AgentCheckpoint(
@@ -473,7 +473,7 @@ def _checkpoint_for(
                 company_id=company.company_id,
                 next_turn_sequence=(2 if company.company_id == observation.company_id else 1),
             )
-            for company in DAIRY_S12_V3_SCENARIO.companies
+            for company in DAIRY_S9_V3_SCENARIO.companies
         ),
     )
 

@@ -11,7 +11,7 @@ from company_bench.codex_artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
 )
-from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.models import (
     CompanyObservation,
     EpisodeResult,
@@ -32,7 +32,7 @@ from company_bench.web import create_app
 
 def _app(repository: MemoryRunRepository) -> FastAPI:
     """Create an app with deterministic server-side policy availability."""
-    factory = PolicyFactory(DAIRY_S12_V3_SCENARIO, repository)
+    factory = PolicyFactory(DAIRY_S9_V3_SCENARIO, repository)
     return create_app(repository, factory)
 
 
@@ -75,12 +75,12 @@ def test_run_list_and_detail_http_flow() -> None:
         assert detail.status_code == 200
         result = EpisodeResult.model_validate(detail.json())
         assert result.seed == 42
-        assert result.scenario == DAIRY_S12_V3_SCENARIO
-        assert len(result.scenario.companies) == 12
+        assert result.scenario == DAIRY_S9_V3_SCENARIO
+        assert len(result.scenario.companies) == 9
         assert result.decisions == ()
         assert len(result.snapshots) == 30
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
-        assert len(turns) > (DAIRY_S12_V3_SCENARIO.days * len(DAIRY_S12_V3_SCENARIO.companies))
+        assert len(turns) > (DAIRY_S9_V3_SCENARIO.days * len(DAIRY_S9_V3_SCENARIO.companies))
         assert turns[0]["turn"]["state_version"] == 0
         assert turns[0]["envelope"]["command"]["kind"] in {
             "produce",
@@ -90,7 +90,7 @@ def test_run_list_and_detail_http_flow() -> None:
 
         summaries = client.get("/api/runs").json()
         assert summaries[0]["run_id"] == result.run_id
-        assert summaries[0]["scenario_id"] == "flow.dairy.base.s12.v3"
+        assert summaries[0]["scenario_id"] == "flow.dairy.base.s9.v3"
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -142,8 +142,8 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
                 mode=PolicyKind.BASELINE,
                 status=status,
                 seed=sequence,
-                scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
-                total_days=DAIRY_S12_V3_SCENARIO.days,
+                scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+                total_days=DAIRY_S9_V3_SCENARIO.days,
                 submitted_at=submitted_at + timedelta(minutes=sequence),
             )
             for sequence, status in enumerate(RunStatus)
@@ -262,8 +262,8 @@ def test_default_app_runs_the_v2_scenario(monkeypatch: MonkeyPatch) -> None:
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
 
     assert completed.status is RunStatus.COMPLETED
-    assert result.scenario == DAIRY_S12_V3_SCENARIO
-    assert len(turns) > (DAIRY_S12_V3_SCENARIO.days * len(DAIRY_S12_V3_SCENARIO.companies))
+    assert result.scenario == DAIRY_S9_V3_SCENARIO
+    assert len(turns) > (DAIRY_S9_V3_SCENARIO.days * len(DAIRY_S9_V3_SCENARIO.companies))
 
 
 def test_codex_profile_can_be_enabled_without_exposing_credentials(
@@ -281,7 +281,7 @@ def test_codex_profile_can_be_enabled_without_exposing_credentials(
         "label": "Codex company agents",
         "available": True,
         "provider": "codex",
-        "model": "gpt-5.6-sol",
+        "model": "gpt-5.6-luna",
         "reasoning_effort": "low",
         "description": "Each company is controlled by an independent Codex runtime.",
         "unavailable_reason": None,
@@ -304,8 +304,8 @@ def test_codex_artifacts_are_loaded_lazily_from_run_files(
             run_id=run_id,
             mode=PolicyKind.CODEX,
             seed=42,
-            scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
-            total_days=DAIRY_S12_V3_SCENARIO.days,
+            scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S9_V3_SCENARIO.days,
             submitted_at=now,
         )
     )
@@ -372,8 +372,8 @@ def test_v2_codex_artifacts_are_resolved_by_domain_turn(
             run_id=run_id,
             mode=PolicyKind.CODEX,
             seed=42,
-            scenario_id=DAIRY_S12_V3_SCENARIO.scenario_id,
-            total_days=DAIRY_S12_V3_SCENARIO.days,
+            scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S9_V3_SCENARIO.days,
             submitted_at=now,
         )
     )

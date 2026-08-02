@@ -20,7 +20,7 @@ from company_bench.codex_artifacts import (
     CodexArtifactStore,
     CodexArtifactView,
 )
-from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.market_timeline import MarketTimelineProjector
 from company_bench.models import PolicyKind, PolicyMetadata, ProductId
 from company_bench.repository import MemoryRunRepository, SQLiteRunRepository
@@ -127,7 +127,9 @@ class _MarketTimelineAgent:
     async def act(self, turn: AgentTurn) -> CompanyCommand:
         """Return one deterministic command from the current virtual minute."""
         minute = turn.sim_time.minute_of_day
-        open_minute = turn.observation.runtime.open_minute
+        runtime = turn.observation.runtime
+        open_minute = runtime.open_minute
+        production_complete = open_minute + runtime.operation_duration_minutes
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
             return PlaceOrder(
                 side=MarketSide.BUY,
@@ -142,27 +144,30 @@ class _MarketTimelineAgent:
                 product=ProductId.RAW_MILK,
                 quantity=Decimal("60"),
             )
-        if minute == open_minute + 30:
+        if minute == production_complete:
             return PlaceOrder(
                 side=MarketSide.SELL,
                 product=ProductId.RAW_MILK,
                 quantity=Decimal("50"),
                 limit_price=Decimal("1.65"),
             )
-        if minute == open_minute + 31 and turn.open_orders:
+        if minute == production_complete + runtime.decision_interval_minutes and turn.open_orders:
             return ReplaceOrder(
                 order_id=turn.open_orders[0].order_id,
                 quantity=Decimal("10"),
                 limit_price=Decimal("1.64"),
             )
-        if minute == open_minute + 32 and turn.open_orders:
+        if (
+            minute == production_complete + 2 * runtime.decision_interval_minutes
+            and turn.open_orders
+        ):
             return CancelOrder(order_id=turn.open_orders[0].order_id)
         return Wait()
 
 
 @pytest.mark.asyncio
 async def test_timeline_projects_system_steps_turns_and_typed_state_changes() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -218,10 +223,10 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
 @pytest.mark.asyncio
 async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() -> None:
     companies = tuple(
-        DAIRY_S12_V3_SCENARIO.company(company_id)
+        DAIRY_S9_V3_SCENARIO.company(company_id)
         for company_id in ("farm_a", "processor_a")
     )
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(
         update={
             "scenario_id": "timeline.market.s2.v3",
             "days": 1,
@@ -239,6 +244,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
     page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
     frames = {moment.sim_time.minute_of_day: moment.market for moment in page.moments}
+    fill_minute = scenario.runtime.open_minute + scenario.runtime.operation_duration_minutes
     raw_at_open = next(
         book
         for book in frames[scenario.runtime.open_minute].closing_order_books
@@ -246,7 +252,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     )
     raw_after_fill = next(
         book
-        for book in frames[scenario.runtime.open_minute + 30].closing_order_books
+        for book in frames[fill_minute].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
 
@@ -260,7 +266,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert open_flow[0].matched_quantity == 0
     assert open_flow[0].remaining_quantity == Decimal("40")
 
-    fill_frame = frames[scenario.runtime.open_minute + 30]
+    fill_frame = frames[fill_minute]
     assert len(fill_frame.order_flow) == 1
     fill_flow = fill_frame.order_flow[0]
     assert isinstance(fill_flow, MarketOrderPlaced)
@@ -274,19 +280,23 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert tuple(trade.quantity for trade in fill_frame.trades) == (Decimal("40"),)
     assert fill_frame.trades[0].maker_order_id == fill_flow.matches[0].maker_order.order_id
     assert fill_frame.trades[0].taker_order_id == fill_flow.incoming_order.order_id
-    assert fill_frame.trades[0].arrives_at.minute_of_day == scenario.runtime.open_minute + 60
+    assert fill_frame.trades[0].arrives_at.minute_of_day == (
+        fill_minute + scenario.runtime.delivery_duration_minutes
+    )
     assert raw_after_fill.last_trade_price == Decimal("1.66")
     assert raw_after_fill.best_bid is None
     assert raw_after_fill.best_ask == Decimal("1.65")
     assert raw_after_fill.asks[0].size == Decimal("10")
     original_order_id = raw_after_fill.asks[0].orders[0].order_id
+    replace_minute = fill_minute + scenario.runtime.decision_interval_minutes
+    cancel_minute = replace_minute + scenario.runtime.decision_interval_minutes
 
     raw_after_replace = next(
         book
-        for book in frames[scenario.runtime.open_minute + 31].closing_order_books
+        for book in frames[replace_minute].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
-    replace_flow = frames[scenario.runtime.open_minute + 31].order_flow
+    replace_flow = frames[replace_minute].order_flow
     assert len(replace_flow) == 1
     assert isinstance(replace_flow[0], MarketOrderReplaced)
     assert replace_flow[0].replaced_order.order_id == original_order_id
@@ -295,17 +305,16 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
     raw_after_cancel = next(
         book
-        for book in frames[scenario.runtime.open_minute + 32].closing_order_books
+        for book in frames[cancel_minute].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
-    cancel_flow = frames[scenario.runtime.open_minute + 32].order_flow
+    cancel_flow = frames[cancel_minute].order_flow
     assert len(cancel_flow) == 1
     assert isinstance(cancel_flow[0], MarketOrderCancelled)
     assert cancel_flow[0].cancelled_order.order_id == raw_after_replace.asks[0].orders[0].order_id
     assert raw_after_cancel.bids == ()
     assert raw_after_cancel.asks == ()
 
-    cancel_minute = scenario.runtime.open_minute + 32
     partial_projection = MarketTimelineProjector().project_day(
         scenario,
         1,
@@ -324,7 +333,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
 @pytest.mark.asyncio
 async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -405,7 +414,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
 async def test_trace_detail_degrades_when_optional_artifact_is_missing_or_unreadable(
     tmp_path: Path,
 ) -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -469,7 +478,7 @@ async def test_trace_detail_degrades_when_optional_artifact_is_missing_or_unread
 async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
     tmp_path: Path,
 ) -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     memory = MemoryRunRepository()
     await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -489,7 +498,7 @@ async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
 
 @pytest.mark.asyncio
 async def test_timeline_does_not_invent_unpersisted_system_steps() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     durable = MemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -528,7 +537,7 @@ class _StopAfterFirstProgress:
 
 @pytest.mark.asyncio
 async def test_failed_run_timeline_preserves_raw_dust_order_and_provider_audit() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     run_id = "failed_dust_history"
     agents: dict[str, CompanyAgent] = {
@@ -601,7 +610,7 @@ async def test_failed_run_timeline_preserves_raw_dust_order_and_provider_audit()
 
 @pytest.mark.asyncio
 async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -652,7 +661,7 @@ async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(

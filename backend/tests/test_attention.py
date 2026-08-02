@@ -56,8 +56,9 @@ def _turn(
 def test_runtime_defaults_bound_attention_without_periodic_order_review() -> None:
     runtime = RuntimeSpec()
 
+    assert runtime.decision_interval_minutes == 30
     assert runtime.max_wait_minutes == 120
-    assert runtime.max_turns_per_company_day == 25
+    assert runtime.max_turns_per_company_day == 10
     assert "order_review_interval_minutes" not in RuntimeSpec.model_fields
 
 
@@ -76,11 +77,11 @@ def test_wait_accepts_at_most_three_typed_alerts() -> None:
 def test_agent_turn_exposes_a_consistent_daily_budget(
     first_observation: CompanyObservation,
 ) -> None:
-    turn = _turn(first_observation, turn_number=25)
+    turn = _turn(first_observation, turn_number=10)
 
-    assert turn.turn_number_today == turn.turn_limit_today == 25
+    assert turn.turn_number_today == turn.turn_limit_today == 10
     with pytest.raises(ValidationError, match="cannot exceed"):
-        _turn(first_observation, turn_number=26)
+        _turn(first_observation, turn_number=11)
     with pytest.raises(ValidationError, match="must match the runtime turn limit"):
         AgentTurn(
             turn_id="run_1.farm_a.t1",
@@ -88,7 +89,7 @@ def test_agent_turn_exposes_a_consistent_daily_budget(
             sim_time=SimTime.at(day=0, hour=9),
             state_version=0,
             turn_number_today=1,
-            turn_limit_today=24,
+            turn_limit_today=9,
             wake_reasons=(WakeReason.DAY_OPEN,),
             observation=first_observation,
             available_cash=first_observation.cash,

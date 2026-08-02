@@ -12,7 +12,7 @@ from company_bench.agents import (
     LlmCompanyAgent,
     observation_hash,
 )
-from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import (
     CompanyObservation,
@@ -114,7 +114,7 @@ def _turn(
 def _observation(company_id: str) -> CompanyObservation:
     """Read one company's initial V3 observation."""
     engine = EconomyEngine()
-    world = engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=42)
+    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=42)
     return next(
         observation
         for observation in engine.observe(world)
@@ -503,7 +503,7 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
 
 @pytest.mark.asyncio
 async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     run_id = "llm_runtime_cycle"
     repository = MemoryRunRepository()
     agents: dict[str, LlmCompanyAgent] = {}

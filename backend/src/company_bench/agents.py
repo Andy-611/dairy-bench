@@ -561,7 +561,9 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "condition is needed; otherwise provide up to three OR price alerts over "
         "visible best_bid or best_ask values; every alert must still be false when armed. "
         "Background monitoring consumes no turn, but every model call counts against the "
-        "daily turn budget supplied in the turn. Do not poll for ordinary quote changes. "
+        "daily turn budget supplied in the turn. Except for an accepted wait, each decision "
+        "starts the runtime's decision_interval_minutes cooldown. Do not poll for ordinary "
+        "quote changes. "
         f"Authorized commands: {commands}."
     )
 

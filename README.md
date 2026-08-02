@@ -1,10 +1,10 @@
 # Dairy Bench
 
 Dairy Bench is an event-driven multi-agent benchmark for a perishable dairy
-supply chain. Four farms, four processors, and four retailers share two spot
-markets; each of the twelve companies is controlled by an independent agent.
+supply chain. Three farms, three processors, and three retailers share two spot
+markets; each of the nine companies is controlled by an independent agent.
 
-The default scenario is `flow.dairy.base.s12.v3`. An episode lasts 30 simulated
+The default scenario is `flow.dairy.base.s9.v3`. An episode lasts 30 simulated
 days, and every decision is one strongly typed atomic command:
 
 ```text
@@ -27,8 +27,9 @@ deliveries, or trade results. Natural-language text never settles a transaction.
   `SHA256(seed | minute | company)` order. Provider response latency is audited
   but cannot change the economic result.
 - `produce` and `transform` occupy the company's physical resource for 30 virtual
-  minutes. Market and retail-price commands remain instantaneous, subject to the
-  one-decision-per-virtual-minute throttle.
+  minutes. Market and retail-price commands remain instantaneous. Except for an
+  accepted `wait`, each decision starts a 30-minute Agent cooldown; the daily cap
+  is ten turns. A matched price alert still wakes the company on the next minute.
 - A trade pays the seller immediately and schedules automatic buyer delivery 30
   minutes later. There is no manual dispatch, route, carrier, or escrow workflow.
 - Each agent sees anonymous top-of-book depth, its own orders, available and
@@ -55,7 +56,7 @@ See [V3 architecture and invariants](docs/V3_ARCHITECTURE.md) and
 ```text
 React -> FastAPI -> RunCoordinator -> EpisodeRuntime -> Scheduler + EconomyEngine
                          |                 `-> Evaluator
-                         |-> PolicyFactory -> CompanyAgent x 12
+                         |-> PolicyFactory -> CompanyAgent x 9
                          `-> LifecycleRepository -> Journal + Checkpoint + SQLite
 ```
 

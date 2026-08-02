@@ -1,9 +1,9 @@
 # Dairy Bench
 
-Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark。四家牧场、
-四家加工厂和四家零售商共享两个现货市场，十二家企业各由一个独立 Agent 控制。
+Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark。三家牧场、
+三家加工厂和三家零售商共享两个现货市场，九家企业各由一个独立 Agent 控制。
 
-默认场景为 `flow.dairy.base.s12.v3`。一个 episode 持续 30 个模拟日，每次决策只
+默认场景为 `flow.dairy.base.s9.v3`。一个 episode 持续 30 个模拟日，每次决策只
 提交一条强类型原子命令：
 
 ```text
@@ -25,7 +25,8 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
   `SHA256(seed | minute | company)` 顺序串行提交。Provider 响应延迟只用于审计，
   不影响经济结果。
 - `produce` 和 `transform` 独占企业的物理资源 30 个虚拟分钟；市场命令和零售价
-  命令没有经济冷却，但每家企业每个虚拟分钟最多决策一次。
+  命令没有经济冷却。除成功的 `wait` 外，每次决策后 Agent 冷却 30 分钟，每日最多
+  10 Turn；价格 Alert 命中后仍于下一分钟唤醒。
 - 成交后卖方立即收款，买方在 30 分钟后自动收到货物；不引入手动发货、路线、承运商
   或托管工作流。
 - Agent 可看到匿名盘口、自有订单、可用及冻结资产、待到货、当前作业和当日剩余产能。
@@ -50,7 +51,7 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
 ```text
 React -> FastAPI -> RunCoordinator -> EpisodeRuntime -> Scheduler + EconomyEngine
                          |                 `-> Evaluator
-                         |-> PolicyFactory -> CompanyAgent x 12
+                         |-> PolicyFactory -> CompanyAgent x 9
                          `-> LifecycleRepository -> Journal + Checkpoint + SQLite
 ```
 

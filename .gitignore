@@ -28,6 +28,7 @@ frontend/node_modules/
 frontend/.npm-cache/
 
 # Local configuration and credentials
+.hermes/
 .env
 .env.*
 !.env.example

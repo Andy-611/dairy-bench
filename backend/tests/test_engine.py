@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from company_bench.dairy_scenario import DAIRY_S12_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.engine import EconomyEngine, EconomyState, PendingDelivery
 from company_bench.models import (
     MAX_SEED,
@@ -13,6 +13,7 @@ from company_bench.models import (
     InventoryLot,
     MilkProcessedEvent,
     MilkProducedEvent,
+    ProcessorOperation,
     ProductId,
     TradeExecutedEvent,
 )
@@ -42,7 +43,7 @@ def engine() -> EconomyEngine:
 @pytest.fixture
 def economy(engine: EconomyEngine) -> EconomyState:
     """Open the canonical first business day."""
-    return engine.open_day(engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=7))
+    return engine.open_day(engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=7))
 
 
 def _at(hour: int, minute: int = 0, *, day: int = 0) -> SimTime:
@@ -141,7 +142,7 @@ def _open_with_inventory(
     cash: Decimal = Decimal("1000"),
 ) -> EconomyState:
     """Open day one with one explicit test-only starting lot."""
-    world = engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=7)
+    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=7)
     companies = tuple(
         company.model_copy(
             update={
@@ -198,24 +199,36 @@ def _close_day(engine: EconomyEngine, economy: EconomyState) -> DayResult:
     return engine.close_day(settled, _at(19, 30, day=economy.day - 1))
 
 
-def test_v3_scenario_has_twelve_typed_companies_and_event_schedule() -> None:
-    scenario = DAIRY_S12_V3_SCENARIO
+def test_v3_scenario_has_nine_typed_companies_and_balanced_capacity() -> None:
+    scenario = DAIRY_S9_V3_SCENARIO
     expected_ids = tuple(
         f"{tier}_{suffix}"
         for tier in ("farm", "processor", "retailer")
-        for suffix in ("a", "b", "c", "d")
+        for suffix in ("a", "b", "c")
     )
+    operation_kinds = tuple(company.operation.kind for company in scenario.companies)
 
-    assert scenario.scenario_id == "flow.dairy.base.s12.v3"
+    processor_output_capacity = sum(
+        (
+            company.operation.daily_input_capacity * company.operation.yield_rate
+            for company in scenario.companies
+            if isinstance(company.operation, ProcessorOperation)
+        ),
+        start=Decimal(),
+    )
+    reference_demand = scenario.demand.base_demand * operation_kinds.count("retailer")
+
+    assert scenario.scenario_id == "flow.dairy.base.s9.v3"
     assert scenario.version == 3
     assert scenario.days == 30
     assert tuple(company.company_id for company in scenario.companies) == expected_ids
     assert tuple(company.initial_cash for company in scenario.companies) == (
         Decimal("1000"),
-    ) * 12
-    assert [company.operation.kind for company in scenario.companies].count("farm") == 4
-    assert [company.operation.kind for company in scenario.companies].count("processor") == 4
-    assert [company.operation.kind for company in scenario.companies].count("retailer") == 4
+    ) * 9
+    assert operation_kinds.count("farm") == 3
+    assert operation_kinds.count("processor") == 3
+    assert operation_kinds.count("retailer") == 3
+    assert processor_output_capacity == reference_demand == Decimal("120")
     assert scenario.runtime.open_minute == 9 * 60
     assert scenario.runtime.close_minute == 19 * 60
     assert scenario.runtime.day_close_minute == 19 * 60 + 30
@@ -226,7 +239,7 @@ def test_v3_scenario_has_twelve_typed_companies_and_event_schedule() -> None:
 @pytest.mark.parametrize("seed", [-1, True, MAX_SEED + 1])
 def test_engine_rejects_invalid_seed(seed: int) -> None:
     with pytest.raises(ValueError, match="seed must be"):
-        EconomyEngine().initial_state(DAIRY_S12_V3_SCENARIO, seed)
+        EconomyEngine().initial_state(DAIRY_S9_V3_SCENARIO, seed)
 
 
 def test_production_is_atomic_busy_capacity_limited_and_completes_in_thirty_minutes(
@@ -770,7 +783,7 @@ def test_consumer_sales_run_after_market_close_and_day_closes_at_nineteen_thirty
 
     sales = [event for event in economy.events if isinstance(event, ConsumerSaleEvent)]
     retailer_sale = next(event for event in sales if event.company_id == "retailer_a")
-    assert len(sales) == 4
+    assert len(sales) == 3
     assert retailer_sale.sold_quantity == Decimal("10")
     assert retailer_sale.revenue == Decimal("35.00")
     assert _company(economy, "retailer_a").cash == Decimal("1035.00")
@@ -811,7 +824,7 @@ def test_operation_started_at_eighteen_fifty_nine_finishes_before_day_close(
 
 
 def test_lot_sequence_is_persisted_across_business_days(engine: EconomyEngine) -> None:
-    world = engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=17)
+    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=17)
     day_one = _produce_ready(engine, engine.open_day(world), Decimal("1"))
     first_lot = _company(day_one, "farm_a").inventory[0]
     first_sequence = day_one.next_lot_sequence
@@ -835,17 +848,17 @@ def test_lot_sequence_is_persisted_across_business_days(engine: EconomyEngine) -
 
 
 def test_observation_hides_seed_and_exposes_public_rules(engine: EconomyEngine) -> None:
-    world = engine.initial_state(DAIRY_S12_V3_SCENARIO, seed=314159)
+    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=314159)
     observation = engine.observe(world)[0]
     visible = observation.model_dump()
 
     assert "seed" not in visible
-    assert observation.observation_id == "flow.dairy.base.s12.v3|1|farm_a"
-    assert observation.products == DAIRY_S12_V3_SCENARIO.products
-    assert observation.demand == DAIRY_S12_V3_SCENARIO.demand
-    assert observation.scoring == DAIRY_S12_V3_SCENARIO.scoring
-    assert observation.runtime == DAIRY_S12_V3_SCENARIO.runtime
+    assert observation.observation_id == "flow.dairy.base.s9.v3|1|farm_a"
+    assert observation.products == DAIRY_S9_V3_SCENARIO.products
+    assert observation.demand == DAIRY_S9_V3_SCENARIO.demand
+    assert observation.scoring == DAIRY_S9_V3_SCENARIO.scoring
+    assert observation.runtime == DAIRY_S9_V3_SCENARIO.runtime
     assert tuple(company.company_id for company in observation.public_companies) == tuple(
-        company.company_id for company in DAIRY_S12_V3_SCENARIO.companies
+        company.company_id for company in DAIRY_S9_V3_SCENARIO.companies
     )
     assert all(not hasattr(company, "initial_cash") for company in observation.public_companies)
