@@ -47,7 +47,7 @@ Runtime 只暴露一个主要操作 `run()`，同时负责完整的模拟协议�
 
 ### `RunTimelineProjector`
 
-Projector 是 Operations Replay 背后的读取侧模块。它把权威 Turn Journal、
+Projector 是 Operations Timeline 背后的读取侧模块。它把权威 Turn Journal、
 系统步骤、provider 审计、Replay 血缘和导出的公开产物连接成一条强类型
 时间线。浏览器不会重建因果关系，也不会根据时间戳推断模型调用。
 
@@ -143,9 +143,9 @@ Replay Agent 按顺序消费源 Turn Journal。它会验证当前观察哈希，
 事件、快照和分数完全相同。它不会创建模型 Gateway，也不会调用 provider。
 任何经济、可见性或调度漂移都会立即导致失败。
 
-## Operations Replay
+## Operations Timeline
 
-Operations Replay 以 Turn 为中心，而不是以事件为中心。它把一天组织成多个
+Operations Timeline 以 Turn 为中心，而不是以事件为中心。它把一天组织成多个
 虚拟分钟时刻，并展示：
 
 - 该分钟发生的系统步骤；
@@ -159,7 +159,8 @@ Operations Replay 以 Turn 为中心，而不是以事件为中心。它把一�
 命令的直接影响嵌套在对应 Turn 下面。市场清算、消费者销售、过期和日终状态
 变化显示为系统步骤。这样可以避免把同一个经济行为展示两次。
 
-默认折叠没有效果的 wait，但仍然可以筛选和审计。条目详情采用延迟获取，因此
+默认展示所有没有效果的 wait，并保留完整审计记录；公司、状态和命令筛选仍然生效。
+条目详情采用延迟获取，因此
 30 天运行不需要预先加载所有 trace payload。
 
 ## 信息边界

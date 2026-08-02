@@ -188,6 +188,22 @@ class EpisodeRuntime:
                 )
                 for company in self.scenario.companies
             }
+        if checkpoint is None:
+            self._save_progress(
+                store,
+                (),
+                (),
+                run_id,
+                episode_started_at,
+                economy,
+                scheduler,
+                agents,
+                turns,
+                system_steps,
+                event_records,
+                snapshots,
+                cursors,
+            )
         previous_outcomes = self._previous_outcomes(turns)
         turn_counts = self._turn_counts(turns)
         turn_limit_audits: set[tuple[int, CompanyId]] = {

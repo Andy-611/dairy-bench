@@ -197,6 +197,7 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 ```text
 GET /api/run-jobs
 GET /api/run-jobs/{run_id}
+POST /api/run-jobs/{run_id}/stop
 GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
@@ -206,8 +207,10 @@ GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts
 
 `turns` 是权威业务 Journal；`invocations` 审计 Provider 调用、延迟和 token；
 `timeline` 是可读的因果投影；导出的 `artifacts` 只是源证据，不会触发模型调用。
-Run History 对所有生命周期状态开放；即使没有最终 Episode 或得分，也不会隐藏已经提交
-的 Journal、错误和 Checkpoint。Exact Replay 仍是独立的 completed Run 确定性验证。
+页面会自动打开刚提交或仍在运行的 Run。Exact Replay 下拉框只列出全部 completed Run；
+选择来源即可读取其 Journal、Checkpoint 和最终 Episode，启动 Replay 才会执行确定性验证。
+`stopped` 是不可恢复的永久终态：保留已提交的 Journal、Checkpoint 和时间线，但没有
+最终分数，也不会进入 Exact Replay 来源；`interrupted` 仍专门表示可恢复的后端中断。
 
 ## 添加其他 Provider
 

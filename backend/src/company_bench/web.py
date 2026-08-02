@@ -37,6 +37,7 @@ from company_bench.repository import (
 from company_bench.run_models import (
     PolicyInvocation,
     PolicyProfileView,
+    ReplaySource,
     RunJob,
 )
 from company_bench.runtime import EpisodeRuntime
@@ -199,6 +200,14 @@ def create_app(
         return active_repository.list_jobs(limit)
 
     @app.get(
+        "/api/replay-sources",
+        response_model=tuple[ReplaySource, ...],
+        tags=["runs"],
+    )
+    def list_replay_sources() -> tuple[ReplaySource, ...]:
+        return active_repository.list_replay_sources()
+
+    @app.get(
         "/api/run-jobs/{run_id}",
         response_model=RunJob,
         tags=["runs"],
@@ -208,6 +217,17 @@ def create_app(
         if job is None:
             raise _not_found("Run job", run_id)
         return job
+
+    @app.post(
+        "/api/run-jobs/{run_id}/stop",
+        response_model=RunJob,
+        tags=["runs"],
+    )
+    async def stop_job(run_id: str) -> RunJob:
+        try:
+            return await coordinator.stop(run_id)
+        except LookupError as error:
+            raise _not_found("Run job", run_id) from error
 
     @app.get(
         "/api/runs",

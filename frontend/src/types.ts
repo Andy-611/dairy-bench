@@ -9,7 +9,8 @@ export type RunStatus =
   | "running"
   | "interrupted"
   | "completed"
-  | "failed";
+  | "failed"
+  | "stopped";
 
 declare const decimalTextBrand: unique symbol;
 export type DecimalText = string & { readonly [decimalTextBrand]: true };
@@ -107,6 +108,11 @@ export interface RunJobView extends RunProgressView {
   readonly submittedAt: string;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
+}
+
+export interface ReplaySourceView {
+  readonly runId: string;
+  readonly submittedAt: string;
 }
 
 export interface TimelineContextView {

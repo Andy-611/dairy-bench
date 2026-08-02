@@ -226,6 +226,7 @@ or database. `DAIRY_BENCH_OPENAI_BASE_URL` may target a compatible service.
 ```text
 GET /api/run-jobs
 GET /api/run-jobs/{run_id}
+POST /api/run-jobs/{run_id}/stop
 GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
@@ -236,9 +237,11 @@ GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts
 `turns` is the authoritative business journal. `invocations` audits provider
 calls, latency, and tokens. `timeline` is a causal human-readable projection.
 Exported `artifacts` are source evidence and never trigger another model call.
-Run-history projection is available for every lifecycle status; a missing final
-episode or score never hides already committed journal and checkpoint evidence.
-Exact replay remains a separate completed-run verification operation.
+The operations timeline remains readable from committed journal and checkpoint
+evidence even when a run has no final episode or score. `stopped` is a permanent
+terminal status and is never resumed or offered as an Exact Replay source;
+`interrupted` remains the recoverable backend-shutdown status. Exact Replay is a
+separate completed-run verification operation.
 
 ## Adding another provider
 

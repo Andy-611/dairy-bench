@@ -1,5 +1,6 @@
 import { companyLabel } from "./domainLabels";
 import { isAbortError } from "./requestErrors";
+import { isActiveRun, isGracefulRunTerminal } from "./runStatus";
 import type {
   AgentUsageSummaryView,
   AgentTraceView,
@@ -15,6 +16,7 @@ import type {
   MarketMatchLegView,
   PolicyMode,
   PolicyProfileView,
+  ReplaySourceView,
   QuoteAlertView,
   RunJobView,
   RunRequest,
@@ -43,11 +45,6 @@ interface InvocationUsageView {
 }
 
 const POLL_INTERVAL_MS = 500;
-const ACTIVE_STATUSES: readonly RunStatus[] = [
-  "queued",
-  "running",
-  "interrupted",
-];
 const DECIMAL_TEXT_PATTERN =
   /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
@@ -92,7 +89,7 @@ export class DairyBenchApi {
 
     let progress = parseRunJob(payload);
     onProgress(progress);
-    while (ACTIVE_STATUSES.includes(progress.status)) {
+    while (isActiveRun(progress.status)) {
       await delay(POLL_INTERVAL_MS, signal);
       progress = parseRunJob(
         await this.getJson(`/api/run-jobs/${progress.runId}`, signal),
@@ -100,7 +97,7 @@ export class DairyBenchApi {
       onProgress(progress);
     }
 
-    if (progress.status !== "completed") {
+    if (!isGracefulRunTerminal(progress.status)) {
       throw new ApiError(
         progress.errorMessage ?? "The run did not complete. Check the backend log.",
         500,
@@ -118,6 +115,13 @@ export class DairyBenchApi {
     return array(payload, "RunJob[]").map(parseRunJob);
   }
 
+  public async replaySources(
+    signal?: AbortSignal,
+  ): Promise<readonly ReplaySourceView[]> {
+    const payload = await this.getJson("/api/replay-sources", signal);
+    return array(payload, "ReplaySource[]").map(parseReplaySource);
+  }
+
   public async runJob(
     runId: string,
     signal?: AbortSignal,
@@ -126,6 +130,21 @@ export class DairyBenchApi {
       `/api/run-jobs/${encodeURIComponent(runId)}`,
       signal,
     );
+    return parseRunJob(payload);
+  }
+
+  public async stopRun(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    const response = await fetch(
+      `${this.baseUrl}/api/run-jobs/${encodeURIComponent(runId)}/stop`,
+      { method: "POST", signal },
+    );
+    const payload = await readJsonBody(response, signal);
+    if (!response.ok) {
+      throw new ApiError(errorMessage(payload, response.status), response.status);
+    }
     return parseRunJob(payload);
   }
 
@@ -236,6 +255,14 @@ function parseRunJob(payload: unknown): RunJobView {
     startedAt: nullableDateTime(job.started_at, "started_at"),
     finishedAt: nullableDateTime(job.finished_at, "finished_at"),
     errorMessage: optionalText(job.error_message) ?? optionalText(job.error),
+  };
+}
+
+function parseReplaySource(payload: unknown): ReplaySourceView {
+  const source = record(payload, "ReplaySource");
+  return {
+    runId: text(source.run_id, "run_id"),
+    submittedAt: dateTime(source.submitted_at, "submitted_at"),
   };
 }
 
@@ -1564,7 +1591,8 @@ function runStatus(value: unknown, path: string): RunStatus {
     value === "running" ||
     value === "interrupted" ||
     value === "completed" ||
-    value === "failed"
+    value === "failed" ||
+    value === "stopped"
   ) {
     return value;
   }

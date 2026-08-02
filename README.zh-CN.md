@@ -83,10 +83,14 @@ cd ..
 
 启动器会打开 `http://127.0.0.1:5173`。规则基线不需要模型凭据。
 
-`Run History` 可直接打开 completed、failed、interrupted 或仍在运行的持久化 Run，
-查看已有轨迹、错误和最后 Checkpoint。当前 Run 与天数写入 `?run=...&day=...`，刷新、
-前进和后退都会保留页面状态。`Exact Replay` 是独立功能：它只对 completed Run
-无模型调用地重新执行，并验证结果是否精确一致。
+页面会自动打开刚提交或仍在运行的 Run。当前 Run 与天数写入
+`?run=...&day=...`，刷新、前进和后退都会保留页面状态。选择 `Exact Replay`
+后，随机种子会替换为按提交时间从新到旧排列的全部 completed Run 下拉框；选择来源
+即可打开其持久化结果与时间线，启动 Replay 则不会调用模型，并会验证结果是否精确一致。
+
+Run 仍处于活动状态时，同一个主按钮会变为 `Stop run`。停止是永久操作：
+已经提交的 Journal、Checkpoint 和时间线证据仍可读取，但该 Run 不会生成最终分数、
+不会恢复，也不会成为 Exact Replay 来源。
 
 ## 模型 Agent
 

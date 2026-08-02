@@ -15,6 +15,7 @@ from company_bench.models import EpisodeResult, EventRecord, RunSummary, TradeEx
 from company_bench.run_models import (
     PolicyAuditSink,
     PolicyInvocation,
+    ReplaySource,
     RunCheckpoint,
     RunJob,
     RunStatus,
@@ -41,6 +42,9 @@ class RunRepository(Protocol):
 
     def list(self, limit: int = 50) -> tuple[RunSummary, ...]:
         """Return the most recently completed episodes first."""
+
+    def list_replay_sources(self) -> tuple[ReplaySource, ...]:
+        """Return every completed run from newest submission to oldest."""
 
 
 class LifecycleRepository(RunRepository, PolicyAuditSink, Protocol):
@@ -151,10 +155,27 @@ class MemoryRunRepository:
             )
             return tuple(jobs[:limit])
 
+    def list_replay_sources(self) -> tuple[ReplaySource, ...]:
+        """Return every completed run from newest submission to oldest."""
+        with self._lock:
+            sources = (
+                ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at)
+                for job in self._jobs.values()
+                if job.status == RunStatus.COMPLETED
+            )
+            return tuple(
+                sorted(
+                    sources,
+                    key=lambda source: source.submitted_at,
+                    reverse=True,
+                )
+            )
+
     def list_resumable_jobs(self) -> tuple[RunJob, ...]:
         """Return resumable jobs from oldest to newest."""
         with self._lock:
-            return tuple(job for job in self._jobs.values() if job.status in _RESUMABLE_STATUSES)
+            jobs = (job for job in self._jobs.values() if job.status in _RESUMABLE_STATUSES)
+            return tuple(sorted(jobs, key=lambda job: job.submitted_at))
 
     def record_invocation(self, invocation: PolicyInvocation) -> None:
         """Upsert one invocation by its deterministic identifier."""
@@ -385,6 +406,20 @@ class SQLiteRunRepository:
                 (limit,),
             ).fetchall()
         return tuple(RunJob.model_validate_json(row["payload_json"]) for row in rows)
+
+    def list_replay_sources(self) -> tuple[ReplaySource, ...]:
+        """Return every completed run from newest submission to oldest."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT run_id, submitted_at
+                FROM run_jobs
+                WHERE status = ?
+                ORDER BY submitted_at DESC, rowid DESC
+                """,
+                (RunStatus.COMPLETED.value,),
+            ).fetchall()
+        return tuple(ReplaySource.model_validate(dict(row)) for row in rows)
 
     def list_resumable_jobs(self) -> tuple[RunJob, ...]:
         """Return resumable jobs from oldest to newest."""

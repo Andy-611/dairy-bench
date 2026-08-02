@@ -31,14 +31,17 @@ The dashboard supports four policy modes:
 - **Exact replay**: replays the Turn Journal of a completed source run without
   making model calls.
 
-After submission, the page polls `RunJob` and reports the current day. Full
-results are loaded only after completion. Run History reads completed, failed,
-interrupted, running, and queued jobs without starting a new run. A failed or
-partial run can still open its persisted operations timeline. The selected run
-and day live in the `run` and `day` URL parameters, so refresh and browser
-navigation restore the same view; deep links outside the first history page are
-resolved by ID. `/api/policy-profiles` remains the source of truth for policy
-availability and model configuration.
+After submission, the page polls `RunJob`, automatically selects it, and reports
+the current day. Full results are loaded only after completion. Exact Replay
+uses `/api/replay-sources` to list every completed run from newest to oldest;
+selecting a source also opens its persisted results and operations timeline.
+The selected run and day live in the `run` and `day` URL parameters, so refresh
+and browser navigation restore the same view. `/api/policy-profiles` remains the
+source of truth for policy availability and model configuration.
+
+The primary action becomes **Stop run** while work is active. A stopped run is
+terminal and non-resumable; its persisted timeline and last checkpoint remain
+available, but no final score or replay source is created.
 
 ## Production build
 

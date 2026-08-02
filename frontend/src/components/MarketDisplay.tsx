@@ -50,14 +50,13 @@ export function MarketDisplay({ frame, minute }: MarketDisplayProps) {
 
   return (
     <aside
-      aria-label={`Market at ${clockTime(minute)}`}
+      aria-label={`End-of-minute market state at ${clockTime(minute)}`}
       className="market-display"
       data-minute={minute}
     >
       <header className="market-display-header">
-        <span>BENCHMARK OBSERVER VIEW</span>
         <strong>Market display</strong>
-        <small>Closing state v{frame.stateVersion}</small>
+        <small>End-of-minute state · v{frame.stateVersion}</small>
       </header>
       <OrderFlow
         items={frame.orderFlow}
@@ -65,7 +64,7 @@ export function MarketDisplay({ frame, minute }: MarketDisplayProps) {
         selected={selection?.kind === "flow" ? selection.flow : null}
       />
       <TradeTape frame={frame} minute={minute} />
-      <ClosingOrderBook
+      <EndOfMinuteOrderBook
         book={book}
         books={frame.closingOrderBooks}
         minute={minute}
@@ -102,10 +101,13 @@ function OrderFlow({
     <section className="market-order-flow">
       <header>
         <span>ORDER FLOW</span>
-        <strong>Accepted market commands</strong>
+        <strong>Order commands accepted by the economic engine</strong>
       </header>
       {items.length === 0 ? (
-        <p>No accepted market commands during this minute</p>
+        <p>
+          No order commands were accepted by the economic engine during this
+          minute.
+        </p>
       ) : (
         <ol>
           {items.map((flow) => {
@@ -184,7 +186,7 @@ function TradeTape({
   );
 }
 
-function ClosingOrderBook({
+function EndOfMinuteOrderBook({
   book,
   books,
   minute,
@@ -204,7 +206,7 @@ function ClosingOrderBook({
       <header className="market-book-header">
         <div>
           <span>ACTIVE ORDER BOOK</span>
-          <strong>Closing state after {clockTime(minute)}</strong>
+          <strong>End-of-minute order book · {clockTime(minute)}</strong>
         </div>
         <div className="market-product-tabs" role="tablist" aria-label="Market product">
           {books.map((candidate) => (
@@ -382,9 +384,15 @@ function OrderFlowDetail({
       title={title}
     >
       <div className="drawer-body market-drawer-body">
-        <MarketDrawerSection label="1" title="Accepted market command">
+        <MarketDrawerSection
+          label="1"
+          title="Order command accepted by the economic engine"
+        >
           <dl className="market-detail-grid">
-            <MarketMeta label="Apply sequence" value={`#${flow.applySequence}`} />
+            <MarketMeta
+              label="Command Processing Order"
+              value={`#${flow.applySequence}`}
+            />
             <MarketMeta label="Action" value={flow.action.toUpperCase()} />
             <MarketMeta label="Company" value={companyLabel(order.ownerId)} />
             <MarketMeta label="Side" value={bookSide(order.side).toUpperCase()} />
@@ -403,9 +411,10 @@ function OrderFlowDetail({
           )}
         </MarketDrawerSection>
         {flow.action === "cancel" ? (
-          <MarketDrawerSection label="2" title="Closing disposition">
+          <MarketDrawerSection label="2" title="End-of-minute result">
             <p className="market-result-copy">
-              The active order was removed and does not appear in the closing order book.
+              The active order was removed and does not appear in the
+              end-of-minute order book.
             </p>
           </MarketDrawerSection>
         ) : (
@@ -439,7 +448,7 @@ function OrderFlowDetail({
                 </ol>
               )}
             </MarketDrawerSection>
-            <MarketDrawerSection label="3" title="Closing disposition">
+            <MarketDrawerSection label="3" title="End-of-minute result">
               <dl className="market-detail-grid compact">
                 <MarketMeta
                   label="Submitted"
@@ -473,13 +482,16 @@ function PriceLevelDetail({
   const orderCount = level.orders.length;
   return (
     <DetailDrawer
-      ariaLabel={`${side} price level detail`}
-      eyebrow="CLOSING ORDER BOOK"
+      ariaLabel={`${side} end-of-minute order book price level detail`}
+      eyebrow="END-OF-MINUTE ORDER BOOK"
       onClose={onClose}
       title={`${side.toUpperCase()} ${formatMarketPrice(level.unitPrice)} · ${productLabel(product)}`}
     >
       <div className="drawer-body market-drawer-body">
-        <MarketDrawerSection label="BOOK" title={`Closing state after ${clockTime(minute)}`}>
+        <MarketDrawerSection
+          label="BOOK"
+          title={`End-of-minute order book · ${clockTime(minute)}`}
+        >
           <dl className="market-detail-grid compact">
             <MarketMeta label="Side" value={side.toUpperCase()} />
             <MarketMeta label="Price" value={formatMarketPrice(level.unitPrice)} />

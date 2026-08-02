@@ -36,7 +36,7 @@ type DetailLoader = (
 ) => Promise<TimelineDetailView>;
 type StatusFilter = "accepted" | "all" | "rejected";
 
-interface OperationsReplayProps {
+interface OperationsTimelineProps {
   readonly day: number;
   readonly days: number;
   readonly loadDetail: DetailLoader;
@@ -55,7 +55,6 @@ interface CompanyOption {
 interface TimelineFilters {
   readonly command: TimelineCommandView["kind"] | typeof ALL;
   readonly company: string;
-  readonly showNoEffectWaits: boolean;
   readonly status: StatusFilter;
 }
 
@@ -63,11 +62,10 @@ const ALL = "all";
 const INITIAL_FILTERS: TimelineFilters = {
   command: ALL,
   company: ALL,
-  showNoEffectWaits: false,
   status: "all",
 };
 
-export function OperationsReplay({
+export function OperationsTimeline({
   day,
   days,
   loadDetail,
@@ -76,7 +74,7 @@ export function OperationsReplay({
   revision,
   runId,
   timelinePending = false,
-}: OperationsReplayProps) {
+}: OperationsTimelineProps) {
   const [timeline, setTimeline] = useState<TimelineDayView | null>(null);
   const [filters, setFilters] = useState<TimelineFilters>(INITIAL_FILTERS);
   const [loading, setLoading] = useState(true);
@@ -150,18 +148,6 @@ export function OperationsReplay({
     () => filterMoments(timeline?.moments ?? [], filters),
     [filters, timeline],
   );
-  const hiddenWaitCount = useMemo(
-    () =>
-      filters.showNoEffectWaits
-        ? 0
-        : (timeline?.moments ?? []).reduce(
-            (total, moment) =>
-              total +
-              moment.turns.filter(isCollapsibleWait).length,
-            0,
-          ),
-    [filters.showNoEffectWaits, timeline],
-  );
 
   return (
     <section aria-labelledby="operations-title" className="panel operations-panel">
@@ -169,7 +155,6 @@ export function OperationsReplay({
         context={timeline?.context ?? null}
         day={day}
         days={days}
-        hiddenWaitCount={hiddenWaitCount}
       />
 
       {timeline && (
@@ -226,24 +211,21 @@ function OperationsHeader({
   context,
   day,
   days,
-  hiddenWaitCount,
 }: {
   readonly context: TimelineContextView | null;
   readonly day: number;
   readonly days: number;
-  readonly hiddenWaitCount: number;
 }) {
   return (
     <div className="section-heading operations-heading">
       <div>
-        <span className="eyebrow">TURN-FIRST OPERATIONS REPLAY</span>
-        <h2 id="operations-title">Wake, decide, apply, observe</h2>
+        <span className="eyebrow">OPERATIONS TIMELINE</span>
+        <h2 id="operations-title">
+          Company decisions and economic activity, minute by minute
+        </h2>
       </div>
       <p>
         Day {day} of {context?.totalDays ?? days}
-        {hiddenWaitCount > 0
-          ? ` · ${hiddenWaitCount} no-effect waits collapsed`
-          : " · every matching turn is visible"}
         {context ? checkpointSummary(context) : ""}
       </p>
     </div>
@@ -412,19 +394,6 @@ function TimelineFilterBar({
             </option>
           ))}
         </select>
-      </label>
-      <label className="wait-toggle">
-        <input
-          checked={filters.showNoEffectWaits}
-          onChange={(event) =>
-            onChange({
-              ...filters,
-              showNoEffectWaits: event.target.checked,
-            })
-          }
-          type="checkbox"
-        />
-        <span>Show no-effect waits</span>
       </label>
     </div>
   );
@@ -621,8 +590,7 @@ function filterMoments(
         (filters.command === ALL || turn.command.kind === filters.command) &&
         (filters.status === "all" ||
           (filters.status === "accepted" && turn.accepted) ||
-          (filters.status === "rejected" && !turn.accepted)) &&
-        (filters.showNoEffectWaits || !isCollapsibleWait(turn))
+          (filters.status === "rejected" && !turn.accepted))
       );
     });
     if (turns.length === 0 && systemSteps.length === 0) {
@@ -667,17 +635,4 @@ function concurrencyLabel(moment: TimelineMomentView): string {
   return moment.turns.length === moment.totalTurnCount
     ? `${moment.totalTurnCount} companies observed ${state} concurrently`
     : `${moment.turns.length} of ${moment.totalTurnCount} concurrent turns shown · observed ${state}`;
-}
-
-function isCollapsibleWait(turn: TurnTimelineItemView): boolean {
-  return (
-    turn.accepted &&
-    turn.command.kind === "wait" &&
-    turn.command.alerts.length === 0 &&
-    turn.command.untilMinute === null &&
-    turn.effects.length === 0 &&
-    turn.stateChanges.length === 0 &&
-    turn.nextAvailableMinute === null &&
-    turn.protocolError === null
-  );
 }

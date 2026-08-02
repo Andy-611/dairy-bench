@@ -34,6 +34,7 @@ class RunCoordinator:
         self._runtime = runtime
         self._semaphore = asyncio.Semaphore(max_concurrent_runs)
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._stop_requests: set[str] = set()
 
     def profiles(self) -> tuple[PolicyProfileView, ...]:
         """Expose policy availability without secrets."""
@@ -91,11 +92,38 @@ class RunCoordinator:
         """Return one persisted lifecycle record."""
         return self._repository.get_job(run_id)
 
+    async def stop(self, run_id: str) -> RunJob:
+        """Permanently stop one run after its owned resources are released."""
+        job = self._repository.get_job(run_id)
+        if job is None:
+            raise LookupError(f"Run job '{run_id}' was not found")
+        if job.status.terminal:
+            return job
+
+        task = self._tasks.get(run_id)
+        if task is not None:
+            self._stop_requests.add(run_id)
+            if task.cancelling() == 0:
+                task.cancel()
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.done():
+                    raise
+
+        current = self._repository.get_job(run_id) or job
+        if current.status.terminal:
+            return current
+        stopped = current.mark_stopped(datetime.now(UTC))
+        self._repository.save_job(stopped)
+        return stopped
+
     async def close(self) -> None:
         """Cancel active work and persist an interrupted state."""
         tasks = tuple(self._tasks.values())
         for task in tasks:
-            task.cancel()
+            if task.cancelling() == 0:
+                task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -105,7 +133,12 @@ class RunCoordinator:
             return
         task = asyncio.create_task(self._execute(job))
         self._tasks[job.run_id] = task
-        task.add_done_callback(lambda _: self._tasks.pop(job.run_id, None))
+        task.add_done_callback(lambda _: self._forget_task(job.run_id))
+
+    def _forget_task(self, run_id: str) -> None:
+        """Release task bookkeeping only after cancellation cleanup is complete."""
+        self._tasks.pop(run_id, None)
+        self._stop_requests.discard(run_id)
 
     async def _execute(self, initial_job: RunJob) -> None:
         """Run one episode under the global model-call concurrency bound."""
@@ -153,17 +186,23 @@ class RunCoordinator:
                 job = job.mark_completed(datetime.now(UTC))
                 self._repository.complete_job(result, job)
         except asyncio.CancelledError:
-            self._repository.save_job(
-                job.mark_interrupted(
-                    datetime.now(UTC),
-                    "backend stopped before completion",
-                )
-            )
+            current = self._repository.get_job(job.run_id) or job
+            if not current.status.terminal:
+                if job.run_id in self._stop_requests:
+                    current = current.mark_stopped(datetime.now(UTC))
+                else:
+                    current = current.mark_interrupted(
+                        datetime.now(UTC),
+                        "backend stopped before completion",
+                    )
+                self._repository.save_job(current)
             raise
         except Exception as error:
-            self._repository.save_job(
-                job.mark_failed(
-                    datetime.now(UTC),
-                    bounded_error(error),
+            current = self._repository.get_job(job.run_id) or job
+            if not current.status.terminal:
+                self._repository.save_job(
+                    current.mark_failed(
+                        datetime.now(UTC),
+                        bounded_error(error),
+                    )
                 )
-            )

@@ -28,6 +28,7 @@ from company_bench.repository import MemoryRunRepository
 from company_bench.run_models import (
     InvocationOutcome,
     PolicyInvocation,
+    ReplaySource,
     RunJob,
     RunStatus,
 )
@@ -191,6 +192,68 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
     assert limited_response.status_code == 200
     limited = tuple(RunJob.model_validate(item) for item in limited_response.json())
     assert limited == history[:3]
+
+
+def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
+    repository = MemoryRunRepository()
+    stopped = RunJob(
+        run_id="http_stopped",
+        mode=PolicyKind.BASELINE,
+        status=RunStatus.STOPPED,
+        seed=42,
+        scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+        total_days=DAIRY_S9_V3_SCENARIO.days,
+        submitted_at=datetime(2026, 1, 1, tzinfo=UTC),
+        finished_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    repository.save_job(stopped)
+
+    with TestClient(_app(repository)) as client:
+        response = client.post(f"/api/run-jobs/{stopped.run_id}/stop")
+        missing = client.post("/api/run-jobs/missing/stop")
+
+    assert response.status_code == 200
+    assert RunJob.model_validate(response.json()) == stopped
+    assert missing.status_code == 404
+
+
+def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
+    repository = MemoryRunRepository()
+    submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
+    completed_jobs = tuple(
+        RunJob(
+            run_id=f"replay_source_{sequence}",
+            mode=PolicyKind.BASELINE,
+            status=RunStatus.COMPLETED,
+            seed=sequence,
+            scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+            total_days=DAIRY_S9_V3_SCENARIO.days,
+            submitted_at=submitted_at + timedelta(minutes=sequence),
+        )
+        for sequence in range(501)
+    )
+    for job in completed_jobs:
+        repository.save_job(job)
+    repository.save_job(
+        completed_jobs[-1].model_copy(
+            update={
+                "run_id": "newer_failed_run",
+                "status": RunStatus.FAILED,
+                "submitted_at": submitted_at + timedelta(minutes=501),
+            }
+        )
+    )
+
+    with TestClient(_app(repository)) as client:
+        response = client.get("/api/replay-sources")
+
+    assert response.status_code == 200
+    sources = tuple(ReplaySource.model_validate(item) for item in response.json())
+    assert len(sources) == 501
+    assert sources == tuple(
+        ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at)
+        for job in reversed(completed_jobs)
+    )
 
 
 def test_http_validation_and_localhost_cors() -> None:

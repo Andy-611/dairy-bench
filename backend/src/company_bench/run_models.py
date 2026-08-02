@@ -45,11 +45,12 @@ class RunStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    STOPPED = "stopped"
 
     @property
     def terminal(self) -> bool:
         """Return whether no more work is scheduled for this job."""
-        return self in {self.COMPLETED, self.FAILED}
+        return self in {self.COMPLETED, self.FAILED, self.STOPPED}
 
 
 class RunJob(StrictModel):
@@ -114,12 +115,27 @@ class RunJob(StrictModel):
             error_message=reason,
         )
 
+    def mark_stopped(self, finished_at: datetime) -> Self:
+        """Permanently stop the job without inventing a result or an error."""
+        return self._advance(
+            status=RunStatus.STOPPED,
+            finished_at=finished_at,
+            error_message=None,
+        )
+
     def _advance(self, **changes: object) -> Self:
         """Apply one validated lifecycle transition."""
         candidate = self.model_copy(
             update={**changes, "revision": self.revision + 1},
         )
         return type(self).model_validate_json(candidate.model_dump_json())
+
+
+class ReplaySource(StrictModel):
+    """Completed run identity available as an exact-replay source."""
+
+    run_id: Identifier
+    submitted_at: datetime
 
 
 class CompanyRuntimeCursor(StrictModel):

@@ -51,7 +51,7 @@ Every company owns an independent memory instance:
 
 ### `RunTimelineProjector`
 
-The projector is the read-side module behind Operations Replay. It joins the
+The projector is the read-side module behind the Operations Timeline. It joins the
 authoritative turn journal, system steps, provider audits, replay lineage, and
 exported public artifacts into one typed timeline. The browser does not
 reconstruct causality or infer model calls from timestamps.
@@ -154,9 +154,9 @@ that the source stream is exhausted and that final events, snapshots, and score
 are identical. It creates no model gateway and makes no provider calls. Any
 economic, visibility, or scheduling drift fails fast.
 
-## Operations Replay
+## Operations Timeline
 
-Operations Replay is turn-first rather than event-first. It groups one day into
+The Operations Timeline is turn-first rather than event-first. It groups one day into
 virtual-minute moments and presents:
 
 - system steps at that minute;
@@ -171,7 +171,8 @@ Direct command effects are nested under their turn. Market clearing, consumer
 sales, expiration, and end-of-day state changes are shown as system steps. This
 avoids displaying the same economic action twice.
 
-No-effect waits are collapsed by default but remain filterable and auditable.
+No-effect waits are displayed by default and remain fully auditable. Company,
+status, and command filters still apply.
 Entry details are fetched lazily so a 30-day run does not require every trace
 payload up front.
 

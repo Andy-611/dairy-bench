@@ -523,7 +523,8 @@ class _StopAfterFirstProgress:
         checkpoint: RunCheckpoint,
     ) -> None:
         self.repository.save_progress(turns, system_steps, checkpoint)
-        raise RuntimeError("stop after first progress")
+        if turns or system_steps:
+            raise RuntimeError("stop after first progress")
 
 
 @pytest.mark.asyncio

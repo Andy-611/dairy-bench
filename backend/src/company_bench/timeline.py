@@ -1,4 +1,4 @@
-"""Turn-first operations replay behind a two-method read interface."""
+"""Turn-first operations timeline behind a two-method read interface."""
 
 from __future__ import annotations
 

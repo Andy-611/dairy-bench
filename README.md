@@ -89,11 +89,17 @@ Start FastAPI and Vite:
 The launcher opens `http://127.0.0.1:5173`. The rule baseline needs no model
 credentials.
 
-`Run History` opens the persisted timeline, error, and latest checkpoint for
-completed, failed, interrupted, or active runs. The selected run and day live in
-`?run=...&day=...`, so refresh and browser navigation preserve the view.
-`Exact Replay` is separate: it re-executes a completed source run without model
-calls and verifies deterministic equality.
+The page automatically opens a newly submitted or active run. The current run
+and day live in `?run=...&day=...`, so refresh and browser navigation preserve
+the view. Selecting `Exact Replay` replaces the seed with a source dropdown that
+lists every completed run from newest to oldest. Choosing a source opens its
+persisted results and timeline; starting the replay makes no model calls and
+verifies deterministic equality.
+
+While a run is active, the same primary action becomes `Stop run`.
+Stopping is permanent: committed journals, checkpoints, and timeline evidence
+remain readable, but the run receives no final score, cannot resume, and is not
+an Exact Replay source.
 
 ## Model-backed agents
 

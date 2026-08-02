@@ -26,6 +26,7 @@ from company_bench.run_models import (
     CompanyRuntimeCursor,
     InvocationOutcome,
     PolicyInvocation,
+    ReplaySource,
     RunCheckpoint,
     RunJob,
     RunStatus,
@@ -79,6 +80,12 @@ def test_memory_repository_lists_every_job_status_newest_first() -> None:
     _assert_job_history(repository, jobs)
 
 
+def test_memory_repository_lists_completed_replay_sources() -> None:
+    repository = MemoryRunRepository()
+
+    _assert_replay_sources(repository)
+
+
 def test_sqlite_repository_job_history_survives_reopen(tmp_path: Path) -> None:
     database = tmp_path / "job-history.sqlite3"
     jobs = _history_jobs()
@@ -89,6 +96,16 @@ def test_sqlite_repository_job_history_survives_reopen(tmp_path: Path) -> None:
     with SQLiteRunRepository(database) as reopened:
         assert reopened.list_jobs() == tuple(reversed(jobs))
         assert reopened.list_jobs(2) == tuple(reversed(jobs[-2:]))
+
+
+def test_sqlite_repository_lists_completed_replay_sources(tmp_path: Path) -> None:
+    database = tmp_path / "replay-sources.sqlite3"
+
+    with SQLiteRunRepository(database) as repository:
+        expected = _assert_replay_sources(repository)
+
+    with SQLiteRunRepository(database) as reopened:
+        assert reopened.list_replay_sources() == expected
 
 
 def test_memory_repository_turn_journal_and_checkpoint_contract(
@@ -280,6 +297,9 @@ def _assert_job_history(
     assert repository.list_jobs(2) == expected[:2]
     assert repository.list_jobs(0) == ()
     assert {job.status for job in repository.list_jobs()} == set(RunStatus)
+    assert repository.list_resumable_jobs() == tuple(
+        job for job in jobs if not job.status.terminal
+    )
 
 
 def _history_jobs() -> tuple[RunJob, ...]:
@@ -297,6 +317,50 @@ def _history_jobs() -> tuple[RunJob, ...]:
         )
         for sequence, status in enumerate(RunStatus)
     )
+
+
+def _assert_replay_sources(repository: LifecycleRepository) -> tuple[ReplaySource, ...]:
+    """Exercise completed-only discovery and submission ordering."""
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    older = RunJob(
+        run_id="replay_older",
+        mode=PolicyKind.BASELINE,
+        status=RunStatus.COMPLETED,
+        seed=1,
+        scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
+        total_days=DAIRY_S9_V3_SCENARIO.days,
+        submitted_at=base_time,
+    )
+    newer = older.model_copy(
+        update={
+            "run_id": "replay_newer",
+            "seed": 2,
+            "submitted_at": base_time + timedelta(minutes=1),
+        }
+    )
+    failed = newer.model_copy(
+        update={
+            "run_id": "replay_failed",
+            "status": RunStatus.FAILED,
+            "submitted_at": base_time + timedelta(minutes=2),
+        }
+    )
+    stopped = failed.model_copy(
+        update={
+            "run_id": "replay_stopped",
+            "status": RunStatus.STOPPED,
+            "submitted_at": base_time + timedelta(minutes=3),
+        }
+    )
+    for job in (newer, failed, stopped, older):
+        repository.save_job(job)
+
+    expected = tuple(
+        ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at)
+        for job in (newer, older)
+    )
+    assert repository.list_replay_sources() == expected
+    return expected
 
 
 def _assert_checkpoint_contract(

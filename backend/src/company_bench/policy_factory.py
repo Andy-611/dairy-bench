@@ -131,7 +131,7 @@ class PolicyFactory:
                 mode=PolicyKind.REPLAY,
                 label="Exact replay",
                 available=True,
-                description="Replay a historical run exactly from its source_run_id.",
+                description="Replay a completed persisted run without calling agents.",
             ),
         )
 

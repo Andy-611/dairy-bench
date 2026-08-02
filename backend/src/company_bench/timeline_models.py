@@ -476,7 +476,7 @@ class TimelineMoment(StrictModel):
 
 
 class TimelineDay(StrictModel):
-    """One day of the operations replay plus run-wide day summaries."""
+    """One day of the operations timeline plus run-wide day summaries."""
 
     context: TimelineRunContext
     selected_day: int = Field(ge=1)
