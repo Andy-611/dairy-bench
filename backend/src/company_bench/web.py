@@ -88,9 +88,10 @@ def create_app(
         owned_repository = None
         active_repository = repository
     active_artifacts = artifact_store or CodexArtifactStore.from_environment()
+    owned_codex_sessions: CodexSessionManager | None = None
     if policy_factory is None:
         codex_config = CodexAgentConfig.from_environment()
-        codex_sessions = (
+        owned_codex_sessions = (
             CodexSessionManager(codex_config.session_retention)
             if codex_config is not None
             else None
@@ -102,7 +103,7 @@ def create_app(
             codex_gateway_factory=partial(
                 CodexModelGateway,
                 artifact_sink=active_artifacts,
-                session_manager=codex_sessions,
+                session_manager=owned_codex_sessions,
             ),
             openai_config=OpenAIAgentConfig.from_environment(),
         )
@@ -125,10 +126,18 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await coordinator.start()
-        yield
-        await coordinator.close()
-        if owned_repository is not None:
-            owned_repository.close()
+        try:
+            yield
+        finally:
+            try:
+                await coordinator.close()
+            finally:
+                try:
+                    if owned_codex_sessions is not None:
+                        await owned_codex_sessions.close()
+                finally:
+                    if owned_repository is not None:
+                        owned_repository.close()
 
     app = FastAPI(
         title="Dairy Bench API",

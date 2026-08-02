@@ -55,6 +55,8 @@ from company_bench.run_models import TokenUsage
 type CodexReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 type _CodexRequest = ModelRequest | CommandModelRequest
 
+DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
+DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "medium"
 DEFAULT_CODEX_HOME = Path(__file__).resolve().parents[3] / ".dairy-bench" / "codex"
 _PERSONAL_CODEX_HOME = Path.home() / ".codex"
 _BASE_INSTRUCTIONS = (
@@ -155,8 +157,8 @@ class _CodexClient(CodexSessionClient, Protocol):
 class CodexAgentConfig(StrictModel):
     """Validated server-only configuration for Codex company Agents."""
 
-    model: str = Field(default="gpt-5.6-sol", min_length=1)
-    reasoning_effort: CodexReasoningEffort = "low"
+    model: str = Field(default=DEFAULT_CODEX_MODEL, min_length=1)
+    reasoning_effort: CodexReasoningEffort = DEFAULT_CODEX_REASONING_EFFORT
     timeout_seconds: float = Field(default=180.0, gt=0, le=900)
     max_attempts: int = Field(default=2, ge=1, le=3)
     codex_home: Path = DEFAULT_CODEX_HOME
@@ -169,10 +171,10 @@ class CodexAgentConfig(StrictModel):
             return None
         codex_home = os.getenv("DAIRY_BENCH_CODEX_HOME", "").strip()
         return cls(
-            model=os.getenv("DAIRY_BENCH_CODEX_MODEL", "gpt-5.6-sol"),
+            model=os.getenv("DAIRY_BENCH_CODEX_MODEL", DEFAULT_CODEX_MODEL),
             reasoning_effort=os.getenv(
                 "DAIRY_BENCH_CODEX_REASONING_EFFORT",
-                "low",
+                DEFAULT_CODEX_REASONING_EFFORT,
             ),
             timeout_seconds=float(os.getenv("DAIRY_BENCH_CODEX_TIMEOUT_SECONDS", "180")),
             max_attempts=int(os.getenv("DAIRY_BENCH_CODEX_MAX_ATTEMPTS", "2")),
@@ -229,8 +231,11 @@ class CodexModelGateway(ModelGateway):
             config.runtime_config(Path(self._workspace.name))
         )
         self._artifact_sink = artifact_sink or CodexArtifactStore.from_environment()
-        self._session_manager = session_manager or CodexSessionManager(
-            config.session_retention
+        self._owns_session_manager = session_manager is None
+        self._session_manager = (
+            session_manager
+            if session_manager is not None
+            else CodexSessionManager(config.session_retention)
         )
         self._closed = False
         self._started = False
@@ -296,10 +301,16 @@ class CodexModelGateway(ModelGateway):
             return
         self._closed = True
         try:
-            await self._client.close()
+            if self._owns_session_manager:
+                await self._session_manager.close()
+            else:
+                await self._session_manager.release(self._client)
         finally:
-            self._started = False
-            self._workspace.cleanup()
+            try:
+                await self._client.close()
+            finally:
+                self._started = False
+                self._workspace.cleanup()
 
     async def _ensure_started(self) -> None:
         """Start the runtime once and reject missing ChatGPT authentication."""

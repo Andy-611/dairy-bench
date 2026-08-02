@@ -5,11 +5,16 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, raises
 
+import company_bench.web as web_module
 from company_bench.codex_artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
+)
+from company_bench.codex_sessions import (
+    CodexSessionManager,
+    CodexSessionRetention,
 )
 from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.models import (
@@ -28,6 +33,31 @@ from company_bench.run_models import (
 )
 from company_bench.runtime_models import Produce
 from company_bench.web import create_app
+
+
+class _TrackedOwnedRepository(MemoryRunRepository):
+    """Expose whether the Web lifespan released its owned repository."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    def close(self) -> None:
+        """Record application-owned repository cleanup."""
+        self.close_calls += 1
+
+
+class _TrackedWebSessionManager(CodexSessionManager):
+    """Expose whether the Web lifespan released its shared Session manager."""
+
+    def __init__(self, retention: CodexSessionRetention) -> None:
+        super().__init__(retention)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        """Record application-owned Session manager cleanup."""
+        self.close_calls += 1
+        await super().close()
 
 
 def _app(repository: MemoryRunRepository) -> FastAPI:
@@ -281,11 +311,41 @@ def test_codex_profile_can_be_enabled_without_exposing_credentials(
         "label": "Codex company agents",
         "available": True,
         "provider": "codex",
-        "model": "gpt-5.6-sol",
-        "reasoning_effort": "low",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium",
         "description": "Each company is controlled by an independent Codex runtime.",
         "unavailable_reason": None,
     }
+
+
+def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository = _TrackedOwnedRepository()
+    managers: list[_TrackedWebSessionManager] = []
+
+    def create_manager(retention: CodexSessionRetention) -> _TrackedWebSessionManager:
+        manager = _TrackedWebSessionManager(retention)
+        managers.append(manager)
+        return manager
+
+    async def fail_coordinator_close(_: object) -> None:
+        raise RuntimeError("coordinator close failed")
+
+    monkeypatch.setenv("DAIRY_BENCH_CODEX_ENABLED", "true")
+    monkeypatch.setattr(web_module, "SQLiteRunRepository", lambda _: repository)
+    monkeypatch.setattr(web_module, "CodexSessionManager", create_manager)
+    monkeypatch.setattr(web_module.RunCoordinator, "close", fail_coordinator_close)
+
+    with (
+        raises(RuntimeError, match="coordinator close failed"),
+        TestClient(create_app()),
+    ):
+        assert len(managers) == 1
+        assert managers[0].close_calls == 0
+
+    assert managers[0].close_calls == 1
+    assert repository.close_calls == 1
 
 
 def test_codex_artifacts_are_loaded_lazily_from_run_files(

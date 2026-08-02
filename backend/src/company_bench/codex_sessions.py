@@ -80,8 +80,9 @@ class CodexSessionManager:
         self._retention = retention
         self._wall_clock = wall_clock
         self._interval_clock = interval_clock
-        self._maintenance_lock = asyncio.Lock()
         self._next_maintenance_at = 0.0
+        self._maintenance_task: asyncio.Task[None] | None = None
+        self._maintenance_client: CodexSessionClient | None = None
 
     @staticmethod
     def thread_name(run_id: Identifier, company_id: CompanyId) -> str:
@@ -93,25 +94,53 @@ class CodexSessionManager:
         client: CodexSessionClient,
         thread_id: str,
     ) -> None:
-        """Archive one Session, then run best-effort daily maintenance."""
+        """Archive one Session and schedule best-effort maintenance."""
         await client.thread_archive(thread_id)
-        await self._maintain_if_due(client)
+        self._schedule_maintenance(client)
 
-    async def _maintain_if_due(self, client: CodexSessionClient) -> None:
-        """Serialize maintenance shared by all company runtimes."""
-        if self._interval_clock() < self._next_maintenance_at:
+    async def close(self) -> None:
+        """Wait for and reclaim the optional background maintenance task."""
+        await self._drain_maintenance()
+
+    async def release(self, client: CodexSessionClient) -> None:
+        """Finish maintenance before its borrowed client is closed."""
+        if self._maintenance_client is client:
+            await self._drain_maintenance()
+
+    async def _drain_maintenance(self) -> None:
+        """Reclaim the current maintenance task without cancelling SDK work."""
+        task = self._maintenance_task
+        if task is None:
             return
-        async with self._maintenance_lock:
-            if self._interval_clock() < self._next_maintenance_at:
-                return
-            try:
-                await self._delete_expired(client)
-            except Exception:
-                _LOGGER.warning("Codex Session retention failed", exc_info=True)
-            finally:
-                self._next_maintenance_at = (
-                    self._interval_clock() + _MAINTENANCE_INTERVAL_SECONDS
-                )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+        finally:
+            if self._maintenance_task is task:
+                self._maintenance_task = None
+                self._maintenance_client = None
+
+    def _schedule_maintenance(self, client: CodexSessionClient) -> None:
+        """Start at most one due maintenance task without blocking a Turn."""
+        now = self._interval_clock()
+        task = self._maintenance_task
+        if now < self._next_maintenance_at or (task is not None and not task.done()):
+            return
+        self._next_maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
+        self._maintenance_client = client
+        self._maintenance_task = asyncio.create_task(
+            self._maintain(client),
+            name="dairy-bench-codex-session-maintenance",
+        )
+
+    async def _maintain(self, client: CodexSessionClient) -> None:
+        """Prune expired owned Sessions without affecting Agent outcomes."""
+        try:
+            await self._delete_expired(client)
+        except Exception:
+            _LOGGER.warning("Codex Session retention failed", exc_info=True)
 
     async def _delete_expired(self, client: CodexSessionClient) -> None:
         """Delete only old Dairy Bench Sessions outside protected runs."""
