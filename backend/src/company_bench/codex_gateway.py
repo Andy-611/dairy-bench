@@ -155,7 +155,7 @@ class _CodexClient(CodexSessionClient, Protocol):
 class CodexAgentConfig(StrictModel):
     """Validated server-only configuration for Codex company Agents."""
 
-    model: str = Field(default="gpt-5.6-luna", min_length=1)
+    model: str = Field(default="gpt-5.6-sol", min_length=1)
     reasoning_effort: CodexReasoningEffort = "low"
     timeout_seconds: float = Field(default=180.0, gt=0, le=900)
     max_attempts: int = Field(default=2, ge=1, le=3)
@@ -169,7 +169,7 @@ class CodexAgentConfig(StrictModel):
             return None
         codex_home = os.getenv("DAIRY_BENCH_CODEX_HOME", "").strip()
         return cls(
-            model=os.getenv("DAIRY_BENCH_CODEX_MODEL", "gpt-5.6-luna"),
+            model=os.getenv("DAIRY_BENCH_CODEX_MODEL", "gpt-5.6-sol"),
             reasoning_effort=os.getenv(
                 "DAIRY_BENCH_CODEX_REASONING_EFFORT",
                 "low",
@@ -229,11 +229,8 @@ class CodexModelGateway(ModelGateway):
             config.runtime_config(Path(self._workspace.name))
         )
         self._artifact_sink = artifact_sink or CodexArtifactStore.from_environment()
-        self._owns_session_manager = session_manager is None
-        self._session_manager = (
-            session_manager
-            if session_manager is not None
-            else CodexSessionManager(config.session_retention)
+        self._session_manager = session_manager or CodexSessionManager(
+            config.session_retention
         )
         self._closed = False
         self._started = False
@@ -299,14 +296,10 @@ class CodexModelGateway(ModelGateway):
             return
         self._closed = True
         try:
-            if self._owns_session_manager:
-                await self._session_manager.close()
+            await self._client.close()
         finally:
-            try:
-                await self._client.close()
-            finally:
-                self._started = False
-                self._workspace.cleanup()
+            self._started = False
+            self._workspace.cleanup()
 
     async def _ensure_started(self) -> None:
         """Start the runtime once and reject missing ChatGPT authentication."""

@@ -127,9 +127,7 @@ class _MarketTimelineAgent:
     async def act(self, turn: AgentTurn) -> CompanyCommand:
         """Return one deterministic command from the current virtual minute."""
         minute = turn.sim_time.minute_of_day
-        runtime = turn.observation.runtime
-        open_minute = runtime.open_minute
-        production_complete = open_minute + runtime.operation_duration_minutes
+        open_minute = turn.observation.runtime.open_minute
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
             return PlaceOrder(
                 side=MarketSide.BUY,
@@ -144,23 +142,20 @@ class _MarketTimelineAgent:
                 product=ProductId.RAW_MILK,
                 quantity=Decimal("60"),
             )
-        if minute == production_complete:
+        if minute == open_minute + 30:
             return PlaceOrder(
                 side=MarketSide.SELL,
                 product=ProductId.RAW_MILK,
                 quantity=Decimal("50"),
                 limit_price=Decimal("1.65"),
             )
-        if minute == production_complete + runtime.decision_interval_minutes and turn.open_orders:
+        if minute == open_minute + 31 and turn.open_orders:
             return ReplaceOrder(
                 order_id=turn.open_orders[0].order_id,
                 quantity=Decimal("10"),
                 limit_price=Decimal("1.64"),
             )
-        if (
-            minute == production_complete + 2 * runtime.decision_interval_minutes
-            and turn.open_orders
-        ):
+        if minute == open_minute + 32 and turn.open_orders:
             return CancelOrder(order_id=turn.open_orders[0].order_id)
         return Wait()
 
@@ -244,7 +239,6 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
     page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
     frames = {moment.sim_time.minute_of_day: moment.market for moment in page.moments}
-    fill_minute = scenario.runtime.open_minute + scenario.runtime.operation_duration_minutes
     raw_at_open = next(
         book
         for book in frames[scenario.runtime.open_minute].closing_order_books
@@ -252,7 +246,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     )
     raw_after_fill = next(
         book
-        for book in frames[fill_minute].closing_order_books
+        for book in frames[scenario.runtime.open_minute + 30].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
 
@@ -266,7 +260,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert open_flow[0].matched_quantity == 0
     assert open_flow[0].remaining_quantity == Decimal("40")
 
-    fill_frame = frames[fill_minute]
+    fill_frame = frames[scenario.runtime.open_minute + 30]
     assert len(fill_frame.order_flow) == 1
     fill_flow = fill_frame.order_flow[0]
     assert isinstance(fill_flow, MarketOrderPlaced)
@@ -280,23 +274,19 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert tuple(trade.quantity for trade in fill_frame.trades) == (Decimal("40"),)
     assert fill_frame.trades[0].maker_order_id == fill_flow.matches[0].maker_order.order_id
     assert fill_frame.trades[0].taker_order_id == fill_flow.incoming_order.order_id
-    assert fill_frame.trades[0].arrives_at.minute_of_day == (
-        fill_minute + scenario.runtime.delivery_duration_minutes
-    )
+    assert fill_frame.trades[0].arrives_at.minute_of_day == scenario.runtime.open_minute + 60
     assert raw_after_fill.last_trade_price == Decimal("1.66")
     assert raw_after_fill.best_bid is None
     assert raw_after_fill.best_ask == Decimal("1.65")
     assert raw_after_fill.asks[0].size == Decimal("10")
     original_order_id = raw_after_fill.asks[0].orders[0].order_id
-    replace_minute = fill_minute + scenario.runtime.decision_interval_minutes
-    cancel_minute = replace_minute + scenario.runtime.decision_interval_minutes
 
     raw_after_replace = next(
         book
-        for book in frames[replace_minute].closing_order_books
+        for book in frames[scenario.runtime.open_minute + 31].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
-    replace_flow = frames[replace_minute].order_flow
+    replace_flow = frames[scenario.runtime.open_minute + 31].order_flow
     assert len(replace_flow) == 1
     assert isinstance(replace_flow[0], MarketOrderReplaced)
     assert replace_flow[0].replaced_order.order_id == original_order_id
@@ -305,16 +295,17 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
     raw_after_cancel = next(
         book
-        for book in frames[cancel_minute].closing_order_books
+        for book in frames[scenario.runtime.open_minute + 32].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
-    cancel_flow = frames[cancel_minute].order_flow
+    cancel_flow = frames[scenario.runtime.open_minute + 32].order_flow
     assert len(cancel_flow) == 1
     assert isinstance(cancel_flow[0], MarketOrderCancelled)
     assert cancel_flow[0].cancelled_order.order_id == raw_after_replace.asks[0].orders[0].order_id
     assert raw_after_cancel.bids == ()
     assert raw_after_cancel.asks == ()
 
+    cancel_minute = scenario.runtime.open_minute + 32
     partial_projection = MarketTimelineProjector().project_day(
         scenario,
         1,

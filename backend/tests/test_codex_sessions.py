@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import pytest
 from openai_codex.types import SortDirection, ThreadSortKey
 
 from company_bench.codex_sessions import (
@@ -40,7 +39,6 @@ class _RetentionClient:
         self.archived: list[str] = []
         self.deleted: list[str] = []
         self.list_calls: list[dict[str, object]] = []
-        self.deleted_expired = asyncio.Event()
         self._pages = {
             None: SimpleNamespace(
                 data=[
@@ -69,8 +67,6 @@ class _RetentionClient:
     async def thread_delete(self, thread_id: str) -> None:
         """Record a hard deletion."""
         self.deleted.append(thread_id)
-        if thread_id == "expired":
-            self.deleted_expired.set()
 
     async def thread_list(self, **options: object) -> SimpleNamespace:
         """Return one deterministic archived page."""
@@ -78,105 +74,25 @@ class _RetentionClient:
         return self._pages[options["cursor"]]
 
 
-class _BlockingRetentionClient(_RetentionClient):
-    """Hold maintenance open so its scheduling and cancellation are observable."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.maintenance_started = asyncio.Event()
-        self.maintenance_cancelled = asyncio.Event()
-        self.release_maintenance = asyncio.Event()
-
-    async def thread_list(self, **options: object) -> SimpleNamespace:
-        """Block the first retention page until the test releases it."""
-        self.list_calls.append(options)
-        self.maintenance_started.set()
-        try:
-            await self.release_maintenance.wait()
-        except asyncio.CancelledError:
-            self.maintenance_cancelled.set()
-            raise
-        return self._pages[options["cursor"]]
-
-
-class _FailingRetentionClient(_RetentionClient):
-    """Fail only background retention after a successful archive."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.maintenance_attempted = asyncio.Event()
-
-    async def thread_list(self, **options: object) -> SimpleNamespace:
-        """Expose the attempt before simulating an app-server failure."""
-        self.list_calls.append(options)
-        self.maintenance_attempted.set()
-        raise RuntimeError("retention unavailable")
-
-
 def test_session_manager_archives_then_prunes_only_expired_owned_sessions() -> None:
-    async def exercise() -> None:
-        client = _RetentionClient()
-        manager = CodexSessionManager(
-            CodexSessionRetention(minimum_runs=3),
-            wall_clock=lambda: _NOW,
-            interval_clock=lambda: 100.0,
-        )
+    client = _RetentionClient()
+    manager = CodexSessionManager(
+        CodexSessionRetention(minimum_runs=3),
+        wall_clock=lambda: _NOW,
+        interval_clock=lambda: 100.0,
+    )
 
-        await manager.archive(client, "current-thread")
-        await asyncio.wait_for(client.deleted_expired.wait(), timeout=1)
-        await manager.archive(client, "another-thread")
-        await manager.close()
+    asyncio.run(manager.archive(client, "current-thread"))
+    asyncio.run(manager.archive(client, "another-thread"))
 
-        assert client.archived == ["current-thread", "another-thread"]
-        assert client.deleted == ["expired"]
-        assert len(client.list_calls) == 2
-        first_call = client.list_calls[0]
-        assert first_call == {
-            "archived": True,
-            "cursor": None,
-            "limit": 100,
-            "sort_direction": SortDirection.desc,
-            "sort_key": ThreadSortKey.updated_at,
-        }
-
-    asyncio.run(exercise())
-
-
-def test_session_maintenance_never_blocks_archive_and_has_one_task() -> None:
-    async def exercise() -> None:
-        client = _BlockingRetentionClient()
-        manager = CodexSessionManager(
-            CodexSessionRetention(),
-            interval_clock=lambda: 100.0,
-        )
-
-        await manager.archive(client, "first-thread")
-        await asyncio.wait_for(client.maintenance_started.wait(), timeout=1)
-        await manager.archive(client, "second-thread")
-
-        assert client.archived == ["first-thread", "second-thread"]
-        assert len(client.list_calls) == 1
-
-        await manager.close()
-        assert client.maintenance_cancelled.is_set()
-
-    asyncio.run(exercise())
-
-
-def test_session_maintenance_failure_is_logged_not_raised(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    async def exercise() -> None:
-        client = _FailingRetentionClient()
-        manager = CodexSessionManager(CodexSessionRetention())
-
-        await manager.archive(client, "safe-thread")
-        await asyncio.wait_for(client.maintenance_attempted.wait(), timeout=1)
-        await asyncio.sleep(0)
-        await manager.close()
-
-        assert client.archived == ["safe-thread"]
-
-    asyncio.run(exercise())
-
-    assert "Codex Session retention failed" in caplog.text
+    assert client.archived == ["current-thread", "another-thread"]
+    assert client.deleted == ["expired"]
+    assert len(client.list_calls) == 2
+    first_call = client.list_calls[0]
+    assert first_call == {
+        "archived": True,
+        "cursor": None,
+        "limit": 100,
+        "sort_direction": SortDirection.desc,
+        "sort_key": ThreadSortKey.updated_at,
+    }

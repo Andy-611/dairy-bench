@@ -1106,7 +1106,7 @@ class EpisodeRuntime:
         cursors: Mapping[str, _Cursor],
     ) -> None:
         """Evaluate every plan once against the committed minute-end books."""
-        wake_at = scheduler.now.plus(1)
+        wake_at = scheduler.now.plus(self.scenario.runtime.decision_interval_minutes)
         for company_id, cursor in sorted(cursors.items()):
             plan = cursor.active_wait
             if plan is None:

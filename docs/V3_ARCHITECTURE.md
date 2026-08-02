@@ -156,13 +156,12 @@ job does not restore that day's capacity.
 ## Decisions and deterministic concurrency
 
 Commands have zero modeled duration except for their physical consequences.
-Except for an accepted `wait`, each decision starts a 30-minute Agent cooldown.
-The runtime also enforces a hard cap of ten Agent turns per company per day. The
-current turn number and limit are part of every `AgentTurn`; reaching the limit
-produces one state-neutral,
-journaled `TURN_LIMIT_REACHED` step. Every later causal Wake is suppressed
-without a model call but remains auditable as an `AGENT_WAKE_SUPPRESSED` step
-with its typed signals.
+The runtime prevents zero-time loops with a one-decision-per-company-per-minute
+throttle and a hard cap of 25 Agent turns per company per day. The current turn
+number and limit are part of every `AgentTurn`; reaching the limit produces one
+state-neutral, journaled `TURN_LIMIT_REACHED` step. Every later causal Wake is
+suppressed without a model call but remains auditable as an
+`AGENT_WAKE_SUPPRESSED` step with its typed signals.
 
 Agents woken in the same minute observe the same base `state_version`. Inference
 runs concurrently, but commands apply in a full deterministic permutation:
@@ -186,9 +185,8 @@ already-true alerts reject the entire command without changing economic state.
 Alerts are one-shot. They observe only the final committed order books after all
 seed-ordered commands for a minute have applied, then wake the company on the
 following minute. Own trades, operation completion, and delivery completion are
-important wakes; those arriving during a non-`wait` cooldown are retained until
-the next eligible decision time. Generic order-book mutations are not broadcast,
-and resting orders do not receive an independent polling timer.
+important wakes; generic order-book mutations are not broadcast and resting
+orders do not receive an independent polling timer.
 
 ## Agent projection and information boundary
 

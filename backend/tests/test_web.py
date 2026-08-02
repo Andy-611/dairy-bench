@@ -281,7 +281,7 @@ def test_codex_profile_can_be_enabled_without_exposing_credentials(
         "label": "Codex company agents",
         "available": True,
         "provider": "codex",
-        "model": "gpt-5.6-luna",
+        "model": "gpt-5.6-sol",
         "reasoning_effort": "low",
         "description": "Each company is controlled by an independent Codex runtime.",
         "unavailable_reason": None,

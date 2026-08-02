@@ -95,13 +95,11 @@ company may have only one active physical operation, but that job does not block
 market, wait, or retail-price commands. Starting a job consumes its cash and,
 for transformation, input inventory; output becomes available only at completion.
 
-The business window is `[09:00, 19:00)`. Commands have no economic execution
-delay. Except for an accepted `wait`, each decision starts a 30-minute Agent
-cooldown. The runtime allows at most ten turns per company per day. At 19:00,
-due operation and delivery completions run first, then markets close, then
-consumer sales run.
-Previously committed completions may drain until 19:29; day close occurs at
-19:30.
+The business window is `[09:00, 19:00)`. Commands have no 30-minute economic
+cooldown; the runtime permits at most one decision per company per virtual
+minute and 25 turns per company per day. At 19:00, due operation and delivery
+completions run first, then markets close, then consumer sales run. Previously
+committed completions may drain until 19:29; day close occurs at 19:30.
 
 `wait` is an attention plan rather than a polling action. It may declare up to
 three anonymous quote conditions over visible `best_bid` or `best_ask` values;
@@ -112,9 +110,8 @@ are evaluated only after all commands for a minute have committed; a match wakes
 the company on the following minute. Duplicate, hidden, or already-true alerts,
 and invalid fallback times, reject the whole command without changing the
 economy. Own trades, operation completions, and delivery completions also wake
-the affected company; a Wake arriving during a non-`wait` cooldown is retained
-until the next eligible decision time. Generic book mutations are not broadcast,
-and resting orders have no separate review timer. Reaching the daily cap writes an explicit
+the affected company. Generic book mutations are not broadcast, and resting
+orders have no separate review timer. Reaching the daily cap writes an explicit
 state-neutral audit step and suppresses further Agent calls for that day. Each
 later Wake is still journaled with its typed causal signals.
 
@@ -219,7 +216,7 @@ or database. `DAIRY_BENCH_OPENAI_BASE_URL` may target a compatible service.
 
 | Condition | Result |
 |---|---|
-| Missing or invalid model command | Protocol rejection; economy unchanged; correction may be attempted after the 30-minute decision interval |
+| Missing or invalid model command | Protocol rejection; economy unchanged; correction may be attempted on the next virtual minute |
 | Role, collateral, ownership, capacity, or time rule fails | Typed engine rejection; run continues |
 | Authentication or retry-exhausted provider failure | Entire run fails; no misleading score is emitted |
 | Journal failure or runtime invariant violation | Current transaction rolls back and the run fails |

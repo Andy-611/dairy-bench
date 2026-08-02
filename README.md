@@ -27,9 +27,8 @@ deliveries, or trade results. Natural-language text never settles a transaction.
   `SHA256(seed | minute | company)` order. Provider response latency is audited
   but cannot change the economic result.
 - `produce` and `transform` occupy the company's physical resource for 30 virtual
-  minutes. Market and retail-price commands remain instantaneous. Except for an
-  accepted `wait`, each decision starts a 30-minute Agent cooldown; the daily cap
-  is ten turns. A matched price alert still wakes the company on the next minute.
+  minutes. Market and retail-price commands remain instantaneous, subject to the
+  one-decision-per-virtual-minute throttle.
 - A trade pays the seller immediately and schedules automatic buyer delivery 30
   minutes later. There is no manual dispatch, route, carrier, or escrow workflow.
 - Each agent sees anonymous top-of-book depth, its own orders, available and

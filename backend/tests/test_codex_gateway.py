@@ -11,7 +11,6 @@ import pytest
 from openai_codex import ApprovalMode, Sandbox
 from openai_codex.types import TurnStatus
 
-import company_bench.codex_gateway as codex_gateway_module
 from company_bench.agent_models import (
     CommandModelRequest,
     ModelInfrastructureError,
@@ -27,7 +26,6 @@ from company_bench.codex_gateway import (
     CodexAgentConfig,
     CodexModelGateway,
 )
-from company_bench.codex_sessions import CodexSessionManager, CodexSessionRetention
 from company_bench.models import CompanyObservation, FarmDecision
 from company_bench.runtime_models import AgentTurn, Produce, SimTime, WakeReason
 
@@ -168,19 +166,6 @@ class _FailingArchiveCodex(_FakeCodex):
         raise TimeoutError("Session archive timed out")
 
 
-class _TrackedSessionManager(CodexSessionManager):
-    """Record only the ownership interactions required by the gateway."""
-
-    def __init__(self, retention: CodexSessionRetention) -> None:
-        super().__init__(retention)
-        self.closed = False
-
-    async def close(self) -> None:
-        """Record manager reclamation."""
-        self.closed = True
-        await super().close()
-
-
 def _request(observation: CompanyObservation) -> ModelRequest:
     """Build one provider-neutral farm request."""
     return ModelRequest(
@@ -299,43 +284,6 @@ def test_codex_runtime_requests_all_public_reasoning() -> None:
     assert "show_raw_agent_reasoning=true" in overrides
     assert config.codex_home == DEFAULT_CODEX_HOME.resolve()
     assert runtime.env == {"CODEX_HOME": str(DEFAULT_CODEX_HOME.resolve())}
-
-
-def test_codex_gateway_closes_its_owned_session_manager(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    managers: list[_TrackedSessionManager] = []
-
-    def create_manager(retention: CodexSessionRetention) -> _TrackedSessionManager:
-        manager = _TrackedSessionManager(retention)
-        managers.append(manager)
-        return manager
-
-    monkeypatch.setattr(codex_gateway_module, "CodexSessionManager", create_manager)
-    client = _FakeCodex(_valid_response())
-    gateway = CodexModelGateway(CodexAgentConfig(model="test-model"), "farm_a", client)
-
-    asyncio.run(gateway.close())
-
-    assert len(managers) == 1
-    assert managers[0].closed is True
-    assert client.closed is True
-
-
-def test_codex_gateway_leaves_an_injected_session_manager_open() -> None:
-    client = _FakeCodex(_valid_response())
-    manager = _TrackedSessionManager(CodexSessionRetention())
-    gateway = CodexModelGateway(
-        CodexAgentConfig(model="test-model"),
-        "farm_a",
-        client,
-        session_manager=manager,
-    )
-
-    asyncio.run(gateway.close())
-
-    assert manager.closed is False
-    assert client.closed is True
 
 
 def test_codex_config_rejects_the_personal_history_directory() -> None:

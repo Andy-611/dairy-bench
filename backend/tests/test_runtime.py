@@ -417,7 +417,7 @@ async def test_operation_and_delivery_completions_wake_the_owning_companies() ->
         "processor_a",
     }
     assert {record.turn.sim_time.minute_of_day for record in trade_wakes} == {
-        _OPEN + 30 + scenario.runtime.decision_interval_minutes
+        _OPEN + 31
     }
     for trade_wake in trade_wakes:
         signal = next(
@@ -450,11 +450,10 @@ async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -
         23,
         run_id="market_notifications",
     )
-    at_next_decision = tuple(
+    at_next_minute = tuple(
         record
         for record in execution.turns
-        if record.turn.sim_time.minute_of_day
-        == _OPEN + scenario.runtime.decision_interval_minutes
+        if record.turn.sim_time.minute_of_day == _OPEN + 1
     )
     processor_review = next(
         record
@@ -463,12 +462,10 @@ async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -
         and WakeReason.WAIT_EXPIRED in record.turn.wake_reasons
     )
 
-    assert tuple(record.turn.company_id for record in at_next_decision) == ("processor_a",)
-    assert at_next_decision[0].turn.wake_reasons == (WakeReason.CONTINUE,)
+    assert tuple(record.turn.company_id for record in at_next_minute) == ("processor_a",)
+    assert at_next_minute[0].turn.wake_reasons == (WakeReason.CONTINUE,)
     assert processor_review.turn.sim_time.minute_of_day == (
-        _OPEN
-        + scenario.runtime.decision_interval_minutes
-        + scenario.runtime.max_wait_minutes
+        _OPEN + 1 + scenario.runtime.max_wait_minutes
     )
     assert tuple(order.product for order in processor_review.turn.open_orders) == (
         ProductId.RAW_MILK,
@@ -479,7 +476,6 @@ async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -
 @pytest.mark.asyncio
 async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> None:
     scenario = _scenario(max_turns=3, company_ids=("farm_a", "processor_a"))
-    assert scenario.runtime.decision_interval_minutes == 30
     alert = QuoteAlert(
         product=ProductId.RAW_MILK,
         quote="best_bid",
@@ -531,7 +527,7 @@ async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> Non
 
 
 @pytest.mark.asyncio
-async def test_protocol_rejection_retries_after_the_decision_interval() -> None:
+async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> None:
     scenario = _scenario(max_turns=3)
 
     def broken(_: AgentTurn) -> CompanyCommand:
@@ -549,8 +545,8 @@ async def test_protocol_rejection_retries_after_the_decision_interval() -> None:
         )
         assert tuple(record.turn.sim_time.minute_of_day for record in records) == (
             _OPEN,
-            _OPEN + scenario.runtime.decision_interval_minutes,
-            _OPEN + 2 * scenario.runtime.decision_interval_minutes,
+            _OPEN + 1,
+            _OPEN + 2,
         )
         assert all(
             record.protocol_error == "ModelOutputError: invalid command" for record in records
@@ -590,9 +586,7 @@ async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> 
     assert not first.outcome.accepted
     assert first.outcome.reason == "wait deadline cannot exceed 120 minutes"
     assert first.outcome.resulting_state_version == first.turn.state_version
-    assert correction.turn.sim_time == first.turn.sim_time.plus(
-        scenario.runtime.decision_interval_minutes
-    )
+    assert correction.turn.sim_time == first.turn.sim_time.plus(1)
     assert correction.turn.wake_reasons == (WakeReason.COMMAND_REJECTED,)
     assert correction.turn.previous_outcome == first.outcome
 
