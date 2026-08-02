@@ -226,6 +226,28 @@ Replay uses the same runtime and engine without model calls. Observation hashes,
 commands or protocol rejections, outcomes, `apply_sequence`, system effects,
 events, snapshots, and final score must match exactly.
 
+## Episode evaluation
+
+Each valid episode receives one seed-specific score. For each of the 30 days and
+three retailers, the evaluator derives potential demand `A` from the episode
+seed and uses the continuous net-value ceiling `(A + 14)^2 / 32`. Their sum is
+`E_ref`; it is never selected from participating models. Aggregate company value
+growth is `E_raw`, and `E = clip(E_raw / E_ref, 0, 1)`.
+
+The evaluator computes a raw growth Gini for each three-company tier. With a
+finite-sample maximum of `2/3`, normalized fairness is
+`F = 1 - (G_farm + G_processor + G_retailer) / 2`. A company is bankrupt when
+its day-end cash plus reference-valued inventory has reached zero on any day;
+with `D` bankrupt companies, `B = D / 9`. The final score is:
+
+```text
+Score = 100 * E * sqrt(F * (1 - B))
+```
+
+Economic outcomes do not create eligibility gates. An incomplete,
+protocol-invalid, technically failed, or replay-divergent episode produces no
+score.
+
 ## Core invariants
 
 1. Only `EconomyEngine` changes economic state.

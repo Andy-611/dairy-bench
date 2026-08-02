@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal, DecimalException
+from decimal import Decimal, DecimalException
 from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
+from company_bench.demand import ConsumerDemandCurve
 from company_bench.market import (
     AssetLedger,
     BuyOrder,
@@ -184,11 +184,7 @@ class PendingDelivery(StrictModel):
             expiry_buckets=tuple(
                 DeliveryExpiryBucket(
                     quantity=sum(
-                        (
-                            lot.quantity
-                            for lot in self.lots
-                            if lot.expires_end_of_day == expiry_day
-                        ),
+                        (lot.quantity for lot in self.lots if lot.expires_end_of_day == expiry_day),
                         start=ZERO,
                     ),
                     expires_end_of_day=expiry_day,
@@ -248,8 +244,7 @@ class EconomyState(StrictModel):
         """Protect identities, ownership, and one-resource-per-company invariants."""
         active = self.day == self.base_state.day + 1
         terminal = (
-            self.base_state.day == self.base_state.scenario.days
-            and self.day == self.base_state.day
+            self.base_state.day == self.base_state.scenario.days and self.day == self.base_state.day
         )
         if not (active or terminal):
             raise ValueError("economy day must be active or terminal")
@@ -318,9 +313,7 @@ class EconomyState(StrictModel):
             raise ValueError("active economy events must belong to its day")
         if self.consumer_settlement is not None and self.consumer_settlement.day != self.day:
             raise ValueError("consumer settlement must belong to the active day")
-        if self.consumer_settlement is not None and any(
-            market.is_open for market in self.markets
-        ):
+        if self.consumer_settlement is not None and any(market.is_open for market in self.markets):
             raise ValueError("consumer settlement requires closed markets")
         return self
 
@@ -372,12 +365,8 @@ class _MarketSession:
             economy.companies,
             next_lot_sequence=economy.next_lot_sequence,
         )
-        assets.track_lots(
-            lot for delivery in economy.deliveries for lot in delivery.lots
-        )
-        markets = {
-            state.product: ContinuousSpotMarket(state, assets) for state in economy.markets
-        }
+        assets.track_lots(lot for delivery in economy.deliveries for lot in delivery.lots)
+        markets = {state.product: ContinuousSpotMarket(state, assets) for state in economy.markets}
         return cls(
             assets=assets,
             markets=markets,
@@ -501,11 +490,7 @@ class EconomyEngine:
     ) -> CompanyObservation:
         """Project only currently available assets for one active company."""
         price = next(
-            (
-                item.unit_price
-                for item in economy.retail_prices
-                if item.company_id == company_id
-            ),
+            (item.unit_price for item in economy.retail_prices if item.company_id == company_id),
             None,
         )
         return self._observation(
@@ -595,9 +580,7 @@ class EconomyEngine:
     ) -> tuple[IncomingDeliveryView, ...]:
         """Return guaranteed inbound inventory and its exact arrival time."""
         return tuple(
-            delivery.view()
-            for delivery in economy.deliveries
-            if delivery.buyer_id == company_id
+            delivery.view() for delivery in economy.deliveries if delivery.buyer_id == company_id
         )
 
     @staticmethod
@@ -740,9 +723,7 @@ class EconomyEngine:
         ).model_copy(
             update={
                 "jobs": tuple(
-                    candidate
-                    for candidate in economy.jobs
-                    if candidate.job_id != job_id
+                    candidate for candidate in economy.jobs if candidate.job_id != job_id
                 ),
                 "events": (*economy.events, event),
             }
@@ -803,32 +784,26 @@ class EconomyEngine:
             raise ValueError("markets must close before consumer sales")
 
         session = _MarketSession.from_economy(economy)
+        demand_curve = ConsumerDemandCurve(spec=economy.scenario.demand)
         events: list[ConsumerSaleEvent] = []
         potential_total = ZERO
         demand_total = ZERO
         sold_total = ZERO
         prices = {
-            (price.company_id, price.product): price.unit_price
-            for price in economy.retail_prices
+            (price.company_id, price.product): price.unit_price for price in economy.retail_prices
         }
         for company in economy.scenario.companies:
             operation = company.operation
             if not isinstance(operation, RetailerOperation):
                 continue
-            potential = self._consumer_potential(economy, company.company_id)
+            potential = demand_curve.potential(economy.seed, economy.day, company.company_id)
             price = prices.get((company.company_id, operation.input_product))
             if price is None:
                 demand = potential
                 sold = ZERO
                 revenue = ZERO
             else:
-                adjustment = economy.scenario.demand.price_sensitivity * (
-                    price - economy.scenario.demand.reference_price
-                )
-                demand = max(
-                    ZERO,
-                    (potential - adjustment).quantize(Decimal("1"), rounding=ROUND_HALF_UP),
-                )
+                demand = demand_curve.quantity(potential, price)
                 sold = min(
                     demand,
                     session.assets.quantity(company.company_id, operation.input_product),
@@ -1299,9 +1274,7 @@ class EconomyEngine:
         economy: EconomyState,
     ) -> Callable[[int], Identifier]:
         """Return a deterministic per-command trade identity factory."""
-        return lambda offset: (
-            f"d{economy.day}.trade{economy.next_trade_sequence + offset - 1}"
-        )
+        return lambda offset: f"d{economy.day}.trade{economy.next_trade_sequence + offset - 1}"
 
     def _outcome(
         self,
@@ -1367,26 +1340,6 @@ class EconomyEngine:
         if any(job.company_id == company_id for job in economy.jobs):
             raise _CommandRejected("company operation resource is busy")
 
-    def _consumer_potential(
-        self,
-        economy: EconomyState,
-        retailer_id: CompanyId,
-    ) -> Quantity:
-        shock = self._named_demand_shock(
-            economy.seed,
-            economy.day,
-            retailer_id,
-            economy.scenario.demand.shock_min,
-            economy.scenario.demand.shock_max,
-        )
-        return max(
-            ZERO,
-            (economy.scenario.demand.base_demand + Decimal(shock)).quantize(
-                Decimal("1"),
-                rounding=ROUND_HALF_UP,
-            ),
-        )
-
     def _observation(
         self,
         *,
@@ -1447,8 +1400,7 @@ class EconomyEngine:
                             product=lot.product,
                             quantity=lot.quantity,
                             reference_value_loss=(
-                                lot.quantity
-                                * economy.scenario.product(lot.product).reference_value
+                                lot.quantity * economy.scenario.product(lot.product).reference_value
                             ),
                         )
                     )
@@ -1505,19 +1457,6 @@ class EconomyEngine:
             consumer_sales=consumer_sales,
             expired_quantity=expired_quantity,
         )
-
-    @staticmethod
-    def _named_demand_shock(
-        seed: int,
-        day: int,
-        retailer_id: str,
-        minimum: int,
-        maximum: int,
-    ) -> int:
-        """Derive stable demand without coupling it to call order."""
-        stream = f"{seed}|consumer_demand|{day}|{retailer_id}".encode()
-        value = int.from_bytes(hashlib.sha256(stream).digest()[:8], "big")
-        return minimum + value % (maximum - minimum + 1)
 
 
 def _validate_job_time(started_at: SimTime, completes_at: SimTime) -> None:
@@ -1638,7 +1577,5 @@ def _market_summary(market: MarketState) -> MarketSummary:
     return MarketSummary(
         product=market.product,
         volume=market.volume,
-        average_price=(
-            market.traded_value / market.volume if market.volume > ZERO else None
-        ),
+        average_price=(market.traded_value / market.volume if market.volume > ZERO else None),
     )

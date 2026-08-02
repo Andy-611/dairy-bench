@@ -3,11 +3,11 @@ import { useEffect, useRef, useState } from "react";
 import { DairyBenchApi } from "./api";
 import { CompanyTable } from "./components/CompanyTable";
 import { EmptyState } from "./components/EmptyState";
+import { EvaluationStandard } from "./components/EvaluationStandard";
 import { MetricChart } from "./components/MetricChart";
 import { OperationsReplay } from "./components/OperationsReplay";
 import { RunForm } from "./components/RunForm";
 import { RunHistory } from "./components/RunHistory";
-import { SummaryCards } from "./components/SummaryCards";
 import { TokenSummary } from "./components/TokenSummary";
 import { isAbortError, requestErrorMessage } from "./requestErrors";
 import type {
@@ -223,7 +223,7 @@ export function App() {
             )}
             {episode && (
               <>
-                <SummaryCards score={episode.score} />
+                <EvaluationStandard score={episode.score} />
                 {episode.agentUsage && (
                   <TokenSummary summary={episode.agentUsage} />
                 )}

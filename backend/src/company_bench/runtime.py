@@ -92,6 +92,10 @@ class EpisodeExecution:
     turns: tuple[TurnRecord, ...]
 
 
+class EpisodeProtocolError(RuntimeError):
+    """Reject a technically invalid episode before benchmark scoring."""
+
+
 @dataclass(slots=True)
 class _Cursor:
     next_turn_sequence: int = 1
@@ -193,8 +197,7 @@ class EpisodeRuntime:
         turn_limit_audits: set[tuple[int, CompanyId]] = {
             (step.occurred_at.day + 1, step.company_id)
             for step in system_steps
-            if step.kind is SystemEventKind.TURN_LIMIT_REACHED
-            and step.company_id is not None
+            if step.kind is SystemEventKind.TURN_LIMIT_REACHED and step.company_id is not None
         }
         next_apply_sequence = (
             max((record.outcome.apply_sequence for record in turns), default=0) + 1
@@ -474,8 +477,7 @@ class EpisodeRuntime:
                 company_id = record.turn.company_id
                 audit_key = (economy.day, company_id)
                 if (
-                    turn_counts[audit_key]
-                    != self.scenario.runtime.max_turns_per_company_day
+                    turn_counts[audit_key] != self.scenario.runtime.max_turns_per_company_day
                     or audit_key in turn_limit_audits
                 ):
                     continue
@@ -516,6 +518,11 @@ class EpisodeRuntime:
         for agent in agents.values():
             if isinstance(agent, EpisodeCompletionGuard):
                 agent.ensure_episode_complete()
+        protocol_error_count = sum(record.protocol_error is not None for record in turns)
+        if protocol_error_count:
+            raise EpisodeProtocolError(
+                f"episode contains {protocol_error_count} protocol-invalid turn(s)"
+            )
         events = tuple(record.event for record in event_records)
         episode = EpisodeResult(
             run_id=run_id,
@@ -921,9 +928,7 @@ class EpisodeRuntime:
 
         def priority(item: _PendingTurn) -> tuple[bytes, str]:
             company_id = item.turn.company_id
-            digest = hashlib.sha256(
-                f"{seed}|{at.absolute_minute}|{company_id}".encode()
-            ).digest()
+            digest = hashlib.sha256(f"{seed}|{at.absolute_minute}|{company_id}".encode()).digest()
             return digest, company_id
 
         return tuple(sorted(pending, key=priority))
@@ -993,11 +998,7 @@ class EpisodeRuntime:
             scheduler.schedule_wake(
                 record.turn.company_id,
                 available,
-                (
-                    WakeReason.CONTINUE
-                    if record.outcome.accepted
-                    else WakeReason.COMMAND_REJECTED
-                ),
+                (WakeReason.CONTINUE if record.outcome.accepted else WakeReason.COMMAND_REJECTED),
                 source=JournalEntryReference(
                     entry_id=record.turn.turn_id,
                     entry_type=JournalEntryKind.TURN,

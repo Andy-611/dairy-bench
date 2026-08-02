@@ -441,13 +441,6 @@ button:disabled {
   white-space: pre-wrap;
 }
 
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.metric-card,
 .panel,
 .empty-state {
   border: 1px solid rgb(218 225 218 / 90%);
@@ -455,60 +448,234 @@ button:disabled {
   box-shadow: var(--shadow);
 }
 
-.metric-card {
-  position: relative;
-  display: grid;
-  min-height: 134px;
-  padding: 20px;
-  border-radius: 16px;
+.panel {
+  overflow: hidden;
+  border-radius: 18px;
 }
 
-.metric-card::before {
-  position: absolute;
-  top: 20px;
-  right: 18px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #8a9790;
-  content: "";
-}
-
-.metric-card.positive::before {
-  background: var(--green);
-  box-shadow: 0 0 0 4px var(--green-soft);
-}
-
-.metric-card.negative::before {
-  background: var(--red);
-  box-shadow: 0 0 0 4px #f8e7e4;
-}
-
-.metric-label {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.metric-card strong {
-  align-self: end;
-  margin: 10px 0 4px;
+.formula-section h3 {
+  margin: 5px 0 0;
   color: var(--ink);
   font-family: Georgia, "Songti SC", serif;
-  font-size: clamp(23px, 2vw, 30px);
+  font-weight: 600;
+}
+
+.evaluation-overview {
+  display: grid;
+  grid-template-columns: minmax(250px, 0.7fr) minmax(0, 2fr);
+  gap: 14px;
+  padding: 0 26px 24px;
+}
+
+.final-score-card {
+  display: flex;
+  min-height: 260px;
+  padding: 25px;
+  color: #fff;
+  border-radius: 15px;
+  background:
+    radial-gradient(circle at 86% 14%, rgb(141 210 179 / 34%), transparent 42%),
+    linear-gradient(145deg, var(--green-dark), #176c57);
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.final-score-card > span {
+  color: rgb(233 252 244 / 72%);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+}
+
+.final-score-value {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.final-score-value strong {
+  font-family: Georgia, "Songti SC", serif;
+  font-size: clamp(66px, 7vw, 108px);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  letter-spacing: -0.055em;
+  line-height: 0.82;
+}
+
+.final-score-value small {
+  color: rgb(233 252 244 / 72%);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.final-score-card p {
+  margin: 0;
+  color: rgb(240 255 248 / 76%);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.evaluation-metrics {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 0.78fr);
+  gap: 12px;
+}
+
+.evaluation-metric {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid #e4e9e4;
+  border-radius: 13px;
+  background: #fafbf9;
+}
+
+.evaluation-metric > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.evaluation-metric > header > span {
+  color: var(--green-dark);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.evaluation-metric > header > small {
+  white-space: nowrap;
+}
+
+.evaluation-metric-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  margin: 0;
+}
+
+.evaluation-metric-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.evaluation-metric-list dt,
+.evaluation-metric-list dt > span:last-child {
+  display: flex;
+  align-items: center;
+}
+
+.evaluation-metric-list dt {
+  min-width: 0;
+  gap: 9px;
+}
+
+.evaluation-metric-list dt > span:last-child {
+  align-items: start;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.evaluation-metric-list dt strong {
+  overflow: hidden;
+  color: var(--green-dark);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+
+.evaluation-metric-list dt small,
+.evaluation-metric > header > small {
+  color: #909a94;
+  font-size: 9px;
+}
+
+.evaluation-metric-list dd {
+  margin: 0;
+  color: var(--ink);
+  font-family: Georgia, "Songti SC", serif;
+  font-size: clamp(17px, 1.7vw, 23px);
   font-variant-numeric: tabular-nums;
   font-weight: 600;
 }
 
-.metric-card small {
-  color: #89928d;
-  font-size: 12px;
-  line-height: 1.4;
+.role-dot.bankruptcy {
+  background: var(--orange);
 }
 
-.panel {
-  overflow: hidden;
-  border-radius: 18px;
+.formula-section {
+  padding: 22px 26px 24px;
+  border-top: 1px solid #e5ebe6;
+  background: #f7faf7;
+}
+
+.formula-section > header {
+  margin-bottom: 15px;
+}
+
+.formula-section h3 {
+  font-size: 17px;
+}
+
+.formula-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.formula-grid article {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid #e2e9e3;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.formula-grid article > span {
+  color: var(--green);
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.formula-expression {
+  display: grid;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.formula-expression code {
+  overflow-x: auto;
+  padding-bottom: 2px;
+  color: #173e33;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.5;
+  scrollbar-width: thin;
+  white-space: nowrap;
+}
+
+.formula-grid p,
+.formula-note {
+  margin: 0;
+  color: #7f8a84;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.formula-note {
+  margin-top: 12px;
 }
 
 .token-heading {
@@ -1090,8 +1257,16 @@ footer {
 }
 
 @media (max-width: 1050px) {
-  .summary-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  .evaluation-overview {
+    grid-template-columns: 1fr;
+  }
+
+  .final-score-card {
+    min-height: 190px;
+  }
+
+  .formula-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .hero {
@@ -1203,13 +1378,17 @@ footer {
     border-bottom: 1px solid rgb(255 255 255 / 12%);
   }
 
-  .summary-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .evaluation-overview {
+    padding: 0 18px 18px;
   }
 
-  .metric-card {
-    min-height: 122px;
-    padding: 17px;
+  .evaluation-metrics,
+  .formula-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .formula-section {
+    padding: 19px 18px 21px;
   }
 
   .section-heading {
@@ -1249,12 +1428,13 @@ footer {
 }
 
 @media (max-width: 430px) {
-  .summary-grid {
-    grid-template-columns: 1fr;
+  .final-score-card {
+    min-height: 180px;
+    padding: 21px;
   }
 
-  .metric-card {
-    min-height: 105px;
+  .final-score-value strong {
+    font-size: 66px;
   }
 
   .token-stat-grid {

@@ -95,11 +95,7 @@ def _company(economy: EconomyState, company_id: str) -> CompanyState:
 def _quantity(economy: EconomyState, company_id: str, product: ProductId) -> Decimal:
     """Aggregate currently available inventory."""
     return sum(
-        (
-            lot.quantity
-            for lot in _company(economy, company_id).inventory
-            if lot.product is product
-        ),
+        (lot.quantity for lot in _company(economy, company_id).inventory if lot.product is product),
         start=Decimal("0"),
     )
 
@@ -222,9 +218,7 @@ def test_v3_scenario_has_nine_typed_companies_and_balanced_capacity() -> None:
     assert scenario.version == 3
     assert scenario.days == 30
     assert tuple(company.company_id for company in scenario.companies) == expected_ids
-    assert tuple(company.initial_cash for company in scenario.companies) == (
-        Decimal("1000"),
-    ) * 9
+    assert tuple(company.initial_cash for company in scenario.companies) == (Decimal("1000"),) * 9
     assert operation_kinds.count("farm") == 3
     assert operation_kinds.count("processor") == 3
     assert operation_kinds.count("retailer") == 3
@@ -569,13 +563,14 @@ def test_minimum_legal_partial_fill_preserves_market_state_invariants(
     assert sell.accepted and buy.accepted
     order = engine.company_orders(economy, "farm_a")[0]
     assert order.remaining_quantity == Decimal("59.9998")
-    assert sum(
-        (position.quantity for position in engine.reserved_inventory(economy, "farm_a")),
-        start=Decimal("0"),
-    ) == order.remaining_quantity
-    assert engine.pending_delivery_views(economy, "processor_a")[0].quantity == Decimal(
-        "0.0001"
+    assert (
+        sum(
+            (position.quantity for position in engine.reserved_inventory(economy, "farm_a")),
+            start=Decimal("0"),
+        )
+        == order.remaining_quantity
     )
+    assert engine.pending_delivery_views(economy, "processor_a")[0].quantity == Decimal("0.0001")
     assert EconomyState.model_validate_json(economy.model_dump_json()) == economy
 
 
@@ -796,6 +791,40 @@ def test_consumer_sales_run_after_market_close_and_day_closes_at_nineteen_thirty
     assert result.snapshot.consumer_sales == Decimal("10")
     assert result.snapshot.markets == result.state.previous_markets
     assert result.events == economy.events
+
+
+def test_consumer_demand_remains_continuous_after_price_adjustment(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_inventory(
+        engine,
+        "retailer_a",
+        ProductId.BOTTLED_MILK,
+        Decimal("100"),
+    )
+    economy, outcome = _apply(
+        engine,
+        economy,
+        "retailer_a",
+        SetRetailPrice(
+            product=ProductId.BOTTLED_MILK,
+            unit_price=Decimal("3.55"),
+        ),
+        _at(9),
+        1,
+    )
+    assert outcome.accepted
+
+    economy = engine.close_markets(economy, _at(19))
+    economy = engine.settle_consumer_sales(economy, _at(19))
+    sale = next(
+        event
+        for event in economy.events
+        if isinstance(event, ConsumerSaleEvent) and event.company_id == "retailer_a"
+    )
+
+    assert sale.demand_quantity == sale.potential_demand_quantity - Decimal("0.40")
+    assert sale.demand_quantity != sale.demand_quantity.to_integral_value()
 
 
 def test_operation_started_at_eighteen_fifty_nine_finishes_before_day_close(

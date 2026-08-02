@@ -21,7 +21,7 @@ from company_bench.run_models import (
 )
 from company_bench.runtime_models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 4
+_DATABASE_SCHEMA_VERSION = 5
 _PAYLOAD_SCHEMA_VERSION = 1
 _RESUMABLE_STATUSES = (
     RunStatus.QUEUED,
@@ -347,7 +347,7 @@ class SQLiteRunRepository:
             rows = self._connection.execute(
                 """
                 SELECT run_id, scenario_id, seed, started_at, finished_at,
-                       efficiency, fairness, eligible
+                       score_version, final_score
                 FROM runs
                 ORDER BY finished_at DESC, rowid DESC
                 LIMIT ?
@@ -628,10 +628,20 @@ class SQLiteRunRepository:
             )
 
     def _create_schema(self) -> None:
-        """Create schema v4, upgrading earlier databases without data loss."""
+        """Create the score-v5 schema for new benchmark databases."""
         current_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
-        if current_version not in (0, 1, 2, 3, _DATABASE_SCHEMA_VERSION):
+        if current_version not in (0, _DATABASE_SCHEMA_VERSION):
             raise RuntimeError(f"unsupported database schema version: {current_version}")
+        existing_table = self._connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            LIMIT 1
+            """
+        ).fetchone()
+        if current_version == 0 and existing_table is not None:
+            raise RuntimeError("unversioned existing databases are unsupported")
         schema = """
         CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY,
@@ -641,12 +651,8 @@ class SQLiteRunRepository:
             seed INTEGER NOT NULL,
             started_at TEXT NOT NULL,
             finished_at TEXT NOT NULL,
-            efficiency TEXT NOT NULL,
-            fairness TEXT NOT NULL,
-            gini TEXT NOT NULL,
-            eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
-            consumer_fill_rate TEXT NOT NULL,
-            expired_quantity TEXT NOT NULL,
+            score_version TEXT NOT NULL,
+            final_score TEXT NOT NULL,
             result_json TEXT NOT NULL
         );
 
@@ -869,9 +875,8 @@ class SQLiteRunRepository:
             """
             INSERT INTO runs (
                 run_id, scenario_id, scenario_version, scenario_json, seed,
-                started_at, finished_at, efficiency, fairness, gini, eligible,
-                consumer_fill_rate, expired_quantity, result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                started_at, finished_at, score_version, final_score, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 scenario_id = excluded.scenario_id,
                 scenario_version = excluded.scenario_version,
@@ -879,12 +884,8 @@ class SQLiteRunRepository:
                 seed = excluded.seed,
                 started_at = excluded.started_at,
                 finished_at = excluded.finished_at,
-                efficiency = excluded.efficiency,
-                fairness = excluded.fairness,
-                gini = excluded.gini,
-                eligible = excluded.eligible,
-                consumer_fill_rate = excluded.consumer_fill_rate,
-                expired_quantity = excluded.expired_quantity,
+                score_version = excluded.score_version,
+                final_score = excluded.final_score,
                 result_json = excluded.result_json
             """,
             (
@@ -895,12 +896,8 @@ class SQLiteRunRepository:
                 summary.seed,
                 summary.started_at.isoformat(),
                 summary.finished_at.isoformat(),
-                str(summary.efficiency),
-                str(summary.fairness),
-                str(result.score.gini),
-                int(summary.eligible),
-                str(result.score.consumer_fill_rate),
-                str(result.score.expired_quantity),
+                summary.score_version,
+                str(summary.final_score),
                 result.model_dump_json(),
             ),
         )
@@ -1046,9 +1043,8 @@ def _to_summary(result: EpisodeResult) -> RunSummary:
         seed=result.seed,
         started_at=result.started_at,
         finished_at=result.finished_at,
-        efficiency=result.score.efficiency,
-        fairness=result.score.fairness,
-        eligible=result.score.eligible,
+        score_version=result.score.score_version,
+        final_score=result.score.final_score,
     )
 
 

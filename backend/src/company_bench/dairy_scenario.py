@@ -94,10 +94,7 @@ def _build_dairy_scenario() -> ScenarioSpec:
             shock_min=-5,
             shock_max=5,
         ),
-        scoring=ScoringSpec(
-            max_gini=_money("0.20"),
-            max_within_tier_growth_gap=_money("0.20"),
-        ),
+        scoring=ScoringSpec(),
     )
 
 
