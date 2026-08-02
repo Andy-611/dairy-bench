@@ -104,7 +104,22 @@ def test_run_list_and_detail_http_flow() -> None:
 
         detail = client.get(f"/api/runs/{submitted.run_id}")
         assert detail.status_code == 200
-        result = EpisodeResult.model_validate(detail.json())
+        detail_payload = detail.json()
+        assert set(detail_payload["score"]) == {
+            "score_version",
+            "final_score",
+            "efficiency_raw",
+            "efficiency_reference",
+            "efficiency_score",
+            "farm_gini",
+            "processor_gini",
+            "retailer_gini",
+            "fairness_score",
+            "bankrupt_company_count",
+            "bankruptcy_rate",
+            "companies",
+        }
+        result = EpisodeResult.model_validate(detail_payload)
         assert result.seed == 42
         assert result.scenario == DAIRY_S9_V3_SCENARIO
         assert len(result.scenario.companies) == 9
@@ -120,8 +135,18 @@ def test_run_list_and_detail_http_flow() -> None:
         }
 
         summaries = client.get("/api/runs").json()
+        assert set(summaries[0]) == {
+            "run_id",
+            "scenario_id",
+            "seed",
+            "started_at",
+            "finished_at",
+            "score_version",
+            "final_score",
+        }
         assert summaries[0]["run_id"] == result.run_id
         assert summaries[0]["scenario_id"] == "flow.dairy.base.s9.v3"
+        assert summaries[0]["final_score"] == str(result.score.final_score)
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -338,7 +363,7 @@ def test_default_repository_uses_configured_database(
     assert database.is_file()
 
 
-def test_default_app_runs_the_v2_scenario(monkeypatch: MonkeyPatch) -> None:
+def test_default_app_runs_the_v3_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     repository = MemoryRunRepository()

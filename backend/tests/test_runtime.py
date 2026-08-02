@@ -26,7 +26,7 @@ from company_bench.models import (
 )
 from company_bench.repository import MemoryRunRepository
 from company_bench.run_models import RunCheckpoint
-from company_bench.runtime import EpisodeExecution, EpisodeRuntime
+from company_bench.runtime import EpisodeExecution, EpisodeProtocolError, EpisodeRuntime
 from company_bench.runtime_models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
@@ -106,9 +106,8 @@ class _InterruptOnAttention:
     ) -> None:
         """Stop after an armed Wait and its fallback wake are durable."""
         self.repository.save_progress(turns, system_steps, checkpoint)
-        if (
-            not self.interrupted
-            and any(cursor.active_wait is not None for cursor in checkpoint.cursors)
+        if not self.interrupted and any(
+            cursor.active_wait is not None for cursor in checkpoint.cursors
         ):
             self.interrupted = True
             raise RuntimeError("interrupted after durable attention plan")
@@ -293,9 +292,7 @@ async def test_runtime_orders_open_market_close_consumer_sales_and_day_close() -
         (SystemEventKind.CONSUMER_SALES, _MARKET_CLOSE),
         (SystemEventKind.DAY_CLOSE, _DAY_CLOSE),
     )
-    limit_steps = tuple(
-        step for step in steps if step.kind is SystemEventKind.TURN_LIMIT_REACHED
-    )
+    limit_steps = tuple(step for step in steps if step.kind is SystemEventKind.TURN_LIMIT_REACHED)
     assert {step.company_id for step in limit_steps} == {
         company.company_id for company in scenario.companies
     }
@@ -317,9 +314,7 @@ async def test_turn_limit_journals_each_suppressed_wake_with_its_cause() -> None
         store=repository,
     )
     steps = repository.list_system_steps("turn_limit_audit")
-    suppressed = tuple(
-        step for step in steps if step.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED
-    )
+    suppressed = tuple(step for step in steps if step.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED)
 
     assert len(execution.turns) == 1
     assert len(suppressed) == 1
@@ -416,9 +411,7 @@ async def test_operation_and_delivery_completions_wake_the_owning_companies() ->
         "farm_a",
         "processor_a",
     }
-    assert {record.turn.sim_time.minute_of_day for record in trade_wakes} == {
-        _OPEN + 31
-    }
+    assert {record.turn.sim_time.minute_of_day for record in trade_wakes} == {_OPEN + 31}
     for trade_wake in trade_wakes:
         signal = next(
             signal
@@ -451,9 +444,7 @@ async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -
         run_id="market_notifications",
     )
     at_next_minute = tuple(
-        record
-        for record in execution.turns
-        if record.turn.sim_time.minute_of_day == _OPEN + 1
+        record for record in execution.turns if record.turn.sim_time.minute_of_day == _OPEN + 1
     )
     processor_review = next(
         record
@@ -503,22 +494,17 @@ async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> Non
     source = next(
         record
         for record in execution.turns
-        if record.turn.company_id == "farm_a"
-        and record.turn.sim_time.minute_of_day == _OPEN
+        if record.turn.company_id == "farm_a" and record.turn.sim_time.minute_of_day == _OPEN
     )
     alerted = tuple(
-        record
-        for record in execution.turns
-        if WakeReason.PRICE_ALERT in record.turn.wake_reasons
+        record for record in execution.turns if WakeReason.PRICE_ALERT in record.turn.wake_reasons
     )
 
     assert len(alerted) == 1
     assert alerted[0].turn.company_id == "farm_a"
     assert alerted[0].turn.sim_time.minute_of_day == _OPEN + 1
     signal = next(
-        signal
-        for signal in alerted[0].turn.wake_signals
-        if signal.reason is WakeReason.PRICE_ALERT
+        signal for signal in alerted[0].turn.wake_signals if signal.reason is WakeReason.PRICE_ALERT
     )
     assert signal.source is not None
     assert signal.source.entry_id == source.turn.turn_id
@@ -529,20 +515,24 @@ async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> Non
 @pytest.mark.asyncio
 async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> None:
     scenario = _scenario(max_turns=3)
+    turns: list[TurnRecord] = []
 
     def broken(_: AgentTurn) -> CompanyCommand:
         raise ModelOutputError("invalid command")
 
-    execution = await EpisodeRuntime(scenario).run(
-        _agents(scenario, broken),
-        29,
-        run_id="protocol_rejection",
-    )
+    async def remember(record: TurnRecord) -> None:
+        turns.append(record)
+
+    with pytest.raises(EpisodeProtocolError, match="9 protocol-invalid turn"):
+        await EpisodeRuntime(scenario).run(
+            _agents(scenario, broken),
+            29,
+            run_id="protocol_rejection",
+            on_turn_completed=remember,
+        )
 
     for company in scenario.companies:
-        records = tuple(
-            record for record in execution.turns if record.turn.company_id == company.company_id
-        )
+        records = tuple(record for record in turns if record.turn.company_id == company.company_id)
         assert tuple(record.turn.sim_time.minute_of_day for record in records) == (
             _OPEN,
             _OPEN + 1,
@@ -557,10 +547,9 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
         )
         assert all(right.turn.previous_outcome == left.outcome for left, right in pairwise(records))
         assert all(
-            WakeReason.COMMAND_REJECTED in record.turn.wake_reasons
-            for record in records[1:]
+            WakeReason.COMMAND_REJECTED in record.turn.wake_reasons for record in records[1:]
         )
-    _assert_one_turn_per_company_minute(execution)
+    assert len({(record.turn.company_id, record.turn.sim_time) for record in turns}) == len(turns)
 
 
 @pytest.mark.asyncio
@@ -569,11 +558,7 @@ async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> 
 
     def decide(turn: AgentTurn) -> CompanyCommand:
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            return Wait(
-                until=turn.sim_time.plus(
-                    turn.observation.runtime.max_wait_minutes + 1
-                )
-            )
+            return Wait(until=turn.sim_time.plus(turn.observation.runtime.max_wait_minutes + 1))
         return Wait()
 
     execution = await EpisodeRuntime(scenario).run(
@@ -766,9 +751,7 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
     target_cursor = checkpoint.cursors[0]
     target_plan = target_cursor.active_wait
     assert target_plan is not None
-    invalid_review = target_plan.armed_at.plus(
-        scenario.runtime.max_wait_minutes + 1
-    )
+    invalid_review = target_plan.armed_at.plus(scenario.runtime.max_wait_minutes + 1)
     invalid_plan = target_plan.model_copy(update={"review_at": invalid_review})
     invalid_cursors = tuple(
         cursor.model_copy(update={"active_wait": invalid_plan})
@@ -779,9 +762,7 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
     invalid_turns = tuple(
         record.model_copy(
             update={
-                "outcome": record.outcome.model_copy(
-                    update={"next_available_at": invalid_review}
-                )
+                "outcome": record.outcome.model_copy(update={"next_available_at": invalid_review})
             }
         )
         if record.turn.turn_id == target_plan.source_turn_id
@@ -799,9 +780,7 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
         update={
             "cursors": invalid_cursors,
             "turns": invalid_turns,
-            "scheduler": checkpoint.scheduler.model_copy(
-                update={"pending_events": invalid_events}
-            ),
+            "scheduler": checkpoint.scheduler.model_copy(update={"pending_events": invalid_events}),
         }
     )
     with pytest.raises(ValidationError, match="active wait must match"):

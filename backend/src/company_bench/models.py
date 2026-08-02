@@ -37,6 +37,11 @@ type UnitInterval = Annotated[
     Decimal,
     Field(ge=ZERO, le=Decimal("1")),
 ]
+type BenchmarkScore = Annotated[
+    Decimal,
+    Field(ge=ZERO, le=Decimal("100")),
+]
+type ScoreVersion = Literal["s9-enterprise-v1"]
 
 
 class InvalidOrderQuantity(ValueError):
@@ -50,9 +55,7 @@ def _validate_order_quantity(value: Decimal) -> Decimal:
     decimal_tuple = value.as_tuple()
     digits = decimal_tuple.digits
     excess_places = QUANTITY_QUANTUM.as_tuple().exponent - decimal_tuple.exponent
-    if excess_places > 0 and (
-        excess_places > len(digits) or any(digits[-excess_places:])
-    ):
+    if excess_places > 0 and (excess_places > len(digits) or any(digits[-excess_places:])):
         raise ValueError(f"order quantity must be an exact multiple of {QUANTITY_QUANTUM}")
     return value
 
@@ -173,7 +176,7 @@ class DemandSpec(StrictModel):
 
     base_demand: Quantity
     reference_price: PositiveMoney
-    price_sensitivity: Rate
+    price_sensitivity: PositiveQuantity
     shock_min: int
     shock_max: int
 
@@ -186,10 +189,9 @@ class DemandSpec(StrictModel):
 
 
 class ScoringSpec(StrictModel):
-    """Fairness gates used before efficiency ranking."""
+    """Immutable identity of the active benchmark scoring contract."""
 
-    max_gini: UnitInterval
-    max_within_tier_growth_gap: Rate
+    score_version: ScoreVersion = "s9-enterprise-v1"
 
 
 class RuntimeSpec(StrictModel):
@@ -212,9 +214,13 @@ class RuntimeSpec(StrictModel):
         boundaries = (self.open_minute, self.close_minute, self.day_close_minute)
         if boundaries != tuple(sorted(set(boundaries))):
             raise ValueError("runtime boundaries must be strictly increasing")
-        latest_completion = self.close_minute - 1 + max(
-            self.operation_duration_minutes,
-            self.delivery_duration_minutes,
+        latest_completion = (
+            self.close_minute
+            - 1
+            + max(
+                self.operation_duration_minutes,
+                self.delivery_duration_minutes,
+            )
         )
         if latest_completion >= self.day_close_minute:
             raise ValueError("day close must follow every possible completion")
@@ -600,37 +606,37 @@ class CompanyScore(StrictModel):
     growth: Rate
 
 
-class TierFairness(StrictModel):
-    """Within-tier inequality and threshold status."""
-
-    tier: CompanyTier
-    gini: UnitInterval
-    growth_gap: Rate
-
-
-class ConstraintResult(StrictModel):
-    """One explicit fairness gate and its observed value."""
-
-    name: Identifier
-    actual: Rate
-    limit: Rate
-    passed: bool
-
-
 class ScoreCard(StrictModel):
-    """Efficiency ranking result plus fairness and diagnostics."""
+    """Official S9 enterprise benchmark score and auditable components."""
 
-    efficiency: Decimal
-    fairness: UnitInterval
-    gini: UnitInterval
-    eligible: bool
-    consumer_fill_rate: UnitInterval
-    expired_quantity: Quantity
-    total_trade_quantity: Quantity
-    consumer_revenue: Money
+    score_version: ScoreVersion
+    final_score: BenchmarkScore
+    efficiency_raw: Decimal
+    efficiency_reference: Money
+    efficiency_score: UnitInterval
+    farm_gini: UnitInterval
+    processor_gini: UnitInterval
+    retailer_gini: UnitInterval
+    fairness_score: UnitInterval
+    bankrupt_company_count: int = Field(ge=0)
+    bankruptcy_rate: UnitInterval
     companies: tuple[CompanyScore, ...]
-    tiers: tuple[TierFairness, ...]
-    constraints: tuple[ConstraintResult, ...]
+
+    @model_validator(mode="after")
+    def validate_bankruptcy_rate(self) -> Self:
+        """Keep the aggregate bankruptcy facts aligned with company detail."""
+        company_ids = [company.company_id for company in self.companies]
+        if len(company_ids) != len(set(company_ids)):
+            raise ValueError("score companies must be unique")
+        if self.bankrupt_company_count > len(self.companies):
+            raise ValueError("bankrupt_company_count cannot exceed company count")
+        if self.companies:
+            expected_rate = Decimal(self.bankrupt_company_count) / Decimal(len(self.companies))
+            if self.bankruptcy_rate != expected_rate:
+                raise ValueError("bankruptcy_rate must match bankrupt_company_count")
+        elif self.bankrupt_company_count or self.bankruptcy_rate:
+            raise ValueError("an empty company score cannot report bankruptcy")
+        return self
 
 
 class PolicyMetadata(StrictModel):
@@ -682,6 +688,5 @@ class RunSummary(StrictModel):
     seed: int
     started_at: datetime
     finished_at: datetime
-    efficiency: Decimal
-    fairness: UnitInterval
-    eligible: bool
+    score_version: ScoreVersion
+    final_score: BenchmarkScore

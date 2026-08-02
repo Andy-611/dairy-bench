@@ -1,7 +1,7 @@
 import asyncio
-import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -48,8 +48,7 @@ from company_bench.scheduler import SchedulerCheckpoint
 def run_episode(seed: int = 42) -> EpisodeResult:
     """Create one real V3 episode through the public runtime interface."""
     agents = {
-        company.company_id: BaselineCompanyAgent()
-        for company in DAIRY_S9_V3_SCENARIO.companies
+        company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_V3_SCENARIO.companies
     }
     execution = asyncio.run(
         EpisodeRuntime(DAIRY_S9_V3_SCENARIO).run(
@@ -67,6 +66,7 @@ def test_memory_repository_round_trip_and_summary() -> None:
 
     repository.save(result)
 
+    assert result.score.efficiency_reference == Decimal("8316.09375")
     assert repository.get(result.run_id) == result
     assert repository.get("missing") is None
     assert repository.list()[0].run_id == result.run_id
@@ -175,6 +175,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         summaries = repository.list()
         assert len(summaries) == 1
         assert summaries[0].run_id == result.run_id
+        assert summaries[0].final_score == result.score.final_score
 
     expected_rows = {
         "runs": 1,
@@ -189,7 +190,19 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
+            "run_id",
+            "scenario_id",
+            "scenario_version",
+            "scenario_json",
+            "seed",
+            "started_at",
+            "finished_at",
+            "score_version",
+            "final_score",
+            "result_json",
+        )
         for table, expected in expected_rows.items():
             actual = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             assert actual == expected
@@ -199,6 +212,28 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.get_job(result.run_id) == completed_job
         assert reopened.list_invocations(result.run_id) == (invocation,)
         assert reopened.list_turns(result.run_id) == (completion_turn,)
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 6])
+def test_sqlite_repository_rejects_non_v5_databases(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    database = tmp_path / f"schema-v{version}.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"PRAGMA user_version = {version}")
+
+    with pytest.raises(RuntimeError, match=f"unsupported database schema version: {version}"):
+        SQLiteRunRepository(database)
+
+
+def test_sqlite_repository_rejects_unversioned_existing_schema(tmp_path: Path) -> None:
+    database = tmp_path / "unversioned.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY)")
+
+    with pytest.raises(RuntimeError, match="unversioned existing databases are unsupported"):
+        SQLiteRunRepository(database)
 
 
 def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
@@ -237,34 +272,6 @@ def test_sqlite_repository_orders_v2_invocations_by_turn_application(
 ) -> None:
     with SQLiteRunRepository(tmp_path / "invocations.sqlite3") as repository:
         _assert_invocation_order(repository, first_observation, "sqlite_invocations")
-
-
-@pytest.mark.parametrize("legacy_version", [1, 2, 3])
-def test_sqlite_legacy_database_upgrades_without_losing_completed_run(
-    tmp_path: Path,
-    legacy_version: int,
-) -> None:
-    database = tmp_path / f"legacy-v{legacy_version}.sqlite3"
-    result = run_episode(seed=7)
-    _create_legacy_database(database, result, legacy_version)
-
-    with SQLiteRunRepository(database) as repository:
-        assert repository.get(result.run_id) == result
-
-    with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        tables = {
-            row[0]
-            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        }
-        assert {
-            "runs",
-            "run_jobs",
-            "policy_invocations",
-            "run_checkpoints",
-            "run_turns",
-        }.issubset(tables)
-        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
 
 
 def _assert_turn_contract(
@@ -603,72 +610,3 @@ def _v2_invocation_for(
         command=record.envelope.command,
         command_outcome=record.outcome,
     )
-
-
-def _create_legacy_database(
-    database: Path,
-    result: EpisodeResult,
-    version: int,
-) -> None:
-    """Create a minimal pre-v4 canonical table containing legacy JSON."""
-    if version not in (1, 2, 3):
-        raise ValueError("legacy version must be between 1 and 3")
-    legacy_payload = result.model_dump(mode="json")
-    for policy in legacy_payload["policies"]:
-        for field in (
-            "kind",
-            "provider",
-            "model",
-            "prompt_version",
-            "config_fingerprint",
-            "source_run_id",
-        ):
-            policy.pop(field)
-
-    with sqlite3.connect(database) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE runs (
-                run_id TEXT PRIMARY KEY,
-                scenario_id TEXT NOT NULL,
-                scenario_version INTEGER NOT NULL,
-                scenario_json TEXT NOT NULL,
-                seed INTEGER NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
-                efficiency TEXT NOT NULL,
-                fairness TEXT NOT NULL,
-                gini TEXT NOT NULL,
-                eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
-                consumer_fill_rate TEXT NOT NULL,
-                expired_quantity TEXT NOT NULL,
-                result_json TEXT NOT NULL
-            );
-            """
-        )
-        connection.execute(f"PRAGMA user_version = {version}")
-        connection.execute(
-            """
-            INSERT INTO runs (
-                run_id, scenario_id, scenario_version, scenario_json, seed,
-                started_at, finished_at, efficiency, fairness, gini, eligible,
-                consumer_fill_rate, expired_quantity, result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result.run_id,
-                result.scenario.scenario_id,
-                result.scenario.version,
-                result.scenario.model_dump_json(),
-                result.seed,
-                result.started_at.isoformat(),
-                result.finished_at.isoformat(),
-                str(result.score.efficiency),
-                str(result.score.fairness),
-                str(result.score.gini),
-                int(result.score.eligible),
-                str(result.score.consumer_fill_rate),
-                str(result.score.expired_quantity),
-                json.dumps(legacy_payload),
-            ),
-        )

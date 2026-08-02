@@ -24,11 +24,16 @@ export type JsonValue =
   | { readonly [key: string]: JsonValue };
 
 export interface ScoreView {
-  readonly eligible: boolean;
-  readonly efficiency: number;
-  readonly fairness: number;
-  readonly fulfillmentRate: number;
-  readonly expiredQuantity: number;
+  readonly finalScore: number;
+  readonly efficiencyRaw: number;
+  readonly efficiencyReference: number;
+  readonly efficiencyScore: number;
+  readonly farmGini: number;
+  readonly processorGini: number;
+  readonly retailerGini: number;
+  readonly fairnessScore: number;
+  readonly bankruptCompanyCount: number;
+  readonly bankruptcyRate: number;
 }
 
 export interface TokenUsageView {

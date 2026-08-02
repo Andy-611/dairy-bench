@@ -21,6 +21,7 @@ import type {
   RunJobView,
   RunRequest,
   RunStatus,
+  ScoreView,
   SystemTimelineItemView,
   TimelineCommandView,
   TimelineContextView,
@@ -322,19 +323,7 @@ function parseEpisode(
     seed: number(episode.seed, "seed"),
     days: number(scenario.days, "scenario.days"),
     agentUsage: summarizeAgentUsage(invocations),
-    score: {
-      eligible: boolean(score.eligible, "score.eligible"),
-      efficiency: number(score.efficiency, "score.efficiency"),
-      fairness: number(score.fairness, "score.fairness"),
-      fulfillmentRate: number(
-        score.consumer_fill_rate,
-        "score.consumer_fill_rate",
-      ),
-      expiredQuantity: number(
-        score.expired_quantity,
-        "score.expired_quantity",
-      ),
-    },
+    score: parseScore(score),
     companies: companyScores.map((companyScore, index) =>
       parseCompany(
         companyScore,
@@ -344,6 +333,27 @@ function parseEpisode(
       ),
     ),
     snapshots: parseSnapshots(episode.snapshots),
+  };
+}
+
+function parseScore(score: JsonRecord): ScoreView {
+  return {
+    finalScore: number(score.final_score, "score.final_score"),
+    efficiencyRaw: number(score.efficiency_raw, "score.efficiency_raw"),
+    efficiencyReference: number(
+      score.efficiency_reference,
+      "score.efficiency_reference",
+    ),
+    efficiencyScore: number(score.efficiency_score, "score.efficiency_score"),
+    farmGini: number(score.farm_gini, "score.farm_gini"),
+    processorGini: number(score.processor_gini, "score.processor_gini"),
+    retailerGini: number(score.retailer_gini, "score.retailer_gini"),
+    fairnessScore: number(score.fairness_score, "score.fairness_score"),
+    bankruptCompanyCount: number(
+      score.bankrupt_company_count,
+      "score.bankrupt_company_count",
+    ),
+    bankruptcyRate: number(score.bankruptcy_rate, "score.bankruptcy_rate"),
   };
 }
 
