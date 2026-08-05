@@ -4,9 +4,14 @@ import { companyLabel } from "../domainLabels";
 import { formatExactDecimal, formatValue } from "../format";
 import { isAbortError, requestErrorMessage } from "../requestErrors";
 import {
+  ACCEPTED_BY_ENGINE_LABEL,
   clockTime,
+  commandDispositionLabel,
   commandLabel,
+  commandProcessingResult,
   commandSummary,
+  decisionContextSummary,
+  nextDecisionTiming,
   plural,
   systemLabel,
   wakeLabel,
@@ -371,9 +376,9 @@ function TimelineFilterBar({
           }
           value={filters.status}
         >
-          <option value="all">Accepted and rejected</option>
-          <option value="accepted">Accepted only</option>
-          <option value="rejected">Rejected only</option>
+          <option value="all">All Results</option>
+          <option value="accepted">{ACCEPTED_BY_ENGINE_LABEL}</option>
+          <option value="rejected">Rejected Commands</option>
         </select>
       </label>
       <label>
@@ -415,7 +420,7 @@ function MinuteBucket({
             ? concurrencyLabel(moment)
             : moment.turns.length === 1
               ? "1 company turn"
-              : "System transition"}
+              : "System event"}
         </span>
       </header>
       <div className="minute-content">
@@ -462,7 +467,7 @@ function SystemStepCard({
   return (
     <button className="system-step-card" onClick={onSelect} type="button">
       <span className="system-step-icon" aria-hidden="true">
-        SYS
+        SYSTEM
       </span>
       <span>
         <small>{systemLabel(step.kind)}</small>
@@ -475,7 +480,6 @@ function SystemStepCard({
         {step.affectedCompanyIds.length > 0
           ? step.affectedCompanyIds.map((id) => companyLabel(id)).join(", ")
           : "No direct economic impact"}
-        {step.reconstructed && " · reconstructed from the source journal"}
       </span>
     </button>
   );
@@ -497,37 +501,31 @@ function TurnCard({
         <span className={`role-dot ${turn.role}`} />
         <span>
           <strong>{turn.companyName}</strong>
-          <small>
-            Observed v{turn.stateVersion} · Apply #{turn.applySequence}
-          </small>
+          <small>{decisionContextSummary(turn)}</small>
         </span>
         <span className={`decision-status ${turn.accepted ? "accepted" : "rejected"}`}>
-          {turn.accepted ? "Accepted" : "Rejected"}
+          {commandDispositionLabel(turn)}
         </span>
       </header>
       <ol className="decision-chain">
         <DecisionStage
-          label="Wake"
+          label="Decision Trigger"
           value={turn.wakeSignals
             .map((signal) => wakeLabel(signal.reason))
             .join(" · ")}
         />
         <DecisionStage
-          label="Command"
+          label="Company Command"
           value={commandSummary(turn.command)}
         />
         <DecisionStage
-          label="Outcome"
+          label="Command Processing Result"
           tone={turn.accepted ? "positive" : "negative"}
-          value={commandResult(turn)}
+          value={commandProcessingResult(turn)}
         />
         <DecisionStage
-          label="Next"
-          value={
-            turn.nextAvailableMinute === null
-              ? "No scheduled continuation"
-              : `Next decision at ${clockTime(turn.nextAvailableMinute)}`
-          }
+          label="Next Decision Timing"
+          value={nextDecisionTiming(turn)}
         />
       </ol>
       <footer>
@@ -544,19 +542,6 @@ function TurnCard({
       </footer>
     </article>
   );
-}
-
-function commandResult(turn: TurnTimelineItemView): string {
-  if (!turn.accepted) {
-    return turn.reason ?? "Rejected";
-  }
-  if (turn.outcomeOrderId !== null) {
-    return `Accepted · Order ${turn.outcomeOrderId}`;
-  }
-  if (turn.outcomeJobId !== null) {
-    return `Accepted · Job ${turn.outcomeJobId}`;
-  }
-  return "Accepted";
 }
 
 function DecisionStage({

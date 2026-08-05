@@ -5,7 +5,12 @@ import type {
   EconomicEffectView,
   QuoteAlertView,
   TimelineCommandView,
+  TurnTimelineItemView,
 } from "./types";
+
+export const ACCEPTED_BY_ENGINE_LABEL = "Accepted by Engine";
+export const COMMAND_PROCESSING_ORDER_LABEL = "Command Processing Order";
+export const ORDER_BOOK_PRIORITY_LABEL = "Order-book Priority";
 
 const COMMAND_LABELS: Readonly<Record<TimelineCommandView["kind"], string>> = {
   cancel_order: "Cancel order",
@@ -52,6 +57,56 @@ export function systemLabel(kind: string): string {
   return SYSTEM_LABELS[kind] ?? humanizeIdentifier(kind);
 }
 
+export function decisionContextSummary(turn: TurnTimelineItemView): string {
+  return `Decision based on economic state v${turn.stateVersion} · ${commandProcessingOrderSummary(turn.applySequence)}`;
+}
+
+export function commandProcessingOrderSummary(sequence: number): string {
+  return `${COMMAND_PROCESSING_ORDER_LABEL} #${sequence}`;
+}
+
+export function commandDispositionLabel(turn: TurnTimelineItemView): string {
+  if (turn.accepted) {
+    return ACCEPTED_BY_ENGINE_LABEL;
+  }
+  return turn.dispositionSource === "economic_engine"
+    ? "Rejected by Engine"
+    : "Rejected by Runtime";
+}
+
+export function commandProcessingResult(turn: TurnTimelineItemView): string {
+  if (!turn.accepted) {
+    const disposition = rejectedDisposition(turn.dispositionSource);
+    return turn.reason === null ? disposition : `${disposition} · ${turn.reason}`;
+  }
+  return `Accepted by economic engine · ${acceptedCommandResult(turn)}`;
+}
+
+export function nextDecisionTiming(turn: TurnTimelineItemView): string {
+  if (turn.nextAvailableMinute === null) {
+    return "No same-day follow-up scheduled";
+  }
+  const time = clockTime(turn.nextAvailableMinute);
+  if (turn.accepted && turn.command.kind === "wait") {
+    return turn.command.alerts.length > 0
+      ? `Price alert, or fallback review at ${time}`
+      : `Fallback review at ${time}`;
+  }
+  return `Routine follow-up at ${time}`;
+}
+
+export function economicStateTransitionSummary(
+  before: number | null,
+  after: number | null,
+): string {
+  if (before === null || after === null) {
+    return "Not available";
+  }
+  return before === after
+    ? `Economic state unchanged · v${before}`
+    : `v${before} → v${after}`;
+}
+
 export function commandSummary(command: TimelineCommandView): string {
   switch (command.kind) {
     case "produce":
@@ -68,6 +123,42 @@ export function commandSummary(command: TimelineCommandView): string {
       return `Set ${productLabel(command.product)} retail price to ${formatExactDecimal(command.unitPrice)}`;
     case "wait":
       return waitSummary(command);
+  }
+}
+
+function acceptedCommandResult(turn: TurnTimelineItemView): string {
+  switch (turn.command.kind) {
+    case "produce":
+      return identifiedResult("Production job started", turn.outcomeJobId);
+    case "transform":
+      return identifiedResult("Transformation job started", turn.outcomeJobId);
+    case "place_order":
+      return identifiedResult("Market order placed", turn.outcomeOrderId);
+    case "replace_order":
+      return identifiedResult("Replacement order placed", turn.outcomeOrderId);
+    case "cancel_order":
+      return `Market order cancelled: ${turn.command.orderId}`;
+    case "set_retail_price":
+      return "Retail price updated";
+    case "wait":
+      return "Attention plan armed";
+  }
+}
+
+function identifiedResult(label: string, identifier: string | null): string {
+  return identifier === null ? label : `${label}: ${identifier}`;
+}
+
+function rejectedDisposition(
+  source: TurnTimelineItemView["dispositionSource"],
+): string {
+  switch (source) {
+    case "economic_engine":
+      return "Rejected by economic engine";
+    case "runtime_attention":
+      return "Rejected by runtime attention validation";
+    case "runtime_protocol":
+      return "Rejected by runtime protocol validation";
   }
 }
 

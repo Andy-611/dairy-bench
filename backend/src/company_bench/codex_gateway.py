@@ -56,7 +56,7 @@ type CodexReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 type _CodexRequest = ModelRequest | CommandModelRequest
 
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
-DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "medium"
+DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "high"
 DEFAULT_CODEX_HOME = Path(__file__).resolve().parents[3] / ".dairy-bench" / "codex"
 _PERSONAL_CODEX_HOME = Path.home() / ".codex"
 _BASE_INSTRUCTIONS = (

@@ -118,7 +118,7 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 
 ## 数据与验证
 
-默认数据库为 `backend/data/dairy_bench.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
+默认 score-v5 数据库为 `backend/data/dairy_bench_v5.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
 路径，用 `DAIRY_BENCH_ARTIFACTS_DIR` 覆盖产物目录。
 
 ```powershell

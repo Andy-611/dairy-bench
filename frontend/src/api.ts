@@ -4,6 +4,7 @@ import { isActiveRun, isGracefulRunTerminal } from "./runStatus";
 import type {
   AgentUsageSummaryView,
   AgentTraceView,
+  CommandDispositionSource,
   CommandStateChangeView,
   CompanyResultView,
   CompanyRole,
@@ -818,7 +819,15 @@ function parseTurnTimelineItem(
     ),
     command: parseTimelineCommand(item.command, `${path}.command`),
     accepted: boolean(outcome.accepted, `${path}.outcome.accepted`),
+    dispositionSource: commandDispositionSource(
+      item.disposition_source,
+      `${path}.disposition_source`,
+    ),
     reason: nullableText(outcome.reason, `${path}.outcome.reason`),
+    resultingStateVersion: number(
+      outcome.resulting_state_version,
+      `${path}.outcome.resulting_state_version`,
+    ),
     outcomeOrderId: nullableText(outcome.order_id, `${path}.outcome.order_id`),
     outcomeJobId: nullableText(outcome.job_id, `${path}.outcome.job_id`),
     effects: parseTimelineEffects(item.effects, `${path}.effects`),
@@ -888,7 +897,6 @@ function parseSystemTimelineItem(
     ).map((value, index) =>
       text(value, `${path}.affected_company_ids[${index}]`),
     ),
-    reconstructed: false,
     title: text(item.title, `${path}.title`),
     summary: text(item.summary, `${path}.summary`),
   };
@@ -1581,6 +1589,20 @@ function role(value: unknown, path: string): CompanyRole {
     return value;
   }
   throw new Error(`Backend field ${path} is not a known company tier.`);
+}
+
+function commandDispositionSource(
+  value: unknown,
+  path: string,
+): CommandDispositionSource {
+  if (
+    value === "economic_engine" ||
+    value === "runtime_attention" ||
+    value === "runtime_protocol"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known disposition source.`);
 }
 
 function policyMode(value: unknown, path: string): PolicyMode {

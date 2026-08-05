@@ -7,7 +7,13 @@ import {
   formatMarketPrice,
   isZeroDecimal,
 } from "../format";
-import { clockTime, plural } from "../timelineFormatters";
+import {
+  COMMAND_PROCESSING_ORDER_LABEL,
+  ORDER_BOOK_PRIORITY_LABEL,
+  clockTime,
+  commandProcessingOrderSummary,
+  plural,
+} from "../timelineFormatters";
 import type {
   MarketFrameView,
   MarketOrderFlowItemView,
@@ -123,7 +129,12 @@ function OrderFlow({
                   onClick={() => onSelect(flow)}
                   type="button"
                 >
-                  <span className="market-flow-sequence">#{flow.applySequence}</span>
+                  <span
+                    className="market-flow-sequence"
+                    title={commandProcessingOrderSummary(flow.applySequence)}
+                  >
+                    Command #{flow.applySequence}
+                  </span>
                   <span className={`market-flow-action ${flow.action}`}>
                     {flow.action.toUpperCase()}
                   </span>
@@ -165,7 +176,12 @@ function TradeTape({
         <ol>
           {frame.trades.map((trade) => (
             <li key={trade.tradeId} title={`Trade ${trade.tradeId}`}>
-              <span className="trade-sequence">#{trade.applySequence}</span>
+              <span
+                className="trade-sequence"
+                title={commandProcessingOrderSummary(trade.applySequence)}
+              >
+                Command #{trade.applySequence}
+              </span>
               <span className="trade-contract">
                 <strong>{productLabel(trade.product)}</strong>
                 <span>
@@ -390,7 +406,7 @@ function OrderFlowDetail({
         >
           <dl className="market-detail-grid">
             <MarketMeta
-              label="Command Processing Order"
+              label={COMMAND_PROCESSING_ORDER_LABEL}
               value={`#${flow.applySequence}`}
             />
             <MarketMeta label="Action" value={flow.action.toUpperCase()} />
@@ -402,7 +418,10 @@ function OrderFlowDetail({
               value={`${formatExactDecimal(order.remainingQuantity)} @ ${formatMarketPrice(order.limitPrice)}`}
             />
             <MarketMeta label="Order ID" value={order.orderId} />
-            <MarketMeta label="Priority" value={`#${order.prioritySequence}`} />
+            <MarketMeta
+              label={ORDER_BOOK_PRIORITY_LABEL}
+              value={`#${order.prioritySequence}`}
+            />
           </dl>
           {flow.action === "replace" && (
             <p className="market-replacement-note">
@@ -440,8 +459,12 @@ function OrderFlowDetail({
                         {companyLabel(match.makerOrder.ownerId)}
                       </span>
                       <small>
-                        <code>{match.makerOrder.orderId}</code> · Priority #{match.makerOrder.prioritySequence}
-                        {" · "}{formatExactDecimal(match.makerOrder.remainingQuantity)} available before fill
+                        <code>{match.makerOrder.orderId}</code>
+                        {" · "}
+                        {ORDER_BOOK_PRIORITY_LABEL} #{match.makerOrder.prioritySequence}
+                        {" · "}
+                        {formatExactDecimal(match.makerOrder.remainingQuantity)}
+                        {" available before fill"}
                       </small>
                     </li>
                   ))}
@@ -505,7 +528,7 @@ function PriceLevelDetail({
               <span>Order ID</span>
               <span>Company</span>
               <span>Remaining</span>
-              <span>Priority</span>
+              <span>{ORDER_BOOK_PRIORITY_LABEL}</span>
             </div>
             {level.orders.map((order) => (
               <div className="market-order-detail-row" key={order.orderId}>

@@ -451,6 +451,11 @@ export interface TracePreviewView {
   readonly appliedToCommittedTurn: boolean;
 }
 
+export type CommandDispositionSource =
+  | "economic_engine"
+  | "runtime_attention"
+  | "runtime_protocol";
+
 export interface TurnTimelineItemView {
   readonly entryType: "turn";
   readonly entryId: string;
@@ -466,7 +471,9 @@ export interface TurnTimelineItemView {
   readonly observationDelta: ObservationDeltaView;
   readonly command: TimelineCommandView;
   readonly accepted: boolean;
+  readonly dispositionSource: CommandDispositionSource;
   readonly reason: string | null;
+  readonly resultingStateVersion: number;
   readonly outcomeOrderId: string | null;
   readonly outcomeJobId: string | null;
   readonly effects: readonly EconomicEffectView[];
@@ -491,7 +498,6 @@ export interface SystemTimelineItemView {
   readonly referenceIds: readonly string[];
   readonly effects: readonly EconomicEffectView[];
   readonly affectedCompanyIds: readonly string[];
-  readonly reconstructed: false;
   readonly title: string;
   readonly summary: string;
 }

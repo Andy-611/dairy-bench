@@ -130,7 +130,7 @@ economic mutation.
 
 ## Data and verification
 
-The default database is `backend/data/dairy_bench.sqlite3`. Override it with
+The default score-v5 database is `backend/data/dairy_bench_v5.sqlite3`. Override it with
 `DAIRY_BENCH_DB`; override artifacts with `DAIRY_BENCH_ARTIFACTS_DIR`.
 
 ```powershell

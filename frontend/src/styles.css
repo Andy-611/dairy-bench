@@ -2096,8 +2096,11 @@ footer {
   margin-left: auto;
   padding: 4px 7px;
   border-radius: 20px;
-  font-size: 9px;
+  font-size: 8px;
   font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 
 .decision-status.accepted {
@@ -2121,7 +2124,7 @@ footer {
 .decision-chain li {
   position: relative;
   display: grid;
-  grid-template-columns: 61px minmax(0, 1fr);
+  grid-template-columns: 108px minmax(0, 1fr);
   gap: 8px;
   min-height: 30px;
   padding: 5px 0 5px 11px;
@@ -2664,6 +2667,10 @@ footer {
   border: 1px solid #edf1ee;
   border-radius: 8px;
   background: #edf1ee;
+}
+
+.decision-metadata {
+  margin-bottom: 14px;
 }
 
 .detail-metadata > div {

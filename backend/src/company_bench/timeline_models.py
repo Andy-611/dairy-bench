@@ -35,6 +35,7 @@ from company_bench.runtime_models import (
     SystemStepRecord,
     TurnRecord,
     TurnReplayOrigin,
+    Wait,
     WakeSignal,
 )
 
@@ -177,6 +178,14 @@ type CommandStateChange = Annotated[
 ]
 
 
+class CommandDispositionSource(StrEnum):
+    """Authority that accepted or rejected a company command."""
+
+    ECONOMIC_ENGINE = "economic_engine"
+    RUNTIME_ATTENTION = "runtime_attention"
+    RUNTIME_PROTOCOL = "runtime_protocol"
+
+
 class TurnTimelineItem(StrictModel):
     """One complete wake-to-outcome decision loop."""
 
@@ -196,6 +205,7 @@ class TurnTimelineItem(StrictModel):
     observation_delta: ObservationDelta
     command: CompanyCommand
     outcome: CommandOutcome
+    disposition_source: CommandDispositionSource
     effects: tuple[DomainEvent, ...]
     state_changes: tuple[CommandStateChange, ...] = ()
     next_available_at: SimTime | None = None
@@ -204,6 +214,22 @@ class TurnTimelineItem(StrictModel):
     protocol_error: str | None = None
     title: str
     summary: str
+
+    @model_validator(mode="after")
+    def validate_disposition_source(self) -> Self:
+        """Keep the displayed authority aligned with the persisted outcome."""
+        source = self.disposition_source
+        if self.outcome.accepted and source is not CommandDispositionSource.ECONOMIC_ENGINE:
+            raise ValueError("accepted commands must be attributed to the economic engine")
+        if (self.protocol_error is not None) != (
+            source is CommandDispositionSource.RUNTIME_PROTOCOL
+        ):
+            raise ValueError("runtime protocol attribution must match protocol_error")
+        if source is CommandDispositionSource.RUNTIME_ATTENTION and (
+            self.outcome.accepted or not isinstance(self.command, Wait)
+        ):
+            raise ValueError("runtime attention may only reject Wait commands")
+        return self
 
 
 class SystemTimelineItem(StrictModel):

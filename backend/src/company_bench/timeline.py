@@ -51,6 +51,7 @@ from company_bench.timeline_models import (
     AgentTracePreview,
     ArtifactStatus,
     ArtifactUnavailableReason,
+    CommandDispositionSource,
     DayTimelineSummary,
     InventoryQuantityChange,
     ObservationDelta,
@@ -380,6 +381,7 @@ class RunTimelineProjector:
             observation_delta=self._observation_delta(record, previous),
             command=record.envelope.command,
             outcome=record.outcome,
+            disposition_source=_disposition_source(record),
             effects=record.outcome.events,
             state_changes=_state_changes(record),
             next_available_at=record.outcome.next_available_at,
@@ -768,6 +770,15 @@ def _command_title(record: TurnRecord) -> str:
     if isinstance(command, SetRetailPrice):
         return f"Set retail price for {command.product.value.replace('_', ' ')}"
     return "Wait"
+
+
+def _disposition_source(record: TurnRecord) -> CommandDispositionSource:
+    """Identify the module that produced the persisted command disposition."""
+    if record.protocol_error is not None:
+        return CommandDispositionSource.RUNTIME_PROTOCOL
+    if not record.outcome.accepted and isinstance(record.envelope.command, Wait):
+        return CommandDispositionSource.RUNTIME_ATTENTION
+    return CommandDispositionSource.ECONOMIC_ENGINE
 
 
 def _turn_summary(record: TurnRecord) -> str:

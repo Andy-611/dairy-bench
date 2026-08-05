@@ -14,8 +14,10 @@ import {
 } from "../format";
 import { isAbortError, requestErrorMessage } from "../requestErrors";
 import {
+  COMMAND_PROCESSING_ORDER_LABEL,
   clockTime,
   commandSummary,
+  economicStateTransitionSummary,
   effectSummary,
   plural,
   quoteAlertSummary,
@@ -115,6 +117,29 @@ function TurnDetail({
 }) {
   return (
     <div className="drawer-body">
+      <dl className="detail-metadata decision-metadata">
+        <Meta label="Simulation time" value={clockTime(turn.simMinute)} />
+        <Meta
+          label="Observation source"
+          value={`Economic state v${turn.stateVersion}`}
+        />
+        <Meta
+          label={COMMAND_PROCESSING_ORDER_LABEL}
+          value={`#${turn.applySequence}`}
+        />
+        <Meta
+          label="Resulting economic state"
+          value={`v${turn.resultingStateVersion}`}
+        />
+        <Meta
+          label="Journal entry"
+          value={
+            turn.journalSequence === null
+              ? "Not recorded"
+              : `#${turn.journalSequence}`
+          }
+        />
+      </dl>
       <DrawerSection number="1" title="Why the company acted">
         <ul className="detail-list">
           {turn.wakeSignals.map((signal, index) => {
@@ -155,7 +180,9 @@ function TurnDetail({
           <div>
             <span>Engine result</span>
             <strong className={turn.accepted ? "value-up" : "value-down"}>
-              {turn.accepted ? "Accepted" : "Rejected"}
+              {turn.accepted
+                ? "Accepted by the economic engine"
+                : "Rejected"}
             </strong>
             {turn.reason && <p>{turn.reason}</p>}
           </div>
@@ -240,23 +267,22 @@ function SystemDetail({
 }) {
   return (
     <div className="drawer-body">
-      <DrawerSection number="SYS" title={systemLabel(step.kind)}>
+      <DrawerSection number="SYSTEM" title={systemLabel(step.kind)}>
         <p>{step.summary}</p>
         <dl className="detail-metadata">
           <Meta label="Simulation time" value={clockTime(step.simMinute)} />
           <Meta
-            label="State version"
-            value={
-              step.stateVersionBefore === null
-                ? "Not available"
-                : `v${step.stateVersionBefore} → v${step.stateVersionAfter}`
-            }
+            label="Economic state transition"
+            value={economicStateTransitionSummary(
+              step.stateVersionBefore,
+              step.stateVersionAfter,
+            )}
           />
           <Meta
-            label="Journal"
+            label="Journal entry"
             value={
               step.journalSequence === null
-                ? "Reconstructed view"
+                ? "Not recorded"
                 : `#${step.journalSequence}`
             }
           />
@@ -657,13 +683,7 @@ function RawAudit({
       {data === null ? (
         <p>The immutable journal record is unavailable.</p>
       ) : (
-        <>
-          <p>
-            Known product names are translated for this English UI; the stored
-            journal remains unchanged.
-          </p>
-          <pre>{formatAuditPayload(data)}</pre>
-        </>
+        <pre>{formatAuditPayload(data)}</pre>
       )}
     </details>
   );

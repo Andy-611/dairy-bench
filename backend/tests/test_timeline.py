@@ -41,6 +41,7 @@ from company_bench.runtime_models import (
     PlaceOrder,
     Produce,
     ReplaceOrder,
+    SimTime,
     SystemStepRecord,
     TurnRecord,
     Wait,
@@ -50,6 +51,7 @@ from company_bench.timeline import RunTimelineProjector
 from company_bench.timeline_models import (
     ArtifactStatus,
     ArtifactUnavailableReason,
+    CommandDispositionSource,
     MarketOrderCancelled,
     MarketOrderPlaced,
     MarketOrderReplaced,
@@ -192,6 +194,12 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
         for moment in page.moments
         for turn in moment.turns
     )
+    assert all(
+        turn.disposition_source is CommandDispositionSource.ECONOMIC_ENGINE
+        for moment in page.moments
+        for turn in moment.turns
+        if turn.outcome.accepted
+    )
     close = next(
         step for moment in page.moments for step in moment.system_steps if step.kind == "day_close"
     )
@@ -213,6 +221,50 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
     assert turn_detail.system_step is None
     assert system_detail.turn is None
     assert system_detail.system_step == system_record
+
+
+@pytest.mark.asyncio
+async def test_timeline_identifies_runtime_attention_rejection() -> None:
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(
+        update={
+            "days": 1,
+            "runtime": DAIRY_S9_V3_SCENARIO.runtime.model_copy(
+                update={"max_turns_per_company_day": 1}
+            ),
+        }
+    )
+    invalid_deadline = SimTime(
+        absolute_minute=(
+            scenario.runtime.open_minute + scenario.runtime.max_wait_minutes + 1
+        )
+    )
+    agents = {
+        company.company_id: FixedCommandAgent(
+            (Wait(until=invalid_deadline),)
+            if company.company_id == "farm_a"
+            else (Wait(),)
+        )
+        for company in scenario.companies
+    }
+    repository = MemoryRunRepository()
+    execution = await EpisodeRuntime(scenario).run(
+        agents,
+        42,
+        run_id="timeline_attention_rejection",
+        store=repository,
+    )
+    _complete(repository, execution, mode=PolicyKind.BASELINE)
+
+    page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
+    farm_turn = next(
+        turn
+        for moment in page.moments
+        for turn in moment.turns
+        if turn.company_id == "farm_a"
+    )
+
+    assert not farm_turn.outcome.accepted
+    assert farm_turn.disposition_source is CommandDispositionSource.RUNTIME_ATTENTION
 
 
 @pytest.mark.asyncio
@@ -587,6 +639,7 @@ async def test_failed_run_timeline_preserves_raw_dust_order_and_provider_audit()
     assert isinstance(turn.command, PlaceOrder)
     assert turn.command.quantity == Decimal("8.9E-91")
     assert not turn.outcome.accepted
+    assert turn.disposition_source is CommandDispositionSource.ECONOMIC_ENGINE
     assert "exact multiple of 0.0001" in turn.outcome.reason
     assert turn.protocol_error is None
     assert invocation.command == turn.command

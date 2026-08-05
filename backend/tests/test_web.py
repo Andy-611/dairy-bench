@@ -400,7 +400,7 @@ def test_codex_profile_can_be_enabled_without_exposing_credentials(
         "available": True,
         "provider": "codex",
         "model": "gpt-5.6-luna",
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
         "description": "Each company is controlled by an independent Codex runtime.",
         "unavailable_reason": None,
     }

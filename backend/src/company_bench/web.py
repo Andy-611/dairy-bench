@@ -49,7 +49,7 @@ from company_bench.timeline import (
 )
 from company_bench.timeline_models import TimelineDay, TimelineDetail
 
-DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench.sqlite3"
+DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench_v5.sqlite3"
 
 
 class RunRequest(BaseModel):

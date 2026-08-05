@@ -3,11 +3,6 @@ const PRODUCT_LABELS: Readonly<Record<string, string>> = {
   raw_milk: "Raw milk",
 };
 
-const AUDIT_VALUE_LABELS: Readonly<Record<string, string>> = {
-  "\u76d2\u88c5\u5976": "Bottled milk",
-  "\u539f\u5976": "Raw milk",
-};
-
 export function companyLabel(
   companyId: string | null,
   backendName?: string,
@@ -27,12 +22,7 @@ export function productLabel(productId: string): string {
 }
 
 export function formatAuditPayload(data: unknown): string {
-  const payload = JSON.stringify(
-    data,
-    (_key, value: unknown) =>
-      typeof value === "string" ? (AUDIT_VALUE_LABELS[value] ?? value) : value,
-    2,
-  );
+  const payload = JSON.stringify(data, null, 2);
   return payload ?? "null";
 }
 
