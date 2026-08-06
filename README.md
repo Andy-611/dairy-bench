@@ -4,7 +4,7 @@ Dairy Bench is an event-driven multi-agent benchmark for a perishable dairy
 supply chain. Three farms, three processors, and three retailers share two spot
 markets; each of the nine companies is controlled by an independent agent.
 
-The default scenario is `flow.dairy.base.s9.v3`. An episode lasts 30 simulated
+The default scenario is `flow.dairy.base.s9.v4`. An episode lasts 30 simulated
 days, and every decision is one strongly typed atomic command:
 
 ```text
@@ -132,7 +132,7 @@ economic mutation.
 
 ## Data and verification
 
-The default score-v7 database is `backend/data/dairy_bench_v7.sqlite3`. Override it with
+The default score-v8 database is `backend/data/dairy_bench_v8.sqlite3`. Override it with
 `DAIRY_BENCH_DB`; override artifacts with `DAIRY_BENCH_ARTIFACTS_DIR`.
 
 ```powershell

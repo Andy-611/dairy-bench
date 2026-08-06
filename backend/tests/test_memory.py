@@ -7,7 +7,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.memory import (
     AgentCheckpoint,
@@ -33,7 +33,7 @@ RUN_ID = "memory_run"
 def observations() -> dict[str, CompanyObservation]:
     """Return one private day-one observation per company."""
     engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=42)
+    state = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return {observation.company_id: observation for observation in engine.observe(state)}
 
 
@@ -63,6 +63,7 @@ def test_memory_rejects_cross_company_and_cross_run_state(
         memory.remember(_exchange(observations["processor_a"], 2))
 
     checkpoint = memory.checkpoint()
+    assert checkpoint.schema_version == 4
     with pytest.raises(ValueError, match="another company"):
         ConversationMemory.restore(RUN_ID, "farm_b", checkpoint)
     with pytest.raises(ValueError, match="another run"):
@@ -129,11 +130,17 @@ def test_checkpoint_round_trip_restores_exact_context(
 def test_default_summary_is_deterministic(
     observations: dict[str, CompanyObservation],
 ) -> None:
+    probe = ConversationMemory(RUN_ID, "farm_a", max_tokens=100_000, chars_per_token=1)
+    probe.remember(_exchange(observations["farm_a"], 1))
+    one_exchange_tokens = probe.estimated_tokens
+    probe.remember(_exchange(observations["farm_a"], 2))
+    budget = (one_exchange_tokens + probe.estimated_tokens) // 2
+
     def build() -> ConversationMemory:
         memory = ConversationMemory(
             RUN_ID,
             "farm_a",
-            max_tokens=2_500,
+            max_tokens=budget,
             chars_per_token=1,
         )
         for index in range(1, 4):

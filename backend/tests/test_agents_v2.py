@@ -12,7 +12,7 @@ from company_bench.agents import (
     LlmCompanyAgent,
     observation_hash,
 )
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import (
     CompanyObservation,
@@ -116,7 +116,7 @@ def _turn(
 def _observation(company_id: str) -> CompanyObservation:
     """Read one company's initial V3 observation."""
     engine = EconomyEngine()
-    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=42)
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return next(
         observation for observation in engine.observe(world) if observation.company_id == company_id
     )
@@ -137,6 +137,13 @@ def _with_inventory(
             )
         }
     )
+
+
+def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decimal]:
+    """Split one exact total into the baseline's 40/40/20 quote shape."""
+    first = quantity * Decimal("0.4")
+    second = quantity * Decimal("0.4")
+    return first, second, quantity - first - second
 
 
 def test_quote_ladder_uses_the_strict_v3_command_schema() -> None:
@@ -258,6 +265,7 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
     assert "continuous spot market" in request.instructions
     assert "Your sole objective is to maximize your own company's profit." in request.instructions
     assert "resting price" in request.instructions
+    assert "C(u+q)-C(u)" in request.instructions
     assert "after 30 virtual minutes" in request.instructions
     assert "set_quote_ladder" in request.instructions
     assert "zero to three unique" in request.instructions
@@ -273,6 +281,14 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
     assert level == {"unit_price": "1.50", "quantity": "30", "order_count": 2}
     assert prompt_input["turn"]["marked_surplus"] == "0"
     assert "market_views" not in prompt_input["turn"]
+    assert "remaining_operation_capacity" not in prompt_input["turn"]
+    observed_payload = prompt_input["turn"]["observation"]
+    if observation.daily_operation is None:
+        assert "daily_operation" not in observed_payload
+    else:
+        daily_operation = observed_payload["daily_operation"]
+        assert daily_operation["company_id"] == observation.company_id
+        assert "daily_base_unit_cost" in daily_operation
     assert agent.metadata.version == "3"
     assert agent.metadata.prompt_version == COMMAND_PROMPT_VERSION
 
@@ -362,14 +378,17 @@ async def test_llm_agent_accepts_a_schema_valid_quote_ladder_for_engine_audit() 
 async def test_baseline_processor_procures_transforms_and_trades_while_busy() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
+    assert observation.daily_operation is not None
+    capacity = min(observation.daily_operation.daily_capacity, Decimal("50"))
+    first, second, third = _three_level_quantities(capacity)
 
     assert await agent.act(_turn("processor_procure", observation)) == SetQuoteLadder(
         product=ProductId.RAW_MILK,
         side=MarketSide.BUY,
         levels=(
-            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.60")),
-            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.50")),
-            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.40")),
+            QuoteLevel(quantity=first, limit_price=Decimal("1.60")),
+            QuoteLevel(quantity=second, limit_price=Decimal("1.50")),
+            QuoteLevel(quantity=third, limit_price=Decimal("1.40")),
         ),
     )
 
@@ -383,7 +402,7 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
     ) == Transform(
         input_product=ProductId.RAW_MILK,
         output_product=ProductId.BOTTLED_MILK,
-        input_quantity=Decimal("50"),
+        input_quantity=capacity,
     )
 
     bottled_stock = _with_inventory(observation, bottled_milk=Decimal("20"))
@@ -457,6 +476,9 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
 async def test_baseline_does_not_duplicate_a_resting_order() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
+    assert observation.daily_operation is not None
+    capacity = min(observation.daily_operation.remaining_capacity, Decimal("50"))
+    quantities = _three_level_quantities(capacity)
     orders = tuple(
         OpenOrderView(
             order_id=f"order_{index}",
@@ -470,11 +492,7 @@ async def test_baseline_does_not_duplicate_a_resting_order() -> None:
             queue_ahead_quantity=Decimal(),
         )
         for index, (quantity, price) in enumerate(
-            (
-                (Decimal("20"), Decimal("1.60")),
-                (Decimal("20"), Decimal("1.50")),
-                (Decimal("10"), Decimal("1.40")),
-            ),
+            zip(quantities, map(Decimal, ("1.60", "1.50", "1.40")), strict=True),
             start=1,
         )
     )
@@ -593,7 +611,7 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
 
 @pytest.mark.asyncio
 async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
-    scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
     run_id = "llm_runtime_cycle"
     repository = MemoryRunRepository()
     agents: dict[str, LlmCompanyAgent] = {}

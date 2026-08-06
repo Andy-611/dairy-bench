@@ -151,7 +151,7 @@ class CompanyRuntimeCursor(StrictModel):
 class RunCheckpoint(StrictModel):
     """Complete atomic state needed to resume one V3 episode."""
 
-    schema_version: Literal[5] = 5
+    schema_version: Literal[6] = 6
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState

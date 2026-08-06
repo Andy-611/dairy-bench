@@ -129,8 +129,8 @@ class EpisodeRuntime:
         evaluator: Evaluator | None = None,
         agent_timeout_seconds: float = 180.0,
     ) -> None:
-        if scenario.version != 3:
-            raise ValueError("EpisodeRuntime requires a V3 scenario")
+        if not scenario.uses_event_runtime:
+            raise ValueError("EpisodeRuntime requires an event-driven scenario")
         if agent_timeout_seconds <= 0:
             raise ValueError("agent_timeout_seconds must be positive")
         self.scenario = scenario
@@ -853,10 +853,6 @@ class EpisodeRuntime:
                 company_id,
             ),
             active_operation=self._engine.operation_view(economy, company_id),
-            remaining_operation_capacity=self._engine.remaining_operation_capacity(
-                economy,
-                company_id,
-            ),
             visible_events=visible,
             previous_outcome=previous_outcome,
         )

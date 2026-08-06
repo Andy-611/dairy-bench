@@ -246,7 +246,7 @@ class RunTimelineProjector:
         )
         if scenario is None:
             raise TimelineNotFoundError(f"run '{run_id}' has no readable scenario")
-        if scenario.version < 3:
+        if not scenario.uses_event_runtime:
             raise TimelineUnsupportedError("The operations timeline is available for V3 runs only")
 
         turns = self._source.list_turns(run_id)

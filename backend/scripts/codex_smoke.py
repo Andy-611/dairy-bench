@@ -5,7 +5,7 @@ import asyncio
 from company_bench.agent_models import PolicyInfrastructureError
 from company_bench.agents import COMMAND_PROMPT_VERSION, LlmCompanyAgent
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import PolicyKind, PolicyMetadata
 from company_bench.repository import MemoryRunRepository
@@ -20,7 +20,7 @@ async def main() -> None:
 
     repository = MemoryRunRepository()
     engine = EconomyEngine()
-    scenario = DAIRY_S9_V3_SCENARIO
+    scenario = DAIRY_S9_SCENARIO
     economy = engine.open_day(engine.initial_state(scenario, seed=42))
     company_id = scenario.companies[0].company_id
     observation = engine.observe_active(economy, company_id)

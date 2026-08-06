@@ -2,8 +2,10 @@ from decimal import Decimal
 from typing import Final, Literal
 
 from company_bench.models import (
+    CapacityFunction,
     CompanyOperation,
     CompanySpec,
+    CostFunction,
     DemandSpec,
     FarmOperation,
     ProcessorOperation,
@@ -14,7 +16,7 @@ from company_bench.models import (
     ScoringSpec,
 )
 
-__all__ = ("DAIRY_S9_V3_SCENARIO",)
+__all__ = ("DAIRY_S9_SCENARIO",)
 
 type _CompanySuffix = Literal["a", "b", "c"]
 type _CompanyTemplate = tuple[str, CompanyOperation]
@@ -47,16 +49,36 @@ def _build_companies() -> tuple[CompanySpec, ...]:
         (
             "牧场",
             FarmOperation(
-                daily_capacity=_money("60"),
-                unit_cost=_money("1.00"),
+                capacity=CapacityFunction(
+                    normal_capacity=_money("60"),
+                    persistence=_money("0.75"),
+                    volatility=_money("0.05"),
+                    minimum_factor=_money("0.85"),
+                    maximum_factor=_money("1.10"),
+                ),
+                cost=CostFunction(
+                    normal_unit_cost=_money("1.00"),
+                    daily_volatility=_money("0.10"),
+                    curvature=_money("0.35"),
+                ),
             ),
         ),
         (
             "加工厂",
             ProcessorOperation(
-                daily_input_capacity=_money("50"),
+                capacity=CapacityFunction(
+                    normal_capacity=_money("50"),
+                    persistence=_money("0.60"),
+                    volatility=_money("0.08"),
+                    minimum_factor=_money("0.75"),
+                    maximum_factor=_money("1.10"),
+                ),
+                cost=CostFunction(
+                    normal_unit_cost=_money("0.40"),
+                    daily_volatility=_money("0.15"),
+                    curvature=_money("0.65"),
+                ),
                 yield_rate=_money("0.8"),
-                processing_cost_per_input=_money("0.40"),
             ),
         ),
         ("零售商", RetailerOperation()),
@@ -69,8 +91,8 @@ def _build_companies() -> tuple[CompanySpec, ...]:
 def _build_dairy_scenario() -> ScenarioSpec:
     """Build the canonical event-driven Dairy Bench scenario."""
     return ScenarioSpec(
-        scenario_id="flow.dairy.base.s9.v3",
-        version=3,
+        scenario_id="flow.dairy.base.s9.v4",
+        version=4,
         days=30,
         products=(
             ProductSpec(
@@ -98,4 +120,4 @@ def _build_dairy_scenario() -> ScenarioSpec:
     )
 
 
-DAIRY_S9_V3_SCENARIO: Final[ScenarioSpec] = _build_dairy_scenario()
+DAIRY_S9_SCENARIO: Final[ScenarioSpec] = _build_dairy_scenario()

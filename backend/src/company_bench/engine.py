@@ -10,6 +10,7 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, model_validator
 
 from company_bench.demand import ConsumerDemandCurve
+from company_bench.economics import OperatingEconomics
 from company_bench.market import (
     AssetLedger,
     BuyOrder,
@@ -29,6 +30,8 @@ from company_bench.models import (
     CompanySpec,
     CompanyState,
     ConsumerSaleEvent,
+    CostFunction,
+    DailyOperationState,
     DayResult,
     DaySnapshot,
     DeliveryCompletedEvent,
@@ -76,7 +79,6 @@ from company_bench.runtime_models import (
 )
 
 __all__ = [
-    "CompanyQuantity",
     "ConsumerSettlement",
     "EconomyEngine",
     "EconomyState",
@@ -103,10 +105,10 @@ class ProductionJob(StrictModel):
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
-        """Require exact cost and a same-day future completion."""
+        """Require exact average cost and a same-day future completion."""
         _validate_job_time(self.started_at, self.completes_at)
-        if self.cash_cost != self.quantity * self.unit_cost:
-            raise ValueError("production cash cost must equal quantity times unit cost")
+        if self.unit_cost != self.cash_cost / self.quantity:
+            raise ValueError("production unit cost must equal its realized batch average")
         return self
 
 
@@ -127,12 +129,12 @@ class TransformationJob(StrictModel):
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
-        """Require exact cost, different products, and a future completion."""
+        """Require exact average cost, different products, and a future completion."""
         _validate_job_time(self.started_at, self.completes_at)
         if self.input_product is self.output_product:
             raise ValueError("transformation input and output products must differ")
-        if self.cash_cost != self.input_quantity * self.processing_cost_per_input:
-            raise ValueError("transformation cash cost must match its input cost")
+        if self.processing_cost_per_input != self.cash_cost / self.input_quantity:
+            raise ValueError("processing unit cost must equal its realized batch average")
         return self
 
 
@@ -202,13 +204,6 @@ class ConsumerSettlement(StrictModel):
     sold_quantity: Quantity
 
 
-class CompanyQuantity(StrictModel):
-    """One company's consumed daily operating capacity."""
-
-    company_id: CompanyId
-    quantity: Quantity
-
-
 class RetailPriceState(StrictModel):
     """One retailer's active consumer price."""
 
@@ -228,8 +223,7 @@ class EconomyState(StrictModel):
     jobs: tuple[OperationJob, ...] = ()
     deliveries: tuple[PendingDelivery, ...] = ()
     retail_prices: tuple[RetailPriceState, ...] = ()
-    production_used: tuple[CompanyQuantity, ...] = ()
-    transformation_used: tuple[CompanyQuantity, ...] = ()
+    operation_states: tuple[DailyOperationState, ...]
     consumer_settlement: ConsumerSettlement | None = None
     events: tuple[DomainEvent, ...] = ()
     next_lot_sequence: int = Field(default=1, ge=1)
@@ -247,6 +241,17 @@ class EconomyState(StrictModel):
         )
         if not (active or terminal):
             raise ValueError("economy day must be active or terminal")
+        if active:
+            expected_operations = OperatingEconomics(
+                self.scenario,
+                self.seed,
+            ).open_day(self.day, self.base_state.operation_states)
+            reset_operations = tuple(
+                state.model_copy(update={"used_capacity": ZERO})
+                for state in self.operation_states
+            )
+            if reset_operations != expected_operations:
+                raise ValueError("economy operation states do not match seed-derived conditions")
 
         company_ids = tuple(company.company_id for company in self.companies)
         expected_ids = tuple(company.company_id for company in self.scenario.companies)
@@ -269,14 +274,11 @@ class EconomyState(StrictModel):
             ((price.company_id, price.product) for price in self.retail_prices),
             "retail price keys",
         )
-        _require_unique(
-            (entry.company_id for entry in self.production_used),
-            "production usage companies",
+        expected_operators = tuple(
+            company.company_id for company in self.scenario.productive_companies
         )
-        _require_unique(
-            (entry.company_id for entry in self.transformation_used),
-            "transformation usage companies",
-        )
+        if tuple(state.company_id for state in self.operation_states) != expected_operators:
+            raise ValueError("economy operation states must match productive companies")
         _require_unique(
             (lot.lot_id for lot in _persisted_lots(self)),
             "global inventory lot ids",
@@ -297,10 +299,6 @@ class EconomyState(StrictModel):
             raise ValueError("pending delivery belongs to an unknown buyer")
         if any(price.company_id not in known for price in self.retail_prices):
             raise ValueError("retail price belongs to an unknown company")
-        if any(entry.company_id not in known for entry in self.production_used):
-            raise ValueError("production usage belongs to an unknown company")
-        if any(entry.company_id not in known for entry in self.transformation_used):
-            raise ValueError("transformation usage belongs to an unknown company")
         if len({market.is_open for market in self.markets}) != 1:
             raise ValueError("product markets must open and close together")
         simulation_day = self.day - 1
@@ -418,10 +416,11 @@ class EconomyEngine:
 
     def initial_state(self, scenario: ScenarioSpec, seed: int) -> WorldState:
         """Create an empty-inventory V3 world."""
-        if scenario.version != 3:
-            raise ValueError("EconomyEngine requires a V3 scenario")
+        if not scenario.uses_event_runtime:
+            raise ValueError("EconomyEngine requires an event-driven scenario")
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
             raise ValueError(f"seed must be an integer from 0 to {MAX_SEED}")
+        economics = OperatingEconomics(scenario, seed)
         return WorldState(
             scenario=scenario,
             seed=seed,
@@ -430,27 +429,33 @@ class EconomyEngine:
                 CompanyState(company_id=company.company_id, cash=company.initial_cash)
                 for company in scenario.companies
             ),
+            operation_states=economics.initial_states(),
         )
 
     def open_day(self, state: WorldState, *, state_version: int = 0) -> EconomyState:
         """Open fresh product books and daily operating resources."""
-        if state.scenario.version != 3:
-            raise ValueError("EconomyEngine requires a V3 scenario")
+        if not state.scenario.uses_event_runtime:
+            raise ValueError("EconomyEngine requires an event-driven scenario")
         if state.day >= state.scenario.days:
             raise ValueError("the episode is already complete")
         assets = AssetLedger.from_world(
             state,
             next_lot_sequence=state.next_lot_sequence,
         )
+        day = state.day + 1
         return EconomyState(
             base_state=state,
-            day=state.day + 1,
+            day=day,
             state_version=state_version,
             companies=state.companies,
             markets=tuple(
                 ContinuousSpotMarket.open(product.product, assets).state
                 for product in state.scenario.products
             ),
+            operation_states=OperatingEconomics(
+                state.scenario,
+                state.seed,
+            ).open_day(day, state.operation_states),
             next_lot_sequence=state.next_lot_sequence,
         )
 
@@ -458,12 +463,20 @@ class EconomyEngine:
         """Project next-day morning facts without opening mutable runtime state."""
         if state.day >= state.scenario.days:
             return ()
+        operation_states = OperatingEconomics(
+            state.scenario,
+            state.seed,
+        ).open_day(state.day + 1, state.operation_states)
         return tuple(
             self._observation(
                 state=state,
                 day=state.day + 1,
                 company_id=company.company_id,
                 company_state=_company_state(state.companies, company.company_id),
+                daily_operation=_optional_operation_state(
+                    operation_states,
+                    company.company_id,
+                ),
                 retail_price=None,
             )
             for company in state.scenario.companies
@@ -484,6 +497,10 @@ class EconomyEngine:
             day=economy.day,
             company_id=company_id,
             company_state=_company_state(economy.companies, company_id),
+            daily_operation=_optional_operation_state(
+                economy.operation_states,
+                company_id,
+            ),
             retail_price=price,
         )
 
@@ -609,18 +626,8 @@ class EconomyEngine:
         company_id: CompanyId,
     ) -> Quantity | None:
         """Return today's unused production input capacity for an operator."""
-        operation = economy.scenario.company(company_id).operation
-        if isinstance(operation, FarmOperation):
-            return operation.daily_capacity - _used(
-                economy.production_used,
-                company_id,
-            )
-        if isinstance(operation, ProcessorOperation):
-            return operation.daily_input_capacity - _used(
-                economy.transformation_used,
-                company_id,
-            )
-        return None
+        state = _optional_operation_state(economy.operation_states, company_id)
+        return None if state is None else state.remaining_capacity
 
     def apply_batch(
         self,
@@ -862,6 +869,7 @@ class EconomyEngine:
             seed=economy.seed,
             day=economy.day,
             companies=companies,
+            operation_states=economy.operation_states,
             previous_markets=markets,
             next_lot_sequence=economy.next_lot_sequence,
         )
@@ -944,14 +952,13 @@ class EconomyEngine:
         if command.product is not operation.output_product:
             raise _CommandRejected("farm cannot produce the requested product")
         self._require_idle(economy, company.company_id)
-        used = _used(economy.production_used, company.company_id)
-        available_capacity = operation.daily_capacity - used
-        if command.quantity > available_capacity:
-            raise _CommandRejected(
-                f"insufficient production capacity: requested {command.quantity}, "
-                f"available {available_capacity}"
-            )
-        cost = command.quantity * operation.unit_cost
+        operation_state, cost = _price_operation(
+            economy,
+            company.company_id,
+            command.quantity,
+            operation.cost,
+            "production",
+        )
         session = _MarketSession.from_economy(economy)
         if cost > session.assets.cash(company.company_id):
             raise _CommandRejected(
@@ -969,16 +976,15 @@ class EconomyEngine:
             ),
             product=command.product,
             quantity=command.quantity,
-            unit_cost=operation.unit_cost,
+            unit_cost=cost / command.quantity,
             cash_cost=cost,
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
                 "jobs": (*economy.jobs, job),
-                "production_used": _set_used(
-                    economy.production_used,
-                    company.company_id,
-                    used + command.quantity,
+                "operation_states": _replace_operation_state(
+                    economy.operation_states,
+                    operation_state,
                 ),
                 "next_job_sequence": sequence + 1,
             }
@@ -1005,13 +1011,13 @@ class EconomyEngine:
         ):
             raise _CommandRejected("processor cannot perform the requested transformation")
         self._require_idle(economy, company.company_id)
-        used = _used(economy.transformation_used, company.company_id)
-        available_capacity = operation.daily_input_capacity - used
-        if command.input_quantity > available_capacity:
-            raise _CommandRejected(
-                f"insufficient transformation capacity: requested {command.input_quantity}, "
-                f"available {available_capacity}"
-            )
+        operation_state, cost = _price_operation(
+            economy,
+            company.company_id,
+            command.input_quantity,
+            operation.cost,
+            "transformation",
+        )
         session = _MarketSession.from_economy(economy)
         available_input = session.assets.quantity(company.company_id, command.input_product)
         if command.input_quantity > available_input:
@@ -1019,7 +1025,6 @@ class EconomyEngine:
                 f"insufficient inventory: requested {command.input_quantity}, "
                 f"available {available_input}"
             )
-        cost = command.input_quantity * operation.processing_cost_per_input
         if cost > session.assets.cash(company.company_id):
             raise _CommandRejected(
                 f"insufficient cash: required {cost}, "
@@ -1043,16 +1048,15 @@ class EconomyEngine:
             output_product=command.output_product,
             input_quantity=command.input_quantity,
             output_quantity=command.input_quantity * operation.yield_rate,
-            processing_cost_per_input=operation.processing_cost_per_input,
+            processing_cost_per_input=cost / command.input_quantity,
             cash_cost=cost,
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
                 "jobs": (*economy.jobs, job),
-                "transformation_used": _set_used(
-                    economy.transformation_used,
-                    company.company_id,
-                    used + command.input_quantity,
+                "operation_states": _replace_operation_state(
+                    economy.operation_states,
+                    operation_state,
                 ),
                 "next_job_sequence": sequence + 1,
             }
@@ -1298,6 +1302,7 @@ class EconomyEngine:
         day: int,
         company_id: CompanyId,
         company_state: CompanyState,
+        daily_operation: DailyOperationState | None,
         retail_price: Money | None,
     ) -> CompanyObservation:
         scenario = state.scenario
@@ -1309,6 +1314,7 @@ class EconomyEngine:
             day=day,
             company_id=company_id,
             operation=company.operation,
+            daily_operation=daily_operation,
             products=scenario.products,
             demand=scenario.demand,
             scoring=scenario.scoring,
@@ -1491,20 +1497,56 @@ def _inventory_quantity(state: CompanyState, product: ProductId) -> Quantity:
     )
 
 
-def _used(entries: tuple[CompanyQuantity, ...], company_id: CompanyId) -> Quantity:
-    return next(
-        (entry.quantity for entry in entries if entry.company_id == company_id),
-        ZERO,
+def _optional_operation_state(
+    states: tuple[DailyOperationState, ...],
+    company_id: CompanyId,
+) -> DailyOperationState | None:
+    return next((state for state in states if state.company_id == company_id), None)
+
+
+def _operation_state(
+    states: tuple[DailyOperationState, ...],
+    company_id: CompanyId,
+) -> DailyOperationState:
+    state = _optional_operation_state(states, company_id)
+    if state is None:
+        raise ValueError(f"company has no productive operation: {company_id}")
+    return state
+
+
+def _replace_operation_state(
+    states: tuple[DailyOperationState, ...],
+    replacement: DailyOperationState,
+) -> tuple[DailyOperationState, ...]:
+    return tuple(
+        replacement if state.company_id == replacement.company_id else state
+        for state in states
     )
 
 
-def _set_used(
-    entries: tuple[CompanyQuantity, ...],
+def _price_operation(
+    economy: EconomyState,
     company_id: CompanyId,
-    quantity: Quantity,
-) -> tuple[CompanyQuantity, ...]:
-    retained = tuple(entry for entry in entries if entry.company_id != company_id)
-    return (*retained, CompanyQuantity(company_id=company_id, quantity=quantity))
+    quantity: Decimal,
+    cost_function: CostFunction,
+    label: str,
+) -> tuple[DailyOperationState, Money]:
+    state = _operation_state(economy.operation_states, company_id)
+    if quantity > state.remaining_capacity:
+        raise _CommandRejected(
+            f"insufficient {label} capacity: requested {quantity}, "
+            f"available {state.remaining_capacity}"
+        )
+    try:
+        cost = cost_function.incremental_cost(
+            daily_capacity=state.daily_capacity,
+            used_capacity=state.used_capacity,
+            quantity=quantity,
+            daily_base_unit_cost=state.daily_base_unit_cost,
+        )
+        return state.consume(quantity), cost
+    except ValueError as error:
+        raise _CommandRejected(str(error)) from error
 
 
 def _operation_completion(job: OperationJob) -> ScheduledCompletion:

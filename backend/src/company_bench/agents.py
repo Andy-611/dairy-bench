@@ -50,7 +50,7 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.4"
+COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.5"
 
 
 class CompanyAgent(Protocol):
@@ -305,7 +305,7 @@ class BaselineCompanyAgent:
 
     metadata = PolicyMetadata(
         name="event-baseline",
-        version="4",
+        version="5",
         kind=PolicyKind.BASELINE,
     )
 
@@ -325,7 +325,7 @@ class BaselineCompanyAgent:
         operation = turn.observation.operation
         assert isinstance(operation, FarmOperation)
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            capacity = _remaining_capacity(turn, operation.daily_capacity)
+            capacity = _remaining_capacity(turn)
             if capacity <= 0:
                 return Wait()
             return Produce(
@@ -344,7 +344,7 @@ class BaselineCompanyAgent:
     def _processor_command(turn: AgentTurn) -> CompanyCommand:
         operation = turn.observation.operation
         assert isinstance(operation, ProcessorOperation)
-        capacity = _remaining_capacity(turn, operation.daily_input_capacity)
+        capacity = _remaining_capacity(turn)
         raw_quantity = turn.observation.quantity(operation.input_product)
         if raw_quantity > 0 and capacity > 0 and turn.active_operation is None:
             return Transform(
@@ -529,8 +529,14 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "quantities by expiry; in-transit lots remain in pending_deliveries. "
         "marked_surplus is guaranteed marked asset value minus initial cash, including "
         "reserved assets, pending deliveries, and active-operation output at reference "
-        "values. Use only supplied facts and submit exactly one atomic command; never "
-        "invent identity, time, or state version. Every order quantity must be at least "
+        "values. For productive companies, observation.daily_operation supplies "
+        "K=daily_capacity, u=used_capacity, remaining_capacity, and "
+        "c=daily_base_unit_cost, while observation.operation.cost.curvature supplies "
+        "curvature; "
+        "for a new quantity q, cash cost is C(u+q)-C(u), where "
+        "C(x)=c*x+curvature*c*x^2/(2*K). Use only supplied facts and "
+        "submit exactly one atomic command; never invent identity, time, or state version. "
+        "Every production, transformation, and quote-level quantity must be at least "
         f"{QUANTITY_QUANTUM} and use at most four decimal places (an exact multiple of "
         f"{QUANTITY_QUANTUM}); never submit a dust quantity. set_quote_ladder declares "
         "the complete target state for one product and side: use zero to three unique "
@@ -651,9 +657,12 @@ def _pending_quantity(turn: AgentTurn, product: ProductId) -> Decimal:
     )
 
 
-def _remaining_capacity(turn: AgentTurn, configured: Decimal) -> Decimal:
+def _remaining_capacity(turn: AgentTurn) -> Decimal:
+    """Return a productive company's private realized remaining capacity."""
     remaining = turn.remaining_operation_capacity
-    return configured if remaining is None else remaining
+    if remaining is None:
+        raise TypeError("productive baseline turn requires daily operation state")
+    return remaining
 
 
 def _estimated_tokens(*parts: str) -> int:

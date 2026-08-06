@@ -199,8 +199,8 @@ class PolicyFactory:
         completed_turns: tuple[TurnRecord, ...] = (),
     ) -> AgentBundle:
         """Create fresh event-driven company actors for one V3 episode."""
-        if self._scenario.version != 3:
-            raise ValueError("event-driven Agents require a V3 scenario")
+        if not self._scenario.uses_event_runtime:
+            raise ValueError("event-driven Agents require an event-driven scenario")
         if mode is PolicyKind.BASELINE:
             return AgentBundle(
                 {company.company_id: BaselineCompanyAgent() for company in self._scenario.companies}

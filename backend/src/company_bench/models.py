@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
@@ -17,7 +17,10 @@ from pydantic import (
 )
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
 QUANTITY_QUANTUM = Decimal("0.0001")
+DAILY_UNIT_COST_QUANTUM = Decimal("0.0001")
+OPERATION_COST_QUANTUM = Decimal("0.00000001")
 MAX_SEED = 2_147_483_647
 
 type CompanyId = Annotated[
@@ -33,6 +36,8 @@ type PositiveQuantity = Annotated[Decimal, Field(gt=ZERO)]
 type Money = Annotated[Decimal, Field(ge=ZERO)]
 type PositiveMoney = Annotated[Decimal, Field(gt=ZERO)]
 type Rate = Annotated[Decimal, Field(ge=ZERO)]
+type Persistence = Annotated[Decimal, Field(ge=ZERO, lt=ONE)]
+type OpenUnitInterval = Annotated[Decimal, Field(ge=ZERO, lt=ONE)]
 type UnitInterval = Annotated[
     Decimal,
     Field(ge=ZERO, le=Decimal("1")),
@@ -48,22 +53,37 @@ class InvalidOrderQuantity(ValueError):
     """An order quantity cannot be represented at the market's fixed precision."""
 
 
-def _validate_order_quantity(value: Decimal) -> Decimal:
-    """Validate the market tick from the Decimal coefficient without arithmetic."""
+def _validate_exact_quantity(value: Decimal, label: str) -> Decimal:
+    """Validate one quantity quantum from its Decimal coefficient."""
     if not value.is_finite() or value <= ZERO:
-        raise ValueError("order quantity must be positive and finite")
+        raise ValueError(f"{label} quantity must be positive and finite")
     decimal_tuple = value.as_tuple()
     digits = decimal_tuple.digits
     excess_places = QUANTITY_QUANTUM.as_tuple().exponent - decimal_tuple.exponent
     if excess_places > 0 and (excess_places > len(digits) or any(digits[-excess_places:])):
-        raise ValueError(f"order quantity must be an exact multiple of {QUANTITY_QUANTUM}")
+        raise ValueError(f"{label} quantity must be an exact multiple of {QUANTITY_QUANTUM}")
     return value
+
+
+def _validate_order_quantity(value: Decimal) -> Decimal:
+    """Validate an exact market quantity."""
+    return _validate_exact_quantity(value, "order")
+
+
+def _validate_operation_quantity(value: Decimal) -> Decimal:
+    """Validate an exact production or transformation quantity."""
+    return _validate_exact_quantity(value, "operation")
 
 
 type OrderQuantity = Annotated[
     Decimal,
     Field(gt=ZERO),
     AfterValidator(_validate_order_quantity),
+]
+type OperationQuantity = Annotated[
+    Decimal,
+    Field(gt=ZERO),
+    AfterValidator(_validate_operation_quantity),
 ]
 
 _ORDER_QUANTITY_ADAPTER = TypeAdapter(OrderQuantity)
@@ -89,6 +109,17 @@ class StrictModel(BaseModel):
         str_strip_whitespace=True,
         validate_default=True,
     )
+
+
+def _require_finite_between(
+    value: Decimal,
+    minimum: Decimal,
+    maximum: Decimal,
+    label: str,
+) -> None:
+    """Reject non-finite values and values outside one closed interval."""
+    if not value.is_finite() or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be finite and between {minimum} and {maximum}")
 
 
 class ProductId(StrEnum):
@@ -124,24 +155,168 @@ class ProductSpec(StrictModel):
     reference_value: PositiveMoney
 
 
-class FarmOperation(StrictModel):
+class DailyCapacity(StrictModel):
+    """One realized daily capacity and its persistent availability state."""
+
+    availability: PositiveQuantity
+    quantity: PositiveQuantity
+
+
+class CapacityFunction(StrictModel):
+    """Generate bounded, persistent daily capacity from one private innovation."""
+
+    normal_capacity: PositiveQuantity
+    persistence: Persistence
+    volatility: Rate
+    minimum_factor: PositiveQuantity
+    maximum_factor: PositiveQuantity
+
+    @model_validator(mode="after")
+    def validate_factor_range(self) -> Self:
+        """Require the neutral operating state to lie inside an ordered range."""
+        if self.minimum_factor > ONE or self.maximum_factor < ONE:
+            raise ValueError("capacity factor range must contain 1")
+        if self.minimum_factor > self.maximum_factor:
+            raise ValueError("minimum capacity factor must not exceed maximum")
+        if any(
+            factor.quantize(QUANTITY_QUANTUM, rounding=ROUND_HALF_EVEN) != factor
+            for factor in (self.minimum_factor, self.maximum_factor)
+        ):
+            raise ValueError("capacity factor bounds must use at most four decimal places")
+        minimum_capacity = (self.normal_capacity * self.minimum_factor).quantize(
+            QUANTITY_QUANTUM,
+            rounding=ROUND_HALF_EVEN,
+        )
+        if minimum_capacity <= ZERO:
+            raise ValueError("minimum realized capacity must survive quantity precision")
+        return self
+
+    def daily_capacity(
+        self,
+        previous_availability: Decimal,
+        innovation: Decimal,
+    ) -> DailyCapacity:
+        """Advance the AR(1) availability state and return its bounded capacity."""
+        _require_finite_between(
+            previous_availability,
+            self.minimum_factor,
+            self.maximum_factor,
+            "previous availability",
+        )
+        _require_finite_between(innovation, -ONE, ONE, "capacity innovation")
+        availability = min(
+            self.maximum_factor,
+            max(
+                self.minimum_factor,
+                ONE
+                + self.persistence * (previous_availability - ONE)
+                + self.volatility * innovation,
+            ),
+        ).quantize(QUANTITY_QUANTUM, rounding=ROUND_HALF_EVEN)
+        return DailyCapacity(
+            availability=availability,
+            quantity=(self.normal_capacity * availability).quantize(
+                QUANTITY_QUANTUM,
+                rounding=ROUND_HALF_EVEN,
+            ),
+        )
+
+
+class CostFunction(StrictModel):
+    """Realize private base cost and price cumulative capacity use convexly."""
+
+    normal_unit_cost: PositiveMoney
+    daily_volatility: OpenUnitInterval = ZERO
+    curvature: PositiveQuantity
+
+    @model_validator(mode="after")
+    def validate_minimum_cost(self) -> Self:
+        """Require the smallest supported batch to retain a positive cash cost."""
+        minimum_unit_cost = self.normal_unit_cost * (ONE - self.daily_volatility)
+        if minimum_unit_cost.quantize(
+            DAILY_UNIT_COST_QUANTUM,
+            rounding=ROUND_HALF_EVEN,
+        ) <= ZERO:
+            raise ValueError("minimum daily unit cost must survive cost precision")
+        minimum_batch_cost = minimum_unit_cost * QUANTITY_QUANTUM
+        if minimum_batch_cost.quantize(
+            OPERATION_COST_QUANTUM,
+            rounding=ROUND_HALF_EVEN,
+        ) <= ZERO:
+            raise ValueError("minimum operation cost must survive cash precision")
+        return self
+
+    def daily_base_unit_cost(self, innovation: Decimal) -> PositiveMoney:
+        """Return today's positive private base cost from a symmetric innovation."""
+        _require_finite_between(innovation, -ONE, ONE, "cost innovation")
+        return (
+            self.normal_unit_cost * (ONE + self.daily_volatility * innovation)
+        ).quantize(DAILY_UNIT_COST_QUANTUM, rounding=ROUND_HALF_EVEN)
+
+    def incremental_cost(
+        self,
+        *,
+        daily_capacity: Decimal,
+        used_capacity: Decimal,
+        quantity: Decimal,
+        daily_base_unit_cost: Decimal,
+    ) -> Money:
+        """Charge the rounded cumulative-cost difference for one new batch."""
+        if not daily_capacity.is_finite() or daily_capacity <= ZERO:
+            raise ValueError("daily capacity must be positive and finite")
+        if not used_capacity.is_finite() or used_capacity < ZERO:
+            raise ValueError("used capacity must be nonnegative and finite")
+        _validate_operation_quantity(quantity)
+        if not daily_base_unit_cost.is_finite() or daily_base_unit_cost <= ZERO:
+            raise ValueError("daily base unit cost must be positive and finite")
+        if used_capacity + quantity > daily_capacity:
+            raise ValueError("production quantity exceeds remaining daily capacity")
+        return self._total_cost(
+            used_capacity + quantity,
+            daily_capacity,
+            daily_base_unit_cost,
+        ) - self._total_cost(
+            used_capacity,
+            daily_capacity,
+            daily_base_unit_cost,
+        )
+
+    def _total_cost(
+        self,
+        quantity: Decimal,
+        daily_capacity: Decimal,
+        daily_base_unit_cost: Decimal,
+    ) -> Money:
+        total = daily_base_unit_cost * quantity + (
+            self.curvature
+            * daily_base_unit_cost
+            * quantity**2
+            / (Decimal("2") * daily_capacity)
+        )
+        return total.quantize(OPERATION_COST_QUANTUM, rounding=ROUND_HALF_EVEN)
+
+
+class ProductiveOperation(StrictModel):
+    """Shared operating economics for production and transformation roles."""
+
+    capacity: CapacityFunction
+    cost: CostFunction
+
+
+class FarmOperation(ProductiveOperation):
     """Production capability composed into a farm company."""
 
     kind: Literal["farm"] = "farm"
     output_product: ProductId = ProductId.RAW_MILK
-    daily_capacity: PositiveQuantity
-    unit_cost: PositiveMoney
 
 
-class ProcessorOperation(StrictModel):
+class ProcessorOperation(ProductiveOperation):
     """Conversion capability composed into a processor company."""
 
     kind: Literal["processor"] = "processor"
     input_product: ProductId = ProductId.RAW_MILK
     output_product: ProductId = ProductId.BOTTLED_MILK
-    daily_input_capacity: PositiveQuantity
     yield_rate: PositiveQuantity
-    processing_cost_per_input: Money
 
 
 class RetailerOperation(StrictModel):
@@ -169,6 +344,35 @@ class CompanySpec(StrictModel):
     def tier(self) -> CompanyTier:
         """Return the value-chain tier implied by the operation."""
         return CompanyTier(self.operation.kind)
+
+
+class DailyOperationState(StrictModel):
+    """One operator's private daily economics and consumed capacity."""
+
+    company_id: CompanyId
+    availability: PositiveQuantity
+    daily_capacity: PositiveQuantity
+    daily_base_unit_cost: PositiveMoney
+    used_capacity: Quantity = ZERO
+
+    @model_validator(mode="after")
+    def validate_usage(self) -> Self:
+        """Keep consumed capacity inside today's realized limit."""
+        if self.used_capacity > self.daily_capacity:
+            raise ValueError("used capacity cannot exceed daily capacity")
+        return self
+
+    @property
+    def remaining_capacity(self) -> Quantity:
+        """Return capacity that remains available today."""
+        return self.daily_capacity - self.used_capacity
+
+    def consume(self, quantity: Decimal) -> DailyOperationState:
+        """Return the state after reserving capacity for one accepted batch."""
+        _validate_operation_quantity(quantity)
+        if quantity > self.remaining_capacity:
+            raise ValueError("consumed capacity exceeds the daily remainder")
+        return self.model_copy(update={"used_capacity": self.used_capacity + quantity})
 
 
 class DemandSpec(StrictModel):
@@ -265,6 +469,11 @@ class ScenarioSpec(StrictModel):
                 raise ValueError(f"{company.company_id} references an unknown product")
         return self
 
+    @property
+    def uses_event_runtime(self) -> bool:
+        """Return whether this scenario uses the event-driven runtime generation."""
+        return self.version >= 3
+
     def product(self, product_id: ProductId) -> ProductSpec:
         """Return one product specification by identity."""
         return next(product for product in self.products if product.product == product_id)
@@ -272,6 +481,15 @@ class ScenarioSpec(StrictModel):
     def company(self, company_id: str) -> CompanySpec:
         """Return one company specification by identity."""
         return next(company for company in self.companies if company.company_id == company_id)
+
+    @property
+    def productive_companies(self) -> tuple[CompanySpec, ...]:
+        """Return productive companies in canonical scenario order."""
+        return tuple(
+            company
+            for company in self.companies
+            if isinstance(company.operation, ProductiveOperation)
+        )
 
     def inventory_value(
         self,
@@ -333,6 +551,7 @@ class WorldState(StrictModel):
     seed: int
     day: int = Field(ge=0)
     companies: tuple[CompanyState, ...]
+    operation_states: tuple[DailyOperationState, ...]
     previous_markets: tuple[MarketSummary, ...] = ()
     next_lot_sequence: int = Field(default=1, ge=1)
 
@@ -345,6 +564,11 @@ class WorldState(StrictModel):
             raise ValueError("world state must match the scenario company set")
         if self.day > self.scenario.days:
             raise ValueError("world state exceeds the scenario duration")
+        expected_operators = tuple(
+            company.company_id for company in self.scenario.productive_companies
+        )
+        if tuple(state.company_id for state in self.operation_states) != expected_operators:
+            raise ValueError("world operation states must match productive companies")
         return self
 
 
@@ -372,6 +596,7 @@ class CompanyObservation(StrictModel):
     day: int = Field(ge=1)
     company_id: CompanyId
     operation: CompanyOperation
+    daily_operation: DailyOperationState | None = None
     products: tuple[ProductSpec, ...]
     demand: DemandSpec
     scoring: ScoringSpec
@@ -381,6 +606,18 @@ class CompanyObservation(StrictModel):
     previous_markets: tuple[MarketSummary, ...]
     runtime: RuntimeSpec = RuntimeSpec()
     retail_price: Money | None = None
+
+    @model_validator(mode="after")
+    def validate_daily_operation(self) -> Self:
+        """Expose daily economics exactly to productive companies themselves."""
+        productive = isinstance(self.operation, ProductiveOperation)
+        if productive != (self.daily_operation is not None):
+            raise ValueError("daily operation must match the company's productive role")
+        if self.daily_operation is not None and (
+            self.daily_operation.company_id != self.company_id
+        ):
+            raise ValueError("daily operation must belong to the observed company")
+        return self
 
     def quantity(self, product: ProductId) -> Decimal:
         """Return the observed total for a product."""

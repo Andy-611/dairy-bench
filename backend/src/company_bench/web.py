@@ -22,7 +22,7 @@ from company_bench.codex_artifacts import (
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
 from company_bench.codex_sessions import CodexSessionManager
 from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.models import (
     MAX_SEED,
     EpisodeResult,
@@ -49,7 +49,7 @@ from company_bench.timeline import (
 )
 from company_bench.timeline_models import TimelineDay, TimelineDetail
 
-DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench_v7.sqlite3"
+DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench_v8.sqlite3"
 
 
 class RunRequest(BaseModel):
@@ -98,7 +98,7 @@ def create_app(
             else None
         )
         active_factory = PolicyFactory(
-            scenario=DAIRY_S9_V3_SCENARIO,
+            scenario=DAIRY_S9_SCENARIO,
             audit_sink=active_repository,
             codex_config=codex_config,
             codex_gateway_factory=partial(
@@ -111,8 +111,8 @@ def create_app(
     else:
         active_factory = policy_factory
     active_scenario = active_factory.scenario
-    if active_scenario.version != 3:
-        raise ValueError("the web application requires an event-driven V3 scenario")
+    if not active_scenario.uses_event_runtime:
+        raise ValueError("the web application requires an event-driven scenario")
     runtime = EpisodeRuntime(
         active_scenario,
         agent_timeout_seconds=active_factory.policy_timeout_seconds,

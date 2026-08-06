@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import (
     ZERO,
@@ -20,10 +20,10 @@ from company_bench.scoring import Evaluator
 
 
 def _scenario(days: int = 1) -> ScenarioSpec:
-    return DAIRY_S9_V3_SCENARIO.model_copy(
+    return DAIRY_S9_SCENARIO.model_copy(
         update={
             "days": days,
-            "demand": DAIRY_S9_V3_SCENARIO.demand.model_copy(
+            "demand": DAIRY_S9_SCENARIO.demand.model_copy(
                 update={"shock_min": 0, "shock_max": 0}
             ),
         }

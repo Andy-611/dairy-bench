@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from company_bench.agents import BaselineCompanyAgent
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.memory import AgentCheckpoint
 from company_bench.models import (
@@ -48,10 +48,10 @@ from company_bench.scheduler import SchedulerCheckpoint
 def run_episode(seed: int = 42) -> EpisodeResult:
     """Create one real V3 episode through the public runtime interface."""
     agents = {
-        company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_V3_SCENARIO.companies
+        company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_SCENARIO.companies
     }
     execution = asyncio.run(
-        EpisodeRuntime(DAIRY_S9_V3_SCENARIO).run(
+        EpisodeRuntime(DAIRY_S9_SCENARIO).run(
             agents,
             seed,
             run_id=f"repository_{seed}",
@@ -190,7 +190,10 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute(
+            "SELECT schema_version FROM run_turns"
+        ).fetchone()[0] == 4
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
             "scenario_id",
@@ -214,8 +217,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8])
-def test_sqlite_repository_rejects_non_v7_databases(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 9])
+def test_sqlite_repository_rejects_non_v8_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -244,6 +247,7 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
+    assert checkpoint.schema_version == 6
 
     with SQLiteRunRepository(database) as repository:
         _assert_turn_contract(repository, first, second)
@@ -316,8 +320,8 @@ def _history_jobs() -> tuple[RunJob, ...]:
             mode=PolicyKind.BASELINE,
             status=status,
             seed=sequence,
-            scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
-            total_days=DAIRY_S9_V3_SCENARIO.days,
+            scenario_id=DAIRY_S9_SCENARIO.scenario_id,
+            total_days=DAIRY_S9_SCENARIO.days,
             submitted_at=submitted_at + timedelta(minutes=sequence),
         )
         for sequence, status in enumerate(RunStatus)
@@ -332,8 +336,8 @@ def _assert_replay_sources(repository: LifecycleRepository) -> tuple[ReplaySourc
         mode=PolicyKind.BASELINE,
         status=RunStatus.COMPLETED,
         seed=1,
-        scenario_id=DAIRY_S9_V3_SCENARIO.scenario_id,
-        total_days=DAIRY_S9_V3_SCENARIO.days,
+        scenario_id=DAIRY_S9_SCENARIO.scenario_id,
+        total_days=DAIRY_S9_SCENARIO.days,
         submitted_at=base_time,
     )
     newer = older.model_copy(
@@ -506,7 +510,7 @@ def _checkpoint_for(
 ) -> RunCheckpoint:
     """Build a complete, versioned recovery payload around one turn."""
     engine = EconomyEngine()
-    world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=42)
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return RunCheckpoint(
         run_id=record.run_id,
         episode_started_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -525,7 +529,7 @@ def _checkpoint_for(
                     else PolicyKind.BASELINE
                 ),
             )
-            for company in DAIRY_S9_V3_SCENARIO.companies
+            for company in DAIRY_S9_SCENARIO.companies
         ),
         agent_states=(
             AgentCheckpoint(
@@ -542,7 +546,7 @@ def _checkpoint_for(
                 company_id=company.company_id,
                 next_turn_sequence=(2 if company.company_id == observation.company_id else 1),
             )
-            for company in DAIRY_S9_V3_SCENARIO.companies
+            for company in DAIRY_S9_SCENARIO.companies
         ),
     )
 

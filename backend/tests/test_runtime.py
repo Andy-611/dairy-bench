@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from company_bench.agent_models import ModelOutputError
 from company_bench.agents import CompanyAgent, ReplayCompanyAgent
-from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
 from company_bench.models import (
     ConsumerSaleEvent,
     DeliveryCompletedEvent,
@@ -130,14 +130,14 @@ def _scenario(
         )
         if bottled_farm and company.company_id == "farm_a"
         else company
-        for company in (DAIRY_S9_V3_SCENARIO.company(item) for item in company_ids)
+        for company in (DAIRY_S9_SCENARIO.company(item) for item in company_ids)
     )
-    return DAIRY_S9_V3_SCENARIO.model_copy(
+    return DAIRY_S9_SCENARIO.model_copy(
         update={
             "scenario_id": "test.runtime.s3.v3",
             "days": 1,
             "companies": companies,
-            "runtime": DAIRY_S9_V3_SCENARIO.runtime.model_copy(
+            "runtime": DAIRY_S9_SCENARIO.runtime.model_copy(
                 update={"max_turns_per_company_day": max_turns}
             ),
         }

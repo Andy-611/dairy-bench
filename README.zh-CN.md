@@ -3,7 +3,7 @@
 Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark。三家牧场、
 三家加工厂和三家零售商共享两个现货市场，九家企业各由一个独立 Agent 控制。
 
-默认场景为 `flow.dairy.base.s9.v3`。一个 episode 持续 30 个模拟日，每次决策只
+默认场景为 `flow.dairy.base.s9.v4`。一个 episode 持续 30 个模拟日，每次决策只
 提交一条强类型原子命令：
 
 ```text
@@ -120,7 +120,7 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 
 ## 数据与验证
 
-默认 score-v7 数据库为 `backend/data/dairy_bench_v7.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
+默认 score-v8 数据库为 `backend/data/dairy_bench_v8.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
 路径，用 `DAIRY_BENCH_ARTIFACTS_DIR` 覆盖产物目录。
 
 ```powershell
