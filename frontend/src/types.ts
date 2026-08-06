@@ -233,21 +233,10 @@ export type TimelineCommandView =
       readonly inputQuantity: DecimalText;
     }
   | {
-      readonly kind: "place_order";
+      readonly kind: "set_quote_ladder";
       readonly side: "buy" | "sell";
       readonly product: string;
-      readonly quantity: DecimalText;
-      readonly limitPrice: DecimalText;
-    }
-  | {
-      readonly kind: "cancel_order";
-      readonly orderId: string;
-    }
-  | {
-      readonly kind: "replace_order";
-      readonly orderId: string;
-      readonly quantity: DecimalText;
-      readonly limitPrice: DecimalText;
+      readonly levels: readonly QuoteLevelView[];
     }
   | {
       readonly kind: "set_retail_price";
@@ -290,11 +279,12 @@ export type CommandStateChangeView =
 export interface ObservationFactsView {
   readonly cash: DecimalText;
   readonly reservedCash: DecimalText;
+  readonly markedSurplus: DecimalText;
   readonly inventory: Readonly<Record<string, DecimalText>>;
-  readonly reservedInventory: Readonly<Record<string, DecimalText>>;
+  readonly inventoryExpiry: readonly InventoryExpiryBucketView[];
   readonly retailPrice: DecimalText | null;
   readonly openOrders: readonly OpenOrderView[];
-  readonly marketViews: readonly MarketView[];
+  readonly orderBooks: readonly OrderBookView[];
   readonly pendingDeliveries: readonly IncomingDeliveryView[];
   readonly activeOperation: OperationJobView | null;
   readonly remainingOperationCapacity: DecimalText | null;
@@ -311,21 +301,47 @@ export interface OpenOrderView {
   readonly limitPrice: DecimalText;
   readonly placedAtMinute: number;
   readonly prioritySequence: number;
+  readonly queueAheadQuantity: DecimalText;
 }
 
 export interface PriceLevelView {
   readonly unitPrice: DecimalText;
   readonly quantity: DecimalText;
+  readonly orderCount: number;
 }
 
-export interface MarketView {
+export interface QuoteLevelView {
+  readonly quantity: DecimalText;
+  readonly limitPrice: DecimalText;
+}
+
+export interface QuoteLadderLevelResultView {
+  readonly level: QuoteLevelView;
+  readonly action: "keep" | "place" | "replace";
+  readonly orderId: string;
+  readonly replacedOrderId: string | null;
+  readonly prioritySequence: number;
+  readonly remainingQuantity: DecimalText;
+}
+
+export interface QuoteLadderResultView {
+  readonly levels: readonly QuoteLadderLevelResultView[];
+  readonly cancelledOrderIds: readonly string[];
+}
+
+export interface OrderBookView {
   readonly product: string;
-  readonly bestBid: DecimalText | null;
-  readonly bestAsk: DecimalText | null;
-  readonly topBids: readonly PriceLevelView[];
-  readonly topAsks: readonly PriceLevelView[];
+  readonly bids: readonly PriceLevelView[];
+  readonly asks: readonly PriceLevelView[];
   readonly lastTradePrice: DecimalText | null;
   readonly dailyVolume: DecimalText;
+}
+
+export interface InventoryExpiryBucketView {
+  readonly product: string;
+  readonly expiresEndOfDay: number;
+  readonly availableQuantity: DecimalText;
+  readonly reservedQuantity: DecimalText;
 }
 
 export interface MarketPriceLevelView {
@@ -374,10 +390,17 @@ export interface MarketOrderCancelledView {
   readonly cancelledOrder: OpenOrderView;
 }
 
+export interface MarketOrderKeptView {
+  readonly action: "keep";
+  readonly applySequence: number;
+  readonly preservedOrder: OpenOrderView;
+}
+
 export type MarketOrderFlowItemView =
   | MarketOrderPlacedView
   | MarketOrderReplacedView
-  | MarketOrderCancelledView;
+  | MarketOrderCancelledView
+  | MarketOrderKeptView;
 
 export interface TimelineTradeView {
   readonly applySequence: number;
@@ -474,7 +497,7 @@ export interface TurnTimelineItemView {
   readonly dispositionSource: CommandDispositionSource;
   readonly reason: string | null;
   readonly resultingStateVersion: number;
-  readonly outcomeOrderId: string | null;
+  readonly quoteLadderResult: QuoteLadderResultView | null;
   readonly outcomeJobId: string | null;
   readonly effects: readonly EconomicEffectView[];
   readonly stateChanges: readonly CommandStateChangeView[];

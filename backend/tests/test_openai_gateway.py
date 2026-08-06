@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Callable
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -18,8 +19,15 @@ from company_bench.agent_models import (
     ModelRequest,
     ModelResult,
 )
-from company_bench.models import CompanyObservation, FarmDecision
-from company_bench.runtime_models import AgentTurn, Produce, SimTime, WakeReason
+from company_bench.models import CompanyObservation, FarmDecision, ProductId
+from company_bench.runtime_models import (
+    AgentTurn,
+    MarketSide,
+    QuoteLevel,
+    SetQuoteLadder,
+    SimTime,
+    WakeReason,
+)
 
 type ResponseHandler = Callable[[httpx.Request], httpx.Response]
 
@@ -95,6 +103,7 @@ async def _generate_command(
             wake_reasons=(WakeReason.DAY_OPEN,),
             observation=observation,
             available_cash=observation.cash,
+            marked_surplus=Decimal(),
         )
         return await gateway.generate_command(
             CommandModelRequest(
@@ -103,7 +112,7 @@ async def _generate_command(
                 turn=turn,
                 instructions="Call exactly one tool.",
                 input_text=turn.model_dump_json(),
-                allowed_commands=("produce", "wait"),
+                allowed_commands=("produce", "set_quote_ladder", "wait"),
             )
         )
 
@@ -165,8 +174,13 @@ def _tool_response(
                 "id": "fc_test",
                 "type": "function_call",
                 "call_id": "call_test",
-                "name": "produce",
-                "arguments": '{"product":"raw_milk","quantity":"12"}',
+                "name": "set_quote_ladder",
+                "arguments": (
+                    '{"product":"raw_milk","side":"sell","levels":'
+                    '[{"quantity":"8","limit_price":"1.20"},'
+                    '{"quantity":"3","limit_price":"1.40"},'
+                    '{"quantity":"1","limit_price":"1.60"}]}'
+                ),
                 "status": "completed",
             }
         ]
@@ -275,13 +289,29 @@ def test_openai_gateway_uses_exactly_one_native_command_tool(
 
     result = asyncio.run(_generate_command(handler, first_observation))
 
-    assert result.command == Produce(product="raw_milk", quantity="12")
+    assert result.command == SetQuoteLadder(
+        product=ProductId.RAW_MILK,
+        side=MarketSide.SELL,
+        levels=(
+            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("1.20")),
+            QuoteLevel(quantity=Decimal("3"), limit_price=Decimal("1.40")),
+            QuoteLevel(quantity=Decimal("1"), limit_price=Decimal("1.60")),
+        ),
+    )
     assert result.response_id == "resp_tool"
     payload = requests[0]
     assert payload["parallel_tool_calls"] is False
     assert payload["max_tool_calls"] == 1
     assert payload["tool_choice"] == "required"
-    assert {tool["name"] for tool in payload["tools"]} == {"produce", "wait"}
+    assert {tool["name"] for tool in payload["tools"]} == {
+        "produce",
+        "set_quote_ladder",
+        "wait",
+    }
+    ladder = next(tool for tool in payload["tools"] if tool["name"] == "set_quote_ladder")
+    parameters = ladder["parameters"]
+    assert set(parameters["required"]) == {"product", "side", "levels"}
+    assert parameters["properties"]["levels"]["maxItems"] == 3
 
 
 @pytest.mark.parametrize(

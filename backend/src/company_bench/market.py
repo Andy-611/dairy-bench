@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Protocol, Self, TypeVar
 
 from pydantic import Field, model_validator
 
@@ -24,7 +24,18 @@ from company_bench.models import (
     StrictModel,
     WorldState,
 )
-from company_bench.runtime_models import MarketSide, MarketView, PriceLevel, SimTime
+from company_bench.runtime_models import (
+    MarketSide,
+    OpenOrderView,
+    OrderBookView,
+    PriceLevelView,
+    QuoteLadder,
+    QuoteLadderResult,
+    QuoteLevel,
+    QuoteLevelAction,
+    QuoteLevelResult,
+    SimTime,
+)
 
 __all__ = [
     "AssetLedger",
@@ -33,11 +44,101 @@ __all__ = [
     "LimitOrder",
     "MarketError",
     "MarketState",
+    "OrderIdentity",
+    "PriceTimeQueue",
+    "QuoteLadderExecution",
     "SellOrder",
     "TradeFill",
 ]
 
 TradeIdFactory = Callable[[int], Identifier]
+
+
+@dataclass(frozen=True, slots=True)
+class OrderIdentity:
+    """Engine-owned identity and FIFO sequence for one new order."""
+
+    order_id: Identifier
+    priority_sequence: int
+
+
+OrderIdentityFactory = Callable[[int], OrderIdentity]
+
+
+class _QueueOrder(Protocol):
+    """Structural fields required by price-time queue projection."""
+
+    order_id: Identifier
+    product: ProductId
+    side: MarketSide
+    remaining_quantity: PositiveQuantity
+    limit_price: PositiveMoney
+    placed_at: SimTime
+    priority_sequence: int
+
+
+_QueueOrderT = TypeVar("_QueueOrderT", bound=_QueueOrder)
+
+
+class PriceTimeQueue:
+    """Own the FIFO rule shared by matching and order-book projections."""
+
+    @staticmethod
+    def priority(order: _QueueOrder) -> tuple[int, int, str]:
+        """Return one order's time-priority key within a price level."""
+        return (
+            order.placed_at.absolute_minute,
+            order.priority_sequence,
+            order.order_id,
+        )
+
+    @classmethod
+    def quantity_ahead(
+        cls,
+        order: _QueueOrder,
+        candidates: Iterable[_QueueOrder],
+    ) -> Quantity:
+        """Sum active same-level quantity with earlier time priority."""
+        priority = cls.priority(order)
+        return sum(
+            (
+                candidate.remaining_quantity
+                for candidate in candidates
+                if candidate.product is order.product
+                and candidate.side is order.side
+                and candidate.limit_price == order.limit_price
+                and cls.priority(candidate) < priority
+            ),
+            start=ZERO,
+        )
+
+    @classmethod
+    def best_crossing(
+        cls,
+        incoming: _QueueOrder,
+        candidates: Iterable[_QueueOrderT],
+    ) -> _QueueOrderT | None:
+        """Select the executable maker by price and then FIFO priority."""
+        crossing = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.product is incoming.product
+            and candidate.side is not incoming.side
+            and (
+                incoming.limit_price >= candidate.limit_price
+                if incoming.side is MarketSide.BUY
+                else incoming.limit_price <= candidate.limit_price
+            )
+        )
+        if not crossing:
+            return None
+        return min(
+            crossing,
+            key=lambda order: (
+                order.limit_price if incoming.side is MarketSide.BUY else -order.limit_price,
+                *cls.priority(order),
+            ),
+        )
 
 
 class MarketError(ValueError):
@@ -111,11 +212,7 @@ class AssetLedger:
     def quantity(self, company_id: CompanyId, product: ProductId) -> Decimal:
         """Return currently available, unreserved on-hand inventory."""
         return sum(
-            (
-                lot.quantity
-                for lot in self._account(company_id).inventory
-                if lot.product is product
-            ),
+            (lot.quantity for lot in self._account(company_id).inventory if lot.product is product),
             start=ZERO,
         )
 
@@ -125,9 +222,7 @@ class AssetLedger:
         if amount < ZERO:
             raise MarketError("cash debit must be nonnegative")
         if amount > account.cash:
-            raise MarketError(
-                f"insufficient cash: requested {amount}, available {account.cash}"
-            )
+            raise MarketError(f"insufficient cash: requested {amount}, available {account.cash}")
         account.cash -= amount
 
     def credit_cash(self, company_id: CompanyId, amount: Decimal) -> None:
@@ -163,9 +258,7 @@ class AssetLedger:
         account.inventory = retained
         retained_ids = {lot.lot_id for lot in retained}
         return tuple(
-            lot.model_copy(
-                update={"lot_id": self._allocate_lot_id(company_id, "reserve")}
-            )
+            lot.model_copy(update={"lot_id": self._allocate_lot_id(company_id, "reserve")})
             if lot.lot_id in retained_ids
             else lot
             for lot in reserved
@@ -196,9 +289,7 @@ class AssetLedger:
         """Give dispatched lots globally unique buyer-side identities."""
         self._account(buyer_id)
         return tuple(
-            lot.model_copy(
-                update={"lot_id": self._allocate_lot_id(buyer_id, "trade")}
-            )
+            lot.model_copy(update={"lot_id": self._allocate_lot_id(buyer_id, "trade")})
             for lot in lots
         )
 
@@ -304,6 +395,23 @@ class SellOrder(_BaseOrder):
 type LimitOrder = Annotated[BuyOrder | SellOrder, Field(discriminator="side")]
 
 
+@dataclass(frozen=True, slots=True)
+class _QuotePlanLevel:
+    """One deterministic target-to-existing reconciliation decision."""
+
+    level: QuoteLevel
+    action: QuoteLevelAction
+    prior_order: LimitOrder | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _QuotePlan:
+    """Complete staged mutation plan for one company-side ladder."""
+
+    levels: tuple[_QuotePlanLevel, ...]
+    cancelled_orders: tuple[LimitOrder, ...]
+
+
 class TradeFill(StrictModel):
     """One maker-priced fill and its dispatched buyer-side lots."""
 
@@ -330,6 +438,14 @@ class TradeFill(StrictModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class QuoteLadderExecution:
+    """Atomic ladder result plus every immediate fill."""
+
+    result: QuoteLadderResult
+    fills: tuple[TradeFill, ...]
+
+
 class MarketState(StrictModel):
     """Complete immutable state of one continuous product market."""
 
@@ -351,6 +467,16 @@ class MarketState(StrictModel):
             raise ValueError("market priority sequences must be unique")
         if any(order.product is not self.product for order in self.orders):
             raise ValueError("every order must match the market product")
+        ladders: dict[tuple[CompanyId, MarketSide], list[LimitOrder]] = {}
+        for order in self.orders:
+            ladders.setdefault((order.owner_id, order.side), []).append(order)
+        if any(len(orders) > 3 for orders in ladders.values()):
+            raise ValueError("a company quote ladder cannot exceed three levels")
+        if any(
+            len({order.limit_price for order in orders}) != len(orders)
+            for orders in ladders.values()
+        ):
+            raise ValueError("a company quote ladder cannot repeat a price")
         reserved_lot_ids = [
             lot.lot_id
             for order in self.orders
@@ -373,18 +499,22 @@ class MarketState(StrictModel):
             raise ValueError("a continuous order book cannot remain crossed")
         return self
 
-    def view(self) -> MarketView:
-        """Project anonymous top-of-book depth without rebuilding an asset ledger."""
-        bids = _price_levels(self.orders, MarketSide.BUY)[:3]
-        asks = _price_levels(self.orders, MarketSide.SELL)[:3]
-        return MarketView(
+    def view(self) -> OrderBookView:
+        """Project complete anonymous depth without rebuilding an asset ledger."""
+        return OrderBookView(
             product=self.product,
-            best_bid=bids[0].unit_price if bids else None,
-            best_ask=asks[0].unit_price if asks else None,
-            top_bids=bids,
-            top_asks=asks,
+            bids=_price_levels(self.orders, MarketSide.BUY),
+            asks=_price_levels(self.orders, MarketSide.SELL),
             last_trade_price=self.last_trade_price,
             daily_volume=self.volume,
+        )
+
+    def company_order_views(self, company_id: CompanyId) -> tuple[OpenOrderView, ...]:
+        """Project one company's active orders with current queue depth."""
+        return tuple(
+            _open_order_view(order, self.orders)
+            for order in self.orders
+            if order.owner_id == company_id
         )
 
 
@@ -411,12 +541,100 @@ class ContinuousSpotMarket:
         """Return the current immutable market state."""
         return self._state
 
-    @property
-    def assets(self) -> AssetLedger:
-        """Return the transaction-local asset ledger shared by product markets."""
-        return self._assets
+    def set_quote_ladder(
+        self,
+        *,
+        owner_id: CompanyId,
+        ladder: QuoteLadder,
+        placed_at: SimTime,
+        order_identity_factory: OrderIdentityFactory,
+        trade_id_factory: TradeIdFactory,
+    ) -> QuoteLadderExecution:
+        """Reconcile one target ladder atomically, preserving exact quotes."""
+        self._require_open()
+        staged_assets = self._assets.clone()
+        staged = ContinuousSpotMarket(self._state, staged_assets)
+        plan = staged._quote_plan(owner_id, ladder.side, ladder.levels)
+        retired = (
+            *(
+                level.prior_order
+                for level in plan.levels
+                if level.action is QuoteLevelAction.REPLACE and level.prior_order is not None
+            ),
+            *plan.cancelled_orders,
+        )
+        for order in retired:
+            staged._cancel(order_id=order.order_id, owner_id=owner_id)
+        staged._require_ladder_collateral(owner_id, ladder.side, plan.levels)
 
-    def place(
+        fills: list[TradeFill] = []
+        results: list[QuoteLevelResult] = []
+        new_order_count = 0
+        for target in plan.levels:
+            prior = target.prior_order
+            if target.action is QuoteLevelAction.KEEP:
+                if prior is None:
+                    raise RuntimeError("kept quote has no prior order")
+                results.append(
+                    QuoteLevelResult(
+                        level=target.level,
+                        action=target.action,
+                        order_id=prior.order_id,
+                        priority_sequence=prior.priority_sequence,
+                        remaining_quantity=prior.remaining_quantity,
+                    )
+                )
+                continue
+
+            new_order_count += 1
+            identity = order_identity_factory(new_order_count)
+            fill_offset = len(fills)
+            fills.extend(
+                staged._place(
+                    order_id=identity.order_id,
+                    owner_id=owner_id,
+                    side=ladder.side,
+                    quantity=target.level.quantity,
+                    limit_price=target.level.limit_price,
+                    placed_at=placed_at,
+                    priority_sequence=identity.priority_sequence,
+                    trade_id_factory=lambda offset, base=fill_offset: trade_id_factory(
+                        base + offset
+                    ),
+                )
+            )
+            remaining = next(
+                (
+                    order.remaining_quantity
+                    for order in staged.state.orders
+                    if order.order_id == identity.order_id
+                ),
+                ZERO,
+            )
+            results.append(
+                QuoteLevelResult(
+                    level=target.level,
+                    action=target.action,
+                    order_id=identity.order_id,
+                    replaced_order_id=(
+                        prior.order_id
+                        if target.action is QuoteLevelAction.REPLACE and prior is not None
+                        else None
+                    ),
+                    priority_sequence=identity.priority_sequence,
+                    remaining_quantity=remaining,
+                )
+            )
+
+        result = QuoteLadderResult(
+            levels=tuple(results),
+            cancelled_order_ids=tuple(order.order_id for order in plan.cancelled_orders),
+        )
+        self._assets._commit_from(staged_assets)
+        self._state = staged.state
+        return QuoteLadderExecution(result=result, fills=tuple(fills))
+
+    def _place(
         self,
         *,
         order_id: Identifier,
@@ -428,7 +646,7 @@ class ContinuousSpotMarket:
         priority_sequence: int,
         trade_id_factory: TradeIdFactory,
     ) -> tuple[TradeFill, ...]:
-        """Reserve an exact order, match immediately, and rest any remainder."""
+        """Reserve one exact order, match immediately, and rest any remainder."""
         self._require_open()
         self._require_new_identity(order_id, priority_sequence)
         self._reject_self_cross(owner_id, side, limit_price)
@@ -443,38 +661,7 @@ class ContinuousSpotMarket:
         )
         return self._match(order, trade_id_factory)
 
-    def replace(
-        self,
-        *,
-        old_order_id: Identifier,
-        owner_id: CompanyId,
-        new_order_id: Identifier,
-        quantity: OrderQuantity,
-        limit_price: Decimal,
-        placed_at: SimTime,
-        priority_sequence: int,
-        trade_id_factory: TradeIdFactory,
-    ) -> tuple[TradeFill, ...]:
-        """Stage cancel-and-place atomically, losing the old time priority."""
-        staged_assets = self._assets.clone()
-        staged = ContinuousSpotMarket(self._state, staged_assets)
-        old = staged._owned_order(old_order_id, owner_id)
-        staged.cancel(order_id=old_order_id, owner_id=owner_id)
-        fills = staged.place(
-            order_id=new_order_id,
-            owner_id=owner_id,
-            side=old.side,
-            quantity=quantity,
-            limit_price=limit_price,
-            placed_at=placed_at,
-            priority_sequence=priority_sequence,
-            trade_id_factory=trade_id_factory,
-        )
-        self._assets._commit_from(staged_assets)
-        self._state = staged.state
-        return fills
-
-    def cancel(self, *, order_id: Identifier, owner_id: CompanyId) -> LimitOrder:
+    def _cancel(self, *, order_id: Identifier, owner_id: CompanyId) -> LimitOrder:
         """Cancel one owned order and release its full remaining collateral."""
         self._require_open()
         order = self._owned_order(order_id, owner_id)
@@ -482,13 +669,101 @@ class ContinuousSpotMarket:
         self._state = self._state.model_copy(
             update={
                 "orders": tuple(
-                    candidate
-                    for candidate in self._state.orders
-                    if candidate.order_id != order_id
+                    candidate for candidate in self._state.orders if candidate.order_id != order_id
                 )
             }
         )
         return order
+
+    def _quote_plan(
+        self,
+        owner_id: CompanyId,
+        side: MarketSide,
+        levels: tuple[QuoteLevel, ...],
+    ) -> _QuotePlan:
+        """Pair target levels with existing quotes using one stable convention."""
+        existing = sorted(
+            (
+                order
+                for order in self._state.orders
+                if order.owner_id == owner_id and order.side is side
+            ),
+            key=lambda order: (
+                -order.limit_price if side is MarketSide.BUY else order.limit_price,
+                *PriceTimeQueue.priority(order),
+            ),
+        )
+        planned: list[_QuotePlanLevel | None] = [None] * len(levels)
+
+        for index, level in enumerate(levels):
+            prior = _pop_matching_order(
+                existing,
+                lambda order, target=level: (
+                    order.limit_price == target.limit_price
+                    and order.remaining_quantity == target.quantity
+                ),
+            )
+            if prior is not None:
+                planned[index] = _QuotePlanLevel(level, QuoteLevelAction.KEEP, prior)
+
+        for index, level in enumerate(levels):
+            if planned[index] is not None:
+                continue
+            prior = _pop_matching_order(
+                existing,
+                lambda order, target=level: order.limit_price == target.limit_price,
+            )
+            if prior is not None:
+                planned[index] = _QuotePlanLevel(level, QuoteLevelAction.REPLACE, prior)
+
+        unmatched_indices = [index for index, item in enumerate(planned) if item is None]
+        paired_count = min(len(unmatched_indices), len(existing))
+        for index, prior in zip(
+            unmatched_indices[:paired_count],
+            existing[:paired_count],
+            strict=True,
+        ):
+            planned[index] = _QuotePlanLevel(
+                levels[index],
+                QuoteLevelAction.REPLACE,
+                prior,
+            )
+        for index in unmatched_indices[paired_count:]:
+            planned[index] = _QuotePlanLevel(levels[index], QuoteLevelAction.PLACE)
+        return _QuotePlan(
+            levels=tuple(item for item in planned if item is not None),
+            cancelled_orders=tuple(existing[paired_count:]),
+        )
+
+    def _require_ladder_collateral(
+        self,
+        owner_id: CompanyId,
+        side: MarketSide,
+        levels: tuple[_QuotePlanLevel, ...],
+    ) -> None:
+        """Preflight aggregate collateral after all changed quotes are released."""
+        changed = tuple(
+            level.level for level in levels if level.action is not QuoteLevelAction.KEEP
+        )
+        if side is MarketSide.BUY:
+            required = sum(
+                (level.quantity * level.limit_price for level in changed),
+                start=ZERO,
+            )
+            available = self._assets.cash(owner_id)
+            if required > available:
+                raise MarketError(
+                    f"insufficient cash for quote ladder: required {required}, "
+                    f"available {available}"
+                )
+            return
+        required = sum((level.quantity for level in changed), start=ZERO)
+        available = self._assets.quantity(owner_id, self._state.product)
+        if required > available:
+            raise MarketError(
+                f"insufficient inventory for quote ladder: requested {required}, "
+                f"available {available}"
+            )
 
     def close(self) -> tuple[LimitOrder, ...]:
         """Close the market and release every resting commitment."""
@@ -499,8 +774,8 @@ class ContinuousSpotMarket:
         self._state = self._state.model_copy(update={"is_open": False, "orders": ()})
         return released
 
-    def view(self) -> MarketView:
-        """Return best prices and the top three anonymous depth levels."""
+    def view(self) -> OrderBookView:
+        """Return all anonymous public price levels."""
         return self._state.view()
 
     def _reserve_order(
@@ -548,7 +823,10 @@ class ContinuousSpotMarket:
         last_trade_price = self._state.last_trade_price
 
         active: LimitOrder | None = incoming
-        while active is not None and (resting := _best_crossing(active, orders)) is not None:
+        while (
+            active is not None
+            and (resting := PriceTimeQueue.best_crossing(active, orders)) is not None
+        ):
             quantity = min(active.remaining_quantity, resting.remaining_quantity)
             price = resting.limit_price
             buyer = active if isinstance(active, BuyOrder) else resting
@@ -579,13 +857,9 @@ class ContinuousSpotMarket:
             traded_value += value
             last_trade_price = price
 
-            updated_resting = (
-                updated_buyer if isinstance(resting, BuyOrder) else updated_seller
-            )
+            updated_resting = updated_buyer if isinstance(resting, BuyOrder) else updated_seller
             _update_resting(orders, resting.order_id, updated_resting)
-            updated_incoming = (
-                updated_buyer if isinstance(active, BuyOrder) else updated_seller
-            )
+            updated_incoming = updated_buyer if isinstance(active, BuyOrder) else updated_seller
             active = updated_incoming
 
         if active is not None:
@@ -646,6 +920,17 @@ class ContinuousSpotMarket:
             raise MarketError("self-crossing orders are not allowed")
 
 
+def _pop_matching_order(
+    orders: list[LimitOrder],
+    predicate: Callable[[LimitOrder], bool],
+) -> LimitOrder | None:
+    """Remove and return the first deterministically ordered match."""
+    for index, order in enumerate(orders):
+        if predicate(order):
+            return orders.pop(index)
+    return None
+
+
 def _take_fefo(
     lots: Iterable[InventoryLot],
     product: ProductId,
@@ -681,9 +966,7 @@ def _fill_buy_order(
             raise RuntimeError("filled buy order retained cash")
         return None, refund
     return (
-        order.model_copy(
-            update={"remaining_quantity": remaining, "reserved_cash": reserved}
-        ),
+        order.model_copy(update={"remaining_quantity": remaining, "reserved_cash": reserved}),
         refund,
     )
 
@@ -706,26 +989,6 @@ def _fill_sell_order(
     )
 
 
-def _best_crossing(
-    incoming: LimitOrder,
-    orders: list[LimitOrder],
-) -> LimitOrder | None:
-    candidates = [order for order in orders if _crosses(incoming, order)]
-    if not candidates:
-        return None
-    if isinstance(incoming, BuyOrder):
-        return min(candidates, key=_ask_priority)
-    return min(candidates, key=_bid_priority)
-
-
-def _crosses(incoming: LimitOrder, resting: LimitOrder) -> bool:
-    if incoming.side is resting.side:
-        return False
-    if isinstance(incoming, BuyOrder):
-        return incoming.limit_price >= resting.limit_price
-    return incoming.limit_price <= resting.limit_price
-
-
 def _update_resting(
     orders: list[LimitOrder],
     order_id: Identifier,
@@ -741,17 +1004,38 @@ def _update_resting(
 def _price_levels(
     orders: tuple[LimitOrder, ...],
     side: MarketSide,
-) -> tuple[PriceLevel, ...]:
-    quantities: dict[Decimal, Decimal] = {}
+) -> tuple[PriceLevelView, ...]:
+    orders_by_price: dict[Decimal, list[LimitOrder]] = {}
     for order in orders:
         if order.side is side:
-            quantities[order.limit_price] = (
-                quantities.get(order.limit_price, ZERO) + order.remaining_quantity
-            )
-    reverse = side is MarketSide.BUY
+            orders_by_price.setdefault(order.limit_price, []).append(order)
     return tuple(
-        PriceLevel(unit_price=price, quantity=quantities[price])
-        for price in sorted(quantities, reverse=reverse)
+        PriceLevelView(
+            unit_price=price,
+            quantity=sum(
+                (order.remaining_quantity for order in orders_by_price[price]),
+                start=ZERO,
+            ),
+            order_count=len(orders_by_price[price]),
+        )
+        for price in sorted(orders_by_price, reverse=side is MarketSide.BUY)
+    )
+
+
+def _open_order_view(
+    order: LimitOrder,
+    candidates: Iterable[LimitOrder],
+) -> OpenOrderView:
+    return OpenOrderView(
+        order_id=order.order_id,
+        owner_id=order.owner_id,
+        side=order.side,
+        product=order.product,
+        remaining_quantity=order.remaining_quantity,
+        limit_price=order.limit_price,
+        placed_at=order.placed_at,
+        priority_sequence=order.priority_sequence,
+        queue_ahead_quantity=PriceTimeQueue.quantity_ahead(order, candidates),
     )
 
 
@@ -768,28 +1052,5 @@ def _lot_priority(lot: InventoryLot) -> tuple[int, int, str, str]:
     )
 
 
-def _ask_priority(order: LimitOrder) -> tuple[Decimal, int, int, str]:
-    return (
-        order.limit_price,
-        order.placed_at.absolute_minute,
-        order.priority_sequence,
-        order.order_id,
-    )
-
-
-def _bid_priority(order: LimitOrder) -> tuple[Decimal, int, int, str]:
-    return (
-        -order.limit_price,
-        order.placed_at.absolute_minute,
-        order.priority_sequence,
-        order.order_id,
-    )
-
-
 def _book_storage_priority(order: LimitOrder) -> tuple[str, int, int, str]:
-    return (
-        order.side.value,
-        order.placed_at.absolute_minute,
-        order.priority_sequence,
-        order.order_id,
-    )
+    return (order.side.value, *PriceTimeQueue.priority(order))

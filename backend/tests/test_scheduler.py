@@ -12,14 +12,14 @@ from company_bench.models import (
 )
 from company_bench.runtime_models import (
     AgentTurn,
-    CancelOrder,
     CommandEnvelope,
     CommandOutcome,
     CommandStatus,
     CompanyCommand,
     MarketSide,
-    PlaceOrder,
     Produce,
+    QuoteLevel,
+    SetQuoteLadder,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -46,19 +46,23 @@ def test_company_command_is_discriminated_and_identity_free() -> None:
     adapter = TypeAdapter(CompanyCommand)
     command = adapter.validate_python(
         {
-            "kind": "place_order",
+            "kind": "set_quote_ladder",
             "side": "buy",
             "product": "raw_milk",
-            "quantity": "12.5",
-            "limit_price": "4.20",
+            "levels": [
+                {"quantity": "7.5", "limit_price": "4.20"},
+                {"quantity": "5", "limit_price": "4.00"},
+            ],
         }
     )
 
-    assert command == PlaceOrder(
-        side=MarketSide.BUY,
+    assert command == SetQuoteLadder(
         product="raw_milk",
-        quantity=Decimal("12.5"),
-        limit_price=Decimal("4.20"),
+        side=MarketSide.BUY,
+        levels=(
+            QuoteLevel(quantity=Decimal("7.5"), limit_price=Decimal("4.20")),
+            QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("4.00")),
+        ),
     )
     with pytest.raises(ValidationError):
         adapter.validate_python(
@@ -87,31 +91,10 @@ def test_order_quantity_rejects_dust_and_excess_precision(quantity: str) -> None
         require_order_quantity(Decimal(quantity))
 
 
-@pytest.mark.parametrize(
-    "payload",
-    (
-        {
-            "kind": "place_order",
-            "side": "buy",
-            "product": "raw_milk",
-            "quantity": "59.98181",
-            "limit_price": "1.50",
-        },
-        {
-            "kind": "replace_order",
-            "order_id": "order_1",
-            "quantity": "0.00019",
-            "limit_price": "1.50",
-        },
-    ),
-)
-def test_historical_unquantized_commands_remain_deserializable(
-    payload: dict[str, str],
-) -> None:
-    """Raw audit commands stay readable; execution applies the new invariant."""
-    command = TypeAdapter(CompanyCommand).validate_python(payload)
-
-    assert command.quantity == Decimal(payload["quantity"])
+@pytest.mark.parametrize("kind", ("place_order", "replace_order", "cancel_order"))
+def test_removed_imperative_order_commands_are_rejected(kind: str) -> None:
+    with pytest.raises(ValidationError, match="Input tag"):
+        TypeAdapter(CompanyCommand).validate_python({"kind": kind})
 
 
 @pytest.mark.parametrize(
@@ -132,15 +115,16 @@ def test_historical_unquantized_commands_remain_deserializable(
         ),
         (
             {
-                "kind": "place_order",
+                "kind": "set_quote_ladder",
                 "side": "sell",
                 "product": "bottled_milk",
-                "quantity": "5",
-                "limit_price": "7",
+                "levels": [
+                    {"quantity": "3", "limit_price": "7"},
+                    {"quantity": "2", "limit_price": "8"},
+                ],
             },
-            PlaceOrder,
+            SetQuoteLadder,
         ),
-        ({"kind": "cancel_order", "order_id": "order_1"}, CancelOrder),
         (
             {
                 "kind": "set_retail_price",
@@ -175,6 +159,7 @@ def test_turn_record_requires_runtime_identity_consistency(
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=first_observation.model_copy(update={"company_id": "farm_a"}),
         available_cash=first_observation.cash,
+        marked_surplus=Decimal(),
     )
     envelope = CommandEnvelope(
         turn_id="turn_1",
@@ -265,8 +250,7 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
         SystemEventKind.DAY_CLOSE,
     )
     system_events = tuple(
-        scheduler.schedule_system(kind, at, event_id=kind.value)
-        for kind in system_kinds
+        scheduler.schedule_system(kind, at, event_id=kind.value) for kind in system_kinds
     )
     merged = scheduler.schedule_wake(
         "processor_a",

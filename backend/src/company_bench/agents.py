@@ -40,8 +40,9 @@ from company_bench.runtime_models import (
     AgentTurn,
     CompanyCommand,
     MarketSide,
-    PlaceOrder,
     Produce,
+    QuoteLevel,
+    SetQuoteLadder,
     SetRetailPrice,
     Transform,
     TurnRecord,
@@ -49,7 +50,7 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.1"
+COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.4"
 
 
 class CompanyAgent(Protocol):
@@ -304,7 +305,7 @@ class BaselineCompanyAgent:
 
     metadata = PolicyMetadata(
         name="event-baseline",
-        version="3",
+        version="4",
         kind=PolicyKind.BASELINE,
     )
 
@@ -331,21 +332,13 @@ class BaselineCompanyAgent:
                 product=operation.output_product,
                 quantity=min(capacity, Decimal("50")),
             )
-        if _has_order(turn, MarketSide.SELL, operation.output_product):
-            return Wait()
-        quantity = _floor_order_quantity(
-            min(turn.observation.quantity(operation.output_product), Decimal("50"))
+        command = _sell_ladder(
+            turn,
+            operation.output_product,
+            Decimal("50"),
+            (Decimal("1.20"), Decimal("1.40"), Decimal("1.60")),
         )
-        return (
-            PlaceOrder(
-                side=MarketSide.SELL,
-                product=operation.output_product,
-                quantity=quantity,
-                limit_price=Decimal("1.40"),
-            )
-            if quantity > 0
-            else Wait()
-        )
+        return command or Wait()
 
     @staticmethod
     def _processor_command(turn: AgentTurn) -> CompanyCommand:
@@ -363,46 +356,30 @@ class BaselineCompanyAgent:
                     Decimal("50"),
                 ),
             )
-        bottled = _floor_order_quantity(
-            min(
-                turn.observation.quantity(operation.output_product),
-                Decimal("40"),
-            )
-        )
-        if bottled > 0 and not _has_order(
+        sell_command = _sell_ladder(
             turn,
-            MarketSide.SELL,
             operation.output_product,
-        ):
-            return PlaceOrder(
-                side=MarketSide.SELL,
-                product=operation.output_product,
-                quantity=bottled,
-                limit_price=Decimal("2.50"),
-            )
+            Decimal("40"),
+            (Decimal("2.50"), Decimal("2.65"), Decimal("2.80")),
+        )
+        if sell_command is not None:
+            return sell_command
         order_quantity = _floor_order_quantity(
             min(
                 Decimal("50"),
                 max(
                     Decimal("0"),
-                    capacity
-                    - raw_quantity
-                    - _pending_quantity(turn, operation.input_product),
+                    capacity - raw_quantity - _pending_quantity(turn, operation.input_product),
                 ),
             )
         )
-        if order_quantity > 0 and not _has_order(
+        buy_command = _buy_ladder(
             turn,
-            MarketSide.BUY,
             operation.input_product,
-        ):
-            return PlaceOrder(
-                side=MarketSide.BUY,
-                product=operation.input_product,
-                quantity=order_quantity,
-                limit_price=Decimal("1.60"),
-            )
-        return Wait()
+            order_quantity,
+            (Decimal("1.60"), Decimal("1.50"), Decimal("1.40")),
+        )
+        return buy_command or Wait()
 
     @staticmethod
     def _retailer_command(turn: AgentTurn) -> CompanyCommand:
@@ -421,18 +398,13 @@ class BaselineCompanyAgent:
                 - _pending_quantity(turn, operation.input_product),
             )
         )
-        if order_quantity > 0 and not _has_order(
+        command = _buy_ladder(
             turn,
-            MarketSide.BUY,
             operation.input_product,
-        ):
-            return PlaceOrder(
-                side=MarketSide.BUY,
-                product=operation.input_product,
-                quantity=order_quantity,
-                limit_price=Decimal("2.80"),
-            )
-        return Wait()
+            order_quantity,
+            (Decimal("2.80"), Decimal("2.65"), Decimal("2.50")),
+        )
+        return command or Wait()
 
 
 class ReplayCompanyAgent:
@@ -452,7 +424,7 @@ class ReplayCompanyAgent:
             raise ValueError("replay requires one nonempty source run journal")
         self.metadata = PolicyMetadata(
             name="turn-replay",
-            version="3",
+            version="4",
             kind=PolicyKind.REPLAY,
             source_run_id=source_run_ids.pop(),
         )
@@ -529,14 +501,12 @@ def _allowed_commands(turn: AgentTurn) -> tuple[CommandName, ...]:
     """Expose only commands authorized for the observed company role."""
     operation = turn.observation.operation
     if isinstance(operation, FarmOperation):
-        return ("produce", "place_order", "replace_order", "cancel_order", "wait")
+        return ("produce", "set_quote_ladder", "wait")
     if isinstance(operation, ProcessorOperation):
-        return ("transform", "place_order", "replace_order", "cancel_order", "wait")
+        return ("transform", "set_quote_ladder", "wait")
     if isinstance(operation, RetailerOperation):
         return (
-            "place_order",
-            "replace_order",
-            "cancel_order",
+            "set_quote_ladder",
             "set_retail_price",
             "wait",
         )
@@ -548,18 +518,32 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
     commands = ", ".join(allowed)
     return (
         "You are the sole Agent for one dairy company in a continuous spot market. "
+        "Your sole objective is to maximize your own company's profit. "
         "Orders lock real cash or FEFO inventory, crossing quotes trade immediately at "
         "the resting price, and purchases arrive after 30 virtual minutes. Production "
         "and transformation also complete asynchronously while market commands remain "
-        "available. Use only supplied facts and submit exactly one atomic command; never "
+        "available. Order books list every anonymous price level with aggregate quantity "
+        "and order_count. queue_ahead_quantity is the same-price quantity ahead of your "
+        "order. "
+        "inventory_expiry splits owned spot inventory into available and reserved "
+        "quantities by expiry; in-transit lots remain in pending_deliveries. "
+        "marked_surplus is guaranteed marked asset value minus initial cash, including "
+        "reserved assets, pending deliveries, and active-operation output at reference "
+        "values. Use only supplied facts and submit exactly one atomic command; never "
         "invent identity, time, or state version. Every order quantity must be at least "
         f"{QUANTITY_QUANTUM} and use at most four decimal places (an exact multiple of "
-        f"{QUANTITY_QUANTUM}); never submit a dust quantity. Replacing an order loses its "
-        "former time priority. Use wait when no action is justified: set until to null to "
+        f"{QUANTITY_QUANTUM}); never submit a dust quantity. set_quote_ladder declares "
+        "the complete target state for one product and side: use zero to three unique "
+        "levels ordered best-to-worst (buy prices descending, sell prices ascending), "
+        "and use [] to cancel that ladder. The complete update is atomic. Exact unchanged "
+        "price-quantity levels keep their order identity and priority; every changed level "
+        "loses its old priority. Total asks require real inventory and total bids require "
+        "real cash collateral. Use wait when no action is justified: set until to null to "
         "use the runtime's bounded fallback review when it remains before market close, or "
         "select an earlier deadline within max_wait_minutes. Set alerts to [] when no price "
-        "condition is needed; otherwise provide up to three OR price alerts over "
-        "visible best_bid or best_ask values; every alert must still be false when armed. "
+        "condition is needed; otherwise provide up to three OR price alerts over the "
+        "best visible quote: bids[0].unit_price for best_bid or asks[0].unit_price for "
+        "best_ask. Every alert must still be false when armed. "
         "Background monitoring consumes no turn, but every model call counts against the "
         "daily turn budget supplied in the turn. Do not poll for ordinary quote changes. "
         f"Authorized commands: {commands}."
@@ -571,21 +555,98 @@ def _floor_order_quantity(value: Decimal) -> Decimal:
     return value.quantize(QUANTITY_QUANTUM, rounding=ROUND_DOWN)
 
 
-def _has_order(
+def _sell_ladder(
+    turn: AgentTurn,
+    product: ProductId,
+    limit: Decimal,
+    prices: tuple[Decimal, ...],
+) -> SetQuoteLadder | None:
+    """Quote available plus already-reserved stock without ladder oscillation."""
+    reserved = sum(
+        (
+            order.remaining_quantity
+            for order in turn.open_orders
+            if order.side is MarketSide.SELL and order.product is product
+        ),
+        start=Decimal(),
+    )
+    quantity = min(limit, turn.observation.quantity(product) + reserved)
+    return _target_ladder(turn, MarketSide.SELL, product, quantity, prices)
+
+
+def _buy_ladder(
+    turn: AgentTurn,
+    product: ProductId,
+    quantity: Decimal,
+    prices: tuple[Decimal, ...],
+) -> SetQuoteLadder | None:
+    """Quote a stock gap within conservative full-collateral buying power."""
+    buying_power = turn.available_cash + turn.reserved_cash
+    affordable = _floor_order_quantity(buying_power / prices[0])
+    return _target_ladder(
+        turn,
+        MarketSide.BUY,
+        product,
+        min(quantity, affordable),
+        prices,
+    )
+
+
+def _target_ladder(
     turn: AgentTurn,
     side: MarketSide,
     product: ProductId,
-) -> bool:
-    return any(order.side is side and order.product is product for order in turn.open_orders)
+    quantity: Decimal,
+    prices: tuple[Decimal, ...],
+) -> SetQuoteLadder | None:
+    """Return only a materially different target ladder."""
+    levels = _split_ladder(quantity, prices)
+    existing = tuple(
+        sorted(
+            (
+                order
+                for order in turn.open_orders
+                if order.side is side and order.product is product
+            ),
+            key=lambda order: order.limit_price,
+            reverse=side is MarketSide.BUY,
+        )
+    )
+    if len(existing) == len(levels) and all(
+        order.remaining_quantity == level.quantity and order.limit_price == level.limit_price
+        for order, level in zip(existing, levels, strict=True)
+    ):
+        return None
+    return SetQuoteLadder(product=product, side=side, levels=levels)
+
+
+def _split_ladder(
+    quantity: Decimal,
+    prices: tuple[Decimal, ...],
+) -> tuple[QuoteLevel, ...]:
+    """Split one feasible total across up to three 40/40/20 target levels."""
+    total = _floor_order_quantity(quantity)
+    if total <= 0:
+        return ()
+    count = min(len(prices), int(total / QUANTITY_QUANTUM))
+    if count == 1:
+        quantities = (total,)
+    elif count == 2:
+        first = _floor_order_quantity(total / 2)
+        quantities = (first, total - first)
+    else:
+        first = _floor_order_quantity(total * Decimal("0.4"))
+        second = _floor_order_quantity(total * Decimal("0.4"))
+        quantities = (first, second, total - first - second)
+    return tuple(
+        QuoteLevel(quantity=level_quantity, limit_price=price)
+        for price, level_quantity in zip(prices, quantities, strict=False)
+    )
 
 
 def _pending_quantity(turn: AgentTurn, product: ProductId) -> Decimal:
     return sum(
-        (
-            delivery.quantity
-            for delivery in turn.pending_deliveries
-            if delivery.product is product
-        ),
+        (delivery.quantity for delivery in turn.pending_deliveries if delivery.product is product),
         start=Decimal("0"),
     )
 

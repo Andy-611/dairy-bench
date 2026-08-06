@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self
 
@@ -14,8 +15,8 @@ from company_bench.models import (
     DomainEvent,
     EventRecord,
     Identifier,
-    InventoryPosition,
     Money,
+    OrderQuantity,
     PositiveMoney,
     PositiveQuantity,
     ProductId,
@@ -26,25 +27,29 @@ from company_bench.models import (
 __all__ = [
     "PROTOCOL_ERROR_PREFIX",
     "AgentTurn",
-    "CancelOrder",
     "CommandEnvelope",
     "CommandOutcome",
     "CommandStatus",
     "CompanyCommand",
     "DeliveryExpiryBucket",
     "IncomingDeliveryView",
+    "InventoryExpiryBucket",
     "JournalEntryKind",
     "JournalEntryReference",
     "MarketSide",
-    "MarketView",
     "OpenOrderView",
     "OperationJobView",
-    "PlaceOrder",
-    "PriceLevel",
+    "OrderBookView",
+    "PriceLevelView",
     "Produce",
     "QuoteAlert",
-    "ReplaceOrder",
+    "QuoteLadder",
+    "QuoteLadderResult",
+    "QuoteLevel",
+    "QuoteLevelAction",
+    "QuoteLevelResult",
     "ScheduledCompletion",
+    "SetQuoteLadder",
     "SetRetailPrice",
     "SimTime",
     "SystemEventKind",
@@ -208,30 +213,37 @@ class Transform(StrictModel):
         return self
 
 
-class PlaceOrder(StrictModel):
-    """Place one limit order without accepting an LLM-supplied identity."""
+class QuoteLevel(StrictModel):
+    """One independently collateralized price-quantity level."""
 
-    kind: Literal["place_order"] = "place_order"
+    quantity: OrderQuantity
+    limit_price: PositiveMoney
+
+
+class QuoteLadder(StrictModel):
+    """Validated target levels for one side of one product market."""
+
     side: MarketSide
+    levels: tuple[QuoteLevel, ...] = Field(default=(), max_length=3)
+
+    @model_validator(mode="after")
+    def validate_levels(self) -> Self:
+        """Require unique levels ordered from most to least competitive."""
+        prices = tuple(level.limit_price for level in self.levels)
+        if len(prices) != len(set(prices)):
+            raise ValueError("quote ladder prices must be unique")
+        expected = tuple(sorted(prices, reverse=self.side is MarketSide.BUY))
+        if prices != expected:
+            direction = "descending" if self.side is MarketSide.BUY else "ascending"
+            raise ValueError(f"quote ladder prices must be {direction}")
+        return self
+
+
+class SetQuoteLadder(QuoteLadder):
+    """Atomically set one validated target ladder."""
+
+    kind: Literal["set_quote_ladder"] = "set_quote_ladder"
     product: ProductId
-    quantity: PositiveQuantity
-    limit_price: PositiveMoney
-
-
-class CancelOrder(StrictModel):
-    """Cancel an existing order owned by the runtime-bound company."""
-
-    kind: Literal["cancel_order"] = "cancel_order"
-    order_id: Identifier
-
-
-class ReplaceOrder(StrictModel):
-    """Atomically replace one owned order and lose its former priority."""
-
-    kind: Literal["replace_order"] = "replace_order"
-    order_id: Identifier
-    quantity: PositiveQuantity
-    limit_price: PositiveMoney
 
 
 class SetRetailPrice(StrictModel):
@@ -260,7 +272,7 @@ class Wait(StrictModel):
 
 
 type CompanyCommand = Annotated[
-    Produce | Transform | PlaceOrder | ReplaceOrder | CancelOrder | SetRetailPrice | Wait,
+    Produce | Transform | SetQuoteLadder | SetRetailPrice | Wait,
     Field(discriminator="kind"),
 ]
 
@@ -281,6 +293,62 @@ class CommandStatus(StrEnum):
 
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+
+
+class QuoteLevelAction(StrEnum):
+    """How one target quote reconciled with the prior ladder."""
+
+    KEEP = "keep"
+    PLACE = "place"
+    REPLACE = "replace"
+
+
+class QuoteLevelResult(StrictModel):
+    """Auditable application result for one target quote level."""
+
+    level: QuoteLevel
+    action: QuoteLevelAction
+    order_id: Identifier
+    replaced_order_id: Identifier | None = None
+    priority_sequence: int = Field(ge=1)
+    remaining_quantity: Quantity
+
+    @model_validator(mode="after")
+    def validate_result(self) -> Self:
+        """Keep identities and post-match quantity consistent with the action."""
+        if self.remaining_quantity > self.level.quantity:
+            raise ValueError("remaining quote quantity cannot exceed its target")
+        if self.action is QuoteLevelAction.REPLACE:
+            if self.replaced_order_id is None or self.replaced_order_id == self.order_id:
+                raise ValueError("replacement requires distinct old and new order ids")
+        elif self.replaced_order_id is not None:
+            raise ValueError("only replacement levels may reference an old order")
+        if self.action is QuoteLevelAction.KEEP and self.remaining_quantity != self.level.quantity:
+            raise ValueError("kept quote quantity must remain unchanged")
+        return self
+
+
+class QuoteLadderResult(StrictModel):
+    """Complete reconciliation result for one atomic target ladder."""
+
+    levels: tuple[QuoteLevelResult, ...] = Field(default=(), max_length=3)
+    cancelled_order_ids: tuple[Identifier, ...] = Field(default=(), max_length=3)
+
+    @model_validator(mode="after")
+    def validate_identities(self) -> Self:
+        """Require each old and new order identity to appear only once."""
+        current_ids = [level.order_id for level in self.levels]
+        old_ids = [
+            level.replaced_order_id for level in self.levels if level.replaced_order_id is not None
+        ]
+        if len(current_ids) != len(set(current_ids)):
+            raise ValueError("quote ladder order ids must be unique")
+        retired_ids = [*old_ids, *self.cancelled_order_ids]
+        if len(retired_ids) != len(set(retired_ids)):
+            raise ValueError("retired quote ladder order ids must be unique")
+        if set(current_ids) & set(retired_ids):
+            raise ValueError("current and retired quote ladder order ids must be disjoint")
+        return self
 
 
 class ScheduledCompletion(StrictModel):
@@ -316,7 +384,7 @@ class CommandOutcome(StrictModel):
     reason: str | None = Field(default=None, min_length=1, max_length=500)
     resulting_state_version: int = Field(ge=0)
     apply_sequence: int = Field(ge=1)
-    order_id: Identifier | None = None
+    quote_ladder_result: QuoteLadderResult | None = None
     job_id: Identifier | None = None
     events: tuple[DomainEvent, ...] = ()
     scheduled_completions: tuple[ScheduledCompletion, ...] = ()
@@ -348,25 +416,59 @@ class OpenOrderView(StrictModel):
     limit_price: PositiveMoney
     placed_at: SimTime
     priority_sequence: int = Field(ge=1)
+    queue_ahead_quantity: Quantity
 
 
-class PriceLevel(StrictModel):
-    """Anonymous aggregate quantity resting at one price."""
+class PriceLevelView(StrictModel):
+    """Anonymous aggregate resting at one public price level."""
 
     unit_price: PositiveMoney
     quantity: PositiveQuantity
+    order_count: int = Field(ge=1)
 
 
-class MarketView(StrictModel):
-    """Anonymous continuous-market facts visible to one Agent."""
+class OrderBookView(StrictModel):
+    """Complete anonymous order-book depth visible to one Agent."""
 
     product: ProductId
-    best_bid: PositiveMoney | None = None
-    best_ask: PositiveMoney | None = None
-    top_bids: tuple[PriceLevel, ...] = ()
-    top_asks: tuple[PriceLevel, ...] = ()
+    bids: tuple[PriceLevelView, ...] = ()
+    asks: tuple[PriceLevelView, ...] = ()
     last_trade_price: PositiveMoney | None = None
     daily_volume: Quantity = ZERO
+
+    @model_validator(mode="after")
+    def validate_book(self) -> Self:
+        """Require unique sorted levels and an uncrossed resting book."""
+        bid_prices = tuple(level.unit_price for level in self.bids)
+        ask_prices = tuple(level.unit_price for level in self.asks)
+        if bid_prices != tuple(sorted(set(bid_prices), reverse=True)):
+            raise ValueError("bid levels must have unique descending prices")
+        if ask_prices != tuple(sorted(set(ask_prices))):
+            raise ValueError("ask levels must have unique ascending prices")
+        if bid_prices and ask_prices and bid_prices[0] >= ask_prices[0]:
+            raise ValueError("a continuous order book cannot remain crossed")
+        return self
+
+    def best_price(self, side: MarketSide) -> PositiveMoney | None:
+        """Return the first public price on one side, if present."""
+        levels = self.bids if side is MarketSide.BUY else self.asks
+        return levels[0].unit_price if levels else None
+
+
+class InventoryExpiryBucket(StrictModel):
+    """Owned spot inventory sharing one product and expiry day."""
+
+    product: ProductId
+    expires_end_of_day: int = Field(ge=1)
+    available_quantity: Quantity
+    reserved_quantity: Quantity
+
+    @model_validator(mode="after")
+    def validate_quantity(self) -> Self:
+        """Omit economically empty expiry buckets."""
+        if self.available_quantity + self.reserved_quantity <= ZERO:
+            raise ValueError("an inventory expiry bucket must contain inventory")
+        return self
 
 
 class DeliveryExpiryBucket(StrictModel):
@@ -391,9 +493,7 @@ class IncomingDeliveryView(StrictModel):
         days = tuple(bucket.expires_end_of_day for bucket in self.expiry_buckets)
         if days != tuple(sorted(set(days))):
             raise ValueError("delivery expiry buckets must be unique and ordered")
-        if sum((bucket.quantity for bucket in self.expiry_buckets), start=ZERO) != (
-            self.quantity
-        ):
+        if sum((bucket.quantity for bucket in self.expiry_buckets), start=ZERO) != (self.quantity):
             raise ValueError("delivery expiry buckets must sum to quantity")
         return self
 
@@ -422,9 +522,10 @@ class AgentTurn(StrictModel):
     observation: CompanyObservation
     available_cash: Money
     reserved_cash: Money = ZERO
-    reserved_inventory: tuple[InventoryPosition, ...] = ()
+    marked_surplus: Decimal = Field(allow_inf_nan=False)
+    inventory_expiry: tuple[InventoryExpiryBucket, ...] = ()
     open_orders: tuple[OpenOrderView, ...] = ()
-    market_views: tuple[MarketView, ...] = ()
+    order_books: tuple[OrderBookView, ...] = ()
     pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
     active_operation: OperationJobView | None = None
     remaining_operation_capacity: Quantity | None = None
@@ -441,15 +542,36 @@ class AgentTurn(StrictModel):
         if len(self.wake_reasons) != len(set(self.wake_reasons)):
             raise ValueError("wake_reasons must be unique")
         if self.wake_signals:
-            signal_reasons = tuple(
-                dict.fromkeys(signal.reason for signal in self.wake_signals)
-            )
+            signal_reasons = tuple(dict.fromkeys(signal.reason for signal in self.wake_signals))
             if signal_reasons != self.wake_reasons:
                 raise ValueError("wake_signals must cover wake_reasons in order")
         if self.observation.company_id != self.company_id:
             raise ValueError("observation company_id must match the turn")
         if self.observation.cash != self.available_cash:
             raise ValueError("available_cash must match the observed cash")
+        if any(order.owner_id != self.company_id for order in self.open_orders):
+            raise ValueError("open_orders must be owned by the observed company")
+        product_order = {
+            product.product: index for index, product in enumerate(self.observation.products)
+        }
+        expiry_keys = tuple(
+            (bucket.product, bucket.expires_end_of_day) for bucket in self.inventory_expiry
+        )
+        if len(expiry_keys) != len(set(expiry_keys)):
+            raise ValueError("inventory_expiry keys must be unique")
+        if any(product not in product_order for product, _ in expiry_keys):
+            raise ValueError("inventory_expiry contains an unknown product")
+        if expiry_keys != tuple(
+            sorted(expiry_keys, key=lambda key: (product_order[key[0]], key[1]))
+        ):
+            raise ValueError("inventory_expiry must follow product and expiry order")
+        book_products = tuple(book.product for book in self.order_books)
+        if len(book_products) != len(set(book_products)):
+            raise ValueError("order_books products must be unique")
+        if any(product not in product_order for product in book_products):
+            raise ValueError("order_books contains an unknown product")
+        if book_products != tuple(sorted(book_products, key=product_order.__getitem__)):
+            raise ValueError("order_books must follow scenario product order")
         if self.previous_outcome is not None:
             if self.previous_outcome.company_id != self.company_id:
                 raise ValueError("previous outcome company_id must match the turn")
@@ -546,6 +668,13 @@ class TurnRecord(StrictModel):
             raise ValueError("outcome cannot move the state version backwards")
         if self.outcome.occurred_at.absolute_minute < self.envelope.issued_at.absolute_minute:
             raise ValueError("outcome cannot precede the command")
+        command = self.envelope.command
+        result = self.outcome.quote_ladder_result
+        expects_ladder_result = self.outcome.accepted and isinstance(command, SetQuoteLadder)
+        if (result is not None) != expects_ladder_result:
+            raise ValueError("only an accepted quote ladder requires a ladder result")
+        if result is not None and tuple(level.level for level in result.levels) != command.levels:
+            raise ValueError("quote ladder result levels must match the command target")
         if (
             self.turn.previous_outcome is not None
             and self.outcome.apply_sequence <= self.turn.previous_outcome.apply_sequence

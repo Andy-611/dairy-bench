@@ -34,12 +34,13 @@ from company_bench.runtime_models import (
     DeliveryExpiryBucket,
     IncomingDeliveryView,
     MarketSide,
-    MarketView,
     OpenOrderView,
     OperationJobView,
-    PlaceOrder,
+    OrderBookView,
+    PriceLevelView,
     Produce,
-    ReplaceOrder,
+    QuoteLevel,
+    SetQuoteLadder,
     SetRetailPrice,
     SimTime,
     Transform,
@@ -89,7 +90,7 @@ def _turn(
     *,
     wake_reason: WakeReason = WakeReason.DAY_OPEN,
     open_orders: tuple[OpenOrderView, ...] = (),
-    market_views: tuple[MarketView, ...] = (),
+    order_books: tuple[OrderBookView, ...] = (),
     pending_deliveries: tuple[IncomingDeliveryView, ...] = (),
     active_operation: OperationJobView | None = None,
 ) -> AgentTurn:
@@ -104,8 +105,9 @@ def _turn(
         wake_reasons=(wake_reason,),
         observation=observation,
         available_cash=observation.cash,
+        marked_surplus=Decimal(),
         open_orders=open_orders,
-        market_views=market_views,
+        order_books=order_books,
         pending_deliveries=pending_deliveries,
         active_operation=active_operation,
     )
@@ -116,9 +118,7 @@ def _observation(company_id: str) -> CompanyObservation:
     engine = EconomyEngine()
     world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=42)
     return next(
-        observation
-        for observation in engine.observe(world)
-        if observation.company_id == company_id
+        observation for observation in engine.observe(world) if observation.company_id == company_id
     )
 
 
@@ -139,29 +139,65 @@ def _with_inventory(
     )
 
 
-def test_replace_order_uses_the_strict_v3_command_schema() -> None:
+def test_quote_ladder_uses_the_strict_v3_command_schema() -> None:
     submission = CommandSubmission.model_validate_json(
-        '{"command":{"kind":"replace_order","order_id":"order_7",'
-        '"quantity":"12.5","limit_price":"1.55"}}'
+        '{"command":{"kind":"set_quote_ladder","product":"raw_milk",'
+        '"side":"sell","levels":[{"quantity":"10","limit_price":"1.20"},'
+        '{"quantity":"5","limit_price":"1.40"}]}}'
     )
 
-    assert submission.command == ReplaceOrder(
-        order_id="order_7",
-        quantity=Decimal("12.5"),
-        limit_price=Decimal("1.55"),
+    assert submission.command == SetQuoteLadder(
+        product=ProductId.RAW_MILK,
+        side=MarketSide.SELL,
+        levels=(
+            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.20")),
+            QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("1.40")),
+        ),
     )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         CommandSubmission.model_validate(
             {
                 "command": {
-                    "kind": "replace_order",
+                    "kind": "set_quote_ladder",
+                    "product": "raw_milk",
+                    "side": "sell",
+                    "levels": [],
                     "order_id": "order_7",
-                    "quantity": "12.5",
-                    "limit_price": "1.55",
-                    "side": "buy",
                 }
             }
         )
+
+
+def test_quote_ladder_enforces_depth_order_and_exact_quantities() -> None:
+    assert (
+        SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.BUY,
+            levels=(),
+        ).levels
+        == ()
+    )
+
+    with pytest.raises(ValidationError, match="at most 3 items"):
+        SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.BUY,
+            levels=tuple(
+                QuoteLevel(quantity=Decimal("1"), limit_price=Decimal(price))
+                for price in ("1.40", "1.30", "1.20", "1.10")
+            ),
+        )
+    with pytest.raises(ValidationError, match="descending"):
+        SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.BUY,
+            levels=(
+                QuoteLevel(quantity=Decimal("1"), limit_price=Decimal("1.40")),
+                QuoteLevel(quantity=Decimal("1"), limit_price=Decimal("1.50")),
+            ),
+        )
+    with pytest.raises(ValidationError, match=r"multiple of 0\.0001"):
+        QuoteLevel(quantity=Decimal("0.00009"), limit_price=Decimal("1.40"))
 
 
 @pytest.mark.asyncio
@@ -170,18 +206,16 @@ def test_replace_order_uses_the_strict_v3_command_schema() -> None:
     (
         (
             "farm_a",
-            ("produce", "place_order", "replace_order", "cancel_order", "wait"),
+            ("produce", "set_quote_ladder", "wait"),
         ),
         (
             "processor_a",
-            ("transform", "place_order", "replace_order", "cancel_order", "wait"),
+            ("transform", "set_quote_ladder", "wait"),
         ),
         (
             "retailer_a",
             (
-                "place_order",
-                "replace_order",
-                "cancel_order",
+                "set_quote_ladder",
                 "set_retail_price",
                 "wait",
             ),
@@ -198,24 +232,47 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
         Wait(),
         company_id=company_id,
     )
-    market = MarketView(
+    market = OrderBookView(
         product=ProductId.RAW_MILK,
-        best_bid=Decimal("1.50"),
-        best_ask=Decimal("1.60"),
+        bids=(
+            PriceLevelView(
+                unit_price=Decimal("1.50"),
+                quantity=Decimal("30"),
+                order_count=2,
+            ),
+        ),
+        asks=(
+            PriceLevelView(
+                unit_price=Decimal("1.60"),
+                quantity=Decimal("10"),
+                order_count=1,
+            ),
+        ),
     )
 
-    await agent.act(_turn("v3_prompt", observation, market_views=(market,)))
+    await agent.act(_turn("v3_prompt", observation, order_books=(market,)))
 
     request = gateway.command_requests[0]
     prompt_input = json.loads(request.input_text)
     assert request.allowed_commands == allowed_commands
     assert "continuous spot market" in request.instructions
+    assert "Your sole objective is to maximize your own company's profit." in request.instructions
     assert "resting price" in request.instructions
     assert "after 30 virtual minutes" in request.instructions
-    assert "replace_order" in request.instructions
+    assert "set_quote_ladder" in request.instructions
+    assert "zero to three unique" in request.instructions
+    assert "use [] to cancel" in request.instructions
+    assert "place_order" not in request.instructions
+    assert "replace_order" not in request.instructions
+    assert "cancel_order" not in request.instructions
     assert "at least 0.0001" in request.instructions
     assert "at most four decimal places" in request.instructions
-    assert prompt_input["turn"]["market_views"][0]["best_bid"] == "1.50"
+    assert "queue_ahead_quantity is the same-price quantity ahead" in request.instructions
+    assert "marked_surplus is guaranteed marked asset value" in request.instructions
+    level = prompt_input["turn"]["order_books"][0]["bids"][0]
+    assert level == {"unit_price": "1.50", "quantity": "30", "order_count": 2}
+    assert prompt_input["turn"]["marked_surplus"] == "0"
+    assert "market_views" not in prompt_input["turn"]
     assert agent.metadata.version == "3"
     assert agent.metadata.prompt_version == COMMAND_PROMPT_VERSION
 
@@ -237,11 +294,14 @@ async def test_baseline_farm_produces_then_offers_completed_inventory() -> None:
             stocked,
             wake_reason=WakeReason.OPERATION_COMPLETED,
         )
-    ) == PlaceOrder(
-        side=MarketSide.SELL,
+    ) == SetQuoteLadder(
         product=ProductId.RAW_MILK,
-        quantity=Decimal("50"),
-        limit_price=Decimal("1.40"),
+        side=MarketSide.SELL,
+        levels=(
+            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.20")),
+            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.40")),
+            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.60")),
+        ),
     )
 
 
@@ -262,27 +322,33 @@ async def test_baseline_floors_orders_without_overcommitting_inventory() -> None
         )
     )
 
-    assert isinstance(command, PlaceOrder)
-    assert command.quantity == Decimal("49.9999")
-    assert command.quantity <= stocked.quantity(ProductId.RAW_MILK)
+    assert isinstance(command, SetQuoteLadder)
+    assert command.levels == (
+        QuoteLevel(quantity=Decimal("19.9999"), limit_price=Decimal("1.20")),
+        QuoteLevel(quantity=Decimal("19.9999"), limit_price=Decimal("1.40")),
+        QuoteLevel(quantity=Decimal("10.0001"), limit_price=Decimal("1.60")),
+    )
+    assert sum((level.quantity for level in command.levels), Decimal()) == Decimal("49.9999")
 
     dust = _with_inventory(observation, raw_milk=Decimal("0.00009"))
-    assert await agent.act(
-        _turn(
-            "farm_dust",
-            dust,
-            wake_reason=WakeReason.OPERATION_COMPLETED,
+    assert (
+        await agent.act(
+            _turn(
+                "farm_dust",
+                dust,
+                wake_reason=WakeReason.OPERATION_COMPLETED,
+            )
         )
-    ) == Wait()
+        == Wait()
+    )
 
 
 @pytest.mark.asyncio
-async def test_llm_agent_preserves_a_dust_order_for_engine_audit() -> None:
-    command = PlaceOrder(
-        side=MarketSide.SELL,
+async def test_llm_agent_accepts_a_schema_valid_quote_ladder_for_engine_audit() -> None:
+    command = SetQuoteLadder(
         product=ProductId.RAW_MILK,
-        quantity=Decimal("8.9E-91"),
-        limit_price=Decimal("1.40"),
+        side=MarketSide.SELL,
+        levels=(QuoteLevel(quantity=Decimal("0.0001"), limit_price=Decimal("1.40")),),
     )
     agent, _, repository = _llm_agent("dust_output", command)
 
@@ -291,16 +357,20 @@ async def test_llm_agent_preserves_a_dust_order_for_engine_audit() -> None:
     assert submitted == command
     assert repository.list_invocations("dust_output")[0].outcome is InvocationOutcome.SUCCESS
 
+
 @pytest.mark.asyncio
 async def test_baseline_processor_procures_transforms_and_trades_while_busy() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
 
-    assert await agent.act(_turn("processor_procure", observation)) == PlaceOrder(
-        side=MarketSide.BUY,
+    assert await agent.act(_turn("processor_procure", observation)) == SetQuoteLadder(
         product=ProductId.RAW_MILK,
-        quantity=Decimal("50"),
-        limit_price=Decimal("1.60"),
+        side=MarketSide.BUY,
+        levels=(
+            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.60")),
+            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.50")),
+            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.40")),
+        ),
     )
 
     raw_stock = _with_inventory(observation, raw_milk=Decimal("50"))
@@ -331,11 +401,14 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
             wake_reason=WakeReason.PRICE_ALERT,
             active_operation=active_operation,
         )
-    ) == PlaceOrder(
-        side=MarketSide.SELL,
+    ) == SetQuoteLadder(
         product=ProductId.BOTTLED_MILK,
-        quantity=Decimal("20"),
-        limit_price=Decimal("2.50"),
+        side=MarketSide.SELL,
+        levels=(
+            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("2.50")),
+            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("2.65")),
+            QuoteLevel(quantity=Decimal("4"), limit_price=Decimal("2.80")),
+        ),
     )
 
 
@@ -369,11 +442,14 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
             wake_reason=WakeReason.PRICE_ALERT,
             pending_deliveries=(delivery,),
         )
-    ) == PlaceOrder(
-        side=MarketSide.BUY,
+    ) == SetQuoteLadder(
         product=ProductId.BOTTLED_MILK,
-        quantity=Decimal("25"),
-        limit_price=Decimal("2.80"),
+        side=MarketSide.BUY,
+        levels=(
+            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2.80")),
+            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2.65")),
+            QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("2.50")),
+        ),
     )
 
 
@@ -381,25 +457,39 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
 async def test_baseline_does_not_duplicate_a_resting_order() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
-    order = OpenOrderView(
-        order_id="order_1",
-        owner_id="processor_a",
-        side=MarketSide.BUY,
-        product=ProductId.RAW_MILK,
-        remaining_quantity=Decimal("20"),
-        limit_price=Decimal("1.60"),
-        placed_at=SimTime(absolute_minute=540),
-        priority_sequence=1,
+    orders = tuple(
+        OpenOrderView(
+            order_id=f"order_{index}",
+            owner_id="processor_a",
+            side=MarketSide.BUY,
+            product=ProductId.RAW_MILK,
+            remaining_quantity=quantity,
+            limit_price=price,
+            placed_at=SimTime(absolute_minute=540),
+            priority_sequence=index,
+            queue_ahead_quantity=Decimal(),
+        )
+        for index, (quantity, price) in enumerate(
+            (
+                (Decimal("20"), Decimal("1.60")),
+                (Decimal("20"), Decimal("1.50")),
+                (Decimal("10"), Decimal("1.40")),
+            ),
+            start=1,
+        )
     )
 
-    assert await agent.act(
-        _turn(
-            "processor_wait",
-            observation,
-            wake_reason=WakeReason.PRICE_ALERT,
-            open_orders=(order,),
+    assert (
+        await agent.act(
+            _turn(
+                "processor_wait",
+                observation,
+                wake_reason=WakeReason.PRICE_ALERT,
+                open_orders=orders,
+            )
         )
-    ) == Wait()
+        == Wait()
+    )
 
 
 @pytest.mark.asyncio

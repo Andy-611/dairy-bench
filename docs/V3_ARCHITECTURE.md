@@ -40,8 +40,8 @@ Responsibilities are deliberately narrow:
   application order, journal sequencing, and checkpoint boundaries.
 - `EconomyEngine` owns business authorization, operations, deliveries, consumer
   settlement, inventory expiry, and typed projections.
-- `ContinuousSpotMarket` owns reservation, price-time matching, partial fills,
-  replacement, cancellation, and book close for one product.
+- `ContinuousSpotMarket` owns atomic target-ladder reconciliation, collateral
+  reservation, price-time matching, partial fills, and book close for one product.
 - `AssetLedger` is the transaction-local authority for available cash and FEFO
   inventory. Both product markets share one ledger within an engine transaction.
 - `LifecycleRepository` atomically persists journal additions and the replacement
@@ -84,18 +84,20 @@ plain DAY limit orders exist.
 
 ### Reservation
 
-- Place and replace quantities cross the engine boundary only as a positive
-  `OrderQuantity`, an exact multiple of `0.0001`. Invalid raw commands are
-  rejected before a market session exists; they are never rounded and cannot
-  mutate assets or replace an existing order.
+- One `set_quote_ladder` command defines zero to three distinct target prices for
+  one product and side. Every level crosses the engine boundary only as a
+  positive `OrderQuantity`, an exact multiple of `0.0001`. Invalid raw commands
+  are rejected before a market session exists; they are never rounded.
 - A bid removes `remaining_quantity * limit_price` from available cash and
   stores it on `BuyOrder`.
 - An ask removes exact FEFO lots from available inventory and stores them on
   `SellOrder`.
 - Production output, inbound deliveries, and lots already held by another ask
   are unavailable.
-- If the entire requested commitment cannot be reserved, the command is rejected
-  with no state change. There is no settlement-time clipping.
+- All mutable old levels and target levels are staged in one transaction. The
+  complete Bid notional or Ask quantity must be backed after reusable old holds
+  are released; otherwise the original ladder and every hold remain unchanged.
+  There is no per-level partial commit or settlement-time clipping.
 
 The private observation reports available and reserved assets separately. Total
 economic ownership is therefore visible without allowing the same asset to back
@@ -115,10 +117,22 @@ Partial fill describes quantity interaction, not under-collateralization: every
 remaining unit is still fully backed. When a bid executes below its limit, the
 unused price difference returns to available cash immediately.
 
-`replace_order` atomically releases the old commitment and attempts a new one
-with a new identity and priority. If validation or reservation fails, the whole
-transaction is discarded and the old order remains. Cancellation and 19:00 book
-close release all unfilled collateral. Self-crossing orders are rejected.
+The ladder is a target state. Bid targets must arrive from highest to lowest and
+Ask targets from lowest to highest; invalid ordering is rejected. Reconciliation
+first keeps exact price-and-quantity matches, then replaces remaining same-price
+levels, pairs the remaining old and target levels in price-priority order as
+replacements, cancels unmatched old levels, and places unmatched targets. Empty
+`levels` cancels the complete product-side ladder. Exact matches retain their
+order ID, arrival time, and priority; every replacement or placement is an
+independent order with a new identity and priority. The market applies new levels from best
+to worst price so immediate matching is deterministic.
+
+Because the command supplies no level identity, repricing and a cancel-plus-place
+intention are observationally indistinguishable and both lose old priority. The
+deterministic pairing defines the auditable result without requiring the Agent
+to micromanage order IDs. If any validation, self-cross, or reservation check
+fails, the complete staged transaction is discarded. At 19:00, book close
+releases all unfilled collateral.
 
 ### Trade and delivery
 
@@ -149,9 +163,9 @@ Starting either job:
 - exposes no output until that completion creates a new expiring inventory lot.
 
 Each company has at most one active physical operation. The resource lock does
-not block order placement, replacement, cancellation, retail pricing, or wait.
-Daily used capacity is tracked independently from the active job, so completing a
-job does not restore that day's capacity.
+not block quote-ladder updates, retail pricing, or wait. Daily used capacity is
+tracked independently from the active job, so completing a job does not restore
+that day's capacity.
 
 ## Decisions and deterministic concurrency
 
@@ -170,9 +184,11 @@ runs concurrently, but commands apply in a full deterministic permutation:
 sort_key = SHA256(seed | absolute_minute | company_id)
 ```
 
-The resulting global `apply_sequence` is journaled and supplies order arrival
-priority. Real response latency, retries, and provider load are audited but never
-feed matching.
+The resulting global `apply_sequence` is journaled as command-processing order.
+When that command is applied, each new or replaced ladder level receives its own
+persisted order priority sequence in best-to-worst target order; unchanged
+levels retain theirs. Real response latency, retries, and provider load are
+audited but never feed matching.
 
 Sparse decisions are governed by the in-process `AgentAttention` module. An
 accepted `wait` may arm up to three Agent-visible `best_bid`/`best_ask` threshold
@@ -193,15 +209,25 @@ orders do not receive an independent polling timer.
 The engine builds a private `AgentTurn` rather than exposing `EconomyState`.
 Along with available assets and events, it contains:
 
-- `open_orders` owned by the company;
-- `market_views` with anonymous best prices, top-three aggregated depth, last
-  trade price, and daily volume;
-- `reserved_cash` and `reserved_inventory`;
+- `open_orders` owned by the company, each with current same-price FIFO quantity
+  ahead;
+- `order_books` with every anonymous aggregated price level, its quantity and
+  order count, plus last trade price and daily volume;
+- `reserved_cash`, `marked_surplus`, and `inventory_expiry`, whose buckets split
+  available from ask-reserved spot inventory;
 - `pending_deliveries` with exact arrival times and quantity-preserving expiry
   buckets;
 - `active_operation`; and
 - `remaining_operation_capacity`; and
 - the current daily turn number and hard limit.
+
+`marked_surplus` values available cash, bid-reserved cash, available and
+ask-reserved inventory, pending deliveries, and guaranteed active-operation
+output at immutable product reference values, then subtracts the company's
+episode initial cash. Moving the same asset between available, reserved,
+in-transit, and completed states is therefore value-neutral. `inventory_expiry`
+covers spot inventory only; pending deliveries retain their own expiry buckets,
+and work in process enters an expiry bucket only when completed.
 
 Other companies' identities, holdings, orders, memories, and traces stay hidden.
 Natural-language reasoning is non-binding; only the validated structured command
@@ -253,18 +279,22 @@ score.
 1. Only `EconomyEngine` changes economic state.
 2. One company submits at most one command in a same-minute batch.
 3. Every resting order is fully backed by uniquely held cash or inventory.
-4. Every live order quantity is positive and aligned to the `0.0001` market
+4. One company has at most three distinct active price levels per product and
+   side; one ladder command commits all of its changes or none of them.
+5. Every live order quantity is positive and aligned to the `0.0001` market
    tick; raw journal commands remain audit evidence, not executable state.
-5. Available, reserved, and pending inventory lots have globally unique IDs.
-6. One company has at most one active operation; one trade has one pending
+6. Every active order has an independent persisted priority sequence; one
+   command's `apply_sequence` is not reused as three order priorities.
+7. Available, reserved, and pending inventory lots have globally unique IDs.
+8. One company has at most one active operation; one trade has one pending
    delivery until completion.
-7. Product markets share session state and always open or close together.
-8. No company command is accepted outside `[09:00, 19:00)`.
-9. Books, jobs, and deliveries are empty before the 19:30 day snapshot.
-10. Provider completion order never changes economic application order.
-11. Journal plus checkpoint, not prompts or UI projections, is the replay
+9. Product markets share session state and always open or close together.
+10. No company command is accepted outside `[09:00, 19:00)`.
+11. Books, jobs, and deliveries are empty before the 19:30 day snapshot.
+12. Provider completion order never changes economic application order.
+13. Journal plus checkpoint, not prompts or UI projections, is the replay
     authority.
-12. Attention reads only the anonymous Agent market projection; observer UI
+14. Attention reads only the anonymous Agent market projection; observer UI
     order-book data can never wake an Agent or change economic state.
 
 ## Deliberate non-goals

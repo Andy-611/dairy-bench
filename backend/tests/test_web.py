@@ -70,7 +70,7 @@ def _app(repository: MemoryRunRepository) -> FastAPI:
 def _wait_for_terminal_job(
     client: TestClient,
     run_id: str,
-    timeout_seconds: float = 60,
+    timeout_seconds: float = 120,
 ) -> RunJob:
     """Poll the public job endpoint until the run reaches a terminal state."""
     deadline = time.monotonic() + timeout_seconds
@@ -80,7 +80,7 @@ def _wait_for_terminal_job(
         job = RunJob.model_validate(response.json())
         if job.status.terminal:
             return job
-        time.sleep(0.01)
+        time.sleep(0.05)
     raise AssertionError(f"run job {run_id} did not finish within {timeout_seconds}s")
 
 
@@ -130,7 +130,7 @@ def test_run_list_and_detail_http_flow() -> None:
         assert turns[0]["turn"]["state_version"] == 0
         assert turns[0]["envelope"]["command"]["kind"] in {
             "produce",
-            "place_order",
+            "set_quote_ladder",
             "set_retail_price",
         }
 

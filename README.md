@@ -18,11 +18,13 @@ deliveries, or trade results. Natural-language text never settles a transaction.
 
 - Continuous fully collateralized limit-order books for raw and bottled milk.
   Crossing orders trade immediately with price-time priority, the maker's price,
-  and partial fills. Agents may place, replace, or cancel resting orders.
+  and partial fills. In one model call, an agent may set a target ladder of up
+  to three independent price levels for one product and side.
 - Bids reserve their full limit-price cash commitment; asks reserve exact FEFO
-  inventory lots. Rejected orders never create phantom liquidity.
+  inventory lots. A ladder update either reconciles every level atomically or
+  leaves the original orders and collateral unchanged.
 - Order quantities use a fixed `0.0001` market tick. Non-positive, dust, or
-  over-precision place/replace requests are rejected without rounding.
+  over-precision quote levels are rejected without rounding.
 - Same-minute agent calls run concurrently, then commands commit in a persisted
   `SHA256(seed | minute | company)` order. Provider response latency is audited
   but cannot change the economic result.
@@ -31,9 +33,9 @@ deliveries, or trade results. Natural-language text never settles a transaction.
   one-decision-per-virtual-minute throttle.
 - A trade pays the seller immediately and schedules automatic buyer delivery 30
   minutes later. There is no manual dispatch, route, carrier, or escrow workflow.
-- Each agent sees anonymous top-of-book depth, its own orders, available and
-  reserved assets, inbound deliveries, its active operation, and remaining daily
-  operation capacity.
+- Each agent sees every anonymous aggregated price level, its own queue-aware
+  orders, expiry-aware available and reserved assets, inbound deliveries, its
+  active operation, and remaining daily operation capacity.
 - Every company has private token-budgeted memory. Immutable journals, atomic
   checkpoints, crash recovery, and exact replay remain the durable authority.
 
@@ -130,7 +132,7 @@ economic mutation.
 
 ## Data and verification
 
-The default score-v5 database is `backend/data/dairy_bench_v5.sqlite3`. Override it with
+The default score-v7 database is `backend/data/dairy_bench_v7.sqlite3`. Override it with
 `DAIRY_BENCH_DB`; override artifacts with `DAIRY_BENCH_ARTIFACTS_DIR`.
 
 ```powershell

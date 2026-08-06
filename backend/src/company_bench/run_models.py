@@ -151,7 +151,7 @@ class CompanyRuntimeCursor(StrictModel):
 class RunCheckpoint(StrictModel):
     """Complete atomic state needed to resume one V3 episode."""
 
-    schema_version: Literal[3] = 3
+    schema_version: Literal[5] = 5
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -444,9 +444,7 @@ def _validate_attention_commitments(checkpoint: RunCheckpoint) -> None:
                 continue
             if signal.source is None or signal.source.entry_type is not JournalEntryKind.TURN:
                 raise ValueError("wait-expiry wakes require a source Turn")
-            actual.append(
-                (event.company_id, event.at.absolute_minute, signal.source.entry_id)
-            )
+            actual.append((event.company_id, event.at.absolute_minute, signal.source.entry_id))
     _require_unique(actual, "wait-expiry commitments")
     if set(actual) != set(expected):
         raise ValueError("armed waits and wait-expiry wakes must match")

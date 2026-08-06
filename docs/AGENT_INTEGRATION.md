@@ -26,19 +26,41 @@ The model must choose exactly one role-authorized command:
 |---|---|
 | `produce(product, quantity)` | Start one farm production job |
 | `transform(input_product, output_product, input_quantity)` | Start one processor conversion job |
-| `place_order(side, product, quantity, limit_price)` | Submit a collateralized limit order |
-| `replace_order(order_id, quantity, limit_price)` | Atomically replace an owned order and lose its old priority |
-| `cancel_order(order_id)` | Cancel an owned resting order and release its remaining hold |
+| `set_quote_ladder(product, side, levels)` | Atomically set up to three target price-quantity levels |
 | `set_retail_price(product, unit_price)` | Set a retailer's consumer price |
 | `wait(until?)` | Yield until a deadline or another relevant event |
 
 Farms may produce and trade raw milk. Processors may transform and trade raw or
 bottled milk. Retailers may trade bottled milk and set its consumer price.
 
-For `place_order` and `replace_order`, `quantity` must be positive and an exact
-multiple of `0.0001` (at most four decimal places). The engine rejects the whole
-command rather than rounding it; agents should use `wait` instead of submitting
-dust quantities.
+Each `set_quote_ladder` level contains `quantity` and `limit_price`. A ladder has
+at most three levels with distinct prices; every quantity must be positive and
+an exact multiple of `0.0001` (at most four decimal places). The engine rejects
+the whole command rather than rounding it. An empty `levels` tuple withdraws all
+of the company's quotes for that product and side.
+
+The command describes a target state, not a sequence of exchange operations.
+The Agent must supply Bid targets from highest to lowest price and Ask targets
+from lowest to highest; an out-of-order ladder is rejected. The market then
+reconciles the ordered levels deterministically:
+
+1. an exact price-and-quantity match is kept with its existing order identity
+   and priority;
+2. remaining targets at an existing price replace that order;
+3. remaining old and target levels pair in price-priority order as replacements;
+4. unmatched old levels are cancelled, and unmatched targets are placed.
+
+Every replaced or newly placed level is an independent order with a new identity
+and priority. Because levels do not carry a model-supplied identity, a price
+change and a cancel-plus-place intention are not distinguishable; both lose old
+priority and the deterministic pairing above defines the audit result. One
+`set_quote_ladder` call performs the complete reconciliation and consumes one
+Agent turn.
+
+An accepted `CommandOutcome.quote_ladder_result` reports every target level's
+`keep`, `replace`, or `place` action, resulting order ID and priority, immediate
+post-match remaining quantity, plus separately cancelled order IDs. Fill events
+and scheduled deliveries remain in the outcome's normal event fields.
 
 OpenAI uses Responses API function tools with one required, non-parallel tool
 call. Codex uses a strict structured-output envelope. Both validate against the
@@ -53,10 +75,13 @@ not mutate the economy.
 - simulation time, state version, daily turn number and limit, typed wake reasons,
   and causal references;
 - available cash and inventory, plus retail price where applicable;
-- cash and FEFO inventory reserved by its own resting orders;
-- its own open orders, including remaining quantity and priority sequence;
-- anonymous `MarketView` values for relevant products: best bid and ask, top
-  three aggregated bid/ask levels, last trade price, and daily volume;
+- reserved cash, `marked_surplus`, and owned spot inventory grouped by product
+  and expiry day with separate available and order-reserved quantities;
+- its own open orders, including remaining quantity, priority sequence, and the
+  total same-price quantity ahead in the FIFO queue;
+- anonymous `OrderBookView` values for relevant products: every aggregated bid
+  and ask price level with quantity and active order count, plus last trade price
+  and daily volume. `bids[0]` and `asks[0]` are the best visible quotes;
 - guaranteed inbound deliveries with product, quantity, exact arrival time, and
   quantity-preserving expiry buckets;
 - the active production or transformation job, if any, and remaining daily
@@ -72,17 +97,21 @@ is the source of truth.
 
 Both product markets use continuous fully collateralized limit books:
 
-1. Order quantity is a positive exact multiple of `0.0001`; invalid precision
-   rejects the whole place/replace command without rounding.
-2. A bid reserves `quantity * limit_price`; an ask reserves exact FEFO lots.
-3. Insufficient available cash or inventory rejects the whole new order.
-4. A new order crosses while `best_bid >= best_ask`.
-5. Better prices win; equal prices use the persisted arrival priority.
+1. Every level quantity is a positive exact multiple of `0.0001`; one invalid
+   level rejects the complete ladder without rounding.
+2. The market stages the complete reconciliation. Unchanged levels keep their
+   existing holds; mutable old levels release theirs inside the staged transaction.
+3. All target Bids together require full `quantity * limit_price` cash backing;
+   all target Asks together require exact FEFO inventory backing. Any shortfall
+   restores the complete original ladder.
+4. New or replaced levels enter the matcher from best to worst target price and
+   cross while `best_bid >= best_ask`.
+5. Better prices win; equal prices use each order's persisted priority sequence.
 6. The execution price is the resting maker order's price.
-7. A fill may consume only part of either order. The remainder keeps its
-   priority; an explicit replace receives a new order ID and priority.
-8. Buyer price improvement is released immediately. Cancellation or 19:00
-   market close releases every unfilled hold.
+7. A fill may consume only part of an order. Its remainder keeps its independent
+   priority; a replaced level receives a new order ID and priority.
+8. Buyer price improvement is released immediately. An empty target ladder or
+   19:00 market close releases every affected unfilled hold.
 
 Every fill pays the seller immediately and creates one automatic delivery to
 the buyer 30 virtual minutes later. Until arrival, those lots are visible as

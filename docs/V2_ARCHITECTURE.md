@@ -96,10 +96,15 @@ Each turn permits exactly one role-authorized atomic command:
 
 - `Produce`
 - `Transform`
-- `PlaceOrder`
-- `CancelOrder`
+- `SetQuoteLadder`
 - `SetRetailPrice`
 - `Wait`
+
+`SetQuoteLadder` uses one command to set zero to three independent target
+price-quantity levels for one product and side. The same deterministic
+Keep/Replace/Cancel/Place reconciliation and all-or-nothing collateral rule
+described by the current market contract apply; an empty ladder withdraws all
+quotes on that product side.
 
 The runtime binds `turn_id`, `company_id`, `sim_time`, and `state_version`.
 Models cannot supply or forge those fields.

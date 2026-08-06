@@ -38,11 +38,9 @@ from company_bench.diagnostics import bounded_error
 from company_bench.models import NoOpDecision, StrictModel
 from company_bench.run_models import TokenUsage
 from company_bench.runtime_models import (
-    CancelOrder,
     CompanyCommand,
-    PlaceOrder,
     Produce,
-    ReplaceOrder,
+    SetQuoteLadder,
     SetRetailPrice,
     Transform,
     Wait,
@@ -53,9 +51,7 @@ _COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
 _COMMAND_MODELS: dict[CommandName, type[BaseModel]] = {
     "produce": Produce,
     "transform": Transform,
-    "place_order": PlaceOrder,
-    "replace_order": ReplaceOrder,
-    "cancel_order": CancelOrder,
+    "set_quote_ladder": SetQuoteLadder,
     "set_retail_price": SetRetailPrice,
     "wait": Wait,
 }

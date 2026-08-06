@@ -106,13 +106,15 @@ function OrderFlow({
   return (
     <section className="market-order-flow">
       <header>
-        <span>ORDER FLOW</span>
-        <strong>Order commands accepted by the economic engine</strong>
+        <span>QUOTE LADDER FLOW</span>
+        <strong>
+          Atomic reconciliation actions produced by quote-ladder commands
+        </strong>
       </header>
       {items.length === 0 ? (
         <p>
-          No order commands were accepted by the economic engine during this
-          minute.
+          No quote-ladder reconciliation changed or preserved an order during
+          this minute.
         </p>
       ) : (
         <ol>
@@ -120,11 +122,11 @@ function OrderFlow({
             const order = flowOrder(flow);
             const isSelected =
               selected?.applySequence === flow.applySequence &&
-              selected.action === flow.action;
+              flowOrder(selected).orderId === order.orderId;
             return (
-              <li key={`${flow.applySequence}-${flow.action}`}>
+              <li key={`${flow.applySequence}-${order.orderId}`}>
                 <button
-                  aria-label={`Open ${flow.action} order ${order.orderId} matching detail`}
+                  aria-label={`Open ${flow.action} quote ${order.orderId} reconciliation detail`}
                   className={isSelected ? "selected" : undefined}
                   onClick={() => onSelect(flow)}
                   type="button"
@@ -133,7 +135,7 @@ function OrderFlow({
                     className="market-flow-sequence"
                     title={commandProcessingOrderSummary(flow.applySequence)}
                   >
-                    Command #{flow.applySequence}
+                    Ladder #{flow.applySequence}
                   </span>
                   <span className={`market-flow-action ${flow.action}`}>
                     {flow.action.toUpperCase()}
@@ -402,7 +404,7 @@ function OrderFlowDetail({
       <div className="drawer-body market-drawer-body">
         <MarketDrawerSection
           label="1"
-          title="Order command accepted by the economic engine"
+          title="Atomic quote-ladder reconciliation"
         >
           <dl className="market-detail-grid">
             <MarketMeta
@@ -429,7 +431,17 @@ function OrderFlowDetail({
             </p>
           )}
         </MarketDrawerSection>
-        {flow.action === "cancel" ? (
+        {flow.action === "keep" ? (
+          <MarketDrawerSection
+            label="2"
+            title="Immediate reconciliation result"
+          >
+            <p className="market-result-copy">
+              This quote was unchanged, so its existing order ID and time
+              priority were preserved.
+            </p>
+          </MarketDrawerSection>
+        ) : flow.action === "cancel" ? (
           <MarketDrawerSection label="2" title="End-of-minute result">
             <p className="market-result-copy">
               The active order was removed and does not appear in the
@@ -471,7 +483,7 @@ function OrderFlowDetail({
                 </ol>
               )}
             </MarketDrawerSection>
-            <MarketDrawerSection label="3" title="End-of-minute result">
+            <MarketDrawerSection label="3" title="Immediate command result">
               <dl className="market-detail-grid compact">
                 <MarketMeta
                   label="Submitted"
@@ -575,10 +587,16 @@ function MarketMeta({ label, value }: { readonly label: string; readonly value: 
 }
 
 function flowOrder(flow: MarketOrderFlowItemView): OpenOrderView {
+  if (flow.action === "keep") {
+    return flow.preservedOrder;
+  }
   return flow.action === "cancel" ? flow.cancelledOrder : flow.incomingOrder;
 }
 
 function flowResult(flow: MarketOrderFlowItemView): string {
+  if (flow.action === "keep") {
+    return "Priority kept";
+  }
   if (flow.action === "cancel") {
     return "Removed";
   }

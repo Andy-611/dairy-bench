@@ -21,9 +21,7 @@ DecisionModel = TypeVar("DecisionModel", bound=BaseModel)
 type CommandName = Literal[
     "produce",
     "transform",
-    "place_order",
-    "replace_order",
-    "cancel_order",
+    "set_quote_ladder",
     "set_retail_price",
     "wait",
 ]

@@ -16,6 +16,7 @@ from company_bench.market import (
     ContinuousSpotMarket,
     MarketError,
     MarketState,
+    OrderIdentity,
     SellOrder,
     TradeFill,
 )
@@ -34,7 +35,6 @@ from company_bench.models import (
     DomainEvent,
     FarmOperation,
     Identifier,
-    InvalidOrderQuantity,
     InventoryExpiredEvent,
     InventoryLot,
     InventoryPosition,
@@ -42,7 +42,6 @@ from company_bench.models import (
     MilkProcessedEvent,
     MilkProducedEvent,
     Money,
-    OrderQuantity,
     ProcessorOperation,
     ProductId,
     PublicCompany,
@@ -52,23 +51,23 @@ from company_bench.models import (
     StrictModel,
     TradeExecutedEvent,
     WorldState,
-    require_order_quantity,
 )
 from company_bench.runtime_models import (
-    CancelOrder,
     CommandEnvelope,
     CommandOutcome,
     CommandStatus,
     DeliveryExpiryBucket,
     IncomingDeliveryView,
+    InventoryExpiryBucket,
     MarketSide,
-    MarketView,
     OpenOrderView,
     OperationJobView,
-    PlaceOrder,
+    OrderBookView,
     Produce,
-    ReplaceOrder,
+    QuoteLadderResult,
+    QuoteLevelAction,
     ScheduledCompletion,
+    SetQuoteLadder,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -380,19 +379,6 @@ class _MarketSession:
         except KeyError as error:
             raise MarketError(f"unknown market product: {product.value}") from error
 
-    def containing(self, order_id: Identifier) -> ContinuousSpotMarket:
-        """Find the sole market containing an active order."""
-        matches = tuple(
-            market
-            for market in self.markets.values()
-            if any(order.order_id == order_id for order in market.state.orders)
-        )
-        if not matches:
-            raise MarketError("order does not exist")
-        if len(matches) != 1:
-            raise RuntimeError("order identity is duplicated across markets")
-        return matches[0]
-
     def freeze(self, *, next_lot_sequence: int | None = None) -> _SessionSnapshot:
         """Freeze a successful transaction back into checkpoint-safe values."""
         return _SessionSnapshot(
@@ -410,7 +396,7 @@ class _CommandEffect:
     """One successfully applied command and its immediate audit output."""
 
     economy: EconomyState
-    order_id: Identifier | None = None
+    quote_ladder_result: QuoteLadderResult | None = None
     job_id: Identifier | None = None
     events: tuple[DomainEvent, ...] = ()
     completions: tuple[ScheduledCompletion, ...] = ()
@@ -506,33 +492,20 @@ class EconomyEngine:
         economy: EconomyState,
         company_id: CompanyId,
     ) -> tuple[OpenOrderView, ...]:
-        """Return only active orders owned by one company."""
+        """Return owned active orders with current same-price queue depth."""
         return tuple(
-            OpenOrderView(
-                order_id=order.order_id,
-                owner_id=order.owner_id,
-                side=order.side,
-                product=order.product,
-                remaining_quantity=order.remaining_quantity,
-                limit_price=order.limit_price,
-                placed_at=order.placed_at,
-                priority_sequence=order.priority_sequence,
-            )
-            for market in economy.markets
-            for order in market.orders
-            if order.owner_id == company_id
+            order for market in economy.markets for order in market.company_order_views(company_id)
         )
 
     @staticmethod
-    def market_views(
+    def order_books(
         economy: EconomyState,
         company_id: CompanyId,
-    ) -> tuple[MarketView, ...]:
-        """Return anonymous books relevant to one company's value-chain role."""
+    ) -> tuple[OrderBookView, ...]:
+        """Return complete anonymous books relevant to one company's role."""
         company = economy.scenario.company(company_id)
-        relevant = _relevant_products(company)
-        markets = {market.product: market for market in economy.markets}
-        return tuple(markets[product].view() for product in relevant)
+        relevant = set(_relevant_products(company))
+        return tuple(market.view() for market in economy.markets if market.product in relevant)
 
     @staticmethod
     def reserved_cash(economy: EconomyState, company_id: CompanyId) -> Money:
@@ -548,29 +521,53 @@ class EconomyEngine:
         )
 
     @staticmethod
-    def reserved_inventory(
+    def marked_surplus(
         economy: EconomyState,
         company_id: CompanyId,
-    ) -> tuple[InventoryPosition, ...]:
-        """Aggregate inventory collateral held by the company's asks."""
-        quantities = {
-            product.product: sum(
-                (
-                    lot.quantity
-                    for market in economy.markets
-                    for order in market.orders
-                    if isinstance(order, SellOrder) and order.owner_id == company_id
-                    for lot in order.reserved_lots
-                    if lot.product is product.product
-                ),
-                start=ZERO,
-            )
-            for product in economy.scenario.products
+    ) -> Decimal:
+        """Mark guaranteed owned assets against the episode's initial value."""
+        company = _company_state(economy.companies, company_id)
+        owned_lots = (
+            *company.inventory,
+            *_reserved_lots(economy, company_id),
+            *(
+                lot
+                for delivery in economy.deliveries
+                if delivery.buyer_id == company_id
+                for lot in delivery.lots
+            ),
+        )
+        marked_value = (
+            company.cash
+            + EconomyEngine.reserved_cash(economy, company_id)
+            + economy.scenario.inventory_value(owned_lots)
+            + _operation_output_value(economy, company_id)
+        )
+        return marked_value - economy.scenario.company(company_id).initial_cash
+
+    @staticmethod
+    def inventory_expiry(
+        economy: EconomyState,
+        company_id: CompanyId,
+    ) -> tuple[InventoryExpiryBucket, ...]:
+        """Aggregate available and ask-reserved spot inventory by expiry."""
+        available = _expiry_quantities(_company_state(economy.companies, company_id).inventory)
+        reserved = _expiry_quantities(_reserved_lots(economy, company_id))
+        product_order = {
+            product.product: index for index, product in enumerate(economy.scenario.products)
         }
+        keys = sorted(
+            available.keys() | reserved.keys(),
+            key=lambda key: (product_order[key[0]], key[1]),
+        )
         return tuple(
-            InventoryPosition(product=product, quantity=quantity)
-            for product, quantity in quantities.items()
-            if quantity > ZERO
+            InventoryExpiryBucket(
+                product=product,
+                expires_end_of_day=expiry_day,
+                available_quantity=available.get((product, expiry_day), ZERO),
+                reserved_quantity=reserved.get((product, expiry_day), ZERO),
+            )
+            for product, expiry_day in keys
         )
 
     @staticmethod
@@ -913,7 +910,7 @@ class EconomyEngine:
             envelope,
             apply_sequence,
             accepted=True,
-            order_id=effect.order_id,
+            quote_ladder_result=effect.quote_ladder_result,
             job_id=effect.job_id,
             events=effect.events,
             completions=effect.completions,
@@ -930,12 +927,8 @@ class EconomyEngine:
             return self._produce(economy, envelope)
         if isinstance(command, Transform):
             return self._transform(economy, envelope)
-        if isinstance(command, PlaceOrder):
-            return self._place(economy, envelope, apply_sequence)
-        if isinstance(command, ReplaceOrder):
-            return self._replace(economy, envelope, apply_sequence)
-        if isinstance(command, CancelOrder):
-            return self._cancel(economy, envelope)
+        if isinstance(command, SetQuoteLadder):
+            return self._set_quote_ladder(economy, envelope)
         if isinstance(command, SetRetailPrice):
             return self._set_retail_price(economy, envelope)
         if isinstance(command, Wait):
@@ -1070,86 +1063,39 @@ class EconomyEngine:
             completions=(_operation_completion(job),),
         )
 
-    def _place(
+    def _set_quote_ladder(
         self,
         economy: EconomyState,
         envelope: CommandEnvelope,
-        apply_sequence: int,
     ) -> _CommandEffect:
         command = envelope.command
-        if not isinstance(command, PlaceOrder):
-            raise TypeError("place handler requires PlaceOrder")
-        quantity = _validated_order_quantity(command.quantity)
+        if not isinstance(command, SetQuoteLadder):
+            raise TypeError("quote ladder handler requires SetQuoteLadder")
         company = economy.scenario.company(envelope.company_id)
         if not _order_is_authorized(company, command.side, command.product):
             raise _CommandRejected("order side or product is not authorized for this company")
         session = _MarketSession.from_economy(economy)
         sequence = economy.next_order_sequence
-        order_id = f"d{economy.day}.o{sequence}.{company.company_id}"
-        fills = session.market(command.product).place(
-            order_id=order_id,
+        execution = session.market(command.product).set_quote_ladder(
             owner_id=company.company_id,
-            side=command.side,
-            quantity=quantity,
-            limit_price=command.limit_price,
+            ladder=command,
             placed_at=envelope.issued_at,
-            priority_sequence=apply_sequence,
+            order_identity_factory=lambda offset: OrderIdentity(
+                order_id=f"d{economy.day}.o{sequence + offset - 1}.{company.company_id}",
+                priority_sequence=sequence + offset - 1,
+            ),
             trade_id_factory=self._trade_id_factory(economy),
         )
-        return self._commit_order(
+        created = sum(
+            level.action is not QuoteLevelAction.KEEP for level in execution.result.levels
+        )
+        return self._commit_quote_ladder(
             economy,
             session,
             envelope.issued_at,
-            fills,
-            order_id,
-            sequence + 1,
-        )
-
-    def _replace(
-        self,
-        economy: EconomyState,
-        envelope: CommandEnvelope,
-        apply_sequence: int,
-    ) -> _CommandEffect:
-        command = envelope.command
-        if not isinstance(command, ReplaceOrder):
-            raise TypeError("replace handler requires ReplaceOrder")
-        quantity = _validated_order_quantity(command.quantity)
-        session = _MarketSession.from_economy(economy)
-        market = session.containing(command.order_id)
-        sequence = economy.next_order_sequence
-        order_id = f"d{economy.day}.o{sequence}.{envelope.company_id}"
-        fills = market.replace(
-            old_order_id=command.order_id,
-            owner_id=envelope.company_id,
-            new_order_id=order_id,
-            quantity=quantity,
-            limit_price=command.limit_price,
-            placed_at=envelope.issued_at,
-            priority_sequence=apply_sequence,
-            trade_id_factory=self._trade_id_factory(economy),
-        )
-        return self._commit_order(
-            economy,
-            session,
-            envelope.issued_at,
-            fills,
-            order_id,
-            sequence + 1,
-        )
-
-    def _cancel(self, economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
-        command = envelope.command
-        if not isinstance(command, CancelOrder):
-            raise TypeError("cancel handler requires CancelOrder")
-        session = _MarketSession.from_economy(economy)
-        session.containing(command.order_id).cancel(
-            order_id=command.order_id,
-            owner_id=envelope.company_id,
-        )
-        return _CommandEffect(
-            economy=economy._with_market_session(session.freeze()),
-            order_id=command.order_id,
+            execution.result,
+            execution.fills,
+            sequence + created,
         )
 
     @staticmethod
@@ -1192,15 +1138,20 @@ class EconomyEngine:
             raise TypeError("wait handler requires Wait")
         return _CommandEffect(economy=economy)
 
-    def _commit_order(
+    def _commit_quote_ladder(
         self,
         economy: EconomyState,
         session: _MarketSession,
         at: SimTime,
+        result: QuoteLadderResult,
         fills: tuple[TradeFill, ...],
-        order_id: Identifier,
         next_order_sequence: int,
     ) -> _CommandEffect:
+        changed = bool(result.cancelled_order_ids) or any(
+            level.action is not QuoteLevelAction.KEEP for level in result.levels
+        )
+        if not changed:
+            return _CommandEffect(economy=economy, quote_ladder_result=result)
         trade_effects = self._trade_effects(economy, fills, at)
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
@@ -1213,7 +1164,7 @@ class EconomyEngine:
         )
         return _CommandEffect(
             economy=updated,
-            order_id=order_id,
+            quote_ladder_result=result,
             events=trade_effects.events,
             completions=trade_effects.completions,
         )
@@ -1284,7 +1235,7 @@ class EconomyEngine:
         *,
         accepted: bool,
         reason: str | None = None,
-        order_id: Identifier | None = None,
+        quote_ladder_result: QuoteLadderResult | None = None,
         job_id: Identifier | None = None,
         events: tuple[DomainEvent, ...] = (),
         completions: tuple[ScheduledCompletion, ...] = (),
@@ -1305,7 +1256,7 @@ class EconomyEngine:
             reason=reason,
             resulting_state_version=economy.state_version,
             apply_sequence=apply_sequence,
-            order_id=order_id,
+            quote_ladder_result=quote_ladder_result,
             job_id=job_id,
             events=events,
             scheduled_completions=completions,
@@ -1466,6 +1417,45 @@ def _validate_job_time(started_at: SimTime, completes_at: SimTime) -> None:
         raise ValueError("operation must complete within its business day")
 
 
+def _reserved_lots(
+    economy: EconomyState,
+    company_id: CompanyId,
+) -> tuple[InventoryLot, ...]:
+    """Return every lot collateralizing the company's active asks."""
+    return tuple(
+        lot
+        for market in economy.markets
+        for order in market.orders
+        if isinstance(order, SellOrder) and order.owner_id == company_id
+        for lot in order.reserved_lots
+    )
+
+
+def _expiry_quantities(
+    lots: Iterable[InventoryLot],
+) -> dict[tuple[ProductId, int], Quantity]:
+    """Aggregate lots without exposing their private identities."""
+    quantities: dict[tuple[ProductId, int], Quantity] = {}
+    for lot in lots:
+        key = (lot.product, lot.expires_end_of_day)
+        quantities[key] = quantities.get(key, ZERO) + lot.quantity
+    return quantities
+
+
+def _operation_output_value(economy: EconomyState, company_id: CompanyId) -> Money:
+    """Mark the guaranteed output of one funded active operation."""
+    job = next((job for job in economy.jobs if job.company_id == company_id), None)
+    if job is None:
+        return ZERO
+    if isinstance(job, ProductionJob):
+        product = job.product
+        quantity = job.quantity
+    else:
+        product = job.output_product
+        quantity = job.output_quantity
+    return quantity * economy.scenario.product(product).reference_value
+
+
 def _persisted_lots(economy: EconomyState) -> Iterable[InventoryLot]:
     """Yield every on-hand, reserved, and in-transit inventory lot."""
     for company in economy.companies:
@@ -1525,14 +1515,6 @@ def _operation_completion(job: OperationJob) -> ScheduledCompletion:
         reference_id=job.job_id,
         company_id=job.company_id,
     )
-
-
-def _validated_order_quantity(value: Decimal) -> OrderQuantity:
-    """Translate the public command value into the market's exact quantity type."""
-    try:
-        return require_order_quantity(value)
-    except InvalidOrderQuantity as error:
-        raise _CommandRejected(str(error)) from error
 
 
 def _order_is_authorized(

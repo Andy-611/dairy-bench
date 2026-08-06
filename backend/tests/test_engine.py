@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.engine import EconomyEngine, EconomyState, PendingDelivery
@@ -10,6 +11,7 @@ from company_bench.models import (
     ConsumerSaleEvent,
     DayResult,
     DeliveryCompletedEvent,
+    InventoryExpiredEvent,
     InventoryLot,
     MilkProcessedEvent,
     MilkProducedEvent,
@@ -18,15 +20,15 @@ from company_bench.models import (
     TradeExecutedEvent,
 )
 from company_bench.runtime_models import (
-    CancelOrder,
     CommandEnvelope,
     CommandOutcome,
     CompanyCommand,
     DeliveryExpiryBucket,
     MarketSide,
-    PlaceOrder,
     Produce,
-    ReplaceOrder,
+    QuoteLevel,
+    QuoteLevelAction,
+    SetQuoteLadder,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -44,6 +46,14 @@ def engine() -> EconomyEngine:
 def economy(engine: EconomyEngine) -> EconomyState:
     """Open the canonical first business day."""
     return engine.open_day(engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=7))
+
+
+def test_initial_decision_projections_are_economically_empty(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    assert engine.marked_surplus(economy, "farm_a") == Decimal("0")
+    assert engine.inventory_expiry(economy, "farm_a") == ()
 
 
 def _at(hour: int, minute: int = 0, *, day: int = 0) -> SimTime:
@@ -119,14 +129,41 @@ def _order(
     product: ProductId,
     quantity: Decimal | str,
     price: Decimal | str,
-) -> PlaceOrder:
+) -> SetQuoteLadder:
     """Build one concise limit order."""
-    return PlaceOrder(
+    return SetQuoteLadder(
         side=side,
         product=product,
-        quantity=Decimal(quantity),
-        limit_price=Decimal(price),
+        levels=(
+            QuoteLevel(
+                quantity=Decimal(quantity),
+                limit_price=Decimal(price),
+            ),
+        ),
     )
+
+
+def _ladder(
+    side: MarketSide,
+    product: ProductId,
+    levels: tuple[tuple[str, str], ...],
+) -> SetQuoteLadder:
+    """Build one concise multi-level target ladder as price-quantity pairs."""
+    return SetQuoteLadder(
+        side=side,
+        product=product,
+        levels=tuple(
+            QuoteLevel(quantity=Decimal(quantity), limit_price=Decimal(price))
+            for price, quantity in levels
+        ),
+    )
+
+
+def _order_id(outcome: CommandOutcome) -> str:
+    """Return the sole target order identity from a one-level ladder result."""
+    result = outcome.quote_ladder_result
+    assert result is not None and len(result.levels) == 1
+    return result.levels[0].order_id
 
 
 def _open_with_inventory(
@@ -138,20 +175,36 @@ def _open_with_inventory(
     cash: Decimal = Decimal("1000"),
 ) -> EconomyState:
     """Open day one with one explicit test-only starting lot."""
+    return _open_with_lots(
+        engine,
+        company_id,
+        (
+            InventoryLot(
+                lot_id=f"seed.{company_id}.{product.value}",
+                product=product,
+                quantity=quantity,
+                produced_day=1,
+                expires_end_of_day=5,
+            ),
+        ),
+        cash=cash,
+    )
+
+
+def _open_with_lots(
+    engine: EconomyEngine,
+    company_id: str,
+    lots: tuple[InventoryLot, ...],
+    *,
+    cash: Decimal = Decimal("1000"),
+) -> EconomyState:
+    """Open day one with explicit test-only inventory lots."""
     world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=7)
     companies = tuple(
         company.model_copy(
             update={
                 "cash": cash,
-                "inventory": (
-                    InventoryLot(
-                        lot_id=f"seed.{company_id}.{product.value}",
-                        product=product,
-                        quantity=quantity,
-                        produced_day=1,
-                        expires_end_of_day=5,
-                    ),
-                ),
+                "inventory": lots,
             }
         )
         if company.company_id == company_id
@@ -266,6 +319,8 @@ def test_production_is_atomic_busy_capacity_limited_and_completes_in_thirty_minu
     assert _company(economy, "farm_a").cash == Decimal("940")
     assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == 0
     assert engine.remaining_operation_capacity(economy, "farm_a") == 0
+    assert engine.marked_surplus(economy, "farm_a") == 0
+    assert engine.inventory_expiry(economy, "farm_a") == ()
 
     busy_state, busy = _apply(
         engine,
@@ -285,6 +340,8 @@ def test_production_is_atomic_busy_capacity_limited_and_completes_in_thirty_minu
     assert isinstance(event, MilkProducedEvent)
     assert event.actual_quantity == Decimal("60")
     assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == Decimal("60")
+    assert engine.marked_surplus(economy, "farm_a") == 0
+    assert engine.inventory_expiry(economy, "farm_a")[0].available_quantity == 60
 
     unchanged, exhausted = _apply(
         engine,
@@ -358,6 +415,8 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     assert _quantity(economy, "processor_a", ProductId.RAW_MILK) == 0
     assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == 0
     assert engine.remaining_operation_capacity(economy, "processor_a") == 0
+    assert engine.marked_surplus(economy, "processor_a") == 50
+    assert engine.inventory_expiry(economy, "processor_a") == ()
 
     unchanged, busy = _apply(
         engine,
@@ -376,6 +435,8 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     assert event.actual_input == Decimal("50")
     assert event.output_quantity == Decimal("40.0")
     assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == Decimal("40.0")
+    assert engine.marked_surplus(economy, "processor_a") == 50
+    assert engine.inventory_expiry(economy, "processor_a")[0].available_quantity == 40
 
     unchanged, exhausted = _apply(
         engine,
@@ -440,7 +501,11 @@ def test_orders_require_authorization_and_full_cash_or_inventory_collateral(
         engine,
         economy,
         "processor_a",
-        _order(MarketSide.BUY, ProductId.RAW_MILK, "1", "1"),
+        _ladder(
+            MarketSide.BUY,
+            ProductId.RAW_MILK,
+            (("10", "100"), ("9", "1")),
+        ),
         _at(9, 4),
         5,
     )
@@ -449,23 +514,13 @@ def test_orders_require_authorization_and_full_cash_or_inventory_collateral(
 
 
 @pytest.mark.parametrize("quantity", ("8.9E-91", "59.999999999999999"))
-def test_unquantized_place_order_is_rejected_before_assets_change(
-    engine: EconomyEngine,
+def test_unquantized_quote_level_is_rejected_at_the_schema_boundary(
     economy: EconomyState,
     quantity: str,
 ) -> None:
-    unchanged, outcome = _apply(
-        engine,
-        economy,
-        "processor_a",
-        _order(MarketSide.BUY, ProductId.RAW_MILK, quantity, "1"),
-        _at(9),
-        1,
-    )
-
-    assert not outcome.accepted
-    assert "exact multiple of 0.0001" in outcome.reason
-    assert unchanged == economy
+    with pytest.raises(ValidationError, match=r"exact multiple of 0\.0001"):
+        _order(MarketSide.BUY, ProductId.RAW_MILK, quantity, "1")
+    assert economy.state_version == 0
 
 
 @pytest.mark.parametrize("quantity", ("1E+24", "1E+999999"))
@@ -507,7 +562,7 @@ def test_out_of_range_order_quantity_is_rejected_without_decimal_failure(
 
 
 @pytest.mark.parametrize("quantity", ("8.9E-91", "59.999999999999999"))
-def test_unquantized_replace_order_preserves_the_original_commitment(
+def test_invalid_ladder_update_cannot_disturb_the_original_commitment(
     engine: EconomyEngine,
     economy: EconomyState,
     quantity: str,
@@ -520,22 +575,9 @@ def test_unquantized_replace_order_preserves_the_original_commitment(
         _at(9),
         1,
     )
-    unchanged, outcome = _apply(
-        engine,
-        economy,
-        "processor_a",
-        ReplaceOrder(
-            order_id=placed.order_id,
-            quantity=Decimal(quantity),
-            limit_price=Decimal("1"),
-        ),
-        _at(9, 1),
-        2,
-    )
-
-    assert not outcome.accepted
-    assert "exact multiple of 0.0001" in outcome.reason
-    assert unchanged == economy
+    with pytest.raises(ValidationError, match=r"exact multiple of 0\.0001"):
+        _order(MarketSide.BUY, ProductId.RAW_MILK, quantity, "1")
+    assert engine.company_orders(economy, "processor_a")[0].order_id == _order_id(placed)
 
 
 def test_minimum_legal_partial_fill_preserves_market_state_invariants(
@@ -565,7 +607,7 @@ def test_minimum_legal_partial_fill_preserves_market_state_invariants(
     assert order.remaining_quantity == Decimal("59.9998")
     assert (
         sum(
-            (position.quantity for position in engine.reserved_inventory(economy, "farm_a")),
+            (bucket.reserved_quantity for bucket in engine.inventory_expiry(economy, "farm_a")),
             start=Decimal("0"),
         )
         == order.remaining_quantity
@@ -613,9 +655,15 @@ def test_match_pays_seller_now_and_delivers_inventory_thirty_minutes_later(
     assert _company(economy, "farm_a").cash == Decimal("999.00")
     assert _company(economy, "processor_a").cash == Decimal("991.00")
     assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == 0
-    assert engine.reserved_inventory(economy, "farm_a")[0].quantity == 4
+    farm_expiry = engine.inventory_expiry(economy, "farm_a")
+    assert len(farm_expiry) == 1
+    assert farm_expiry[0].available_quantity == 0
+    assert farm_expiry[0].reserved_quantity == 4
     assert _quantity(economy, "processor_a", ProductId.RAW_MILK) == 0
     assert engine.pending_delivery_views(economy, "processor_a")[0].quantity == 6
+    assert engine.inventory_expiry(economy, "processor_a") == ()
+    assert engine.marked_surplus(economy, "farm_a") == Decimal("3")
+    assert engine.marked_surplus(economy, "processor_a") == Decimal("-3")
 
     completion = outcomes[1].scheduled_completions[0]
     assert completion.kind is SystemEventKind.DELIVERY_COMPLETED
@@ -626,6 +674,8 @@ def test_match_pays_seller_now_and_delivers_inventory_thirty_minutes_later(
     assert _quantity(economy, "processor_a", ProductId.RAW_MILK) == Decimal("6")
     assert economy.deliveries == ()
     assert isinstance(economy.events[-1], DeliveryCompletedEvent)
+    assert engine.marked_surplus(economy, "processor_a") == Decimal("-3")
+    assert engine.inventory_expiry(economy, "processor_a")[0].available_quantity == 6
 
 
 def test_pending_delivery_view_preserves_each_expiry_bucket() -> None:
@@ -658,6 +708,54 @@ def test_pending_delivery_view_preserves_each_expiry_bucket() -> None:
     )
 
 
+def test_inventory_expiry_splits_available_and_fefo_reserved_quantities(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_lots(
+        engine,
+        "farm_a",
+        (
+            InventoryLot(
+                lot_id="seed.farm_a.raw.early",
+                product=ProductId.RAW_MILK,
+                quantity=Decimal("4"),
+                produced_day=1,
+                expires_end_of_day=2,
+            ),
+            InventoryLot(
+                lot_id="seed.farm_a.raw.late",
+                product=ProductId.RAW_MILK,
+                quantity=Decimal("6"),
+                produced_day=1,
+                expires_end_of_day=3,
+            ),
+        ),
+    )
+    economy, placed = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _order(MarketSide.SELL, ProductId.RAW_MILK, "5", "2"),
+        _at(9),
+        1,
+    )
+
+    assert placed.accepted and _order_id(placed)
+    buckets = engine.inventory_expiry(economy, "farm_a")
+    assert tuple(
+        (
+            bucket.expires_end_of_day,
+            bucket.available_quantity,
+            bucket.reserved_quantity,
+        )
+        for bucket in buckets
+    ) == (
+        (2, Decimal("0"), Decimal("4")),
+        (3, Decimal("5"), Decimal("1")),
+    )
+    assert engine.marked_surplus(economy, "farm_a") == Decimal("10")
+
+
 def test_replace_is_atomic_and_cancel_releases_remaining_collateral(
     engine: EconomyEngine,
     economy: EconomyState,
@@ -670,47 +768,48 @@ def test_replace_is_atomic_and_cancel_releases_remaining_collateral(
         _at(9),
         1,
     )
-    assert placed.order_id is not None
+    placed_id = _order_id(placed)
     economy, replaced = _apply(
         engine,
         economy,
         "processor_a",
-        ReplaceOrder(
-            order_id=placed.order_id,
-            quantity=Decimal("4"),
-            limit_price=Decimal("2"),
-        ),
+        _order(MarketSide.BUY, ProductId.RAW_MILK, "4", "2"),
         _at(9, 1),
         2,
     )
 
-    assert replaced.accepted and replaced.order_id != placed.order_id
+    replaced_id = _order_id(replaced)
+    assert replaced.accepted and replaced_id != placed_id
+    assert replaced.quote_ladder_result is not None
+    assert replaced.quote_ladder_result.levels[0].action is QuoteLevelAction.REPLACE
     assert _company(economy, "processor_a").cash == Decimal("992")
     assert engine.reserved_cash(economy, "processor_a") == Decimal("8")
+    assert engine.marked_surplus(economy, "processor_a") == 0
     order = engine.company_orders(economy, "processor_a")[0]
-    assert order.order_id == replaced.order_id
+    assert order.order_id == replaced_id
     assert order.priority_sequence == 2
 
     unchanged, rejected = _apply(
         engine,
         economy,
         "processor_a",
-        ReplaceOrder(
-            order_id=replaced.order_id,
-            quantity=Decimal("1000"),
-            limit_price=Decimal("2"),
-        ),
+        _order(MarketSide.BUY, ProductId.RAW_MILK, "1000", "2"),
         _at(9, 2),
         3,
     )
     assert not rejected.accepted and "cash" in rejected.reason
     assert unchanged == economy
+    assert engine.marked_surplus(unchanged, "processor_a") == 0
 
     economy, cancelled = _apply(
         engine,
         economy,
         "processor_a",
-        CancelOrder(order_id=replaced.order_id),
+        SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.BUY,
+            levels=(),
+        ),
         _at(9, 3),
         4,
     )
@@ -718,6 +817,7 @@ def test_replace_is_atomic_and_cancel_releases_remaining_collateral(
     assert _company(economy, "processor_a").cash == Decimal("1000")
     assert engine.reserved_cash(economy, "processor_a") == 0
     assert engine.company_orders(economy, "processor_a") == ()
+    assert engine.marked_surplus(economy, "processor_a") == 0
 
 
 def test_active_state_rejects_order_identity_reused_across_product_books(
@@ -783,6 +883,7 @@ def test_consumer_sales_run_after_market_close_and_day_closes_at_nineteen_thirty
     assert retailer_sale.revenue == Decimal("35.00")
     assert _company(economy, "retailer_a").cash == Decimal("1035.00")
     assert _quantity(economy, "retailer_a", ProductId.BOTTLED_MILK) == 0
+    assert engine.marked_surplus(economy, "retailer_a") == Decimal("35.00")
 
     with pytest.raises(ValueError, match="wrong configured minute"):
         engine.close_day(economy, _at(19, 29))
@@ -791,6 +892,43 @@ def test_consumer_sales_run_after_market_close_and_day_closes_at_nineteen_thirty
     assert result.snapshot.consumer_sales == Decimal("10")
     assert result.snapshot.markets == result.state.previous_markets
     assert result.events == economy.events
+    retailer_snapshot = next(
+        company for company in result.snapshot.companies if company.company_id == "retailer_a"
+    )
+    assert retailer_snapshot.surplus == Decimal("35.00")
+
+
+def test_marked_surplus_recognizes_expiry_only_at_day_close(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_lots(
+        engine,
+        "farm_a",
+        (
+            InventoryLot(
+                lot_id="seed.farm_a.expiring",
+                product=ProductId.RAW_MILK,
+                quantity=Decimal("3"),
+                produced_day=1,
+                expires_end_of_day=1,
+            ),
+        ),
+    )
+
+    assert engine.marked_surplus(economy, "farm_a") == Decimal("3")
+    assert engine.inventory_expiry(economy, "farm_a")[0].expires_end_of_day == 1
+
+    result = _close_day(engine, economy)
+    farm_snapshot = next(
+        company for company in result.snapshot.companies if company.company_id == "farm_a"
+    )
+    expiry = next(event for event in result.events if isinstance(event, InventoryExpiredEvent))
+    assert expiry.reference_value_loss == Decimal("3")
+    assert farm_snapshot.surplus == Decimal("0")
+
+    day_two = engine.open_day(result.state)
+    assert engine.marked_surplus(day_two, "farm_a") == Decimal("0")
+    assert engine.inventory_expiry(day_two, "farm_a") == ()
 
 
 def test_consumer_demand_remains_continuous_after_price_adjustment(

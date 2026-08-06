@@ -13,10 +13,8 @@ export const COMMAND_PROCESSING_ORDER_LABEL = "Command Processing Order";
 export const ORDER_BOOK_PRIORITY_LABEL = "Order-book Priority";
 
 const COMMAND_LABELS: Readonly<Record<TimelineCommandView["kind"], string>> = {
-  cancel_order: "Cancel order",
-  place_order: "Place order",
   produce: "Produce",
-  replace_order: "Replace order",
+  set_quote_ladder: "Set quote ladder",
   set_retail_price: "Set retail price",
   transform: "Transform",
   wait: "Wait",
@@ -113,12 +111,8 @@ export function commandSummary(command: TimelineCommandView): string {
       return `Produce ${formatExactDecimal(command.quantity)} ${productLabel(command.product)}`;
     case "transform":
       return `Transform ${formatExactDecimal(command.inputQuantity)} ${productLabel(command.inputProduct)} into ${productLabel(command.outputProduct)}`;
-    case "place_order":
-      return `${capitalize(command.side)} ${formatExactDecimal(command.quantity)} ${productLabel(command.product)} at a ${formatExactDecimal(command.limitPrice)} limit`;
-    case "cancel_order":
-      return `Cancel order ${command.orderId}`;
-    case "replace_order":
-      return `Replace order ${shortId(command.orderId)} with ${formatExactDecimal(command.quantity)} units at a ${formatExactDecimal(command.limitPrice)} limit`;
+    case "set_quote_ladder":
+      return quoteLadderSummary(command);
     case "set_retail_price":
       return `Set ${productLabel(command.product)} retail price to ${formatExactDecimal(command.unitPrice)}`;
     case "wait":
@@ -132,17 +126,54 @@ function acceptedCommandResult(turn: TurnTimelineItemView): string {
       return identifiedResult("Production job started", turn.outcomeJobId);
     case "transform":
       return identifiedResult("Transformation job started", turn.outcomeJobId);
-    case "place_order":
-      return identifiedResult("Market order placed", turn.outcomeOrderId);
-    case "replace_order":
-      return identifiedResult("Replacement order placed", turn.outcomeOrderId);
-    case "cancel_order":
-      return `Market order cancelled: ${turn.command.orderId}`;
+    case "set_quote_ladder":
+      return quoteLadderResultSummary(turn);
     case "set_retail_price":
       return "Retail price updated";
     case "wait":
       return "Attention plan armed";
   }
+}
+
+function quoteLadderSummary(
+  command: Extract<TimelineCommandView, { readonly kind: "set_quote_ladder" }>,
+): string {
+  const scope = `${command.side} ${productLabel(command.product)} quote ladder`;
+  if (command.levels.length === 0) {
+    return `Clear ${scope}`;
+  }
+  const levels = command.levels
+    .map(
+      (level) =>
+        `${formatExactDecimal(level.quantity)} @ ${formatExactDecimal(level.limitPrice)}`,
+    )
+    .join(", ");
+  return `Set ${scope}: ${levels}`;
+}
+
+function quoteLadderResultSummary(turn: TurnTimelineItemView): string {
+  const result = turn.quoteLadderResult;
+  if (result === null) {
+    return "Quote ladder reconciled";
+  }
+  const labels = {
+    keep: "kept",
+    place: "placed",
+    replace: "replaced",
+  } as const;
+  const actions = (["keep", "place", "replace"] as const)
+    .map((action) => ({
+      action,
+      count: result.levels.filter((level) => level.action === action).length,
+    }))
+    .filter(({ count }) => count > 0)
+    .map(({ action, count }) => `${count} ${labels[action]}`);
+  if (result.cancelledOrderIds.length > 0) {
+    actions.push(`${result.cancelledOrderIds.length} cancelled`);
+  }
+  return actions.length === 0
+    ? "Quote ladder already clear"
+    : `Quote ladder reconciled: ${actions.join(", ")}`;
 }
 
 function identifiedResult(label: string, identifier: string | null): string {

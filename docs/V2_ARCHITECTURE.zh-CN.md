@@ -89,10 +89,13 @@ wait 定时器或 continuation 定时器会被取消。
 
 - `Produce`
 - `Transform`
-- `PlaceOrder`
-- `CancelOrder`
+- `SetQuoteLadder`
 - `SetRetailPrice`
 - `Wait`
+
+`SetQuoteLadder` 用一条命令为一个产品和方向设置零至三个相互独立的目标价格—数量
+档位。它采用当前市场契约所定义的确定性 Keep/Replace/Cancel/Place 对账与整组原子
+担保规则；空阶梯会撤掉该产品方向上的全部报价。
 
 Runtime 负责绑定 `turn_id`、`company_id`、`sim_time` 和
 `state_version`。模型不能提供或伪造这些字段。

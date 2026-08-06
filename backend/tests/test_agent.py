@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+from decimal import Decimal
 
 import pytest
 from pydantic import SecretStr
@@ -171,6 +172,7 @@ def test_output_failure_retains_codex_artifact_coordinates(
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=first_observation,
         available_cash=first_observation.cash,
+        marked_surplus=Decimal(),
     )
     agent = LlmCompanyAgent(
         run_id="failed_run",

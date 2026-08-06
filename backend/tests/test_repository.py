@@ -190,7 +190,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
             "scenario_id",
@@ -214,8 +214,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 6])
-def test_sqlite_repository_rejects_non_v5_databases(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 8])
+def test_sqlite_repository_rejects_non_v7_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -304,9 +304,7 @@ def _assert_job_history(
     assert repository.list_jobs(2) == expected[:2]
     assert repository.list_jobs(0) == ()
     assert {job.status for job in repository.list_jobs()} == set(RunStatus)
-    assert repository.list_resumable_jobs() == tuple(
-        job for job in jobs if not job.status.terminal
-    )
+    assert repository.list_resumable_jobs() == tuple(job for job in jobs if not job.status.terminal)
 
 
 def _history_jobs() -> tuple[RunJob, ...]:
@@ -363,8 +361,7 @@ def _assert_replay_sources(repository: LifecycleRepository) -> tuple[ReplaySourc
         repository.save_job(job)
 
     expected = tuple(
-        ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at)
-        for job in (newer, older)
+        ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at) for job in (newer, older)
     )
     assert repository.list_replay_sources() == expected
     return expected
@@ -473,6 +470,7 @@ def _turn_for(
         wake_reasons=(WakeReason.DAY_OPEN if sequence == 1 else WakeReason.CONTINUE,),
         observation=observation,
         available_cash=observation.cash,
+        marked_surplus=Decimal(),
     )
     envelope = CommandEnvelope(
         turn_id=turn_id,

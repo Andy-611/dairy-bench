@@ -6,13 +6,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from company_bench.market import PriceTimeQueue
 from company_bench.models import Identifier, ProductId, ScenarioSpec, TradeExecutedEvent
 from company_bench.runtime_models import (
-    CancelOrder,
     MarketSide,
     OpenOrderView,
-    PlaceOrder,
-    ReplaceOrder,
+    QuoteLevelAction,
+    QuoteLevelResult,
+    SetQuoteLadder,
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
@@ -24,6 +25,7 @@ from company_bench.timeline_models import (
     MarketOrderCancelled,
     MarketOrderFlowItem,
     MarketOrderPlaced,
+    MarketOrderPreserved,
     MarketOrderReplaced,
     MarketPriceLevel,
     TimelineTrade,
@@ -38,7 +40,7 @@ class MarketProjectionError(ValueError):
 class _TurnMarketProjection:
     """Compact market effects emitted by one accepted company turn."""
 
-    flow: MarketOrderFlowItem | None = None
+    flows: tuple[MarketOrderFlowItem, ...] = ()
     trades: tuple[TimelineTrade, ...] = ()
 
 
@@ -71,73 +73,84 @@ class _MarketReplay:
             return _TurnMarketProjection()
 
         command = record.envelope.command
-        incoming: OpenOrderView | None = None
-        replaced: OpenOrderView | None = None
-        cancelled: OpenOrderView | None = None
-        if isinstance(command, PlaceOrder):
-            incoming = self._new_order(
-                record,
-                side=command.side,
-                product=command.product,
-                quantity=command.quantity,
-                limit_price=command.limit_price,
-            )
-        elif isinstance(command, ReplaceOrder):
-            replaced = self._remove(command.order_id)
-            incoming = self._new_order(
-                record,
-                side=replaced.side,
-                product=replaced.product,
-                quantity=command.quantity,
-                limit_price=command.limit_price,
-            )
-        elif isinstance(command, CancelOrder):
-            cancelled = self._remove(command.order_id)
-
         events = tuple(
-            event
-            for event in record.outcome.events
-            if isinstance(event, TradeExecutedEvent)
+            event for event in record.outcome.events if isinstance(event, TradeExecutedEvent)
         )
-        if events and incoming is None:
-            raise MarketProjectionError("trade events require an incoming market order")
-        matches: tuple[MarketMatchLeg, ...] = ()
-        remaining = incoming
-        if incoming is not None:
-            remaining, matches = self._apply_fills(incoming, events)
+        if not isinstance(command, SetQuoteLadder):
+            if events or record.outcome.quote_ladder_result is not None:
+                raise MarketProjectionError("only a quote ladder may carry market results")
+            return _TurnMarketProjection()
+        result = record.outcome.quote_ladder_result
+        if result is None or tuple(level.level for level in result.levels) != command.levels:
+            raise MarketProjectionError("accepted quote ladder has no matching result")
+
+        retired_ids = (
+            *result.cancelled_order_ids,
+            *(
+                level.replaced_order_id
+                for level in result.levels
+                if level.replaced_order_id is not None
+            ),
+        )
+        retired = {order_id: self._remove(order_id) for order_id in retired_ids}
+        events_by_order: dict[Identifier, list[TradeExecutedEvent]] = defaultdict(list)
+        for event in events:
+            events_by_order[event.taker_order_id].append(event)
+
+        flows: list[MarketOrderFlowItem] = []
+        for level in result.levels:
+            if level.action is QuoteLevelAction.KEEP:
+                preserved = self._kept_order(record, level)
+                flows.append(
+                    MarketOrderPreserved(
+                        apply_sequence=record.outcome.apply_sequence,
+                        preserved_order=preserved,
+                    )
+                )
+                continue
+
+            incoming = self._new_order(record, level)
+            remaining, matches = self._apply_fills(
+                incoming,
+                tuple(events_by_order.pop(incoming.order_id, ())),
+            )
+            remaining_quantity = (
+                remaining.remaining_quantity if remaining is not None else Decimal()
+            )
+            if remaining_quantity != level.remaining_quantity:
+                raise MarketProjectionError("quote result remaining quantity is inconsistent")
             if remaining is not None:
                 self._add(remaining)
+            common = {
+                "apply_sequence": record.outcome.apply_sequence,
+                "incoming_order": incoming,
+                "matches": matches,
+                "matched_quantity": _matched_quantity(matches),
+                "remaining_quantity": remaining_quantity,
+            }
+            if level.action is QuoteLevelAction.PLACE:
+                flows.append(MarketOrderPlaced(**common))
+            elif level.replaced_order_id is not None:
+                flows.append(
+                    MarketOrderReplaced(
+                        **common,
+                        replaced_order=retired[level.replaced_order_id],
+                    )
+                )
+            else:
+                raise MarketProjectionError("replacement result has no retired order")
 
-        remaining_quantity = (
-            remaining.remaining_quantity if remaining is not None else Decimal()
+        flows.extend(
+            MarketOrderCancelled(
+                apply_sequence=record.outcome.apply_sequence,
+                cancelled_order=retired[order_id],
+            )
+            for order_id in result.cancelled_order_ids
         )
-        flow: MarketOrderFlowItem | None = None
-        if isinstance(command, PlaceOrder) and incoming is not None:
-            flow = MarketOrderPlaced(
-                apply_sequence=record.outcome.apply_sequence,
-                incoming_order=incoming,
-                matches=matches,
-                matched_quantity=_matched_quantity(matches),
-                remaining_quantity=remaining_quantity,
-            )
-        elif isinstance(command, ReplaceOrder) and incoming is not None and replaced is not None:
-            flow = MarketOrderReplaced(
-                apply_sequence=record.outcome.apply_sequence,
-                incoming_order=incoming,
-                matches=matches,
-                matched_quantity=_matched_quantity(matches),
-                remaining_quantity=remaining_quantity,
-                replaced_order=replaced,
-            )
-        elif isinstance(command, CancelOrder) and cancelled is not None:
-            flow = MarketOrderCancelled(
-                apply_sequence=record.outcome.apply_sequence,
-                cancelled_order=cancelled,
-            )
+        if events_by_order:
+            raise MarketProjectionError("trade event references an unknown ladder order")
 
-        arrives_at = record.envelope.issued_at.plus(
-            self.scenario.runtime.delivery_duration_minutes
-        )
+        arrives_at = record.envelope.issued_at.plus(self.scenario.runtime.delivery_duration_minutes)
         trades = tuple(
             TimelineTrade(
                 apply_sequence=record.outcome.apply_sequence,
@@ -155,7 +168,7 @@ class _MarketReplay:
         )
         for event in events:
             self.last_trade_price[event.product] = event.unit_price
-        return _TurnMarketProjection(flow=flow, trades=trades)
+        return _TurnMarketProjection(flows=tuple(flows), trades=trades)
 
     def frame(
         self,
@@ -175,25 +188,48 @@ class _MarketReplay:
     def _new_order(
         self,
         record: TurnRecord,
-        *,
-        side: MarketSide,
-        product: ProductId,
-        quantity: Decimal,
-        limit_price: Decimal,
+        result: QuoteLevelResult,
     ) -> OpenOrderView:
-        order_id = record.outcome.order_id
-        if order_id is None:
-            raise MarketProjectionError("accepted order command has no generated order id")
-        return OpenOrderView(
-            order_id=order_id,
+        command = record.envelope.command
+        if not isinstance(command, SetQuoteLadder):
+            raise MarketProjectionError("new quote requires a ladder command")
+        order = OpenOrderView(
+            order_id=result.order_id,
             owner_id=record.turn.company_id,
-            side=side,
-            product=product,
-            remaining_quantity=quantity,
-            limit_price=limit_price,
+            side=command.side,
+            product=command.product,
+            remaining_quantity=result.level.quantity,
+            limit_price=result.level.limit_price,
             placed_at=record.envelope.issued_at,
-            priority_sequence=record.outcome.apply_sequence,
+            priority_sequence=result.priority_sequence,
+            queue_ahead_quantity=Decimal(),
         )
+        return self._snapshot(order)
+
+    def _kept_order(
+        self,
+        record: TurnRecord,
+        result: QuoteLevelResult,
+    ) -> OpenOrderView:
+        """Validate one exact retained quote against the reconstructed book."""
+        command = record.envelope.command
+        if not isinstance(command, SetQuoteLadder):
+            raise MarketProjectionError("kept quote requires a ladder command")
+        try:
+            order = self.orders[result.order_id]
+        except KeyError as error:
+            raise MarketProjectionError("kept quote is not active") from error
+        if (
+            order.owner_id != record.turn.company_id
+            or order.side is not command.side
+            or order.product is not command.product
+            or order.remaining_quantity != result.level.quantity
+            or order.limit_price != result.level.limit_price
+            or order.priority_sequence != result.priority_sequence
+            or result.remaining_quantity != order.remaining_quantity
+        ):
+            raise MarketProjectionError("kept quote does not match its target result")
+        return self._snapshot(order)
 
     def _apply_fills(
         self,
@@ -237,6 +273,7 @@ class _MarketReplay:
         incoming: OpenOrderView,
         event: TradeExecutedEvent,
     ) -> OpenOrderView:
+        expected = PriceTimeQueue.best_crossing(incoming, self.orders.values())
         try:
             resting = self.orders[event.maker_order_id]
         except KeyError as error:
@@ -253,7 +290,11 @@ class _MarketReplay:
             raise MarketProjectionError(
                 f"trade '{event.trade_id}' does not match its persisted maker order"
             )
-        return resting
+        if expected is None or expected.order_id != resting.order_id:
+            raise MarketProjectionError(
+                f"trade '{event.trade_id}' violates price-time maker priority"
+            )
+        return self._snapshot(resting)
 
     def _add(self, order: OpenOrderView) -> None:
         if order.order_id in self.orders:
@@ -262,9 +303,23 @@ class _MarketReplay:
 
     def _remove(self, order_id: Identifier) -> OpenOrderView:
         try:
-            return self.orders.pop(order_id)
+            order = self.orders[order_id]
         except KeyError as error:
             raise MarketProjectionError(f"active order '{order_id}' does not exist") from error
+        snapshot = self._snapshot(order)
+        self.orders.pop(order_id)
+        return snapshot
+
+    def _snapshot(self, order: OpenOrderView) -> OpenOrderView:
+        """Refresh derived queue depth at one timeline exposure boundary."""
+        return order.model_copy(
+            update={
+                "queue_ahead_quantity": PriceTimeQueue.quantity_ahead(
+                    order,
+                    self.orders.values(),
+                )
+            }
+        )
 
     def _book(self, product: ProductId) -> MarketOrderBook:
         bids = self._levels(product, MarketSide.BUY)
@@ -278,11 +333,7 @@ class _MarketReplay:
             last_trade_price=self.last_trade_price.get(product),
             best_bid=best_bid,
             best_ask=best_ask,
-            spread=(
-                best_ask - best_bid
-                if best_bid is not None and best_ask is not None
-                else None
-            ),
+            spread=(best_ask - best_bid if best_bid is not None and best_ask is not None else None),
         )
 
     def _levels(
@@ -293,7 +344,7 @@ class _MarketReplay:
         orders_by_price: dict[Decimal, list[OpenOrderView]] = defaultdict(list)
         for order in self.orders.values():
             if order.product is product and order.side is side:
-                orders_by_price[order.limit_price].append(order)
+                orders_by_price[order.limit_price].append(self._snapshot(order))
         prices = sorted(orders_by_price, reverse=side is MarketSide.BUY)
         return tuple(
             MarketPriceLevel(
@@ -302,7 +353,7 @@ class _MarketReplay:
                     (order.remaining_quantity for order in orders_by_price[price]),
                     Decimal(),
                 ),
-                orders=tuple(sorted(orders_by_price[price], key=_time_priority)),
+                orders=tuple(sorted(orders_by_price[price], key=PriceTimeQueue.priority)),
             )
             for price in prices
         )
@@ -337,8 +388,7 @@ class MarketTimelineProjector:
             for record in by_minute.get(minute, ()):
                 if isinstance(record, TurnRecord):
                     projection = replay.apply_turn(record)
-                    if projection.flow is not None:
-                        order_flow.append(projection.flow)
+                    order_flow.extend(projection.flows)
                     trades.extend(projection.trades)
                 else:
                     replay.apply_system_step(record)
@@ -366,11 +416,3 @@ def _reduce(order: OpenOrderView, quantity: Decimal) -> OpenOrderView | None:
 
 def _matched_quantity(matches: tuple[MarketMatchLeg, ...]) -> Decimal:
     return sum((match.quantity for match in matches), Decimal())
-
-
-def _time_priority(order: OpenOrderView) -> tuple[int, int, str]:
-    return (
-        order.placed_at.absolute_minute,
-        order.priority_sequence,
-        order.order_id,
-    )

@@ -11,7 +11,7 @@ from pydantic import Field, model_validator
 from company_bench.models import CompanyId, Identifier, StrictModel
 from company_bench.runtime_models import TurnRecord
 
-_CHECKPOINT_SCHEMA_VERSION: Final = 1
+_CHECKPOINT_SCHEMA_VERSION: Final = 3
 _DEFAULT_MAX_TOKENS: Final = 16_384
 _DEFAULT_CHARS_PER_TOKEN: Final = 4
 _SUMMARY_OMISSION: Final = "[older memory omitted]"
@@ -48,7 +48,7 @@ type MemorySummarizer = Callable[
 class AgentCheckpoint(StrictModel):
     """Portable state required to restore one company's memory exactly."""
 
-    schema_version: Literal[1] = _CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[3] = _CHECKPOINT_SCHEMA_VERSION
     run_id: Identifier
     company_id: CompanyId
     revision: int = Field(ge=0)
@@ -298,7 +298,9 @@ def deterministic_summary(
 def _exchange_line(exchange: MemoryExchange) -> str:
     """Render one compact, deterministic, provider-neutral memory line."""
     outcome = exchange.outcome
-    detail = outcome.reason or outcome.order_id or "-"
+    ladder = outcome.quote_ladder_result
+    order_ids = ",".join(level.order_id for level in ladder.levels) if ladder else ""
+    detail = outcome.reason or order_ids or "-"
     detail = " ".join(detail.split())
     return (
         f"{exchange.turn.turn_id}@{exchange.turn.sim_time.absolute_minute}:"

@@ -32,10 +32,9 @@ from company_bench.run_models import (
     TokenUsage,
 )
 from company_bench.runtime_models import (
-    CancelOrder,
-    PlaceOrder,
     Produce,
-    ReplaceOrder,
+    QuoteLevelAction,
+    SetQuoteLadder,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -163,12 +162,14 @@ class RunTimelineProjector:
             selected_turn_records,
         )
         selected_steps = self._system_items(selected_step_records)
-        minutes = tuple(sorted(
-            {
-                *(item.sim_time.absolute_minute for item in selected_turns),
-                *(item.sim_time.absolute_minute for item in selected_steps),
-            }
-        ))
+        minutes = tuple(
+            sorted(
+                {
+                    *(item.sim_time.absolute_minute for item in selected_turns),
+                    *(item.sim_time.absolute_minute for item in selected_steps),
+                }
+            )
+        )
         market_by_minute = self._market.project_day(
             data.scenario,
             day,
@@ -367,11 +368,12 @@ class RunTimelineProjector:
             observation=ObservationFacts(
                 cash=record.turn.available_cash,
                 reserved_cash=record.turn.reserved_cash,
+                marked_surplus=record.turn.marked_surplus,
                 inventory=observation.inventory,
-                reserved_inventory=record.turn.reserved_inventory,
+                inventory_expiry=record.turn.inventory_expiry,
                 retail_price=observation.retail_price,
                 open_orders=record.turn.open_orders,
-                market_views=record.turn.market_views,
+                order_books=record.turn.order_books,
                 pending_deliveries=record.turn.pending_deliveries,
                 active_operation=record.turn.active_operation,
                 remaining_operation_capacity=record.turn.remaining_operation_capacity,
@@ -668,6 +670,7 @@ class RunTimelineProjector:
             raise ValueError("run policies disagree on replay source")
         return next(iter(source_ids), None)
 
+
 def _sum_usage(invocations: Iterable[PolicyInvocation]) -> TokenUsage:
     """Aggregate physical-call counters without estimating money."""
     usages = tuple(invocation.usage for invocation in invocations)
@@ -761,12 +764,10 @@ def _command_title(record: TurnRecord) -> str:
             f"Transform {command.input_product.value.replace('_', ' ')} "
             f"into {command.output_product.value.replace('_', ' ')}"
         )
-    if isinstance(command, PlaceOrder):
-        return f"Place {command.side.value} order for {command.product.value.replace('_', ' ')}"
-    if isinstance(command, ReplaceOrder):
-        return "Replace market order"
-    if isinstance(command, CancelOrder):
-        return "Cancel market order"
+    if isinstance(command, SetQuoteLadder):
+        return (
+            f"Set {command.side.value} quote ladder for {command.product.value.replace('_', ' ')}"
+        )
     if isinstance(command, SetRetailPrice):
         return f"Set retail price for {command.product.value.replace('_', ' ')}"
     return "Wait"
@@ -806,27 +807,35 @@ def _state_changes(
     if not record.outcome.accepted:
         return ()
     command = record.envelope.command
-    if isinstance(command, PlaceOrder) and record.outcome.order_id is not None:
-        return (
-            OrderPlacedChange(
-                order_id=record.outcome.order_id,
-                side=command.side,
-                product=command.product,
-                quantity=command.quantity,
-                limit_price=command.limit_price,
-            ),
+    if isinstance(command, SetQuoteLadder):
+        result = record.outcome.quote_ladder_result
+        if result is None:
+            return ()
+        changes: list[OrderPlacedChange | OrderCancelledChange | OrderReplacedChange] = []
+        for level in result.levels:
+            if level.action is QuoteLevelAction.PLACE:
+                changes.append(
+                    OrderPlacedChange(
+                        order_id=level.order_id,
+                        side=command.side,
+                        product=command.product,
+                        quantity=level.level.quantity,
+                        limit_price=level.level.limit_price,
+                    )
+                )
+            elif level.action is QuoteLevelAction.REPLACE and level.replaced_order_id is not None:
+                changes.append(
+                    OrderReplacedChange(
+                        replaced_order_id=level.replaced_order_id,
+                        order_id=level.order_id,
+                        quantity=level.level.quantity,
+                        limit_price=level.level.limit_price,
+                    )
+                )
+        changes.extend(
+            OrderCancelledChange(order_id=order_id) for order_id in result.cancelled_order_ids
         )
-    if isinstance(command, CancelOrder):
-        return (OrderCancelledChange(order_id=command.order_id),)
-    if isinstance(command, ReplaceOrder) and record.outcome.order_id is not None:
-        return (
-            OrderReplacedChange(
-                replaced_order_id=command.order_id,
-                order_id=record.outcome.order_id,
-                quantity=command.quantity,
-                limit_price=command.limit_price,
-            ),
-        )
+        return tuple(changes)
     if isinstance(command, SetRetailPrice):
         return (
             RetailPriceChanged(

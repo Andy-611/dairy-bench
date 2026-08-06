@@ -668,6 +668,16 @@ function parseMarketOrderFlow(
   const flow = record(payload, path);
   const action = text(flow.action, `${path}.action`);
   const applySequence = number(flow.apply_sequence, `${path}.apply_sequence`);
+  if (action === "keep") {
+    return {
+      action,
+      applySequence,
+      preservedOrder: parseOpenOrder(
+        flow.preserved_order,
+        `${path}.preserved_order`,
+      ),
+    };
+  }
   if (action === "cancel") {
     return {
       action,
@@ -828,7 +838,13 @@ function parseTurnTimelineItem(
       outcome.resulting_state_version,
       `${path}.outcome.resulting_state_version`,
     ),
-    outcomeOrderId: nullableText(outcome.order_id, `${path}.outcome.order_id`),
+    quoteLadderResult:
+      outcome.quote_ladder_result === null
+        ? null
+        : parseQuoteLadderResult(
+            outcome.quote_ladder_result,
+            `${path}.outcome.quote_ladder_result`,
+          ),
     outcomeJobId: nullableText(outcome.job_id, `${path}.outcome.job_id`),
     effects: parseTimelineEffects(item.effects, `${path}.effects`),
     stateChanges: array(item.state_changes, `${path}.state_changes`).map(
@@ -943,10 +959,14 @@ function parseObservation(
       observation.reserved_cash,
       `${path}.reserved_cash`,
     ),
+    markedSurplus: decimalText(
+      observation.marked_surplus,
+      `${path}.marked_surplus`,
+    ),
     inventory: parseInventoryPositions(observation.inventory, `${path}.inventory`),
-    reservedInventory: parseInventoryPositions(
-      observation.reserved_inventory,
-      `${path}.reserved_inventory`,
+    inventoryExpiry: parseInventoryExpiry(
+      observation.inventory_expiry,
+      `${path}.inventory_expiry`,
     ),
     retailPrice: nullableDecimalText(
       observation.retail_price,
@@ -956,8 +976,8 @@ function parseObservation(
       (value, index) =>
         parseOpenOrder(value, `${path}.open_orders[${index}]`),
     ),
-    marketViews: array(observation.market_views, `${path}.market_views`).map(
-      (value, index) => parseMarketView(value, `${path}.market_views[${index}]`),
+    orderBooks: array(observation.order_books, `${path}.order_books`).map(
+      (value, index) => parseOrderBook(value, `${path}.order_books[${index}]`),
     ),
     pendingDeliveries: array(
       observation.pending_deliveries,
@@ -1011,6 +1031,10 @@ function parseOpenOrder(
       order.priority_sequence,
       `${path}.priority_sequence`,
     ),
+    queueAheadQuantity: decimalText(
+      order.queue_ahead_quantity,
+      `${path}.queue_ahead_quantity`,
+    ),
   };
 }
 
@@ -1030,17 +1054,15 @@ function parseInventoryPositions(
   );
 }
 
-function parseMarketView(
+function parseOrderBook(
   payload: unknown,
   path: string,
-): TurnTimelineItemView["observation"]["marketViews"][number] {
+): TurnTimelineItemView["observation"]["orderBooks"][number] {
   const market = record(payload, path);
   return {
     product: text(market.product, `${path}.product`),
-    bestBid: nullableDecimalText(market.best_bid, `${path}.best_bid`),
-    bestAsk: nullableDecimalText(market.best_ask, `${path}.best_ask`),
-    topBids: parsePriceLevels(market.top_bids, `${path}.top_bids`),
-    topAsks: parsePriceLevels(market.top_asks, `${path}.top_asks`),
+    bids: parsePriceLevels(market.bids, `${path}.bids`),
+    asks: parsePriceLevels(market.asks, `${path}.asks`),
     lastTradePrice: nullableDecimalText(
       market.last_trade_price,
       `${path}.last_trade_price`,
@@ -1052,13 +1074,39 @@ function parseMarketView(
 function parsePriceLevels(
   payload: unknown,
   path: string,
-): TurnTimelineItemView["observation"]["marketViews"][number]["topBids"] {
+): TurnTimelineItemView["observation"]["orderBooks"][number]["bids"] {
   return array(payload, path).map((value, index) => {
     const itemPath = `${path}[${index}]`;
     const level = record(value, itemPath);
     return {
       unitPrice: decimalText(level.unit_price, `${itemPath}.unit_price`),
       quantity: decimalText(level.quantity, `${itemPath}.quantity`),
+      orderCount: number(level.order_count, `${itemPath}.order_count`),
+    };
+  });
+}
+
+function parseInventoryExpiry(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["inventoryExpiry"] {
+  return array(payload, path).map((value, index) => {
+    const itemPath = `${path}[${index}]`;
+    const bucket = record(value, itemPath);
+    return {
+      product: text(bucket.product, `${itemPath}.product`),
+      expiresEndOfDay: number(
+        bucket.expires_end_of_day,
+        `${itemPath}.expires_end_of_day`,
+      ),
+      availableQuantity: decimalText(
+        bucket.available_quantity,
+        `${itemPath}.available_quantity`,
+      ),
+      reservedQuantity: decimalText(
+        bucket.reserved_quantity,
+        `${itemPath}.reserved_quantity`,
+      ),
     };
   });
 }
@@ -1287,7 +1335,7 @@ function parseTimelineCommand(
       ),
     };
   }
-  if (kind === "place_order") {
+  if (kind === "set_quote_ladder") {
     const side = text(command.side, `${path}.side`);
     if (side !== "buy" && side !== "sell") {
       throw new Error(`Backend field ${path}.side is not a market side.`);
@@ -1296,22 +1344,9 @@ function parseTimelineCommand(
       kind,
       side,
       product: text(command.product, `${path}.product`),
-      quantity: decimalText(command.quantity, `${path}.quantity`),
-      limitPrice: decimalText(command.limit_price, `${path}.limit_price`),
-    };
-  }
-  if (kind === "cancel_order") {
-    return {
-      kind,
-      orderId: text(command.order_id, `${path}.order_id`),
-    };
-  }
-  if (kind === "replace_order") {
-    return {
-      kind,
-      orderId: text(command.order_id, `${path}.order_id`),
-      quantity: decimalText(command.quantity, `${path}.quantity`),
-      limitPrice: decimalText(command.limit_price, `${path}.limit_price`),
+      levels: array(command.levels, `${path}.levels`).map((value, index) =>
+        parseQuoteLevel(value, `${path}.levels[${index}]`),
+      ),
     };
   }
   if (kind === "set_retail_price") {
@@ -1334,6 +1369,62 @@ function parseTimelineCommand(
     };
   }
   throw new Error(`Backend field ${path}.kind is not an atomic command.`);
+}
+
+function parseQuoteLevel(
+  payload: unknown,
+  path: string,
+): Extract<
+  TimelineCommandView,
+  { readonly kind: "set_quote_ladder" }
+>["levels"][number] {
+  const level = record(payload, path);
+  return {
+    quantity: decimalText(level.quantity, `${path}.quantity`),
+    limitPrice: decimalText(level.limit_price, `${path}.limit_price`),
+  };
+}
+
+function parseQuoteLadderResult(
+  payload: unknown,
+  path: string,
+): NonNullable<TurnTimelineItemView["quoteLadderResult"]> {
+  const result = record(payload, path);
+  return {
+    levels: array(result.levels, `${path}.levels`).map((value, index) => {
+      const levelPath = `${path}.levels[${index}]`;
+      const level = record(value, levelPath);
+      const action = text(level.action, `${levelPath}.action`);
+      if (action !== "keep" && action !== "place" && action !== "replace") {
+        throw new Error(
+          `Backend field ${levelPath}.action is not a quote action.`,
+        );
+      }
+      return {
+        level: parseQuoteLevel(level.level, `${levelPath}.level`),
+        action,
+        orderId: text(level.order_id, `${levelPath}.order_id`),
+        replacedOrderId: nullableText(
+          level.replaced_order_id,
+          `${levelPath}.replaced_order_id`,
+        ),
+        prioritySequence: number(
+          level.priority_sequence,
+          `${levelPath}.priority_sequence`,
+        ),
+        remainingQuantity: decimalText(
+          level.remaining_quantity,
+          `${levelPath}.remaining_quantity`,
+        ),
+      };
+    }),
+    cancelledOrderIds: array(
+      result.cancelled_order_ids,
+      `${path}.cancelled_order_ids`,
+    ).map((value, index) =>
+      text(value, `${path}.cancelled_order_ids[${index}]`),
+    ),
+  };
 }
 
 function parseQuoteAlert(payload: unknown, path: string): QuoteAlertView {

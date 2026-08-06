@@ -10,11 +10,13 @@ from company_bench.market import (
     ContinuousSpotMarket,
     MarketError,
     MarketState,
+    OrderIdentity,
+    QuoteLadderExecution,
     SellOrder,
     TradeFill,
 )
 from company_bench.models import CompanyState, InventoryLot, ProductId
-from company_bench.runtime_models import MarketSide, SimTime
+from company_bench.runtime_models import MarketSide, QuoteLadder, QuoteLevel, SimTime
 
 RAW_MILK = ProductId.RAW_MILK
 
@@ -64,15 +66,69 @@ def _place(
     *,
     minute: int = 540,
 ) -> tuple[TradeFill, ...]:
-    return market.place(
-        order_id=order_id,
+    return market.set_quote_ladder(
         owner_id=owner_id,
-        side=side,
-        quantity=Decimal(quantity),
-        limit_price=Decimal(price),
+        ladder=QuoteLadder(
+            side=side,
+            levels=(
+                QuoteLevel(
+                    quantity=Decimal(quantity),
+                    limit_price=Decimal(price),
+                ),
+            ),
+        ),
         placed_at=SimTime(absolute_minute=minute),
-        priority_sequence=priority,
+        order_identity_factory=lambda _: OrderIdentity(
+            order_id=order_id,
+            priority_sequence=priority,
+        ),
         trade_id_factory=lambda index: f"{order_id}.trade.{index}",
+    ).fills
+
+
+def _clear(
+    market: ContinuousSpotMarket,
+    owner_id: str,
+    side: MarketSide,
+    priority: int,
+) -> None:
+    market.set_quote_ladder(
+        owner_id=owner_id,
+        ladder=QuoteLadder(side=side),
+        placed_at=SimTime(absolute_minute=541),
+        order_identity_factory=lambda _: OrderIdentity(
+            order_id=f"unused_{priority}",
+            priority_sequence=priority,
+        ),
+        trade_id_factory=lambda index: f"clear.trade.{index}",
+    )
+
+
+def _ladder(
+    market: ContinuousSpotMarket,
+    owner_id: str,
+    side: MarketSide,
+    levels: tuple[tuple[str, str], ...],
+    first_priority: int,
+    *,
+    prefix: str,
+    minute: int = 540,
+) -> QuoteLadderExecution:
+    return market.set_quote_ladder(
+        owner_id=owner_id,
+        ladder=QuoteLadder(
+            side=side,
+            levels=tuple(
+                QuoteLevel(quantity=Decimal(quantity), limit_price=Decimal(price))
+                for price, quantity in levels
+            ),
+        ),
+        placed_at=SimTime(absolute_minute=minute),
+        order_identity_factory=lambda offset: OrderIdentity(
+            order_id=f"{prefix}_{offset}",
+            priority_sequence=first_priority + offset - 1,
+        ),
+        trade_id_factory=lambda index: f"{prefix}.trade.{index}",
     )
 
 
@@ -197,8 +253,8 @@ def test_cancel_releases_remaining_cash_and_inventory() -> None:
     _place(market, "bid", "buyer", MarketSide.BUY, "2", "1", 1)
     _place(market, "ask", "seller", MarketSide.SELL, "2", "2", 2)
 
-    market.cancel(order_id="bid", owner_id="buyer")
-    market.cancel(order_id="ask", owner_id="seller")
+    _clear(market, "buyer", MarketSide.BUY, 3)
+    _clear(market, "seller", MarketSide.SELL, 4)
 
     assert market.state.orders == ()
     assert assets.cash("buyer") == Decimal("10")
@@ -214,16 +270,17 @@ def test_successful_replace_loses_the_old_orders_priority() -> None:
     _place(market, "bid_a", "buyer_a", MarketSide.BUY, "1", "2", 1, minute=500)
     _place(market, "bid_b", "buyer_b", MarketSide.BUY, "1", "2", 2, minute=500)
 
-    market.replace(
-        old_order_id="bid_a",
-        owner_id="buyer_a",
-        new_order_id="bid_a_new",
-        quantity=Decimal("1"),
-        limit_price=Decimal("2"),
-        placed_at=SimTime(absolute_minute=500),
-        priority_sequence=3,
-        trade_id_factory=lambda index: f"replace.trade.{index}",
+    replacement = _place(
+        market,
+        "bid_a_new",
+        "buyer_a",
+        MarketSide.BUY,
+        "2",
+        "2",
+        3,
+        minute=500,
     )
+    assert replacement == ()
     fills = _place(
         market,
         "ask",
@@ -247,21 +304,24 @@ def test_failed_replace_is_atomic_on_the_same_market_instance() -> None:
     next_lot_sequence_before = assets.next_lot_sequence
 
     with pytest.raises(MarketError, match="insufficient cash"):
-        market.replace(
-            old_order_id="old_bid",
+        market.set_quote_ladder(
             owner_id="buyer",
-            new_order_id="too_large",
-            quantity=Decimal("10"),
-            limit_price=Decimal("2"),
+            ladder=QuoteLadder(
+                side=MarketSide.BUY,
+                levels=(QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2")),),
+            ),
             placed_at=SimTime(absolute_minute=541),
-            priority_sequence=2,
+            order_identity_factory=lambda _: OrderIdentity(
+                order_id="too_large",
+                priority_sequence=2,
+            ),
             trade_id_factory=lambda index: f"failed.trade.{index}",
         )
 
     assert market.state == state_before
     assert assets.freeze_states() == companies_before
     assert assets.next_lot_sequence == next_lot_sequence_before
-    market.cancel(order_id="old_bid", owner_id="buyer")
+    _clear(market, "buyer", MarketSide.BUY, 3)
     assert assets.cash("buyer") == Decimal("10")
 
 
@@ -329,7 +389,7 @@ def test_fefo_fill_and_partial_lot_slices_keep_unique_ids() -> None:
     }
     assert on_hand_ids.isdisjoint(lot.lot_id for lot in remaining.reserved_lots)
 
-    market.cancel(order_id="ask", owner_id="seller")
+    _clear(market, "seller", MarketSide.SELL, 3)
     seller_lots = assets.freeze_states()[1].inventory
     assert _quantity(seller_lots) == Decimal("4")
     assert len({lot.lot_id for lot in seller_lots}) == len(seller_lots)
@@ -352,30 +412,35 @@ def test_close_releases_every_resting_commitment() -> None:
     assert assets.quantity("seller", RAW_MILK) == Decimal("2")
 
 
-def test_market_view_aggregates_and_limits_each_side_to_top_three_levels() -> None:
-    market, _ = _market(
-        _company("buyer", cash="1000"),
-        _company("seller", inventory=(_lot("lot_1", "20"),)),
-    )
+def test_order_book_view_exposes_every_aggregated_price_level() -> None:
     bids = (("1", "1"), ("4", "1"), ("3", "1"), ("2", "1"), ("4", "2"))
     asks = (("5", "1"), ("8", "1"), ("6", "1"), ("7", "1"), ("5", "2"))
+    buyers = tuple(_company(f"buyer_{index}", cash="100") for index in range(len(bids)))
+    sellers = tuple(
+        _company(
+            f"seller_{index}",
+            inventory=(_lot(f"lot_{index}", quantity),),
+        )
+        for index, (_, quantity) in enumerate(asks)
+    )
+    market, _ = _market(*buyers, *sellers)
     priority = 1
-    for price, quantity in bids:
+    for index, (price, quantity) in enumerate(bids):
         _place(
             market,
             f"bid_{priority}",
-            "buyer",
+            f"buyer_{index}",
             MarketSide.BUY,
             quantity,
             price,
             priority,
         )
         priority += 1
-    for price, quantity in asks:
+    for index, (price, quantity) in enumerate(asks):
         _place(
             market,
             f"ask_{priority}",
-            "seller",
+            f"seller_{index}",
             MarketSide.SELL,
             quantity,
             price,
@@ -385,15 +450,191 @@ def test_market_view_aggregates_and_limits_each_side_to_top_three_levels() -> No
 
     view = market.view()
 
-    assert view.best_bid == Decimal("4")
-    assert view.best_ask == Decimal("5")
-    assert tuple((level.unit_price, level.quantity) for level in view.top_bids) == (
-        (Decimal("4"), Decimal("3")),
-        (Decimal("3"), Decimal("1")),
-        (Decimal("2"), Decimal("1")),
+    assert tuple((level.unit_price, level.quantity, level.order_count) for level in view.bids) == (
+        (Decimal("4"), Decimal("3"), 2),
+        (Decimal("3"), Decimal("1"), 1),
+        (Decimal("2"), Decimal("1"), 1),
+        (Decimal("1"), Decimal("1"), 1),
     )
-    assert tuple((level.unit_price, level.quantity) for level in view.top_asks) == (
-        (Decimal("5"), Decimal("3")),
-        (Decimal("6"), Decimal("1")),
-        (Decimal("7"), Decimal("1")),
+    assert tuple((level.unit_price, level.quantity, level.order_count) for level in view.asks) == (
+        (Decimal("5"), Decimal("3"), 2),
+        (Decimal("6"), Decimal("1"), 1),
+        (Decimal("7"), Decimal("1"), 1),
+        (Decimal("8"), Decimal("1"), 1),
+    )
+
+
+def test_owned_order_queue_tracks_partial_fill_cancel_and_replace() -> None:
+    market, _ = _market(
+        _company("buyer_a", cash="100"),
+        _company("buyer_b", cash="100"),
+        _company("buyer_c", cash="100"),
+        _company("seller", inventory=(_lot("lot_1", "10"),)),
+    )
+    _place(market, "bid_a", "buyer_a", MarketSide.BUY, "10", "1", 1)
+    _place(market, "bid_b", "buyer_b", MarketSide.BUY, "20", "1", 2)
+
+    order = market.state.company_order_views("buyer_b")[0]
+    assert order.queue_ahead_quantity == Decimal("10")
+
+    _place(market, "ask", "seller", MarketSide.SELL, "4", "1", 3)
+    assert market.state.company_order_views("buyer_b")[0].queue_ahead_quantity == Decimal("6")
+
+    _clear(market, "buyer_a", MarketSide.BUY, 4)
+    assert market.state.company_order_views("buyer_b")[0].queue_ahead_quantity == Decimal("0")
+
+    _place(market, "bid_c", "buyer_c", MarketSide.BUY, "5", "1", 5)
+    _place(market, "bid_b_replaced", "buyer_b", MarketSide.BUY, "19", "1", 6)
+    assert market.state.company_order_views("buyer_c")[0].queue_ahead_quantity == Decimal("0")
+    assert market.state.company_order_views("buyer_b")[0].queue_ahead_quantity == Decimal("5")
+
+
+def test_three_level_ladder_is_independently_collateralized_and_ordered() -> None:
+    market, assets = _market(_company("buyer", cash="100"))
+
+    execution = _ladder(
+        market,
+        "buyer",
+        MarketSide.BUY,
+        (("3", "4"), ("2", "3"), ("1", "2")),
+        7,
+        prefix="bid",
+    )
+
+    assert tuple(level.action.value for level in execution.result.levels) == (
+        "place",
+        "place",
+        "place",
+    )
+    assert tuple(order.limit_price for order in market.state.orders) == (
+        Decimal("3"),
+        Decimal("2"),
+        Decimal("1"),
+    )
+    assert tuple(order.priority_sequence for order in market.state.orders) == (7, 8, 9)
+    assert assets.cash("buyer") == Decimal("80")
+
+
+def test_exact_target_ladder_preserves_every_order_identity_and_priority() -> None:
+    market, _ = _market(_company("seller", inventory=(_lot("lot", "3"),)))
+    first = _ladder(
+        market,
+        "seller",
+        MarketSide.SELL,
+        (("1", "1"), ("2", "1"), ("3", "1")),
+        1,
+        prefix="ask",
+    )
+    state_before = market.state
+
+    second = market.set_quote_ladder(
+        owner_id="seller",
+        ladder=QuoteLadder(
+            side=MarketSide.SELL,
+            levels=tuple(level.level for level in first.result.levels),
+        ),
+        placed_at=SimTime(absolute_minute=600),
+        order_identity_factory=lambda _: (_ for _ in ()).throw(
+            AssertionError("an unchanged ladder must not allocate an identity")
+        ),
+        trade_id_factory=lambda index: f"unused.{index}",
+    )
+
+    assert all(level.action.value == "keep" for level in second.result.levels)
+    assert market.state == state_before
+
+
+def test_ladder_reconciliation_replaces_then_cancels_and_places_deterministically() -> None:
+    market, _ = _market(_company("seller", inventory=(_lot("lot", "10"),)))
+    _ladder(
+        market,
+        "seller",
+        MarketSide.SELL,
+        (("1", "1"), ("2", "1"), ("3", "1")),
+        1,
+        prefix="old",
+    )
+
+    reduced = _ladder(
+        market,
+        "seller",
+        MarketSide.SELL,
+        (("1", "1"), ("2.5", "2")),
+        4,
+        prefix="reduced",
+    )
+    assert tuple(level.action.value for level in reduced.result.levels) == (
+        "keep",
+        "replace",
+    )
+    assert reduced.result.cancelled_order_ids == ("old_3",)
+
+    expanded = _ladder(
+        market,
+        "seller",
+        MarketSide.SELL,
+        (("1", "1"), ("2.5", "3"), ("4", "1")),
+        5,
+        prefix="expanded",
+    )
+    assert tuple(level.action.value for level in expanded.result.levels) == (
+        "keep",
+        "replace",
+        "place",
+    )
+
+
+def test_ladder_collateral_failure_rolls_back_the_complete_group() -> None:
+    market, assets = _market(_company("seller", inventory=(_lot("lot", "2"),)))
+    _ladder(
+        market,
+        "seller",
+        MarketSide.SELL,
+        (("1", "1"),),
+        1,
+        prefix="old",
+    )
+    state_before = market.state
+    companies_before = assets.freeze_states()
+
+    with pytest.raises(MarketError, match="insufficient inventory for quote ladder"):
+        _ladder(
+            market,
+            "seller",
+            MarketSide.SELL,
+            (("1", "1"), ("2", "1"), ("3", "1")),
+            2,
+            prefix="failed",
+        )
+
+    assert market.state == state_before
+    assert assets.freeze_states() == companies_before
+
+
+def test_multi_level_matching_uses_unique_command_wide_trade_ids() -> None:
+    market, _ = _market(
+        _company("buyer", cash="100"),
+        _company("seller_a", inventory=(_lot("lot_a", "1"),)),
+        _company("seller_b", inventory=(_lot("lot_b", "1"),)),
+    )
+    _place(market, "ask_a", "seller_a", MarketSide.SELL, "1", "1", 1)
+    _place(market, "ask_b", "seller_b", MarketSide.SELL, "1", "2.5", 2)
+
+    execution = _ladder(
+        market,
+        "buyer",
+        MarketSide.BUY,
+        (("4", "1"), ("3", "1"), ("2", "1")),
+        3,
+        prefix="sweep",
+        minute=541,
+    )
+
+    assert tuple(fill.trade_id for fill in execution.fills) == (
+        "sweep.trade.1",
+        "sweep.trade.2",
+    )
+    assert tuple(fill.taker_order_id for fill in execution.fills) == (
+        "sweep_1",
+        "sweep_2",
     )

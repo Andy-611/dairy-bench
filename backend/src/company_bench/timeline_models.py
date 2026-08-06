@@ -26,10 +26,11 @@ from company_bench.runtime_models import (
     CommandOutcome,
     CompanyCommand,
     IncomingDeliveryView,
+    InventoryExpiryBucket,
     MarketSide,
-    MarketView,
     OpenOrderView,
     OperationJobView,
+    OrderBookView,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
@@ -95,11 +96,12 @@ class ObservationFacts(StrictModel):
 
     cash: Money
     reserved_cash: Money
+    marked_surplus: Decimal
     inventory: tuple[InventoryPosition, ...]
-    reserved_inventory: tuple[InventoryPosition, ...] = ()
+    inventory_expiry: tuple[InventoryExpiryBucket, ...] = ()
     retail_price: Money | None = None
     open_orders: tuple[OpenOrderView, ...] = ()
-    market_views: tuple[MarketView, ...] = ()
+    order_books: tuple[OrderBookView, ...] = ()
     pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
     active_operation: OperationJobView | None = None
     remaining_operation_capacity: Decimal | None = Field(default=None, ge=0)
@@ -335,7 +337,7 @@ class MarketMatchLeg(StrictModel):
 
 
 class _AppliedMarketOrder(StrictModel):
-    """Shared trace for Place and Replace commands entering the matcher."""
+    """Shared trace for one new ladder order entering the matcher."""
 
     apply_sequence: int = Field(ge=1)
     incoming_order: OpenOrderView
@@ -347,8 +349,6 @@ class _AppliedMarketOrder(StrictModel):
     def validate_application(self) -> Self:
         """Require exact submitted, matched, and resting quantities."""
         incoming = self.incoming_order
-        if incoming.priority_sequence != self.apply_sequence:
-            raise ValueError("incoming order priority must equal its apply sequence")
         matched = sum((match.quantity for match in self.matches), Decimal())
         if matched != self.matched_quantity:
             raise ValueError("matched quantity must equal the matching trace")
@@ -374,13 +374,13 @@ class _AppliedMarketOrder(StrictModel):
 
 
 class MarketOrderPlaced(_AppliedMarketOrder):
-    """One accepted PlaceOrder and every immediate maker match."""
+    """One newly placed quote and every immediate maker match."""
 
     action: Literal["place"] = "place"
 
 
 class MarketOrderReplaced(_AppliedMarketOrder):
-    """One accepted atomic ReplaceOrder and every immediate maker match."""
+    """One atomically replaced quote and every immediate maker match."""
 
     action: Literal["replace"] = "replace"
     replaced_order: OpenOrderView
@@ -402,15 +402,23 @@ class MarketOrderReplaced(_AppliedMarketOrder):
 
 
 class MarketOrderCancelled(StrictModel):
-    """One accepted CancelOrder and the active order it removed."""
+    """One target-ladder cancellation and the active order it removed."""
 
     action: Literal["cancel"] = "cancel"
     apply_sequence: int = Field(ge=1)
     cancelled_order: OpenOrderView
 
 
+class MarketOrderPreserved(StrictModel):
+    """One exact target quote whose identity and priority were preserved."""
+
+    action: Literal["keep"] = "keep"
+    apply_sequence: int = Field(ge=1)
+    preserved_order: OpenOrderView
+
+
 type MarketOrderFlowItem = Annotated[
-    MarketOrderPlaced | MarketOrderReplaced | MarketOrderCancelled,
+    MarketOrderPlaced | MarketOrderReplaced | MarketOrderCancelled | MarketOrderPreserved,
     Field(discriminator="action"),
 ]
 
@@ -442,12 +450,12 @@ class MarketFrame(StrictModel):
     def validate_audit_flow(self) -> Self:
         """Require order flow and trade tape to describe the same matches."""
         sequences = tuple(item.apply_sequence for item in self.order_flow)
-        if sequences != tuple(sorted(sequences)) or len(sequences) != len(set(sequences)):
-            raise ValueError("order flow must have unique ascending apply sequences")
+        if sequences != tuple(sorted(sequences)):
+            raise ValueError("order flow must have ascending apply sequences")
 
         projected: list[tuple[object, ...]] = []
         for item in self.order_flow:
-            if isinstance(item, MarketOrderCancelled):
+            if isinstance(item, (MarketOrderCancelled, MarketOrderPreserved)):
                 continue
             taker = item.incoming_order
             for match in item.matches:

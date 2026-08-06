@@ -9,7 +9,8 @@ from pydantic import Field, model_validator
 from company_bench.models import Identifier, StrictModel
 from company_bench.runtime_models import (
     AgentTurn,
-    MarketView,
+    MarketSide,
+    OrderBookView,
     QuoteAlert,
     SimTime,
     Wait,
@@ -61,7 +62,7 @@ class AgentAttention:
 
     def arm(self, command: Wait, turn: AgentTurn) -> ArmedWait:
         """Validate and install one immutable attention plan."""
-        self._validate_alerts(command.alerts, turn.market_views)
+        self._validate_alerts(command.alerts, turn.order_books)
         return ArmedWait(
             source_turn_id=turn.turn_id,
             armed_at=turn.sim_time,
@@ -72,12 +73,12 @@ class AgentAttention:
     def evaluate(
         self,
         plan: ArmedWait,
-        market_views: tuple[MarketView, ...],
+        order_books: tuple[OrderBookView, ...],
     ) -> AttentionMatch | None:
         """Return every satisfied alert in declaration order, if any."""
-        views = {view.product: view for view in market_views}
+        books = {book.product: book for book in order_books}
         matched = tuple(
-            alert for alert in plan.alerts if self._matches(alert, views.get(alert.product))
+            alert for alert in plan.alerts if self._matches(alert, books.get(alert.product))
         )
         if not matched:
             return None
@@ -112,22 +113,23 @@ class AgentAttention:
     def _validate_alerts(
         self,
         alerts: tuple[QuoteAlert, ...],
-        market_views: tuple[MarketView, ...],
+        order_books: tuple[OrderBookView, ...],
     ) -> None:
         if len(alerts) != len(set(alerts)):
             raise AttentionRejected("wait alerts must be unique")
-        views = {view.product: view for view in market_views}
-        hidden = next((alert.product for alert in alerts if alert.product not in views), None)
+        books = {book.product: book for book in order_books}
+        hidden = next((alert.product for alert in alerts if alert.product not in books), None)
         if hidden is not None:
             raise AttentionRejected(f"alert product {hidden.value} is not visible to this company")
-        if any(self._matches(alert, views[alert.product]) for alert in alerts):
+        if any(self._matches(alert, books[alert.product]) for alert in alerts):
             raise AttentionRejected("wait alert must be false when installed")
 
     @staticmethod
-    def _matches(alert: QuoteAlert, view: MarketView | None) -> bool:
-        if view is None:
+    def _matches(alert: QuoteAlert, book: OrderBookView | None) -> bool:
+        if book is None:
             return False
-        quote = view.best_bid if alert.quote == "best_bid" else view.best_ask
+        side = MarketSide.BUY if alert.quote == "best_bid" else MarketSide.SELL
+        quote = book.best_price(side)
         if quote is None:
             return False
         return quote >= alert.price if alert.operator == "at_least" else quote <= alert.price

@@ -1673,6 +1673,11 @@ footer {
   background: #e9f5ef;
 }
 
+.market-flow-action.keep {
+  color: #3f5f79;
+  background: #eaf1f7;
+}
+
 .market-flow-action.replace {
   color: #765b22;
   background: #f8f0dc;

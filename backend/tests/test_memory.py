@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from pydantic import ValidationError
 
@@ -207,6 +209,7 @@ def _exchange(
         wake_reasons=(WakeReason.CONTINUE,),
         observation=observation,
         available_cash=observation.cash,
+        marked_surplus=Decimal(),
     )
     envelope = CommandEnvelope(
         turn_id=turn_id,

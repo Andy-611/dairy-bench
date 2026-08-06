@@ -7,7 +7,8 @@ from company_bench.attention import AgentAttention, ArmedWait, AttentionRejected
 from company_bench.models import CompanyObservation, ProductId, RuntimeSpec
 from company_bench.runtime_models import (
     AgentTurn,
-    MarketView,
+    OrderBookView,
+    PriceLevelView,
     QuoteAlert,
     SimTime,
     Wait,
@@ -36,7 +37,7 @@ def _turn(
     observation: CompanyObservation,
     *,
     minute: int = 9 * 60,
-    market_views: tuple[MarketView, ...] = (),
+    order_books: tuple[OrderBookView, ...] = (),
     turn_number: int = 1,
 ) -> AgentTurn:
     return AgentTurn(
@@ -49,7 +50,16 @@ def _turn(
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=observation,
         available_cash=observation.cash,
-        market_views=market_views,
+        marked_surplus=Decimal(),
+        order_books=order_books,
+    )
+
+
+def _level(price: str) -> PriceLevelView:
+    return PriceLevelView(
+        unit_price=Decimal(price),
+        quantity=Decimal("10"),
+        order_count=1,
     )
 
 
@@ -92,6 +102,7 @@ def test_agent_turn_exposes_a_consistent_daily_budget(
             wake_reasons=(WakeReason.DAY_OPEN,),
             observation=first_observation,
             available_cash=first_observation.cash,
+            marked_surplus=Decimal(),
         )
 
 
@@ -148,8 +159,8 @@ def test_explicit_review_accepts_the_exact_maximum(
 def test_arm_rejects_hidden_duplicate_and_already_true_alerts(
     first_observation: CompanyObservation,
 ) -> None:
-    visible = MarketView(product=ProductId.RAW_MILK, best_ask=Decimal("1.40"))
-    turn = _turn(first_observation, market_views=(visible,))
+    visible = OrderBookView(product=ProductId.RAW_MILK, asks=(_level("1.40"),))
+    turn = _turn(first_observation, order_books=(visible,))
     duplicate = _alert(price="1.30")
 
     with pytest.raises(AttentionRejected, match="not visible"):
@@ -172,9 +183,9 @@ def test_arm_rejects_hidden_duplicate_and_already_true_alerts(
 def test_missing_quote_is_false_and_matching_uses_or_semantics(
     first_observation: CompanyObservation,
 ) -> None:
-    raw_view = MarketView(product=ProductId.RAW_MILK)
-    bottled_view = MarketView(product=ProductId.BOTTLED_MILK, best_bid=Decimal("2.00"))
-    turn = _turn(first_observation, market_views=(raw_view, bottled_view))
+    raw_book = OrderBookView(product=ProductId.RAW_MILK)
+    bottled_book = OrderBookView(product=ProductId.BOTTLED_MILK, bids=(_level("2.00"),))
+    turn = _turn(first_observation, order_books=(raw_book, bottled_book))
     raw_alert = _alert(price="1.30")
     bottled_alert = _alert(
         product=ProductId.BOTTLED_MILK,
@@ -184,13 +195,13 @@ def test_missing_quote_is_false_and_matching_uses_or_semantics(
     )
     plan = AgentAttention().arm(Wait(alerts=(raw_alert, bottled_alert)), turn)
 
-    assert AgentAttention().evaluate(plan, (raw_view, bottled_view)) is None
+    assert AgentAttention().evaluate(plan, (raw_book, bottled_book)) is None
 
     match = AgentAttention().evaluate(
         plan,
         (
-            MarketView(product=ProductId.RAW_MILK, best_ask=Decimal("1.20")),
-            MarketView(product=ProductId.BOTTLED_MILK, best_bid=Decimal("2.30")),
+            OrderBookView(product=ProductId.RAW_MILK, asks=(_level("1.20"),)),
+            OrderBookView(product=ProductId.BOTTLED_MILK, bids=(_level("2.30"),)),
         ),
     )
 
@@ -202,10 +213,10 @@ def test_missing_quote_is_false_and_matching_uses_or_semantics(
 def test_evaluate_treats_an_absent_product_as_not_matching(
     first_observation: CompanyObservation,
 ) -> None:
-    view = MarketView(product=ProductId.RAW_MILK)
+    book = OrderBookView(product=ProductId.RAW_MILK)
     plan = AgentAttention().arm(
         Wait(alerts=(_alert(price="1.30"),)),
-        _turn(first_observation, market_views=(view,)),
+        _turn(first_observation, order_books=(book,)),
     )
 
     assert AgentAttention().evaluate(plan, ()) is None

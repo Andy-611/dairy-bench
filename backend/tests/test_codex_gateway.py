@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +33,15 @@ from company_bench.codex_sessions import (
     CodexSessionManager,
     CodexSessionRetention,
 )
-from company_bench.models import CompanyObservation, FarmDecision
-from company_bench.runtime_models import AgentTurn, Produce, SimTime, WakeReason
+from company_bench.models import CompanyObservation, FarmDecision, ProductId
+from company_bench.runtime_models import (
+    AgentTurn,
+    MarketSide,
+    QuoteLevel,
+    SetQuoteLadder,
+    SimTime,
+    WakeReason,
+)
 
 
 class _FakeThread:
@@ -233,6 +241,7 @@ def _command_request(observation: CompanyObservation) -> CommandModelRequest:
         wake_reasons=(WakeReason.DAY_OPEN,),
         observation=observation,
         available_cash=observation.cash,
+        marked_surplus=Decimal(),
     )
     return CommandModelRequest(
         invocation_id="codex_test.farm_a.t1.provider",
@@ -240,7 +249,7 @@ def _command_request(observation: CompanyObservation) -> CommandModelRequest:
         turn=turn,
         instructions="Return one command.",
         input_text=turn.model_dump_json(),
-        allowed_commands=("produce", "wait"),
+        allowed_commands=("produce", "set_quote_ladder", "wait"),
     )
 
 
@@ -372,7 +381,12 @@ def test_codex_config_rejects_the_personal_history_directory() -> None:
 def test_codex_gateway_adapts_one_structured_atomic_command(
     first_observation: CompanyObservation,
 ) -> None:
-    client = _FakeCodex('{"command":{"kind":"produce","product":"raw_milk","quantity":"12"}}')
+    client = _FakeCodex(
+        '{"command":{"kind":"set_quote_ladder","product":"raw_milk",'
+        '"side":"sell","levels":[{"quantity":"8","limit_price":"1.20"},'
+        '{"quantity":"3","limit_price":"1.40"},'
+        '{"quantity":"1","limit_price":"1.60"}]}}'
+    )
     artifacts = _FakeArtifacts()
     gateway = CodexModelGateway(
         CodexAgentConfig(model="test-model"),
@@ -383,7 +397,15 @@ def test_codex_gateway_adapts_one_structured_atomic_command(
 
     result = asyncio.run(gateway.generate_command(_command_request(first_observation)))
 
-    assert result.command == Produce(product="raw_milk", quantity="12")
+    assert result.command == SetQuoteLadder(
+        product=ProductId.RAW_MILK,
+        side=MarketSide.SELL,
+        levels=(
+            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("1.20")),
+            QuoteLevel(quantity=Decimal("3"), limit_price=Decimal("1.40")),
+            QuoteLevel(quantity=Decimal("1"), limit_price=Decimal("1.60")),
+        ),
+    )
     assert artifacts.calls[0][0].domain_turn_id == "codex_test.farm_a.t1"
     output_schema = client.thread.run_calls[0][1]["output_schema"]
     assert set(output_schema["required"]) == set(output_schema["properties"])
@@ -392,6 +414,7 @@ def test_codex_gateway_adapts_one_structured_atomic_command(
     assert '"oneOf"' not in serialized_schema
     assert '"discriminator"' not in serialized_schema
     assert '"default"' not in serialized_schema
+    assert '"maxItems": 3' in serialized_schema
     asyncio.run(gateway.close())
 
 

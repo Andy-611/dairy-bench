@@ -1,11 +1,11 @@
-"""Run one real Codex V2 company command without starting the web application."""
+"""Run one real Codex V3 company command without starting the web application."""
 
 import asyncio
 
 from company_bench.agent_models import PolicyInfrastructureError
 from company_bench.agents import COMMAND_PROMPT_VERSION, LlmCompanyAgent
 from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
-from company_bench.dairy_scenario import DAIRY_S12_V2_SCENARIO
+from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
 from company_bench.engine import EconomyEngine
 from company_bench.models import PolicyKind, PolicyMetadata
 from company_bench.repository import MemoryRunRepository
@@ -20,15 +20,31 @@ async def main() -> None:
 
     repository = MemoryRunRepository()
     engine = EconomyEngine()
-    economy = engine.open_day(engine.initial_state(DAIRY_S12_V2_SCENARIO, seed=42))
-    company_id = DAIRY_S12_V2_SCENARIO.companies[0].company_id
+    scenario = DAIRY_S9_V3_SCENARIO
+    economy = engine.open_day(engine.initial_state(scenario, seed=42))
+    company_id = scenario.companies[0].company_id
+    observation = engine.observe_active(economy, company_id)
     turn = AgentTurn(
         turn_id=f"codex_smoke.{company_id}.t1",
         company_id=company_id,
         sim_time=SimTime.at(day=0, hour=9),
         state_version=economy.state_version,
+        turn_number_today=1,
+        turn_limit_today=scenario.runtime.max_turns_per_company_day,
         wake_reasons=(WakeReason.DAY_OPEN,),
-        observation=engine.observe_active(economy, company_id),
+        observation=observation,
+        available_cash=observation.cash,
+        reserved_cash=engine.reserved_cash(economy, company_id),
+        marked_surplus=engine.marked_surplus(economy, company_id),
+        inventory_expiry=engine.inventory_expiry(economy, company_id),
+        open_orders=engine.company_orders(economy, company_id),
+        order_books=engine.order_books(economy, company_id),
+        pending_deliveries=engine.pending_delivery_views(economy, company_id),
+        active_operation=engine.operation_view(economy, company_id),
+        remaining_operation_capacity=engine.remaining_operation_capacity(
+            economy,
+            company_id,
+        ),
     )
     gateway = CodexModelGateway(config, company_id)
     agent = LlmCompanyAgent(
@@ -44,8 +60,8 @@ async def main() -> None:
             prompt_version=COMMAND_PROMPT_VERSION,
             config_fingerprint=config.fingerprint,
         ),
-        memory_token_budget=DAIRY_S12_V2_SCENARIO.runtime.compaction_trigger_tokens,
-        max_prompt_tokens=DAIRY_S12_V2_SCENARIO.runtime.max_prompt_tokens,
+        memory_token_budget=scenario.runtime.compaction_trigger_tokens,
+        max_prompt_tokens=scenario.runtime.max_prompt_tokens,
     )
 
     try:

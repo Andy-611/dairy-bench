@@ -21,8 +21,8 @@ from company_bench.codex_artifacts import (
     CodexArtifactView,
 )
 from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
-from company_bench.market_timeline import MarketTimelineProjector
-from company_bench.models import PolicyKind, PolicyMetadata, ProductId
+from company_bench.market_timeline import MarketProjectionError, MarketTimelineProjector
+from company_bench.models import PolicyKind, PolicyMetadata, ProductId, TradeExecutedEvent
 from company_bench.repository import MemoryRunRepository, SQLiteRunRepository
 from company_bench.run_models import (
     InvocationOutcome,
@@ -35,12 +35,11 @@ from company_bench.run_models import (
 from company_bench.runtime import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime_models import (
     AgentTurn,
-    CancelOrder,
     CompanyCommand,
     MarketSide,
-    PlaceOrder,
     Produce,
-    ReplaceOrder,
+    QuoteLevel,
+    SetQuoteLadder,
     SimTime,
     SystemStepRecord,
     TurnRecord,
@@ -54,6 +53,7 @@ from company_bench.timeline_models import (
     CommandDispositionSource,
     MarketOrderCancelled,
     MarketOrderPlaced,
+    MarketOrderPreserved,
     MarketOrderReplaced,
 )
 
@@ -96,22 +96,37 @@ class _UnreadableArtifactStore(CodexArtifactStore):
         raise self._failure
 
 
-class _AuditedDustGateway:
-    """Return one raw dust order with nonzero provider audit metadata."""
+def _ladder(
+    side: MarketSide,
+    product: ProductId,
+    *levels: tuple[str, str],
+) -> SetQuoteLadder:
+    """Build one concise target ladder from quantity-price text pairs."""
+    return SetQuoteLadder(
+        side=side,
+        product=product,
+        levels=tuple(
+            QuoteLevel(quantity=Decimal(quantity), limit_price=Decimal(price))
+            for quantity, price in levels
+        ),
+    )
+
+
+class _AuditedUnauthorizedGateway:
+    """Return one role-invalid ladder with nonzero provider audit metadata."""
 
     async def generate_command(self, _: CommandModelRequest) -> CommandModelResult:
         """Return a schema-valid command that the economy must reject."""
         return CommandModelResult(
-            command=PlaceOrder(
-                side=MarketSide.SELL,
-                product=ProductId.RAW_MILK,
-                quantity=Decimal("8.9E-91"),
-                limit_price=Decimal("1.40"),
+            command=_ladder(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                ("10", "1.40"),
             ),
             provider="scripted",
-            model="dust-model",
-            response_id="response_dust",
-            request_id="request_dust",
+            model="rejection-model",
+            response_id="response_rejected",
+            request_id="request_rejected",
             usage=TokenUsage(input_tokens=3, output_tokens=2, total_tokens=5),
             attempts=2,
             latency_ms=17,
@@ -122,7 +137,7 @@ class _AuditedDustGateway:
 
 
 class _MarketTimelineAgent:
-    """Create one partial fill, replacement, and cancellation for projection tests."""
+    """Create multi-flow ladder changes for projection tests."""
 
     metadata = PolicyMetadata(name="market-timeline", kind=PolicyKind.BASELINE)
 
@@ -131,11 +146,10 @@ class _MarketTimelineAgent:
         minute = turn.sim_time.minute_of_day
         open_minute = turn.observation.runtime.open_minute
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-            return PlaceOrder(
-                side=MarketSide.BUY,
-                product=ProductId.RAW_MILK,
-                quantity=Decimal("40"),
-                limit_price=Decimal("1.66"),
+            return _ladder(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                ("40", "1.66"),
             )
         if turn.company_id != "farm_a":
             return Wait()
@@ -145,20 +159,63 @@ class _MarketTimelineAgent:
                 quantity=Decimal("60"),
             )
         if minute == open_minute + 30:
-            return PlaceOrder(
-                side=MarketSide.SELL,
-                product=ProductId.RAW_MILK,
-                quantity=Decimal("50"),
-                limit_price=Decimal("1.65"),
+            return _ladder(
+                MarketSide.SELL,
+                ProductId.RAW_MILK,
+                ("50", "1.65"),
+                ("10", "1.80"),
             )
         if minute == open_minute + 31 and turn.open_orders:
-            return ReplaceOrder(
-                order_id=turn.open_orders[0].order_id,
-                quantity=Decimal("10"),
-                limit_price=Decimal("1.64"),
+            return _ladder(
+                MarketSide.SELL,
+                ProductId.RAW_MILK,
+                ("10", "1.65"),
+                ("10", "1.75"),
             )
         if minute == open_minute + 32 and turn.open_orders:
-            return CancelOrder(order_id=turn.open_orders[0].order_id)
+            return _ladder(MarketSide.SELL, ProductId.RAW_MILK)
+        return Wait()
+
+
+class _TwoBidMarketTimelineAgent(_MarketTimelineAgent):
+    """Add a second same-price processor bid for priority-corruption tests."""
+
+    async def act(self, turn: AgentTurn) -> CompanyCommand:
+        if turn.company_id.startswith("processor_") and WakeReason.DAY_OPEN in turn.wake_reasons:
+            return _ladder(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                ("40", "1.66"),
+            )
+        return await super().act(turn)
+
+
+class _ThreeFillMarketTimelineAgent:
+    """Execute three target levels independently in one ladder command."""
+
+    metadata = PolicyMetadata(name="three-fill-timeline", kind=PolicyKind.BASELINE)
+
+    async def act(self, turn: AgentTurn) -> CompanyCommand:
+        if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
+            return _ladder(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                ("10", "1.70"),
+                ("10", "1.60"),
+                ("10", "1.50"),
+            )
+        if turn.company_id != "farm_a":
+            return Wait()
+        if WakeReason.DAY_OPEN in turn.wake_reasons:
+            return Produce(product=ProductId.RAW_MILK, quantity=Decimal("30"))
+        if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
+            return _ladder(
+                MarketSide.SELL,
+                ProductId.RAW_MILK,
+                ("10", "1.40"),
+                ("10", "1.45"),
+                ("10", "1.50"),
+            )
         return Wait()
 
 
@@ -234,15 +291,11 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
         }
     )
     invalid_deadline = SimTime(
-        absolute_minute=(
-            scenario.runtime.open_minute + scenario.runtime.max_wait_minutes + 1
-        )
+        absolute_minute=(scenario.runtime.open_minute + scenario.runtime.max_wait_minutes + 1)
     )
     agents = {
         company.company_id: FixedCommandAgent(
-            (Wait(until=invalid_deadline),)
-            if company.company_id == "farm_a"
-            else (Wait(),)
+            (Wait(until=invalid_deadline),) if company.company_id == "farm_a" else (Wait(),)
         )
         for company in scenario.companies
     }
@@ -257,10 +310,7 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
 
     page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
     farm_turn = next(
-        turn
-        for moment in page.moments
-        for turn in moment.turns
-        if turn.company_id == "farm_a"
+        turn for moment in page.moments for turn in moment.turns if turn.company_id == "farm_a"
     )
 
     assert not farm_turn.outcome.accepted
@@ -270,8 +320,7 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
 @pytest.mark.asyncio
 async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() -> None:
     companies = tuple(
-        DAIRY_S9_V3_SCENARIO.company(company_id)
-        for company_id in ("farm_a", "processor_a")
+        DAIRY_S9_V3_SCENARIO.company(company_id) for company_id in ("farm_a", "processor_a")
     )
     scenario = DAIRY_S9_V3_SCENARIO.model_copy(
         update={
@@ -313,7 +362,8 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert open_flow[0].remaining_quantity == Decimal("40")
 
     fill_frame = frames[scenario.runtime.open_minute + 30]
-    assert len(fill_frame.order_flow) == 1
+    assert len(fill_frame.order_flow) == 2
+    assert len({flow.apply_sequence for flow in fill_frame.order_flow}) == 1
     fill_flow = fill_frame.order_flow[0]
     assert isinstance(fill_flow, MarketOrderPlaced)
     assert fill_flow.incoming_order.owner_id == "farm_a"
@@ -327,11 +377,21 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert fill_frame.trades[0].maker_order_id == fill_flow.matches[0].maker_order.order_id
     assert fill_frame.trades[0].taker_order_id == fill_flow.incoming_order.order_id
     assert fill_frame.trades[0].arrives_at.minute_of_day == scenario.runtime.open_minute + 60
+    passive_flow = fill_frame.order_flow[1]
+    assert isinstance(passive_flow, MarketOrderPlaced)
+    assert passive_flow.incoming_order.limit_price == Decimal("1.80")
+    assert passive_flow.matched_quantity == 0
+    assert passive_flow.remaining_quantity == Decimal("10")
     assert raw_after_fill.last_trade_price == Decimal("1.66")
     assert raw_after_fill.best_bid is None
     assert raw_after_fill.best_ask == Decimal("1.65")
     assert raw_after_fill.asks[0].size == Decimal("10")
-    original_order_id = raw_after_fill.asks[0].orders[0].order_id
+    assert tuple(level.unit_price for level in raw_after_fill.asks) == (
+        Decimal("1.65"),
+        Decimal("1.80"),
+    )
+    preserved_order_id = raw_after_fill.asks[0].orders[0].order_id
+    replaced_order_id = raw_after_fill.asks[1].orders[0].order_id
 
     raw_after_replace = next(
         book
@@ -339,11 +399,18 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
         if book.product is ProductId.RAW_MILK
     )
     replace_flow = frames[scenario.runtime.open_minute + 31].order_flow
-    assert len(replace_flow) == 1
-    assert isinstance(replace_flow[0], MarketOrderReplaced)
-    assert replace_flow[0].replaced_order.order_id == original_order_id
-    assert raw_after_replace.best_ask == Decimal("1.64")
-    assert raw_after_replace.asks[0].orders[0].order_id != original_order_id
+    assert len(replace_flow) == 2
+    assert len({flow.apply_sequence for flow in replace_flow}) == 1
+    assert isinstance(replace_flow[0], MarketOrderPreserved)
+    assert replace_flow[0].preserved_order.order_id == preserved_order_id
+    assert isinstance(replace_flow[1], MarketOrderReplaced)
+    assert replace_flow[1].replaced_order.order_id == replaced_order_id
+    assert tuple(level.unit_price for level in raw_after_replace.asks) == (
+        Decimal("1.65"),
+        Decimal("1.75"),
+    )
+    assert raw_after_replace.asks[0].orders[0].order_id == preserved_order_id
+    assert raw_after_replace.asks[1].orders[0].order_id != replaced_order_id
 
     raw_after_cancel = next(
         book
@@ -351,9 +418,12 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
         if book.product is ProductId.RAW_MILK
     )
     cancel_flow = frames[scenario.runtime.open_minute + 32].order_flow
-    assert len(cancel_flow) == 1
-    assert isinstance(cancel_flow[0], MarketOrderCancelled)
-    assert cancel_flow[0].cancelled_order.order_id == raw_after_replace.asks[0].orders[0].order_id
+    assert len(cancel_flow) == 2
+    assert len({flow.apply_sequence for flow in cancel_flow}) == 1
+    assert all(isinstance(flow, MarketOrderCancelled) for flow in cancel_flow)
+    assert {flow.cancelled_order.order_id for flow in cancel_flow} == {
+        level.orders[0].order_id for level in raw_after_replace.asks
+    }
     assert raw_after_cancel.bids == ()
     assert raw_after_cancel.asks == ()
 
@@ -372,6 +442,173 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     )
     assert partial_raw_book.bids == ()
     assert partial_raw_book.asks == ()
+
+
+@pytest.mark.asyncio
+async def test_market_timeline_replays_three_independently_filled_ladder_levels() -> None:
+    companies = tuple(
+        DAIRY_S9_V3_SCENARIO.company(company_id) for company_id in ("farm_a", "processor_a")
+    )
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(
+        update={
+            "scenario_id": "timeline.market.three-fill.s2.v3",
+            "days": 1,
+            "companies": companies,
+        }
+    )
+    repository = MemoryRunRepository()
+    execution = await EpisodeRuntime(scenario).run(
+        {company.company_id: _ThreeFillMarketTimelineAgent() for company in companies},
+        31,
+        run_id="timeline_three_fill",
+        store=repository,
+    )
+    _complete(repository, execution, mode=PolicyKind.BASELINE)
+
+    fill_minute = scenario.runtime.open_minute + 30
+    ladder_record = next(
+        record
+        for record in execution.turns
+        if record.turn.company_id == "farm_a" and record.turn.sim_time.minute_of_day == fill_minute
+    )
+    result = ladder_record.outcome.quote_ladder_result
+    assert result is not None
+    assert len(result.levels) == 3
+    assert {level.action.value for level in result.levels} == {"place"}
+    assert {level.remaining_quantity for level in result.levels} == {Decimal()}
+    assert (
+        len(
+            tuple(
+                event
+                for event in ladder_record.outcome.events
+                if isinstance(event, TradeExecutedEvent)
+            )
+        )
+        == 3
+    )
+
+    page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
+    fill_frame = next(
+        moment.market for moment in page.moments if moment.sim_time.minute_of_day == fill_minute
+    )
+    assert len(fill_frame.order_flow) == 3
+    assert all(isinstance(flow, MarketOrderPlaced) for flow in fill_frame.order_flow)
+    assert {flow.apply_sequence for flow in fill_frame.order_flow} == {
+        ladder_record.outcome.apply_sequence
+    }
+    assert tuple(flow.incoming_order.limit_price for flow in fill_frame.order_flow) == (
+        Decimal("1.40"),
+        Decimal("1.45"),
+        Decimal("1.50"),
+    )
+    assert tuple(flow.matched_quantity for flow in fill_frame.order_flow) == (
+        Decimal("10"),
+        Decimal("10"),
+        Decimal("10"),
+    )
+    assert all(len(flow.matches) == 1 for flow in fill_frame.order_flow)
+    assert tuple(trade.unit_price for trade in fill_frame.trades) == (
+        Decimal("1.70"),
+        Decimal("1.60"),
+        Decimal("1.50"),
+    )
+    assert len({trade.trade_id for trade in fill_frame.trades}) == 3
+    raw_book = next(
+        book for book in fill_frame.closing_order_books if book.product is ProductId.RAW_MILK
+    )
+    assert raw_book.bids == ()
+    assert raw_book.asks == ()
+
+    replayed = MarketTimelineProjector().project_day(
+        scenario,
+        1,
+        repository.list_turns(execution.episode.run_id),
+        repository.list_system_steps(execution.episode.run_id),
+        (fill_minute,),
+    )
+    assert replayed[fill_minute] == fill_frame
+
+
+@pytest.mark.asyncio
+async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> None:
+    companies = tuple(
+        DAIRY_S9_V3_SCENARIO.company(company_id)
+        for company_id in ("farm_a", "processor_a", "processor_b")
+    )
+    scenario = DAIRY_S9_V3_SCENARIO.model_copy(
+        update={
+            "scenario_id": "timeline.market.priority.s3.v3",
+            "days": 1,
+            "companies": companies,
+        }
+    )
+    repository = MemoryRunRepository()
+    execution = await EpisodeRuntime(scenario).run(
+        {company.company_id: _TwoBidMarketTimelineAgent() for company in companies},
+        23,
+        run_id="timeline_market_priority",
+        store=repository,
+    )
+    system_steps = repository.list_system_steps(execution.episode.run_id)
+    frames = MarketTimelineProjector().project_day(
+        scenario,
+        1,
+        execution.turns,
+        system_steps,
+        (scenario.runtime.open_minute, scenario.runtime.open_minute + 30),
+    )
+    raw_at_open = next(
+        book
+        for book in frames[scenario.runtime.open_minute].closing_order_books
+        if book.product is ProductId.RAW_MILK
+    )
+    raw_after_fill = next(
+        book
+        for book in frames[scenario.runtime.open_minute + 30].closing_order_books
+        if book.product is ProductId.RAW_MILK
+    )
+    assert tuple(order.queue_ahead_quantity for order in raw_at_open.bids[0].orders) == (
+        Decimal("0"),
+        Decimal("40"),
+    )
+    assert raw_after_fill.bids[0].orders[0].remaining_quantity == Decimal("30")
+    assert raw_after_fill.bids[0].orders[0].queue_ahead_quantity == Decimal("0")
+
+    trade_record = next(
+        record
+        for record in execution.turns
+        if len(
+            tuple(event for event in record.outcome.events if isinstance(event, TradeExecutedEvent))
+        )
+        == 2
+    )
+    first, second = (
+        event for event in trade_record.outcome.events if isinstance(event, TradeExecutedEvent)
+    )
+    corrupted_first = first.model_copy(
+        update={
+            "maker_order_id": second.maker_order_id,
+            "buyer_id": second.buyer_id,
+        }
+    )
+    corrupted_record = trade_record.model_copy(
+        update={
+            "outcome": trade_record.outcome.model_copy(update={"events": (corrupted_first, second)})
+        }
+    )
+    corrupted_turns = tuple(
+        corrupted_record if record.turn.turn_id == trade_record.turn.turn_id else record
+        for record in execution.turns
+    )
+
+    with pytest.raises(MarketProjectionError, match="price-time maker priority"):
+        MarketTimelineProjector().project_day(
+            scenario,
+            1,
+            corrupted_turns,
+            system_steps,
+            (scenario.runtime.open_minute + 30,),
+        )
 
 
 @pytest.mark.asyncio
@@ -580,25 +817,24 @@ class _StopAfterFirstProgress:
 
 
 @pytest.mark.asyncio
-async def test_failed_run_timeline_preserves_raw_dust_order_and_provider_audit() -> None:
+async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit() -> None:
     scenario = DAIRY_S9_V3_SCENARIO.model_copy(update={"days": 1})
     repository = MemoryRunRepository()
-    run_id = "failed_dust_history"
+    run_id = "failed_ladder_history"
     agents: dict[str, CompanyAgent] = {
-        company.company_id: FixedCommandAgent((Wait(),))
-        for company in scenario.companies
+        company.company_id: FixedCommandAgent((Wait(),)) for company in scenario.companies
     }
     agents["farm_a"] = LlmCompanyAgent(
         run_id=run_id,
         company_id="farm_a",
-        gateway=_AuditedDustGateway(),
+        gateway=_AuditedUnauthorizedGateway(),
         audit_sink=repository,
         metadata=PolicyMetadata(
-            name="audited-dust",
+            name="audited-unauthorized-ladder",
             version="3",
             kind=PolicyKind.OPENAI,
             provider="scripted",
-            model="dust-model",
+            model="rejection-model",
             prompt_version=COMMAND_PROMPT_VERSION,
         ),
     )
@@ -629,23 +865,24 @@ async def test_failed_run_timeline_preserves_raw_dust_order_and_provider_audit()
 
     page = RunTimelineProjector(repository).read_day(run_id, 1)
     turn = next(
-        turn
-        for moment in page.moments
-        for turn in moment.turns
-        if turn.company_id == "farm_a"
+        turn for moment in page.moments for turn in moment.turns if turn.company_id == "farm_a"
     )
     invocation = repository.list_invocations(run_id)[0]
 
-    assert isinstance(turn.command, PlaceOrder)
-    assert turn.command.quantity == Decimal("8.9E-91")
+    assert isinstance(turn.command, SetQuoteLadder)
+    assert turn.command == _ladder(
+        MarketSide.BUY,
+        ProductId.RAW_MILK,
+        ("10", "1.40"),
+    )
     assert not turn.outcome.accepted
     assert turn.disposition_source is CommandDispositionSource.ECONOMIC_ENGINE
-    assert "exact multiple of 0.0001" in turn.outcome.reason
+    assert "not authorized" in turn.outcome.reason
     assert turn.protocol_error is None
     assert invocation.command == turn.command
     assert invocation.command_outcome == turn.outcome
-    assert invocation.response_id == "response_dust"
-    assert invocation.request_id == "request_dust"
+    assert invocation.response_id == "response_rejected"
+    assert invocation.request_id == "request_rejected"
     assert invocation.usage.total_tokens == 5
     assert invocation.attempts == 2
     assert invocation.latency_ms == 17

@@ -844,9 +844,10 @@ class EpisodeRuntime:
             observation=observation,
             available_cash=observation.cash,
             reserved_cash=self._engine.reserved_cash(economy, company_id),
-            reserved_inventory=self._engine.reserved_inventory(economy, company_id),
+            marked_surplus=self._engine.marked_surplus(economy, company_id),
+            inventory_expiry=self._engine.inventory_expiry(economy, company_id),
             open_orders=self._engine.company_orders(economy, company_id),
-            market_views=self._engine.market_views(economy, company_id),
+            order_books=self._engine.order_books(economy, company_id),
             pending_deliveries=self._engine.pending_delivery_views(
                 economy,
                 company_id,
@@ -1130,7 +1131,7 @@ class EpisodeRuntime:
                 continue
             match = self._attention.evaluate(
                 plan,
-                self._engine.market_views(economy, company_id),
+                self._engine.order_books(economy, company_id),
             )
             if match is None:
                 continue

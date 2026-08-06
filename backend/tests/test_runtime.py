@@ -32,9 +32,10 @@ from company_bench.runtime_models import (
     AgentTurn,
     CompanyCommand,
     MarketSide,
-    PlaceOrder,
     Produce,
     QuoteAlert,
+    QuoteLevel,
+    SetQuoteLadder,
     SetRetailPrice,
     SimTime,
     SystemEventKind,
@@ -162,23 +163,37 @@ def _wait(_: AgentTurn) -> CompanyCommand:
     return Wait()
 
 
+def _quote(
+    side: MarketSide,
+    product: ProductId,
+    quantity: Decimal,
+    limit_price: Decimal,
+) -> SetQuoteLadder:
+    """Build one focused ladder for runtime orchestration tests."""
+    return SetQuoteLadder(
+        side=side,
+        product=product,
+        levels=(QuoteLevel(quantity=quantity, limit_price=limit_price),),
+    )
+
+
 def _supply_command(turn: AgentTurn) -> CompanyCommand:
     if turn.company_id == "farm_a":
         if WakeReason.DAY_OPEN in turn.wake_reasons:
             return Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY)
         if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
-            return PlaceOrder(
-                side=MarketSide.SELL,
-                product=ProductId.RAW_MILK,
-                quantity=_QUANTITY,
-                limit_price=Decimal("1.50"),
+            return _quote(
+                MarketSide.SELL,
+                ProductId.RAW_MILK,
+                _QUANTITY,
+                Decimal("1.50"),
             )
     if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-        return PlaceOrder(
-            side=MarketSide.BUY,
-            product=ProductId.RAW_MILK,
-            quantity=_QUANTITY,
-            limit_price=Decimal("2.00"),
+        return _quote(
+            MarketSide.BUY,
+            ProductId.RAW_MILK,
+            _QUANTITY,
+            Decimal("2.00"),
         )
     return Wait()
 
@@ -207,11 +222,11 @@ def _timed_retail_agents(
             if WakeReason.DAY_OPEN in turn.wake_reasons:
                 return Produce(product=ProductId.BOTTLED_MILK, quantity=_QUANTITY)
             if turn.sim_time == trade_at:
-                return PlaceOrder(
-                    side=MarketSide.SELL,
-                    product=ProductId.BOTTLED_MILK,
-                    quantity=_QUANTITY,
-                    limit_price=Decimal("2.50"),
+                return _quote(
+                    MarketSide.SELL,
+                    ProductId.BOTTLED_MILK,
+                    _QUANTITY,
+                    Decimal("2.50"),
                 )
             if turn.sim_time.absolute_minute < trade_at.absolute_minute:
                 return wait_toward(turn)
@@ -222,11 +237,11 @@ def _timed_retail_agents(
                     unit_price=Decimal("3.50"),
                 )
             if turn.sim_time == trade_at:
-                return PlaceOrder(
-                    side=MarketSide.BUY,
-                    product=ProductId.BOTTLED_MILK,
-                    quantity=_QUANTITY,
-                    limit_price=Decimal("3.00"),
+                return _quote(
+                    MarketSide.BUY,
+                    ProductId.BOTTLED_MILK,
+                    _QUANTITY,
+                    Decimal("3.00"),
                 )
             if turn.sim_time.absolute_minute < trade_at.absolute_minute:
                 return wait_toward(turn)
@@ -430,11 +445,11 @@ async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -
 
     def place_one_bid(turn: AgentTurn) -> CompanyCommand:
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-            return PlaceOrder(
-                side=MarketSide.BUY,
-                product=ProductId.RAW_MILK,
-                quantity=_QUANTITY,
-                limit_price=Decimal("2.00"),
+            return _quote(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                _QUANTITY,
+                Decimal("2.00"),
             )
         return Wait()
 
@@ -478,11 +493,11 @@ async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> Non
         if WakeReason.DAY_OPEN in turn.wake_reasons:
             if turn.company_id == "farm_a":
                 return Wait(alerts=(alert,))
-            return PlaceOrder(
-                side=MarketSide.BUY,
-                product=ProductId.RAW_MILK,
-                quantity=_QUANTITY,
-                limit_price=Decimal("1.50"),
+            return _quote(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                _QUANTITY,
+                Decimal("1.50"),
             )
         return Wait()
 

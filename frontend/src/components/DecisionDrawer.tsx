@@ -377,9 +377,9 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
         ))}
       </div>
       <p className="observation-footnote">
-        {formatExactDecimal(turn.observation.reservedCash)} reserved cash;{" "}
-        {reservedInventorySummary(turn.observation.reservedInventory)} reserved
-        inventory. {turn.observation.visibleEventCount} visible economic{" "}
+        Marked surplus {formatSignedExactDecimal(turn.observation.markedSurplus)};{" "}
+        {formatExactDecimal(turn.observation.reservedCash)} reserved cash. {" "}
+        {turn.observation.visibleEventCount} visible economic{" "}
         {plural(turn.observation.visibleEventCount, "event")} at this turn.
         {turn.observation.remainingOperationCapacity !== null &&
           ` Remaining daily operation capacity: ${formatExactDecimal(turn.observation.remainingOperationCapacity)}.`}
@@ -394,24 +394,46 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
                 <strong>
                   {formatExactDecimal(order.remainingQuantity)}{" "}
                   {productLabel(order.product)} at{" "}
-                  {formatExactDecimal(order.limitPrice)} · {shortId(order.orderId)}
+                  {formatExactDecimal(order.limitPrice)};{" "}
+                  {formatExactDecimal(order.queueAheadQuantity)} ahead ·{" "}
+                  {shortId(order.orderId)}
                 </strong>
               </li>
             ))}
           </ul>
         </div>
       )}
-      {turn.observation.marketViews.length > 0 && (
+      {turn.observation.inventoryExpiry.length > 0 && (
         <div className="observed-facts">
-          <h4>Continuous markets</h4>
+          <h4>Inventory expiry</h4>
           <ul className="effect-list">
-            {turn.observation.marketViews.map((market) => (
-              <li key={market.product}>
-                <span>{productLabel(market.product)}</span>
+            {turn.observation.inventoryExpiry.map((bucket) => (
+              <li key={`${bucket.product}-${bucket.expiresEndOfDay}`}>
+                <span>
+                  {productLabel(bucket.product)} · end of D{bucket.expiresEndOfDay}
+                </span>
                 <strong>
-                  Bid {market.bestBid === null ? "none" : formatExactDecimal(market.bestBid)} / ask{" "}
-                  {market.bestAsk === null ? "none" : formatExactDecimal(market.bestAsk)};{" "}
-                  {formatExactDecimal(market.dailyVolume)} traded
+                  {formatExactDecimal(bucket.availableQuantity)} available;{" "}
+                  {formatExactDecimal(bucket.reservedQuantity)} reserved
+                </strong>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {turn.observation.orderBooks.length > 0 && (
+        <div className="observed-facts">
+          <h4>Public order books</h4>
+          <ul className="effect-list">
+            {turn.observation.orderBooks.map((book) => (
+              <li key={book.product}>
+                <span>{productLabel(book.product)}</span>
+                <strong>
+                  Bids: {priceLevelSummary(book.bids)}. Asks: {priceLevelSummary(book.asks)}.
+                  {" "}Last trade: {book.lastTradePrice === null
+                    ? "none"
+                    : formatExactDecimal(book.lastTradePrice)};{" "}
+                  {formatExactDecimal(book.dailyVolume)} traded.
                 </strong>
               </li>
             ))}
@@ -461,16 +483,15 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
   );
 }
 
-function reservedInventorySummary(
-  inventory: TurnTimelineItemView["observation"]["reservedInventory"],
+function priceLevelSummary(
+  levels: TurnTimelineItemView["observation"]["orderBooks"][number]["bids"],
 ): string {
-  const entries = Object.entries(inventory);
-  return entries.length === 0
-    ? "no"
-    : entries
+  return levels.length === 0
+    ? "none"
+    : levels
         .map(
-          ([product, quantity]) =>
-            `${formatExactDecimal(quantity)} ${productLabel(product)}`,
+          (level) =>
+            `${formatExactDecimal(level.unitPrice)} × ${formatExactDecimal(level.quantity)} (${level.orderCount} ${plural(level.orderCount, "order")})`,
         )
         .join(", ");
 }
