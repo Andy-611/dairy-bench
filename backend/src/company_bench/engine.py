@@ -55,6 +55,7 @@ from company_bench.models import (
     TradeExecutedEvent,
     WorldState,
 )
+from company_bench.precision import EconomicPrecision
 from company_bench.runtime_models import (
     CommandEnvelope,
     CommandOutcome,
@@ -107,8 +108,8 @@ class ProductionJob(StrictModel):
     def validate_job(self) -> Self:
         """Require exact average cost and a same-day future completion."""
         _validate_job_time(self.started_at, self.completes_at)
-        if self.unit_cost != self.cash_cost / self.quantity:
-            raise ValueError("production unit cost must equal its realized batch average")
+        if self.unit_cost != EconomicPrecision.round(self.cash_cost / self.quantity):
+            raise ValueError("production unit cost must equal its rounded batch average")
         return self
 
 
@@ -133,8 +134,10 @@ class TransformationJob(StrictModel):
         _validate_job_time(self.started_at, self.completes_at)
         if self.input_product is self.output_product:
             raise ValueError("transformation input and output products must differ")
-        if self.processing_cost_per_input != self.cash_cost / self.input_quantity:
-            raise ValueError("processing unit cost must equal its realized batch average")
+        if self.processing_cost_per_input != EconomicPrecision.round(
+            self.cash_cost / self.input_quantity
+        ):
+            raise ValueError("processing unit cost must equal its rounded batch average")
         return self
 
 
@@ -818,7 +821,9 @@ class EconomyEngine:
                         operation.input_product,
                         sold,
                     )
-                    revenue = sold * price
+                    revenue = EconomicPrecision.round(sold * price)
+                    if revenue <= ZERO:
+                        raise ValueError("consumer sale revenue rounds to zero")
                     session.assets.credit_cash(company.company_id, revenue)
                 else:
                     revenue = ZERO
@@ -976,7 +981,7 @@ class EconomyEngine:
             ),
             product=command.product,
             quantity=command.quantity,
-            unit_cost=cost / command.quantity,
+            unit_cost=EconomicPrecision.round(cost / command.quantity),
             cash_cost=cost,
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
@@ -1018,6 +1023,11 @@ class EconomyEngine:
             operation.cost,
             "transformation",
         )
+        output_quantity = EconomicPrecision.floor_quantity(
+            command.input_quantity * operation.yield_rate
+        )
+        if output_quantity <= ZERO:
+            raise _CommandRejected("transformation output rounds to zero")
         session = _MarketSession.from_economy(economy)
         available_input = session.assets.quantity(company.company_id, command.input_product)
         if command.input_quantity > available_input:
@@ -1047,8 +1057,10 @@ class EconomyEngine:
             input_product=command.input_product,
             output_product=command.output_product,
             input_quantity=command.input_quantity,
-            output_quantity=command.input_quantity * operation.yield_rate,
-            processing_cost_per_input=cost / command.input_quantity,
+            output_quantity=output_quantity,
+            processing_cost_per_input=EconomicPrecision.round(
+                cost / command.input_quantity
+            ),
             cash_cost=cost,
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
@@ -1356,7 +1368,7 @@ class EconomyEngine:
                             lot_id=lot.lot_id,
                             product=lot.product,
                             quantity=lot.quantity,
-                            reference_value_loss=(
+                            reference_value_loss=EconomicPrecision.round(
                                 lot.quantity * economy.scenario.product(lot.product).reference_value
                             ),
                         )
@@ -1459,7 +1471,9 @@ def _operation_output_value(economy: EconomyState, company_id: CompanyId) -> Mon
     else:
         product = job.output_product
         quantity = job.output_quantity
-    return quantity * economy.scenario.product(product).reference_value
+    return EconomicPrecision.round(
+        quantity * economy.scenario.product(product).reference_value
+    )
 
 
 def _persisted_lots(economy: EconomyState) -> Iterable[InventoryLot]:
@@ -1544,6 +1558,8 @@ def _price_operation(
             quantity=quantity,
             daily_base_unit_cost=state.daily_base_unit_cost,
         )
+        if cost <= ZERO:
+            raise ValueError(f"{label} cost rounds to zero")
         return state.consume(quantity), cost
     except ValueError as error:
         raise _CommandRejected(str(error)) from error
@@ -1601,5 +1617,9 @@ def _market_summary(market: MarketState) -> MarketSummary:
     return MarketSummary(
         product=market.product,
         volume=market.volume,
-        average_price=(market.traded_value / market.volume if market.volume > ZERO else None),
+        average_price=(
+            EconomicPrecision.round(market.traded_value / market.volume)
+            if market.volume > ZERO
+            else None
+        ),
     )

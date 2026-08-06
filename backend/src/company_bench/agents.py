@@ -27,6 +27,7 @@ from company_bench.models import (
     PolicyMetadata,
     ProcessorOperation,
     ProductId,
+    Quantity,
     RetailerOperation,
     StrictModel,
 )
@@ -50,7 +51,7 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.5"
+COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.6"
 
 
 class CompanyAgent(Protocol):
@@ -98,11 +99,54 @@ class EpisodeCompletionGuard(Protocol):
         ...
 
 
+class AgentDecisionConstraints(StrictModel):
+    """Explicit decision limits derived from one authoritative turn."""
+
+    market_open_minute: int
+    market_close_minute: int
+    operation_duration_minutes: int
+    delivery_duration_minutes: int
+    decision_interval_minutes: int
+    max_wait_minutes: int
+    used_operation_capacity: Quantity | None
+    remaining_operation_capacity: Quantity | None
+
+    @classmethod
+    def from_turn(cls, turn: AgentTurn) -> AgentDecisionConstraints:
+        """Project runtime and operation limits without owning economic state."""
+        runtime = turn.observation.runtime
+        operation = turn.observation.daily_operation
+        return cls(
+            market_open_minute=runtime.open_minute,
+            market_close_minute=runtime.close_minute,
+            operation_duration_minutes=runtime.operation_duration_minutes,
+            delivery_duration_minutes=runtime.delivery_duration_minutes,
+            decision_interval_minutes=runtime.decision_interval_minutes,
+            max_wait_minutes=runtime.max_wait_minutes,
+            used_operation_capacity=None if operation is None else operation.used_capacity,
+            remaining_operation_capacity=turn.remaining_operation_capacity,
+        )
+
+
 class AgentCommandInput(StrictModel):
-    """Current facts plus one company's bounded private conversation."""
+    """Current facts, explicit limits, and one company's private memory."""
 
     memory: AgentCheckpoint
     turn: AgentTurn
+    decision_constraints: AgentDecisionConstraints
+
+    @classmethod
+    def from_turn(
+        cls,
+        memory: AgentCheckpoint,
+        turn: AgentTurn,
+    ) -> AgentCommandInput:
+        """Build the provider projection from one authoritative turn."""
+        return cls(
+            memory=memory,
+            turn=turn,
+            decision_constraints=AgentDecisionConstraints.from_turn(turn),
+        )
 
 
 class LlmCompanyAgent:
@@ -152,9 +196,9 @@ class LlmCompanyAgent:
             run_id=self._run_id,
             turn=turn,
             instructions=instructions,
-            input_text=AgentCommandInput(
-                memory=self._memory.checkpoint(),
-                turn=turn,
+            input_text=AgentCommandInput.from_turn(
+                self._memory.checkpoint(),
+                turn,
             ).model_dump_json(
                 exclude_defaults=True,
                 exclude_none=True,
@@ -520,8 +564,9 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "You are the sole Agent for one dairy company in a continuous spot market. "
         "Your sole objective is to maximize your own company's profit. "
         "Orders lock real cash or FEFO inventory, crossing quotes trade immediately at "
-        "the resting price, and purchases arrive after 30 virtual minutes. Production "
-        "and transformation also complete asynchronously while market commands remain "
+        "the resting price. Purchases arrive after decision_constraints."
+        "delivery_duration_minutes; production and transformation finish after "
+        "decision_constraints.operation_duration_minutes while market commands remain "
         "available. Order books list every anonymous price level with aggregate quantity "
         "and order_count. queue_ahead_quantity is the same-price quantity ahead of your "
         "order. "
@@ -530,9 +575,9 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "marked_surplus is guaranteed marked asset value minus initial cash, including "
         "reserved assets, pending deliveries, and active-operation output at reference "
         "values. For productive companies, observation.daily_operation supplies "
-        "K=daily_capacity, u=used_capacity, remaining_capacity, and "
-        "c=daily_base_unit_cost, while observation.operation.cost.curvature supplies "
-        "curvature; "
+        "K=daily_capacity and c=daily_base_unit_cost; decision_constraints supplies "
+        "u=used_operation_capacity and remaining_operation_capacity, while "
+        "observation.operation.cost.curvature supplies curvature; "
         "for a new quantity q, cash cost is C(u+q)-C(u), where "
         "C(x)=c*x+curvature*c*x^2/(2*K). Use only supplied facts and "
         "submit exactly one atomic command; never invent identity, time, or state version. "
@@ -546,7 +591,8 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "loses its old priority. Total asks require real inventory and total bids require "
         "real cash collateral. Use wait when no action is justified: set until to null to "
         "use the runtime's bounded fallback review when it remains before market close, or "
-        "select an earlier deadline within max_wait_minutes. Set alerts to [] when no price "
+        "select an earlier deadline within decision_constraints.max_wait_minutes and "
+        "before decision_constraints.market_close_minute. Set alerts to [] when no price "
         "condition is needed; otherwise provide up to three OR price alerts over the "
         "best visible quote: bids[0].unit_price for best_bid or asks[0].unit_price for "
         "best_ask. Every alert must still be false when armed. "

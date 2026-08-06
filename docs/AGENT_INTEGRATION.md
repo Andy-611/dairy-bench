@@ -84,10 +84,16 @@ not mutate the economy.
   and daily volume. `bids[0]` and `asks[0]` are the best visible quotes;
 - guaranteed inbound deliveries with product, quantity, exact arrival time, and
   quantity-preserving expiry buckets;
-- the active production or transformation job, if any, and remaining daily
-  operation capacity;
-- company-visible domain events and the previous command outcome; and
-- that company's private bounded memory context.
+- the active production or transformation job, if any, and the authoritative
+  daily operation state;
+- company-visible domain events and the previous command outcome.
+
+The provider input also carries a typed `decision_constraints` projection. It
+always serializes the business-window and timing limits and, for productive
+companies, the current used and remaining operation capacity. These values are
+derived from `AgentTurn`; they are not a second economic state. The provider
+input combines that projection and turn with the company's private bounded
+memory context.
 
 An agent never sees another company's identity in the public order book,
 private assets, memory, prompt, or provider trace. The engine, not the prompt,
@@ -165,8 +171,9 @@ Each company owns one `ConversationMemory`, model client, and gateway lifecycle.
 The provider request combines:
 
 1. current authoritative `AgentTurn` facts;
-2. recent complete Turn/Command/Outcome exchanges; and
-3. a deterministic long-horizon summary of older complete exchanges.
+2. explicit `decision_constraints` derived from that turn;
+3. recent complete Turn/Command/Outcome exchanges; and
+4. a deterministic long-horizon summary of older complete exchanges.
 
 Compaction is token-budget driven, not a fixed seven-day window. It never splits
 a command from its outcome and requires no extra model call. The default

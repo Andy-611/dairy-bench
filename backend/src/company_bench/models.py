@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -16,11 +15,10 @@ from pydantic import (
     model_validator,
 )
 
+from company_bench.precision import ECONOMIC_QUANTUM, EconomicDecimal, EconomicPrecision
+
 ZERO = Decimal("0")
 ONE = Decimal("1")
-QUANTITY_QUANTUM = Decimal("0.0001")
-DAILY_UNIT_COST_QUANTUM = Decimal("0.0001")
-OPERATION_COST_QUANTUM = Decimal("0.00000001")
 MAX_SEED = 2_147_483_647
 
 type CompanyId = Annotated[
@@ -31,22 +29,22 @@ type Identifier = Annotated[
     str,
     StringConstraints(min_length=1, max_length=128),
 ]
-type Quantity = Annotated[Decimal, Field(ge=ZERO)]
-type PositiveQuantity = Annotated[Decimal, Field(gt=ZERO)]
-type Money = Annotated[Decimal, Field(ge=ZERO)]
-type PositiveMoney = Annotated[Decimal, Field(gt=ZERO)]
-type Rate = Annotated[Decimal, Field(ge=ZERO)]
-type Persistence = Annotated[Decimal, Field(ge=ZERO, lt=ONE)]
-type OpenUnitInterval = Annotated[Decimal, Field(ge=ZERO, lt=ONE)]
+type Quantity = Annotated[EconomicDecimal, Field(ge=ZERO)]
+type PositiveQuantity = Annotated[EconomicDecimal, Field(gt=ZERO)]
+type Money = Annotated[EconomicDecimal, Field(ge=ZERO)]
+type PositiveMoney = Annotated[EconomicDecimal, Field(gt=ZERO)]
+type Rate = Annotated[EconomicDecimal, Field(ge=ZERO)]
+type Persistence = Annotated[EconomicDecimal, Field(ge=ZERO, lt=ONE)]
+type OpenUnitInterval = Annotated[EconomicDecimal, Field(ge=ZERO, lt=ONE)]
 type UnitInterval = Annotated[
-    Decimal,
+    EconomicDecimal,
     Field(ge=ZERO, le=Decimal("1")),
 ]
 type BenchmarkScore = Annotated[
-    Decimal,
+    EconomicDecimal,
     Field(ge=ZERO, le=Decimal("100")),
 ]
-type ScoreVersion = Literal["s9-enterprise-v1"]
+type ScoreVersion = Literal["s9-enterprise-v2"]
 
 
 class InvalidOrderQuantity(ValueError):
@@ -54,15 +52,10 @@ class InvalidOrderQuantity(ValueError):
 
 
 def _validate_exact_quantity(value: Decimal, label: str) -> Decimal:
-    """Validate one quantity quantum from its Decimal coefficient."""
-    if not value.is_finite() or value <= ZERO:
+    """Validate one exact positive economic quantity."""
+    if value <= ZERO:
         raise ValueError(f"{label} quantity must be positive and finite")
-    decimal_tuple = value.as_tuple()
-    digits = decimal_tuple.digits
-    excess_places = QUANTITY_QUANTUM.as_tuple().exponent - decimal_tuple.exponent
-    if excess_places > 0 and (excess_places > len(digits) or any(digits[-excess_places:])):
-        raise ValueError(f"{label} quantity must be an exact multiple of {QUANTITY_QUANTUM}")
-    return value
+    return EconomicPrecision.require_exact(value)
 
 
 def _validate_order_quantity(value: Decimal) -> Decimal:
@@ -76,14 +69,12 @@ def _validate_operation_quantity(value: Decimal) -> Decimal:
 
 
 type OrderQuantity = Annotated[
-    Decimal,
+    EconomicDecimal,
     Field(gt=ZERO),
-    AfterValidator(_validate_order_quantity),
 ]
 type OperationQuantity = Annotated[
-    Decimal,
+    EconomicDecimal,
     Field(gt=ZERO),
-    AfterValidator(_validate_operation_quantity),
 ]
 
 _ORDER_QUANTITY_ADAPTER = TypeAdapter(OrderQuantity)
@@ -95,8 +86,8 @@ def require_order_quantity(value: Decimal) -> OrderQuantity:
         return _ORDER_QUANTITY_ADAPTER.validate_python(value)
     except ValidationError as error:
         raise InvalidOrderQuantity(
-            f"order quantity must be at least {QUANTITY_QUANTUM} and an exact "
-            f"multiple of {QUANTITY_QUANTUM}"
+            f"order quantity must be at least {ECONOMIC_QUANTUM} and an exact "
+            f"multiple of {ECONOMIC_QUANTUM}"
         ) from error
 
 
@@ -178,14 +169,8 @@ class CapacityFunction(StrictModel):
             raise ValueError("capacity factor range must contain 1")
         if self.minimum_factor > self.maximum_factor:
             raise ValueError("minimum capacity factor must not exceed maximum")
-        if any(
-            factor.quantize(QUANTITY_QUANTUM, rounding=ROUND_HALF_EVEN) != factor
-            for factor in (self.minimum_factor, self.maximum_factor)
-        ):
-            raise ValueError("capacity factor bounds must use at most four decimal places")
-        minimum_capacity = (self.normal_capacity * self.minimum_factor).quantize(
-            QUANTITY_QUANTUM,
-            rounding=ROUND_HALF_EVEN,
+        minimum_capacity = EconomicPrecision.round(
+            self.normal_capacity * self.minimum_factor
         )
         if minimum_capacity <= ZERO:
             raise ValueError("minimum realized capacity must survive quantity precision")
@@ -212,13 +197,11 @@ class CapacityFunction(StrictModel):
                 + self.persistence * (previous_availability - ONE)
                 + self.volatility * innovation,
             ),
-        ).quantize(QUANTITY_QUANTUM, rounding=ROUND_HALF_EVEN)
+        )
+        availability = EconomicPrecision.round(availability)
         return DailyCapacity(
             availability=availability,
-            quantity=(self.normal_capacity * availability).quantize(
-                QUANTITY_QUANTUM,
-                rounding=ROUND_HALF_EVEN,
-            ),
+            quantity=EconomicPrecision.round(self.normal_capacity * availability),
         )
 
 
@@ -233,25 +216,19 @@ class CostFunction(StrictModel):
     def validate_minimum_cost(self) -> Self:
         """Require the smallest supported batch to retain a positive cash cost."""
         minimum_unit_cost = self.normal_unit_cost * (ONE - self.daily_volatility)
-        if minimum_unit_cost.quantize(
-            DAILY_UNIT_COST_QUANTUM,
-            rounding=ROUND_HALF_EVEN,
-        ) <= ZERO:
+        if EconomicPrecision.round(minimum_unit_cost) <= ZERO:
             raise ValueError("minimum daily unit cost must survive cost precision")
-        minimum_batch_cost = minimum_unit_cost * QUANTITY_QUANTUM
-        if minimum_batch_cost.quantize(
-            OPERATION_COST_QUANTUM,
-            rounding=ROUND_HALF_EVEN,
-        ) <= ZERO:
+        minimum_batch_cost = minimum_unit_cost * ECONOMIC_QUANTUM
+        if EconomicPrecision.round(minimum_batch_cost) <= ZERO:
             raise ValueError("minimum operation cost must survive cash precision")
         return self
 
     def daily_base_unit_cost(self, innovation: Decimal) -> PositiveMoney:
         """Return today's positive private base cost from a symmetric innovation."""
         _require_finite_between(innovation, -ONE, ONE, "cost innovation")
-        return (
+        return EconomicPrecision.round(
             self.normal_unit_cost * (ONE + self.daily_volatility * innovation)
-        ).quantize(DAILY_UNIT_COST_QUANTUM, rounding=ROUND_HALF_EVEN)
+        )
 
     def incremental_cost(
         self,
@@ -293,7 +270,7 @@ class CostFunction(StrictModel):
             * quantity**2
             / (Decimal("2") * daily_capacity)
         )
-        return total.quantize(OPERATION_COST_QUANTUM, rounding=ROUND_HALF_EVEN)
+        return EconomicPrecision.round(total)
 
 
 class ProductiveOperation(StrictModel):
@@ -496,10 +473,10 @@ class ScenarioSpec(StrictModel):
         inventory: tuple[InventoryLot, ...],
     ) -> Decimal:
         """Value inventory using immutable benchmark references."""
-        return sum(
+        return EconomicPrecision.round(sum(
             (lot.quantity * self.product(lot.product).reference_value for lot in inventory),
             start=ZERO,
-        )
+        ))
 
 
 class InventoryLot(StrictModel):
@@ -806,7 +783,7 @@ class CompanySnapshot(StrictModel):
     bottled_milk_quantity: Quantity
     inventory_value: Money
     net_worth: Money
-    surplus: Decimal
+    surplus: EconomicDecimal
     daily_consumer_sales: Quantity
     daily_expired_quantity: Quantity
 
@@ -839,7 +816,7 @@ class CompanyScore(StrictModel):
     final_cash: Money
     final_inventory_value: Money
     final_value: Money
-    surplus: Decimal
+    surplus: EconomicDecimal
     growth: Rate
 
 
@@ -848,7 +825,7 @@ class ScoreCard(StrictModel):
 
     score_version: ScoreVersion
     final_score: BenchmarkScore
-    efficiency_raw: Decimal
+    efficiency_raw: EconomicDecimal
     efficiency_reference: Money
     efficiency_score: UnitInterval
     farm_gini: UnitInterval
@@ -868,7 +845,9 @@ class ScoreCard(StrictModel):
         if self.bankrupt_company_count > len(self.companies):
             raise ValueError("bankrupt_company_count cannot exceed company count")
         if self.companies:
-            expected_rate = Decimal(self.bankrupt_company_count) / Decimal(len(self.companies))
+            expected_rate = EconomicPrecision.round(
+                Decimal(self.bankrupt_company_count) / Decimal(len(self.companies))
+            )
             if self.bankruptcy_rate != expected_rate:
                 raise ValueError("bankruptcy_rate must match bankrupt_company_count")
         elif self.bankrupt_company_count or self.bankruptcy_rate:

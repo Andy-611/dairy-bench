@@ -217,9 +217,12 @@ Along with available assets and events, it contains:
   available from ask-reserved spot inventory;
 - `pending_deliveries` with exact arrival times and quantity-preserving expiry
   buckets;
-- `active_operation`; and
-- `remaining_operation_capacity`; and
+- `active_operation` and the authoritative daily operation state; and
 - the current daily turn number and hard limit.
+
+The provider adapter adds one typed `decision_constraints` projection with
+explicit runtime limits and derived used/remaining operation capacity. It is
+rebuilt from `AgentTurn` for every request and never owns economic state.
 
 `marked_surplus` values available cash, bid-reserved cash, available and
 ask-reserved inventory, pending deliveries, and guaranteed active-operation

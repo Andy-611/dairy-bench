@@ -182,9 +182,12 @@ Alert 为一次性。系统只在同一分钟所有 seed 排序命令提交完�
 - `reserved_cash`、`marked_surplus` 与 `inventory_expiry`；库存到期桶分别列出可用现货
   与卖单预留现货；
 - `pending_deliveries`，包含准确到达时间和数量守恒的到期日分桶；
-- `active_operation`；
-- `remaining_operation_capacity`；
+- `active_operation` 与权威的当日作业状态；
 - 当日 Turn 序号与硬上限。
+
+Provider Adapter 会额外生成一个强类型 `decision_constraints` 投影，其中显式包含
+运行时限以及派生的已用/剩余作业产能。它在每次请求时从 `AgentTurn` 重建，从不持有
+经济状态。
 
 `marked_surplus` 将可用现金、买单预留现金、可用与卖单预留库存、在途交割和当前作业的
 保证产出统一按不可变产品参考价值计值，再减去企业的 Episode 初始现金。因此，同一资产

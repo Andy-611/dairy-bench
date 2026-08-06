@@ -36,6 +36,7 @@ from company_bench.runtime_models import (
     QuoteLevelResult,
     SimTime,
 )
+from company_bench.precision import EconomicPrecision
 
 __all__ = [
     "AssetLedger",
@@ -218,6 +219,7 @@ class AssetLedger:
 
     def debit_cash(self, company_id: CompanyId, amount: Decimal) -> None:
         """Debit an exact affordable amount."""
+        EconomicPrecision.require_exact(amount)
         account = self._account(company_id)
         if amount < ZERO:
             raise MarketError("cash debit must be nonnegative")
@@ -227,6 +229,7 @@ class AssetLedger:
 
     def credit_cash(self, company_id: CompanyId, amount: Decimal) -> None:
         """Credit an exact nonnegative amount."""
+        EconomicPrecision.require_exact(amount)
         if amount < ZERO:
             raise MarketError("cash credit must be nonnegative")
         self._account(company_id).cash += amount
@@ -368,8 +371,8 @@ class BuyOrder(_BaseOrder):
     @model_validator(mode="after")
     def validate_reserve(self) -> Self:
         """Require exact full cash collateral."""
-        if self.reserved_cash != self.remaining_quantity * self.limit_price:
-            raise ValueError("buy reserve must equal remaining quantity times limit price")
+        if self.reserved_cash != _cash_value(self.remaining_quantity, self.limit_price):
+            raise ValueError("buy reserve must equal the rounded remaining commitment")
         return self
 
 
@@ -429,8 +432,8 @@ class TradeFill(StrictModel):
     @model_validator(mode="after")
     def validate_fill(self) -> Self:
         """Keep value and dispatched inventory exactly aligned."""
-        if self.total_value != self.quantity * self.unit_price:
-            raise ValueError("trade value must equal quantity times unit price")
+        if self.total_value != _cash_value(self.quantity, self.unit_price):
+            raise ValueError("trade value must equal rounded quantity times unit price")
         if any(lot.product is not self.product for lot in self.delivery_lots):
             raise ValueError("delivery lots must match the traded product")
         if _lot_quantity(self.delivery_lots) != self.quantity:
@@ -747,7 +750,7 @@ class ContinuousSpotMarket:
         )
         if side is MarketSide.BUY:
             required = sum(
-                (level.quantity * level.limit_price for level in changed),
+                (_cash_value(level.quantity, level.limit_price) for level in changed),
                 start=ZERO,
             )
             available = self._assets.cash(owner_id)
@@ -803,7 +806,9 @@ class ContinuousSpotMarket:
             "priority_sequence": priority_sequence,
         }
         if side is MarketSide.BUY:
-            reserved_cash = quantity * limit_price
+            reserved_cash = _cash_value(quantity, limit_price)
+            if reserved_cash <= ZERO:
+                raise MarketError("order commitment rounds to zero at economic precision")
             self._assets.reserve_cash(owner_id, reserved_cash)
             return BuyOrder(**common, reserved_cash=reserved_cash)
         if side is MarketSide.SELL:
@@ -834,9 +839,11 @@ class ContinuousSpotMarket:
             if not isinstance(buyer, BuyOrder) or not isinstance(seller, SellOrder):
                 raise RuntimeError("crossing orders must have opposite sides")
 
-            updated_buyer, refund = _fill_buy_order(buyer, quantity, price)
+            value = _cash_value(quantity, price)
+            if value <= ZERO:
+                raise MarketError("trade value rounds to zero at economic precision")
+            updated_buyer, refund = _fill_buy_order(buyer, quantity, value)
             updated_seller, seller_lots = _fill_sell_order(seller, quantity)
-            value = quantity * price
             self._assets.credit_cash(seller.owner_id, value)
             self._assets.credit_cash(buyer.owner_id, refund)
             delivery_lots = self._assets.relabel_for_buyer(buyer.owner_id, seller_lots)
@@ -956,14 +963,16 @@ def _take_fefo(
 def _fill_buy_order(
     order: BuyOrder,
     quantity: Decimal,
-    trade_price: Decimal,
+    trade_value: Decimal,
 ) -> tuple[BuyOrder | None, Decimal]:
     remaining = order.remaining_quantity - quantity
-    reserved = order.reserved_cash - quantity * order.limit_price
-    refund = quantity * (order.limit_price - trade_price)
+    reserved = (
+        _cash_value(remaining, order.limit_price) if remaining > ZERO else ZERO
+    )
+    refund = order.reserved_cash - reserved - trade_value
+    if refund < ZERO:
+        raise MarketError("rounded buy collateral cannot fund this partial fill")
     if remaining == ZERO:
-        if reserved != ZERO:
-            raise RuntimeError("filled buy order retained cash")
         return None, refund
     return (
         order.model_copy(update={"remaining_quantity": remaining, "reserved_cash": reserved}),
@@ -1041,6 +1050,11 @@ def _open_order_view(
 
 def _lot_quantity(lots: Iterable[InventoryLot]) -> Decimal:
     return sum((lot.quantity for lot in lots), start=ZERO)
+
+
+def _cash_value(quantity: Decimal, unit_price: Decimal) -> Decimal:
+    """Return one cash boundary value under the shared precision contract."""
+    return EconomicPrecision.round(quantity * unit_price)
 
 
 def _lot_priority(lot: InventoryLot) -> tuple[int, int, str, str]:

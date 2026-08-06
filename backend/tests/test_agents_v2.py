@@ -8,6 +8,7 @@ from company_bench.agent_gateway import ScriptedModelGateway
 from company_bench.agent_models import CommandSubmission, ModelOutputError
 from company_bench.agents import (
     COMMAND_PROMPT_VERSION,
+    AgentDecisionConstraints,
     BaselineCompanyAgent,
     LlmCompanyAgent,
     observation_hash,
@@ -266,7 +267,8 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
     assert "Your sole objective is to maximize your own company's profit." in request.instructions
     assert "resting price" in request.instructions
     assert "C(u+q)-C(u)" in request.instructions
-    assert "after 30 virtual minutes" in request.instructions
+    assert "decision_constraints.delivery_duration_minutes" in request.instructions
+    assert "decision_constraints.operation_duration_minutes" in request.instructions
     assert "set_quote_ladder" in request.instructions
     assert "zero to three unique" in request.instructions
     assert "use [] to cancel" in request.instructions
@@ -282,15 +284,57 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
     assert prompt_input["turn"]["marked_surplus"] == "0"
     assert "market_views" not in prompt_input["turn"]
     assert "remaining_operation_capacity" not in prompt_input["turn"]
+    constraints = prompt_input["decision_constraints"]
+    assert constraints["market_open_minute"] == observation.runtime.open_minute
+    assert constraints["market_close_minute"] == observation.runtime.close_minute
+    assert constraints["operation_duration_minutes"] == (
+        observation.runtime.operation_duration_minutes
+    )
+    assert constraints["delivery_duration_minutes"] == (
+        observation.runtime.delivery_duration_minutes
+    )
+    assert constraints["decision_interval_minutes"] == (
+        observation.runtime.decision_interval_minutes
+    )
+    assert constraints["max_wait_minutes"] == observation.runtime.max_wait_minutes
     observed_payload = prompt_input["turn"]["observation"]
     if observation.daily_operation is None:
         assert "daily_operation" not in observed_payload
+        assert "used_operation_capacity" not in constraints
+        assert "remaining_operation_capacity" not in constraints
     else:
         daily_operation = observed_payload["daily_operation"]
         assert daily_operation["company_id"] == observation.company_id
         assert "daily_base_unit_cost" in daily_operation
+        assert constraints["used_operation_capacity"] == str(
+            observation.daily_operation.used_capacity
+        )
+        assert constraints["remaining_operation_capacity"] == str(
+            observation.daily_operation.remaining_capacity
+        )
     assert agent.metadata.version == "3"
     assert agent.metadata.prompt_version == COMMAND_PROMPT_VERSION
+
+
+def test_decision_constraints_derive_current_remaining_capacity() -> None:
+    observation = _observation("farm_a")
+    operation = observation.daily_operation
+    assert operation is not None
+    used_capacity = Decimal("10.1234")
+    observation = observation.model_copy(
+        update={
+            "daily_operation": operation.model_copy(
+                update={"used_capacity": used_capacity}
+            )
+        }
+    )
+    turn = _turn("capacity_projection", observation)
+
+    constraints = AgentDecisionConstraints.from_turn(turn)
+
+    assert constraints.used_operation_capacity == used_capacity
+    assert constraints.remaining_operation_capacity == operation.daily_capacity - used_capacity
+    assert "remaining_operation_capacity" not in turn.model_dump()
 
 
 @pytest.mark.asyncio
