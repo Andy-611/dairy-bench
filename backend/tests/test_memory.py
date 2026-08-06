@@ -127,11 +127,17 @@ def test_checkpoint_round_trip_restores_exact_context(
 def test_default_summary_is_deterministic(
     observations: dict[str, CompanyObservation],
 ) -> None:
+    probe = ConversationMemory(RUN_ID, "farm_a", max_tokens=100_000, chars_per_token=1)
+    probe.remember(_exchange(observations["farm_a"], 1))
+    one_exchange_tokens = probe.estimated_tokens
+    probe.remember(_exchange(observations["farm_a"], 2))
+    budget = (one_exchange_tokens + probe.estimated_tokens) // 2
+
     def build() -> ConversationMemory:
         memory = ConversationMemory(
             RUN_ID,
             "farm_a",
-            max_tokens=2_500,
+            max_tokens=budget,
             chars_per_token=1,
         )
         for index in range(1, 4):

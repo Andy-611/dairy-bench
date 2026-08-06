@@ -210,12 +210,21 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
     prompt_input = json.loads(request.input_text)
     assert request.allowed_commands == allowed_commands
     assert "continuous spot market" in request.instructions
+    assert "Your sole objective is to maximize your own company's profit." in request.instructions
     assert "resting price" in request.instructions
+    assert "C(u+q)-C(u)" in request.instructions
     assert "after 30 virtual minutes" in request.instructions
     assert "replace_order" in request.instructions
     assert "at least 0.0001" in request.instructions
     assert "at most four decimal places" in request.instructions
     assert prompt_input["turn"]["market_views"][0]["best_bid"] == "1.50"
+    observed_payload = prompt_input["turn"]["observation"]
+    if observation.daily_operation is None:
+        assert "daily_operation" not in observed_payload
+    else:
+        daily_operation = observed_payload["daily_operation"]
+        assert daily_operation["company_id"] == observation.company_id
+        assert "daily_base_unit_cost" in daily_operation
     assert agent.metadata.version == "3"
     assert agent.metadata.prompt_version == COMMAND_PROMPT_VERSION
 
@@ -295,11 +304,13 @@ async def test_llm_agent_preserves_a_dust_order_for_engine_audit() -> None:
 async def test_baseline_processor_procures_transforms_and_trades_while_busy() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
+    assert observation.daily_operation is not None
+    capacity = min(observation.daily_operation.daily_capacity, Decimal("50"))
 
     assert await agent.act(_turn("processor_procure", observation)) == PlaceOrder(
         side=MarketSide.BUY,
         product=ProductId.RAW_MILK,
-        quantity=Decimal("50"),
+        quantity=capacity,
         limit_price=Decimal("1.60"),
     )
 
@@ -313,7 +324,7 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
     ) == Transform(
         input_product=ProductId.RAW_MILK,
         output_product=ProductId.BOTTLED_MILK,
-        input_quantity=Decimal("50"),
+        input_quantity=capacity,
     )
 
     bottled_stock = _with_inventory(observation, bottled_milk=Decimal("20"))

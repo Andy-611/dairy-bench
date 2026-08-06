@@ -79,7 +79,7 @@ class BaselinePolicy:
         """Choose the documented V1 action for the company's operation."""
         operation = observation.operation
         if isinstance(operation, FarmOperation):
-            quantity = min(operation.daily_capacity, Decimal("50"))
+            quantity = min(_daily_capacity(observation), Decimal("50"))
             return FarmDecision(
                 produce_quantity=quantity,
                 raw_offer_quantity=quantity,
@@ -87,7 +87,7 @@ class BaselinePolicy:
             )
         if isinstance(operation, ProcessorOperation):
             input_quantity = min(
-                operation.daily_input_capacity,
+                _daily_capacity(observation),
                 Decimal("50"),
             )
             return ProcessorDecision(
@@ -107,3 +107,10 @@ class BaselinePolicy:
                 retail_price=Decimal("3.50"),
             )
         raise TypeError(f"unsupported operation: {type(operation).__name__}")
+
+
+def _daily_capacity(observation: CompanyObservation) -> Decimal:
+    """Return the productive company's private realized capacity."""
+    if observation.daily_operation is None:
+        raise ValueError("productive policy requires daily operating economics")
+    return observation.daily_operation.daily_capacity

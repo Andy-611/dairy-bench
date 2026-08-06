@@ -852,10 +852,6 @@ class EpisodeRuntime:
                 company_id,
             ),
             active_operation=self._engine.operation_view(economy, company_id),
-            remaining_operation_capacity=self._engine.remaining_operation_capacity(
-                economy,
-                company_id,
-            ),
             visible_events=visible,
             previous_outcome=previous_outcome,
         )

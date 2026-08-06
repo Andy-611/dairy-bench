@@ -16,6 +16,7 @@ from company_bench.models import (
     Identifier,
     InventoryPosition,
     Money,
+    OperationQuantity,
     PositiveMoney,
     PositiveQuantity,
     ProductId,
@@ -189,7 +190,7 @@ class Produce(StrictModel):
 
     kind: Literal["produce"] = "produce"
     product: ProductId
-    quantity: PositiveQuantity
+    quantity: OperationQuantity
 
 
 class Transform(StrictModel):
@@ -198,7 +199,7 @@ class Transform(StrictModel):
     kind: Literal["transform"] = "transform"
     input_product: ProductId
     output_product: ProductId
-    input_quantity: PositiveQuantity
+    input_quantity: OperationQuantity
 
     @model_validator(mode="after")
     def validate_products(self) -> Self:
@@ -427,9 +428,14 @@ class AgentTurn(StrictModel):
     market_views: tuple[MarketView, ...] = ()
     pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
     active_operation: OperationJobView | None = None
-    remaining_operation_capacity: Quantity | None = None
     visible_events: tuple[DomainEvent, ...] = ()
     previous_outcome: CommandOutcome | None = None
+
+    @property
+    def remaining_operation_capacity(self) -> Quantity | None:
+        """Derive remaining capacity from the sole private operation state."""
+        operation = self.observation.daily_operation
+        return None if operation is None else operation.remaining_capacity
 
     @model_validator(mode="after")
     def validate_turn(self) -> Self:

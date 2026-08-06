@@ -1,8 +1,11 @@
+from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from company_bench.dairy_scenario import DAIRY_S9_V3_SCENARIO
+from company_bench.economics import OperatingEconomics
 from company_bench.engine import EconomyEngine, EconomyState, PendingDelivery
 from company_bench.models import (
     MAX_SEED,
@@ -10,6 +13,7 @@ from company_bench.models import (
     ConsumerSaleEvent,
     DayResult,
     DeliveryCompletedEvent,
+    FarmOperation,
     InventoryLot,
     MilkProcessedEvent,
     MilkProducedEvent,
@@ -187,6 +191,26 @@ def _produce_ready(
     )
 
 
+def _run_operation(
+    engine: EconomyEngine,
+    economy: EconomyState,
+    company_id: str,
+    command: CompanyCommand,
+    start: SimTime,
+    sequence: int,
+) -> tuple[EconomyState, Decimal]:
+    """Start and complete one operation, returning its authoritative cash cost."""
+    started, outcome = _apply(engine, economy, company_id, command, start, sequence)
+    assert outcome.accepted and outcome.job_id is not None
+    job = next(item for item in started.jobs if item.job_id == outcome.job_id)
+    completed = engine.complete_operation(
+        started,
+        outcome.job_id,
+        outcome.scheduled_completions[0].at,
+    )
+    return completed, job.cash_cost
+
+
 def _close_day(engine: EconomyEngine, economy: EconomyState) -> DayResult:
     """Run the fixed 19:00 and 19:30 system transitions."""
     market_close = _at(19, day=economy.day - 1)
@@ -195,7 +219,7 @@ def _close_day(engine: EconomyEngine, economy: EconomyState) -> DayResult:
     return engine.close_day(settled, _at(19, 30, day=economy.day - 1))
 
 
-def test_v3_scenario_has_nine_typed_companies_and_balanced_capacity() -> None:
+def test_v3_scenario_has_nine_typed_companies_and_balanced_nominal_capacity() -> None:
     scenario = DAIRY_S9_V3_SCENARIO
     expected_ids = tuple(
         f"{tier}_{suffix}"
@@ -206,7 +230,7 @@ def test_v3_scenario_has_nine_typed_companies_and_balanced_capacity() -> None:
 
     processor_output_capacity = sum(
         (
-            company.operation.daily_input_capacity * company.operation.yield_rate
+            company.operation.capacity.normal_capacity * company.operation.yield_rate
             for company in scenario.companies
             if isinstance(company.operation, ProcessorOperation)
         ),
@@ -223,6 +247,13 @@ def test_v3_scenario_has_nine_typed_companies_and_balanced_capacity() -> None:
     assert operation_kinds.count("processor") == 3
     assert operation_kinds.count("retailer") == 3
     assert processor_output_capacity == reference_demand == Decimal("120")
+    for operation_type in (FarmOperation, ProcessorOperation):
+        operations = tuple(
+            company.operation
+            for company in scenario.companies
+            if isinstance(company.operation, operation_type)
+        )
+        assert len({(operation.capacity, operation.cost) for operation in operations}) == 1
     assert scenario.runtime.open_minute == 9 * 60
     assert scenario.runtime.close_minute == 19 * 60
     assert scenario.runtime.day_close_minute == 19 * 60 + 30
@@ -236,16 +267,36 @@ def test_engine_rejects_invalid_seed(seed: int) -> None:
         EconomyEngine().initial_state(DAIRY_S9_V3_SCENARIO, seed)
 
 
+@pytest.mark.parametrize(
+    "command_factory",
+    [
+        lambda: Produce(product=ProductId.RAW_MILK, quantity=Decimal("0.00001")),
+        lambda: Transform(
+            input_product=ProductId.RAW_MILK,
+            output_product=ProductId.BOTTLED_MILK,
+            input_quantity=Decimal("0.00001"),
+        ),
+    ],
+)
+def test_operation_commands_reject_dust_quantities(
+    command_factory: Callable[[], CompanyCommand],
+) -> None:
+    with pytest.raises(ValidationError, match=r"exact multiple of 0\.0001"):
+        command_factory()
+
+
 def test_production_is_atomic_busy_capacity_limited_and_completes_in_thirty_minutes(
     engine: EconomyEngine,
     economy: EconomyState,
 ) -> None:
     original = economy
+    capacity = engine.remaining_operation_capacity(economy, "farm_a")
+    assert capacity is not None
     economy, oversized = _apply(
         engine,
         economy,
         "farm_a",
-        _produce("61"),
+        _produce(capacity + Decimal("0.0001")),
         _at(9),
         1,
     )
@@ -256,14 +307,15 @@ def test_production_is_atomic_busy_capacity_limited_and_completes_in_thirty_minu
         engine,
         economy,
         "farm_a",
-        _produce("60"),
+        _produce(capacity),
         _at(9),
         2,
     )
     assert started.accepted and started.job_id is not None
+    job = economy.jobs[0]
     assert started.scheduled_completions[0].kind is SystemEventKind.OPERATION_COMPLETED
     assert started.scheduled_completions[0].at == _at(9, 30)
-    assert _company(economy, "farm_a").cash == Decimal("940")
+    assert _company(economy, "farm_a").cash == Decimal("1000") - job.cash_cost
     assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == 0
     assert engine.remaining_operation_capacity(economy, "farm_a") == 0
 
@@ -283,8 +335,8 @@ def test_production_is_atomic_busy_capacity_limited_and_completes_in_thirty_minu
     economy = engine.complete_operation(economy, started.job_id, _at(9, 30))
     event = economy.events[-1]
     assert isinstance(event, MilkProducedEvent)
-    assert event.actual_quantity == Decimal("60")
-    assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == Decimal("60")
+    assert event.actual_quantity == capacity
+    assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == capacity
 
     unchanged, exhausted = _apply(
         engine,
@@ -341,21 +393,24 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
         engine,
         "processor_a",
         ProductId.RAW_MILK,
-        Decimal("50"),
+        Decimal("100"),
     )
+    capacity = engine.remaining_operation_capacity(economy, "processor_a")
+    assert capacity is not None
     economy, started = _apply(
         engine,
         economy,
         "processor_a",
-        _transform("50"),
+        _transform(capacity),
         _at(9),
         1,
     )
 
     assert started.accepted and started.job_id is not None
+    job = economy.jobs[0]
     assert started.scheduled_completions[0].at == _at(9, 30)
-    assert _company(economy, "processor_a").cash == Decimal("980")
-    assert _quantity(economy, "processor_a", ProductId.RAW_MILK) == 0
+    assert _company(economy, "processor_a").cash == Decimal("1000") - job.cash_cost
+    assert _quantity(economy, "processor_a", ProductId.RAW_MILK) == Decimal("100") - capacity
     assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == 0
     assert engine.remaining_operation_capacity(economy, "processor_a") == 0
 
@@ -373,9 +428,11 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     economy = engine.complete_operation(economy, started.job_id, _at(9, 30))
     event = economy.events[-1]
     assert isinstance(event, MilkProcessedEvent)
-    assert event.actual_input == Decimal("50")
-    assert event.output_quantity == Decimal("40.0")
-    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == Decimal("40.0")
+    assert event.actual_input == capacity
+    assert event.output_quantity == capacity * Decimal("0.8")
+    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == (
+        capacity * Decimal("0.8")
+    )
 
     unchanged, exhausted = _apply(
         engine,
@@ -387,6 +444,61 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     )
     assert not exhausted.accepted and "capacity" in exhausted.reason
     assert unchanged == economy
+
+
+@pytest.mark.parametrize(
+    ("company_id", "command", "with_input_inventory"),
+    [
+        ("farm_a", _produce("10"), False),
+        ("processor_a", _transform("10"), True),
+    ],
+)
+def test_later_equal_batches_cost_more_without_split_order_discount(
+    engine: EconomyEngine,
+    economy: EconomyState,
+    company_id: str,
+    command: CompanyCommand,
+    with_input_inventory: bool,
+) -> None:
+    if with_input_inventory:
+        economy = _open_with_inventory(
+            engine,
+            company_id,
+            ProductId.RAW_MILK,
+            Decimal("100"),
+        )
+    initial_operation = next(
+        state for state in economy.operation_states if state.company_id == company_id
+    )
+    operation = economy.scenario.company(company_id).operation
+    assert isinstance(operation, (FarmOperation, ProcessorOperation))
+
+    economy, first_cost = _run_operation(
+        engine,
+        economy,
+        company_id,
+        command,
+        _at(9),
+        1,
+    )
+    economy, second_cost = _run_operation(
+        engine,
+        economy,
+        company_id,
+        command,
+        _at(9, 31),
+        2,
+    )
+    combined_cost = operation.cost.incremental_cost(
+        daily_capacity=initial_operation.daily_capacity,
+        used_capacity=Decimal("0"),
+        quantity=Decimal("20"),
+        daily_base_unit_cost=initial_operation.daily_base_unit_cost,
+    )
+
+    assert second_cost > first_cost
+    assert first_cost + second_cost == combined_cost
+    assert _company(economy, company_id).cash == Decimal("1000") - combined_cost
 
 
 def test_orders_require_authorization_and_full_cash_or_inventory_collateral(
@@ -610,7 +722,10 @@ def test_match_pays_seller_now_and_delivers_inventory_thirty_minutes_later(
     assert trade.quantity == Decimal("6")
     assert trade.unit_price == Decimal("1.50")
     assert trade.total_value == Decimal("9.00")
-    assert _company(economy, "farm_a").cash == Decimal("999.00")
+    production = next(event for event in economy.events if isinstance(event, MilkProducedEvent))
+    assert _company(economy, "farm_a").cash == (
+        Decimal("1000") - production.cash_cost + trade.total_value
+    )
     assert _company(economy, "processor_a").cash == Decimal("991.00")
     assert _quantity(economy, "farm_a", ProductId.RAW_MILK) == 0
     assert engine.reserved_inventory(economy, "farm_a")[0].quantity == 4
@@ -855,6 +970,9 @@ def test_operation_started_at_eighteen_fifty_nine_finishes_before_day_close(
 def test_lot_sequence_is_persisted_across_business_days(engine: EconomyEngine) -> None:
     world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=17)
     day_one = _produce_ready(engine, engine.open_day(world), Decimal("1"))
+    day_one_operation = next(
+        state for state in day_one.operation_states if state.company_id == "farm_a"
+    )
     first_lot = _company(day_one, "farm_a").inventory[0]
     first_sequence = day_one.next_lot_sequence
     result = _close_day(engine, day_one)
@@ -862,7 +980,17 @@ def test_lot_sequence_is_persisted_across_business_days(engine: EconomyEngine) -
     assert first_lot.lot_id.endswith(".l1")
     assert result.state.next_lot_sequence == first_sequence == 2
     day_two = engine.open_day(result.state)
+    day_two_operation = next(
+        state for state in day_two.operation_states if state.company_id == "farm_a"
+    )
+    economics = OperatingEconomics(DAIRY_S9_V3_SCENARIO, seed=17)
+    reset_day_two = economics.open_day(2, economics.initial_states())
+    reset_farm = next(state for state in reset_day_two if state.company_id == "farm_a")
+
     assert day_two.next_lot_sequence == first_sequence
+    assert day_one_operation.used_capacity == Decimal("1")
+    assert day_two_operation.used_capacity == 0
+    assert day_two_operation.availability != reset_farm.availability
 
     day_two = _produce_ready(
         engine,
@@ -879,6 +1007,7 @@ def test_lot_sequence_is_persisted_across_business_days(engine: EconomyEngine) -
 def test_observation_hides_seed_and_exposes_public_rules(engine: EconomyEngine) -> None:
     world = engine.initial_state(DAIRY_S9_V3_SCENARIO, seed=314159)
     observation = engine.observe(world)[0]
+    active_observation = engine.observe_active(engine.open_day(world), "farm_a")
     visible = observation.model_dump()
 
     assert "seed" not in visible
@@ -887,7 +1016,12 @@ def test_observation_hides_seed_and_exposes_public_rules(engine: EconomyEngine) 
     assert observation.demand == DAIRY_S9_V3_SCENARIO.demand
     assert observation.scoring == DAIRY_S9_V3_SCENARIO.scoring
     assert observation.runtime == DAIRY_S9_V3_SCENARIO.runtime
+    assert observation.daily_operation == active_observation.daily_operation
+    assert observation.daily_operation is not None
     assert tuple(company.company_id for company in observation.public_companies) == tuple(
         company.company_id for company in DAIRY_S9_V3_SCENARIO.companies
     )
     assert all(not hasattr(company, "initial_cash") for company in observation.public_companies)
+    assert all(not hasattr(company, "daily_operation") for company in observation.public_companies)
+    retailer = next(item for item in engine.observe(world) if item.company_id == "retailer_a")
+    assert retailer.daily_operation is None

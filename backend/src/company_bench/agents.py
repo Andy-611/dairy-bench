@@ -49,7 +49,7 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.1"
+COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.2"
 
 
 class CompanyAgent(Protocol):
@@ -324,7 +324,7 @@ class BaselineCompanyAgent:
         operation = turn.observation.operation
         assert isinstance(operation, FarmOperation)
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            capacity = _remaining_capacity(turn, operation.daily_capacity)
+            capacity = _remaining_capacity(turn, operation.capacity.normal_capacity)
             if capacity <= 0:
                 return Wait()
             return Produce(
@@ -351,7 +351,7 @@ class BaselineCompanyAgent:
     def _processor_command(turn: AgentTurn) -> CompanyCommand:
         operation = turn.observation.operation
         assert isinstance(operation, ProcessorOperation)
-        capacity = _remaining_capacity(turn, operation.daily_input_capacity)
+        capacity = _remaining_capacity(turn, operation.capacity.normal_capacity)
         raw_quantity = turn.observation.quantity(operation.input_product)
         if raw_quantity > 0 and capacity > 0 and turn.active_operation is None:
             return Transform(
@@ -548,11 +548,16 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
     commands = ", ".join(allowed)
     return (
         "You are the sole Agent for one dairy company in a continuous spot market. "
+        "Your sole objective is to maximize your own company's profit. "
         "Orders lock real cash or FEFO inventory, crossing quotes trade immediately at "
         "the resting price, and purchases arrive after 30 virtual minutes. Production "
         "and transformation also complete asynchronously while market commands remain "
-        "available. Use only supplied facts and submit exactly one atomic command; never "
-        "invent identity, time, or state version. Every order quantity must be at least "
+        "available. For productive companies, daily_operation supplies capacity K, used "
+        "capacity u, and private base unit cost c, while operation.cost supplies curvature; "
+        "for a new quantity q, cash cost is C(u+q)-C(u), where "
+        "C(x)=c*x+curvature*c*x^2/(2*K). Use only supplied facts and "
+        "submit exactly one atomic command; never invent identity, time, or state version. "
+        "Every production, transformation, and order quantity must be at least "
         f"{QUANTITY_QUANTUM} and use at most four decimal places (an exact multiple of "
         f"{QUANTITY_QUANTUM}); never submit a dust quantity. Replacing an order loses its "
         "former time priority. Use wait when no action is justified: set until to null to "
