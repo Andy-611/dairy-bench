@@ -29,6 +29,7 @@ from company_bench.models import (
     PolicyKind,
     RunSummary,
 )
+from company_bench.newapi_gateway import NewApiClaudeConfig
 from company_bench.policy_factory import PolicyFactory, PolicyUnavailableError
 from company_bench.repository import (
     LifecycleRepository,
@@ -58,6 +59,7 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     mode: PolicyKind = PolicyKind.BASELINE
+    model: str | None = Field(default=None, min_length=1, max_length=256)
     seed: int | None = Field(default=None, strict=True, ge=0, le=MAX_SEED)
     source_run_id: str | None = Field(default=None, min_length=1, max_length=128)
 
@@ -71,6 +73,10 @@ class RunRequest(BaseModel):
                 raise ValueError("replay mode inherits the source seed")
         elif self.source_run_id is not None:
             raise ValueError("source_run_id is only valid in replay mode")
+        if self.mode is PolicyKind.CLAUDE and self.model is None:
+            raise ValueError("Claude mode requires model")
+        if self.mode is not PolicyKind.CLAUDE and self.model is not None:
+            raise ValueError("model is only valid in Claude mode")
         return self
 
 
@@ -100,6 +106,7 @@ def create_app(
         active_factory = PolicyFactory(
             scenario=DAIRY_S9_SCENARIO,
             audit_sink=active_repository,
+            claude_config=NewApiClaudeConfig.from_environment(),
             codex_config=codex_config,
             codex_gateway_factory=partial(
                 CodexModelGateway,
@@ -175,6 +182,7 @@ def create_app(
         try:
             return await coordinator.submit(
                 mode=request.mode,
+                model=request.model,
                 seed=request.seed,
                 source_run_id=request.source_run_id,
             )

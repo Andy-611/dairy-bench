@@ -61,15 +61,17 @@ React -> FastAPI -> RunCoordinator -> EpisodeRuntime -> Scheduler + EconomyEngin
                          `-> LifecycleRepository -> Journal + Checkpoint + SQLite
 ```
 
-Agents may use the rule baseline, Codex, OpenAI, or exact replay. OpenAI uses
-native function tools; Codex uses an equivalent strict structured-output
-adapter. Every provider path validates into the same Pydantic command union.
+Agents may use the rule baseline, Codex, OpenAI, Claude through NewAPI, or exact
+replay. OpenAI uses Responses API function tools, Claude uses native Anthropic
+Messages tools, and Codex uses an equivalent strict structured-output adapter.
+Every provider path validates into the same Pydantic command union.
 
 ## Requirements and startup
 
 - Python 3.12+
 - Node.js 20.19+
-- Codex login or an OpenAI API key only for the corresponding agent mode
+- Codex login, an OpenAI API key, or a NewAPI key only for the corresponding
+  agent mode
 
 Install once from the repository root:
 
@@ -125,8 +127,32 @@ $env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"  # optional
 python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
 ```
 
-Keys never enter the browser, journal, or benchmark database. Provider
-infrastructure failure fails the run rather than fabricating an economic action.
+Configure Claude agents through NewAPI once from the repository root:
+
+```bat
+start.cmd --configure-newapi
+```
+
+The prompt hides the key, validates it against NewAPI's `/v1/models` endpoint,
+and stores a Windows-user-encrypted credential plus a non-secret Claude model
+catalog under `%LOCALAPPDATA%\DairyBench`. Then start normally:
+
+```bat
+start.cmd
+```
+
+If Dairy Bench was already running during configuration, close its backend
+window first so the restarted process can load the credential.
+
+Choose the Claude model in the Run form. The choice is persisted with that Run,
+so an interrupted Run resumes with the same model. Run the configuration command
+again to replace the key or refresh the model catalog. This mode calls NewAPI's
+native `/v1/messages` interface; it does not launch Claude Code or grant coding
+tools.
+
+The decrypted key exists only in the backend process environment and never
+enters the browser, journal, or benchmark database. Provider infrastructure
+failure fails the run rather than fabricating an economic action.
 Invalid structured output becomes an explicit protocol rejection with no
 economic mutation.
 

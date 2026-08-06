@@ -53,10 +53,11 @@ Agent 不提交整日计划，也不能自行提供身份、时间、状态版�
 或 `place` 动作、结果订单 ID 与优先级、立即撮合后的剩余数量，以及单独 Cancel 的订单
 ID；成交事件和计划到货仍使用 Outcome 原有的事件字段。
 
-OpenAI 使用一次必选、不可并行的 Responses API 函数工具调用；Codex 使用严格的
-结构化输出 envelope。两者都按照同一个带判别字段的 Pydantic `CompanyCommand`
-联合类型校验。缺失、多条、未知、未授权或参数错误的调用会成为明确的协议拒绝，且不
-修改经济状态。
+OpenAI 使用一次必选、不可并行的 Responses API 函数工具调用；通过 NewAPI 接入的
+Claude 模型使用原生 Anthropic Messages `/v1/messages` tool-use 格式；Codex 使用严格
+的结构化输出 envelope。所有 Provider 路径都按照同一个带判别字段的 Pydantic
+`CompanyCommand` 联合类型校验。缺失、多条、未知、未授权或参数错误的调用会成为
+明确的协议拒绝，且不修改经济状态。
 
 ## Agent 可以看到什么
 
@@ -207,6 +208,25 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 
 只有后端读取 `OPENAI_API_KEY`；密钥不会进入浏览器、Journal 或数据库。可用
 `DAIRY_BENCH_OPENAI_BASE_URL` 指向兼容服务。
+
+## 通过 NewAPI 运行 Claude Agent
+
+该模式把 Claude 模型接入现有 Dairy Bench 企业 Agent，通过 NewAPI 原生 Anthropic
+Messages `/v1/messages` 接口调用；它不会启动 Claude Code，也不会向模型开放 Claude
+Code 的文件系统、Shell 或编程工具。
+
+```bat
+start.cmd --configure-newapi
+start.cmd
+```
+
+第一条命令会隐藏输入密钥，通过固定的
+`https://newapi.deepwisdom.ai/v1/models` 校验并获取 Claude 模型列表，然后把凭据以
+当前 Windows 用户的 DPAPI 加密格式保存在 `%LOCALAPPDATA%\DairyBench`，同时保存
+不含密钥的模型目录。正常启动时，密钥只解密到后端子进程环境；浏览器只能收到模型
+目录。UI 选中的模型会写入 `RunJob` 和 Policy 审计元数据，恢复运行仍使用同一模型。
+替换密钥或刷新模型列表时，重新执行配置命令即可。
+如果后端已经在运行，配置后需要关闭并重新启动后端进程。
 
 ## 失败语义
 

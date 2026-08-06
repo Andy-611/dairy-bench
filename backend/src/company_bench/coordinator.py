@@ -49,6 +49,7 @@ class RunCoordinator:
         self,
         *,
         mode: PolicyKind,
+        model: str | None = None,
         seed: int | None = None,
         source_run_id: str | None = None,
     ) -> RunJob:
@@ -74,10 +75,11 @@ class RunCoordinator:
         if source_run_id is not None and not self._repository.list_turns(source_run_id):
             raise ValueError("replay source has no event-driven turn journal")
         run_id = f"run_{uuid4().hex}"
-        self._policy_factory.ensure_available(mode)
+        self._policy_factory.ensure_available(mode, model)
         job = RunJob(
             run_id=run_id,
             mode=mode,
+            model=model,
             seed=active_seed,
             source_run_id=source_run_id,
             scenario_id=scenario.scenario_id,
@@ -161,6 +163,7 @@ class RunCoordinator:
                 agent_bundle = self._policy_factory.create_agents(
                     run_id=job.run_id,
                     mode=job.mode,
+                    model=job.model,
                     source_turns=(
                         self._repository.list_turns(job.source_run_id)
                         if job.source_run_id is not None

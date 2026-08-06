@@ -120,6 +120,29 @@ def test_memory_repository_turn_journal_and_checkpoint_contract(
     _assert_checkpoint_contract(repository, checkpoint, first, second)
 
 
+def test_checkpoint_accepts_claude_as_a_memory_owning_policy(
+    first_observation: CompanyObservation,
+) -> None:
+    repository = MemoryRunRepository()
+    turn = _turn_for("claude_checkpoint", first_observation, sequence=1)
+    checkpoint = _checkpoint_for(
+        turn,
+        first_observation,
+        policy_kind=PolicyKind.CLAUDE,
+    )
+
+    repository.save_checkpoint(checkpoint)
+
+    assert repository.get_checkpoint(turn.run_id) == checkpoint
+    policy = next(
+        candidate
+        for candidate in checkpoint.policies
+        if candidate.company_id == first_observation.company_id
+    )
+    assert policy.kind is PolicyKind.CLAUDE
+    assert checkpoint.agent_states[0].company_id == first_observation.company_id
+
+
 def test_memory_repository_progress_is_atomic_and_checkpoint_aligned(
     first_observation: CompanyObservation,
 ) -> None:
@@ -507,6 +530,8 @@ def _turn_for(
 def _checkpoint_for(
     record: TurnRecord,
     observation: CompanyObservation,
+    *,
+    policy_kind: PolicyKind = PolicyKind.OPENAI,
 ) -> RunCheckpoint:
     """Build a complete, versioned recovery payload around one turn."""
     engine = EconomyEngine()
@@ -524,7 +549,7 @@ def _checkpoint_for(
                 company_id=company.company_id,
                 name="checkpoint-test",
                 kind=(
-                    PolicyKind.OPENAI
+                    policy_kind
                     if company.company_id == observation.company_id
                     else PolicyKind.BASELINE
                 ),

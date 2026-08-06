@@ -139,7 +139,8 @@ button:disabled {
   width: 180px;
 }
 
-.replay-field select {
+.replay-field select,
+.model-field select {
   width: 260px;
 }
 

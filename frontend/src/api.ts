@@ -216,11 +216,14 @@ async function readJsonBody(
 }
 
 function runRequestPayload(request: RunRequest): Readonly<Record<string, unknown>> {
-  return request.policyMode === "replay"
-    ? {
-        mode: request.policyMode,
-        source_run_id: request.sourceRunId,
-      }
+  if (request.policyMode === "replay") {
+    return {
+      mode: request.policyMode,
+      source_run_id: request.sourceRunId,
+    };
+  }
+  return request.policyMode === "claude"
+    ? { mode: request.policyMode, model: request.model, seed: request.seed }
     : { mode: request.policyMode, seed: request.seed };
 }
 
@@ -235,6 +238,9 @@ function parsePolicyProfile(
     available: boolean(profile.available, `${path}.available`),
     provider: optionalText(profile.provider),
     model: optionalText(profile.model),
+    models: array(profile.models, `${path}.models`).map((model, index) =>
+      text(model, `${path}.models[${index}]`),
+    ),
     reasoningEffort: optionalText(profile.reasoning_effort),
     description: text(profile.description, `${path}.description`),
     unavailableReason: optionalText(profile.unavailable_reason),
@@ -247,6 +253,7 @@ function parseRunJob(payload: unknown): RunJobView {
     runId: text(job.run_id, "run_id"),
     revision: number(job.revision, "revision"),
     mode: policyMode(job.mode, "mode"),
+    model: nullableText(job.model, "model"),
     status: runStatus(job.status, "status"),
     seed: number(job.seed, "seed"),
     sourceRunId: nullableText(job.source_run_id, "source_run_id"),
@@ -1701,6 +1708,7 @@ function policyMode(value: unknown, path: string): PolicyMode {
     value === "baseline" ||
     value === "codex" ||
     value === "openai" ||
+    value === "claude" ||
     value === "replay"
   ) {
     return value;

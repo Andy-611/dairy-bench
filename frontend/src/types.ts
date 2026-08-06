@@ -1,5 +1,10 @@
 export type CompanyRole = "farm" | "processor" | "retailer";
-export type PolicyMode = "baseline" | "codex" | "openai" | "replay";
+export type PolicyMode =
+  | "baseline"
+  | "codex"
+  | "openai"
+  | "claude"
+  | "replay";
 export type InvocationOutcome =
   | "success"
   | "agent_error"
@@ -91,6 +96,7 @@ export interface PolicyProfileView {
   readonly available: boolean;
   readonly provider: string | null;
   readonly model: string | null;
+  readonly models: readonly string[];
   readonly reasoningEffort: string | null;
   readonly description: string;
   readonly unavailableReason: string | null;
@@ -107,6 +113,7 @@ export interface RunProgressView {
 export interface RunJobView extends RunProgressView {
   readonly revision: number;
   readonly mode: PolicyMode;
+  readonly model: string | null;
   readonly seed: number;
   readonly sourceRunId: string | null;
   readonly scenarioId: string;
@@ -578,6 +585,11 @@ export interface TimelineDetailView {
 export type RunRequest =
   | {
       readonly policyMode: "baseline" | "codex" | "openai";
+      readonly seed: number;
+    }
+  | {
+      readonly policyMode: "claude";
+      readonly model: string;
       readonly seed: number;
     }
   | {

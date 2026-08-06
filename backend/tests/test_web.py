@@ -154,6 +154,7 @@ def test_run_list_and_detail_http_flow() -> None:
             "baseline",
             "codex",
             "openai",
+            "claude",
             "replay",
         ]
         assert (
@@ -162,6 +163,10 @@ def test_run_list_and_detail_http_flow() -> None:
         )
         assert (
             next(profile for profile in profiles if profile["mode"] == "openai")["available"]
+            is False
+        )
+        assert (
+            next(profile for profile in profiles if profile["mode"] == "claude")["available"]
             is False
         )
 
@@ -334,6 +339,20 @@ def test_http_validation_and_localhost_cors() -> None:
             ).status_code
             == 409
         )
+        assert (
+            client.post(
+                "/api/runs",
+                json={"mode": "claude", "seed": 42},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/runs",
+                json={"mode": "claude", "model": "claude-test", "seed": 42},
+            ).status_code
+            == 409
+        )
         assert client.get("/api/runs", params={"limit": 0}).status_code == 422
         assert client.get("/api/run-jobs", params={"limit": 0}).status_code == 422
 
@@ -355,6 +374,9 @@ def test_default_repository_uses_configured_database(
     database = tmp_path / "configured.sqlite3"
     monkeypatch.setenv("DAIRY_BENCH_DB", str(database))
     monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
+    monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
+    monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
+    monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     with TestClient(create_app()) as client:
@@ -365,6 +387,9 @@ def test_default_repository_uses_configured_database(
 
 def test_default_app_runs_the_v3_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
+    monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
+    monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
+    monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     repository = MemoryRunRepository()
 
@@ -400,10 +425,40 @@ def test_codex_profile_can_be_enabled_without_exposing_credentials(
         "available": True,
         "provider": "codex",
         "model": "gpt-5.6-luna",
+        "models": [],
         "reasoning_effort": "high",
         "description": "Each company is controlled by an independent Codex runtime.",
         "unavailable_reason": None,
     }
+
+
+def test_claude_profile_can_be_enabled_without_exposing_credentials(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEWAPI_API_KEY", "secret-newapi-key")
+    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL", "claude-default-model")
+    monkeypatch.setenv(
+        "DAIRY_BENCH_NEWAPI_MODELS",
+        "claude-default-model,claude-second-model",
+    )
+    repository = MemoryRunRepository()
+
+    with TestClient(create_app(repository)) as client:
+        profiles = client.get("/api/policy-profiles").json()
+
+    claude = next(profile for profile in profiles if profile["mode"] == "claude")
+    assert claude == {
+        "mode": "claude",
+        "label": "Claude via NewAPI",
+        "available": True,
+        "provider": "newapi",
+        "model": "claude-default-model",
+        "models": ["claude-default-model", "claude-second-model"],
+        "reasoning_effort": None,
+        "description": "Each company is controlled by an independent Claude model through NewAPI.",
+        "unavailable_reason": None,
+    }
+    assert "secret-newapi-key" not in str(profiles)
 
 
 def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(

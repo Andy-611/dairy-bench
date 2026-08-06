@@ -63,10 +63,11 @@ post-match remaining quantity, plus separately cancelled order IDs. Fill events
 and scheduled deliveries remain in the outcome's normal event fields.
 
 OpenAI uses Responses API function tools with one required, non-parallel tool
-call. Codex uses a strict structured-output envelope. Both validate against the
-same discriminated Pydantic `CompanyCommand` union. Missing, multiple, unknown,
-unauthorized, or malformed calls become explicit protocol rejections; they do
-not mutate the economy.
+call. Claude models reached through NewAPI use the native Anthropic Messages
+`/v1/messages` tool-use format. Codex uses a strict structured-output envelope.
+All provider paths validate against the same discriminated Pydantic
+`CompanyCommand` union. Missing, multiple, unknown, unauthorized, or malformed
+calls become explicit protocol rejections; they do not mutate the economy.
 
 ## What an agent observes
 
@@ -247,6 +248,26 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 
 Only the backend reads `OPENAI_API_KEY`; it never enters the browser, journal,
 or database. `DAIRY_BENCH_OPENAI_BASE_URL` may target a compatible service.
+
+## Running Claude agents through NewAPI
+
+This mode connects a Claude model to the existing Dairy Bench company Agent. It
+uses NewAPI's native Anthropic Messages `/v1/messages` interface; it does not
+launch Claude Code or expose Claude Code's filesystem, shell, or coding tools.
+
+```bat
+start.cmd --configure-newapi
+start.cmd
+```
+
+The first command reads the key with hidden input, validates it through the
+fixed `https://newapi.deepwisdom.ai/v1/models` endpoint, and writes a DPAPI-
+encrypted credential plus a safe Claude model catalog under
+`%LOCALAPPDATA%\DairyBench`. Normal startup decrypts the key only into the
+backend child process environment. The browser receives only the model catalog;
+the selected model is persisted in `RunJob` and policy audit metadata. Re-run
+the configuration command to replace the key or refresh its models.
+Restart an already-running backend after either operation.
 
 ## Failure semantics
 

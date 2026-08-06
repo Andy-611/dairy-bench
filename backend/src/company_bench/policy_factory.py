@@ -24,15 +24,20 @@ from company_bench.models import (
     PolicyMetadata,
     ScenarioSpec,
 )
+from company_bench.newapi_gateway import NewApiClaudeConfig, NewApiClaudeGateway
 from company_bench.policies import BaselinePolicy, CompanyPolicy
 from company_bench.run_models import PolicyAuditSink, PolicyProfileView
 from company_bench.runtime_models import TurnRecord
 
 type OpenAIGatewayFactory = Callable[[OpenAIAgentConfig], CompanyModelGateway]
 type CodexGatewayFactory = Callable[[CodexAgentConfig, str], CompanyModelGateway]
+type NewApiClaudeGatewayFactory = Callable[[NewApiClaudeConfig], CompanyModelGateway]
 type CompanyGatewayFactory = Callable[[str], CompanyModelGateway]
 # Each call must return a fresh gateway owned by exactly one company.
 _OPENAI_UNAVAILABLE = "OpenAI Agent is unavailable: configure OPENAI_API_KEY on the backend"
+_CLAUDE_UNAVAILABLE = (
+    "Claude Agent is unavailable: run `start.cmd --configure-newapi`, then restart `start.cmd`"
+)
 _CODEX_UNAVAILABLE = (
     "Codex Agent is unavailable: run `codex login`, then set "
     "DAIRY_BENCH_CODEX_ENABLED=true before starting the backend"
@@ -75,13 +80,17 @@ class PolicyFactory:
         scenario: ScenarioSpec,
         audit_sink: PolicyAuditSink,
         *,
+        claude_config: NewApiClaudeConfig | None = None,
         codex_config: CodexAgentConfig | None = None,
         openai_config: OpenAIAgentConfig | None = None,
+        claude_gateway_factory: NewApiClaudeGatewayFactory = NewApiClaudeGateway,
         codex_gateway_factory: CodexGatewayFactory = CodexModelGateway,
         gateway_factory: OpenAIGatewayFactory = OpenAIModelGateway,
     ) -> None:
         self._scenario = scenario
         self._audit_sink = audit_sink
+        self._claude_config = claude_config
+        self._claude_gateway_factory = claude_gateway_factory
         self._codex_config = codex_config
         self._codex_gateway_factory = codex_gateway_factory
         self._openai_config = openai_config
@@ -94,6 +103,7 @@ class PolicyFactory:
 
     def profiles(self) -> tuple[PolicyProfileView, ...]:
         """Return browser-safe policy choices."""
+        claude = self._claude_config
         codex = self._codex_config
         openai = self._openai_config
         return (
@@ -128,6 +138,22 @@ class PolicyFactory:
                 ),
             ),
             PolicyProfileView(
+                mode=PolicyKind.CLAUDE,
+                label="Claude via NewAPI",
+                available=claude is not None,
+                provider="newapi",
+                model=claude.model if claude else None,
+                models=claude.available_models if claude else (),
+                description=(
+                    "Each company is controlled by an independent Claude model through NewAPI."
+                ),
+                unavailable_reason=(
+                    None
+                    if claude
+                    else "The local NewAPI credential and Claude model catalog are not configured."
+                ),
+            ),
+            PolicyProfileView(
                 mode=PolicyKind.REPLAY,
                 label="Exact replay",
                 available=True,
@@ -139,7 +165,13 @@ class PolicyFactory:
     def policy_timeout_seconds(self) -> float:
         """Leave enough time for the gateway to exhaust its own retries."""
         configured = tuple(
-            config for config in (self._codex_config, self._openai_config) if config is not None
+            config
+            for config in (
+                self._claude_config,
+                self._codex_config,
+                self._openai_config,
+            )
+            if config is not None
         )
         return max(
             (
@@ -169,6 +201,8 @@ class PolicyFactory:
             return self._codex_bundle(run_id)
         if mode is PolicyKind.OPENAI:
             return self._openai_bundle(run_id)
+        if mode is PolicyKind.CLAUDE:
+            raise ValueError("Claude Agents do not implement pre-V2 daily scenarios")
         if source is None:
             raise ValueError("replay mode requires a completed source run")
         if source.scenario != self._scenario:
@@ -194,6 +228,7 @@ class PolicyFactory:
         *,
         run_id: str,
         mode: PolicyKind,
+        model: str | None = None,
         source_turns: tuple[TurnRecord, ...] = (),
         checkpoints: tuple[AgentCheckpoint, ...] = (),
         completed_turns: tuple[TurnRecord, ...] = (),
@@ -201,6 +236,8 @@ class PolicyFactory:
         """Create fresh event-driven company actors for one V3 episode."""
         if not self._scenario.uses_event_runtime:
             raise ValueError("event-driven Agents require an event-driven scenario")
+        if mode is not PolicyKind.CLAUDE and model is not None:
+            raise ValueError("model is only valid for Claude Agents")
         if mode is PolicyKind.BASELINE:
             return AgentBundle(
                 {company.company_id: BaselineCompanyAgent() for company in self._scenario.companies}
@@ -224,13 +261,20 @@ class PolicyFactory:
                     for company in self._scenario.companies
                 }
             )
-        metadata = self._agent_metadata(mode)
         checkpoint_by_company = {checkpoint.company_id: checkpoint for checkpoint in checkpoints}
         gateway_factory: CompanyGatewayFactory
-        if mode is PolicyKind.OPENAI:
+        if mode is PolicyKind.CLAUDE:
+            config = self._claude_config_for(model)
+            metadata = _claude_metadata(config)
+
+            def gateway_factory(_: str) -> CompanyModelGateway:
+                return self._claude_gateway_factory(config)
+
+        elif mode is PolicyKind.OPENAI:
             config = self._openai_config
             if config is None:
                 raise PolicyUnavailableError(_OPENAI_UNAVAILABLE)
+            metadata = self._agent_metadata(mode)
 
             def gateway_factory(_: str) -> CompanyModelGateway:
                 return self._gateway_factory(config)
@@ -239,6 +283,7 @@ class PolicyFactory:
             config = self._codex_config
             if config is None:
                 raise PolicyUnavailableError(_CODEX_UNAVAILABLE)
+            metadata = self._agent_metadata(mode)
 
             def gateway_factory(company_id: str) -> CompanyModelGateway:
                 return self._codex_gateway_factory(config, company_id)
@@ -287,9 +332,13 @@ class PolicyFactory:
                 prompt_version=COMMAND_PROMPT_VERSION,
                 config_fingerprint=config.fingerprint,
             )
-        raise PolicyUnavailableError(
-            _OPENAI_UNAVAILABLE if mode is PolicyKind.OPENAI else _CODEX_UNAVAILABLE
-        )
+        unavailable = {
+            PolicyKind.CODEX: _CODEX_UNAVAILABLE,
+            PolicyKind.OPENAI: _OPENAI_UNAVAILABLE,
+        }.get(mode)
+        if unavailable is None:
+            raise ValueError(f"unsupported V3 policy mode: {mode.value}")
+        raise PolicyUnavailableError(unavailable)
 
     def _openai_bundle(self, run_id: str) -> PolicyBundle:
         """Build one isolated policy and provider client per company."""
@@ -350,18 +399,42 @@ class PolicyFactory:
             )
         return PolicyBundle(policies, tuple(gateways))
 
-    def ensure_available(self, mode: PolicyKind) -> None:
+    def ensure_available(self, mode: PolicyKind, model: str | None = None) -> None:
         """Reject a disabled profile before a run is queued."""
+        if mode is PolicyKind.CLAUDE:
+            self._claude_config_for(model)
+            return
+        if model is not None:
+            raise ValueError("model is only valid for Claude Agents")
         if mode is PolicyKind.CODEX and self._codex_config is None:
             raise PolicyUnavailableError(_CODEX_UNAVAILABLE)
         if mode is PolicyKind.OPENAI and self._openai_config is None:
             raise PolicyUnavailableError(_OPENAI_UNAVAILABLE)
+
+    def _claude_config_for(self, model: str | None) -> NewApiClaudeConfig:
+        """Resolve one allowed Claude model without exposing the shared credential."""
+        if self._claude_config is None:
+            raise PolicyUnavailableError(_CLAUDE_UNAVAILABLE)
+        return self._claude_config.select_model(model)
 
 
 def _policy_timeout(timeout_seconds: float, max_attempts: int) -> float:
     """Include provider attempts, retry delays, and orchestration overhead."""
     retry_delays = sum(0.25 * 2**index for index in range(max_attempts - 1))
     return timeout_seconds * max_attempts + retry_delays + 5
+
+
+def _claude_metadata(config: NewApiClaudeConfig) -> PolicyMetadata:
+    """Build auditable metadata for one selected Claude model."""
+    return PolicyMetadata(
+        name="claude-company-agent",
+        version="3",
+        kind=PolicyKind.CLAUDE,
+        provider="newapi",
+        model=config.model,
+        prompt_version=COMMAND_PROMPT_VERSION,
+        config_fingerprint=config.fingerprint,
+    )
 
 
 async def _close_gateways(bundle: PolicyBundle | AgentBundle) -> None:

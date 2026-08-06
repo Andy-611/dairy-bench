@@ -11,6 +11,16 @@ set "DAIRY_BENCH_CODEX_CLI="
 set "BACKEND_URL=http://127.0.0.1:8000"
 set "FRONTEND_URL=http://127.0.0.1:5173"
 
+if /i "%~1"=="--configure-newapi" (
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\configure_newapi.ps1"
+  if errorlevel 1 (
+    pause
+    exit /b 1
+  )
+  pause
+  exit /b 0
+)
+
 if not exist "%DAIRY_BENCH_CODEX_HOME%" (
   mkdir "%DAIRY_BENCH_CODEX_HOME%" >nul 2>&1
   if errorlevel 1 (
@@ -53,6 +63,7 @@ if /i "%~1"=="--login" (
 if /i "%~1"=="--check" (
   echo [Dairy Bench] Codex CLI: %DAIRY_BENCH_CODEX_CLI%
   echo [Dairy Bench] Codex home: %DAIRY_BENCH_CODEX_HOME%
+  call :report_newapi_status
   where.exe python.exe
   where.exe npm.cmd
   exit /b 0
@@ -99,6 +110,16 @@ if errorlevel 1 (
 )
 exit /b 0
 
+:report_newapi_status
+if not exist "%LOCALAPPDATA%\DairyBench\newapi-token.clixml" goto :newapi_not_configured
+if not exist "%LOCALAPPDATA%\DairyBench\newapi-claude-models.json" goto :newapi_not_configured
+echo [Dairy Bench] NewAPI: configured for this Windows user
+exit /b 0
+
+:newapi_not_configured
+echo [Dairy Bench] NewAPI: not configured; run start.cmd --configure-newapi
+exit /b 0
+
 :probe_backend
 powershell.exe -NoProfile -Command "$listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $listener) { exit 1 }; try { $api = Invoke-RestMethod -Uri '%BACKEND_URL%/openapi.json' -TimeoutSec 10; if ($api.info.title -eq 'Dairy Bench API') { Write-Host ('[Dairy Bench] Backend already running on port 8000, PID ' + $listener.OwningProcess + '; reusing it.'); exit 0 } } catch {}; $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $listener.OwningProcess); Write-Host ('[Dairy Bench] Port 8000 is occupied by PID ' + $listener.OwningProcess + ': ' + $process.CommandLine); exit 2"
 exit /b %errorlevel%
@@ -118,8 +139,8 @@ exit /b 0
 
 :start_backend
 echo [Dairy Bench] Starting backend...
-start "Dairy Bench Backend" cmd.exe /k "cd /d ""%~dp0backend"" && python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000"
-exit /b 0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\launch_backend.ps1" -RepositoryRoot "%~dp0"
+exit /b %errorlevel%
 
 :start_frontend
 echo [Dairy Bench] Starting frontend...

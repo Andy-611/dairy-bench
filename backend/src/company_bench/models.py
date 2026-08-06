@@ -134,6 +134,7 @@ class PolicyKind(StrEnum):
     BASELINE = "baseline"
     CODEX = "codex"
     OPENAI = "openai"
+    CLAUDE = "claude"
     REPLAY = "replay"
 
 

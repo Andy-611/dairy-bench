@@ -58,6 +58,7 @@ class RunJob(StrictModel):
 
     run_id: Identifier
     mode: PolicyKind
+    model: str | None = Field(default=None, min_length=1, max_length=256)
     status: RunStatus = RunStatus.QUEUED
     revision: int = Field(default=0, ge=0)
     seed: int
@@ -75,6 +76,10 @@ class RunJob(StrictModel):
         """Keep reported progress inside the scenario duration."""
         if self.current_day > self.total_days:
             raise ValueError("current_day must not exceed total_days")
+        if self.mode is PolicyKind.CLAUDE and self.model is None:
+            raise ValueError("Claude jobs require a model")
+        if self.mode is not PolicyKind.CLAUDE and self.model is not None:
+            raise ValueError("model is only valid for Claude jobs")
         return self
 
     def mark_running(self, started_at: datetime) -> Self:
@@ -178,7 +183,7 @@ class RunCheckpoint(StrictModel):
         expected_memory_ids = [
             policy.company_id
             for policy in self.policies
-            if policy.kind in {PolicyKind.CODEX, PolicyKind.OPENAI}
+            if policy.kind in {PolicyKind.CLAUDE, PolicyKind.CODEX, PolicyKind.OPENAI}
         ]
         if company_ids != expected_memory_ids:
             raise ValueError(
@@ -271,6 +276,7 @@ class PolicyProfileView(StrictModel):
     available: bool
     provider: str | None = None
     model: str | None = None
+    models: tuple[str, ...] = ()
     reasoning_effort: str | None = None
     description: str
     unavailable_reason: str | None = None

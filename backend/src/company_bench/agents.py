@@ -20,7 +20,6 @@ from company_bench.agent_models import (
 from company_bench.diagnostics import bounded_error
 from company_bench.memory import AgentCheckpoint, ConversationMemory, MemoryExchange
 from company_bench.models import (
-    QUANTITY_QUANTUM,
     CompanyId,
     FarmOperation,
     PolicyKind,
@@ -31,6 +30,7 @@ from company_bench.models import (
     RetailerOperation,
     StrictModel,
 )
+from company_bench.precision import ECONOMIC_QUANTUM
 from company_bench.run_models import (
     InvocationOutcome,
     PolicyAuditSink,
@@ -582,8 +582,8 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "C(x)=c*x+curvature*c*x^2/(2*K). Use only supplied facts and "
         "submit exactly one atomic command; never invent identity, time, or state version. "
         "Every production, transformation, and quote-level quantity must be at least "
-        f"{QUANTITY_QUANTUM} and use at most four decimal places (an exact multiple of "
-        f"{QUANTITY_QUANTUM}); never submit a dust quantity. set_quote_ladder declares "
+        f"{ECONOMIC_QUANTUM} and use at most four decimal places (an exact multiple of "
+        f"{ECONOMIC_QUANTUM}); never submit a dust quantity. set_quote_ladder declares "
         "the complete target state for one product and side: use zero to three unique "
         "levels ordered best-to-worst (buy prices descending, sell prices ascending), "
         "and use [] to cancel that ladder. The complete update is atomic. Exact unchanged "
@@ -604,7 +604,7 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
 
 def _floor_order_quantity(value: Decimal) -> Decimal:
     """Floor a feasible baseline order to the market quantum."""
-    return value.quantize(QUANTITY_QUANTUM, rounding=ROUND_DOWN)
+    return value.quantize(ECONOMIC_QUANTUM, rounding=ROUND_DOWN)
 
 
 def _sell_ladder(
@@ -680,7 +680,7 @@ def _split_ladder(
     total = _floor_order_quantity(quantity)
     if total <= 0:
         return ()
-    count = min(len(prices), int(total / QUANTITY_QUANTUM))
+    count = min(len(prices), int(total / ECONOMIC_QUANTUM))
     if count == 1:
         quantities = (total,)
     elif count == 2:

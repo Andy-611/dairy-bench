@@ -18,7 +18,7 @@ from openai import (
     LengthFinishReasonError,
     RateLimitError,
 )
-from pydantic import BaseModel, Field, SecretStr, TypeAdapter, ValidationError
+from pydantic import Field, SecretStr, TypeAdapter, ValidationError
 
 from company_bench.agent_models import (
     CommandFactory,
@@ -33,28 +33,15 @@ from company_bench.agent_models import (
     ModelOutputError,
     ModelRequest,
     ModelResult,
+    command_model,
 )
 from company_bench.diagnostics import bounded_error
 from company_bench.models import NoOpDecision, StrictModel
 from company_bench.run_models import TokenUsage
-from company_bench.runtime_models import (
-    CompanyCommand,
-    Produce,
-    SetQuoteLadder,
-    SetRetailPrice,
-    Transform,
-    Wait,
-)
+from company_bench.runtime_models import CompanyCommand
 
 type ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh"]
 _COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
-_COMMAND_MODELS: dict[CommandName, type[BaseModel]] = {
-    "produce": Produce,
-    "transform": Transform,
-    "set_quote_ladder": SetQuoteLadder,
-    "set_retail_price": SetRetailPrice,
-    "wait": Wait,
-}
 
 
 class OpenAIAgentConfig(StrictModel):
@@ -305,7 +292,7 @@ def _command_tools(names: tuple[CommandName, ...]) -> list[dict[str, object]]:
     """Build strict native function schemas from the canonical command models."""
     tools: list[dict[str, object]] = []
     for name in names:
-        model = _COMMAND_MODELS[name]
+        model = command_model(name)
         schema = model.model_json_schema()
         properties = schema.get("properties", {})
         if isinstance(properties, dict):

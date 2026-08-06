@@ -15,7 +15,15 @@ from company_bench.models import (
     StrictModel,
 )
 from company_bench.run_models import TokenUsage
-from company_bench.runtime_models import AgentTurn, CompanyCommand
+from company_bench.runtime_models import (
+    AgentTurn,
+    CompanyCommand,
+    Produce,
+    SetQuoteLadder,
+    SetRetailPrice,
+    Transform,
+    Wait,
+)
 
 DecisionModel = TypeVar("DecisionModel", bound=BaseModel)
 type CommandName = Literal[
@@ -25,6 +33,18 @@ type CommandName = Literal[
     "set_retail_price",
     "wait",
 ]
+_COMMAND_MODELS: dict[CommandName, type[BaseModel]] = {
+    "produce": Produce,
+    "transform": Transform,
+    "set_quote_ladder": SetQuoteLadder,
+    "set_retail_price": SetRetailPrice,
+    "wait": Wait,
+}
+
+
+def command_model(name: CommandName) -> type[BaseModel]:
+    """Return the canonical Pydantic model for one command tool."""
+    return _COMMAND_MODELS[name]
 
 
 class DecisionSubmission[SubmissionModel: BaseModel](StrictModel):

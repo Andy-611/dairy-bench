@@ -28,6 +28,7 @@ from company_bench.models import (
     PolicyKind,
     PolicyMetadata,
 )
+from company_bench.newapi_gateway import NewApiClaudeConfig
 from company_bench.policy_factory import PolicyFactory
 from company_bench.repository import MemoryRunRepository
 from company_bench.run_models import InvocationOutcome, RunStatus, TokenUsage
@@ -91,6 +92,67 @@ class _RecordingCodexGatewayFactory:
         self.company_ids.append(company_id)
         self.gateways.append(gateway)
         return gateway
+
+
+class _RecordingClaudeGatewayFactory:
+    """Create and retain one observable NewAPI gateway per company Agent."""
+
+    def __init__(self) -> None:
+        self.configs: list[NewApiClaudeConfig] = []
+        self.gateways: list[_TrackedScriptedGateway] = []
+
+    def __call__(self, config: NewApiClaudeConfig) -> _TrackedScriptedGateway:
+        """Create a fresh scripted substitute for one NewAPI client."""
+        gateway = _TrackedScriptedGateway()
+        self.configs.append(config)
+        self.gateways.append(gateway)
+        return gateway
+
+
+def test_claude_mode_owns_nine_independent_company_gateways() -> None:
+    repository = MemoryRunRepository()
+    gateway_factory = _RecordingClaudeGatewayFactory()
+    factory = PolicyFactory(
+        DAIRY_S9_SCENARIO,
+        repository,
+        claude_config=NewApiClaudeConfig(
+            api_key=SecretStr("test-key"),
+            model="test-claude-default",
+            models=("test-claude-default", "test-claude-selected"),
+        ),
+        claude_gateway_factory=gateway_factory,
+    )
+
+    bundle = factory.create_agents(
+        run_id="claude_run",
+        mode=PolicyKind.CLAUDE,
+        model="test-claude-selected",
+    )
+    agents = tuple(bundle.agents.values())
+    asyncio.run(bundle.close())
+
+    expected_count = len(DAIRY_S9_SCENARIO.companies)
+    assert len(gateway_factory.gateways) == expected_count
+    assert all(config.model == "test-claude-selected" for config in gateway_factory.configs)
+    assert len({id(gateway) for gateway in gateway_factory.gateways}) == expected_count
+    assert all(gateway.closed for gateway in gateway_factory.gateways)
+    assert len({id(agent) for agent in agents}) == expected_count
+    assert all(isinstance(agent, LlmCompanyAgent) for agent in agents)
+    assert all(agent.metadata.name == "claude-company-agent" for agent in agents)
+    assert all(agent.metadata.kind is PolicyKind.CLAUDE for agent in agents)
+    assert all(agent.metadata.provider == "newapi" for agent in agents)
+    assert all(agent.metadata.model == "test-claude-selected" for agent in agents)
+    assert all(agent.metadata.version == "3" for agent in agents)
+    assert all(agent.metadata.prompt_version == COMMAND_PROMPT_VERSION for agent in agents)
+
+
+def test_claude_mode_does_not_fall_through_to_pre_v2_replay() -> None:
+    repository = MemoryRunRepository()
+    legacy_scenario = DAIRY_S9_SCENARIO.model_copy(update={"version": 1})
+    factory = PolicyFactory(legacy_scenario, repository)
+
+    with pytest.raises(ValueError, match="do not implement pre-V2"):
+        factory.create(run_id="legacy_claude", mode=PolicyKind.CLAUDE)
 
 
 def test_codex_mode_owns_nine_independent_company_runtimes() -> None:

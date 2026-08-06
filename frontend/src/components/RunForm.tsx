@@ -6,13 +6,6 @@ import type {
   ReplaySourceView,
 } from "../types";
 
-const MODE_LABELS: Readonly<Record<PolicyMode, string>> = {
-  baseline: "Rule baseline",
-  codex: "Codex agents",
-  openai: "OpenAI agents",
-  replay: "Exact replay",
-};
-
 export type RunControl =
   | { readonly state: "idle" }
   | { readonly state: "starting" }
@@ -20,6 +13,7 @@ export type RunControl =
   | { readonly state: "stopping"; readonly runId: string };
 
 interface RunFormProps {
+  readonly claudeModel: string;
   readonly mode: PolicyMode;
   readonly profiles: readonly PolicyProfileView[];
   readonly replaySources: readonly ReplaySourceView[];
@@ -28,6 +22,7 @@ interface RunFormProps {
   readonly sourceRunId: string;
   readonly control: RunControl;
   readonly onModeChange: (mode: PolicyMode) => void;
+  readonly onClaudeModelChange: (model: string) => void;
   readonly onSeedChange: (seed: string) => void;
   readonly onSourceRunIdChange: (runId: string) => void;
   readonly onRun: () => void;
@@ -35,6 +30,7 @@ interface RunFormProps {
 }
 
 export function RunForm({
+  claudeModel,
   mode,
   profiles,
   replaySources,
@@ -42,6 +38,7 @@ export function RunForm({
   seed,
   sourceRunId,
   control,
+  onClaudeModelChange,
   onModeChange,
   onSeedChange,
   onSourceRunIdChange,
@@ -52,7 +49,8 @@ export function RunForm({
   const formLocked = control.state !== "idle";
   const canStart =
     Boolean(selectedProfile?.available) &&
-    (mode !== "replay" || Boolean(sourceRunId));
+    (mode !== "replay" || Boolean(sourceRunId)) &&
+    (mode !== "claude" || Boolean(claudeModel));
 
   function handleSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
@@ -76,7 +74,7 @@ export function RunForm({
               key={profile.mode}
               value={profile.mode}
             >
-              {MODE_LABELS[profile.mode]}
+              {profile.label}
               {!profile.available ? " (not configured)" : ""}
             </option>
           ))}
@@ -128,6 +126,25 @@ export function RunForm({
         </label>
       )}
 
+      {mode === "claude" && selectedProfile && (
+        <label className="run-field model-field">
+          <span>Claude model</span>
+          <select
+            disabled={formLocked || selectedProfile.models.length === 0}
+            name="claudeModel"
+            onChange={(event) => onClaudeModelChange(event.target.value)}
+            required
+            value={claudeModel}
+          >
+            {selectedProfile.models.map((model) => (
+              <option key={model} value={model}>
+                {model}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
       <span className="sr-only" id="seed-help">
         Use the same seed to reproduce the economic environment.
       </span>
@@ -141,6 +158,8 @@ export function RunForm({
         <span className="profile-hint" title={selectedProfile.description}>
           {mode === "replay"
             ? "Creates a new deterministic run from a completed source; no agents are called."
+            : mode === "claude" && claudeModel
+            ? [selectedProfile.provider, claudeModel].filter(Boolean).join(" / ")
             : selectedProfile.model
             ? [
                 selectedProfile.provider,

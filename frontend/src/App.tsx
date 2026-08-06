@@ -40,6 +40,7 @@ export function App() {
   const workspace = useRunWorkspace(api);
   const [mode, setMode] = useState<PolicyMode>("baseline");
   const [profiles, setProfiles] = useState<readonly PolicyProfileView[]>([]);
+  const [claudeModel, setClaudeModel] = useState("");
   const [seed, setSeed] = useState("42");
   const [progress, setProgress] = useState<RunJobView | null>(null);
   const [runTransition, setRunTransition] = useState<RunTransition | null>(null);
@@ -52,7 +53,11 @@ export function App() {
     const controller = new AbortController();
     void api
       .policyProfiles(controller.signal)
-      .then(setProfiles)
+      .then((loadedProfiles) => {
+        setProfiles(loadedProfiles);
+        const claude = loadedProfiles.find((profile) => profile.mode === "claude");
+        setClaudeModel((current) => current || claude?.model || claude?.models[0] || "");
+      })
       .catch((reason: unknown) => {
         if (!isAbortError(reason)) {
           setError({
@@ -95,6 +100,7 @@ export function App() {
   async function runBenchmark(): Promise<void> {
     const request = buildRunRequest(
       mode,
+      claudeModel,
       seed,
       workspace.selectedReplaySourceId,
     );
@@ -232,9 +238,11 @@ export function App() {
           </span>
         </div>
         <RunForm
+          claudeModel={claudeModel}
           control={runControl}
           mode={mode}
           onModeChange={setMode}
+          onClaudeModelChange={setClaudeModel}
           onRun={() => void runBenchmark()}
           onSeedChange={setSeed}
           onSourceRunIdChange={workspace.selectReplaySource}
@@ -372,6 +380,7 @@ export function App() {
 
 function buildRunRequest(
   mode: PolicyMode,
+  claudeModel: string,
   seed: string,
   sourceRunId: string,
 ): RunRequest | string {
@@ -382,11 +391,15 @@ function buildRunRequest(
   }
 
   const parsedSeed = Number(seed);
-  return Number.isInteger(parsedSeed) &&
-    parsedSeed >= 0 &&
-    parsedSeed <= MAX_SEED
-    ? { policyMode: mode, seed: parsedSeed }
-    : `The random seed must be an integer from 0 to ${MAX_SEED}.`;
+  if (!Number.isInteger(parsedSeed) || parsedSeed < 0 || parsedSeed > MAX_SEED) {
+    return `The random seed must be an integer from 0 to ${MAX_SEED}.`;
+  }
+  if (mode === "claude") {
+    return claudeModel
+      ? { policyMode: mode, model: claudeModel, seed: parsedSeed }
+      : "Claude mode requires a configured model.";
+  }
+  return { policyMode: mode, seed: parsedSeed };
 }
 
 function progressText(
