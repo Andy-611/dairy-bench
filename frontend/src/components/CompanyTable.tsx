@@ -1,7 +1,7 @@
 import {
+  formatExactDecimal,
   formatGrowth,
-  formatSignedValue,
-  formatValue,
+  formatSignedExactDecimal,
   ROLE_LABELS,
 } from "../format";
 import type { CompanyResultView, CompanyRole } from "../types";
@@ -71,13 +71,13 @@ export function CompanyTable({ companies }: CompanyTableProps) {
                   </div>
                 </td>
                 <td>{company.policyName}</td>
-                <td className="numeric">{formatValue(company.initialCash)}</td>
-                <td className="numeric">{formatValue(company.finalCash)}</td>
-                <td className="numeric">{formatValue(company.inventoryValue)}</td>
+                <td className="numeric">{formatExactDecimal(company.initialCash)}</td>
+                <td className="numeric">{formatExactDecimal(company.finalCash)}</td>
+                <td className="numeric">{formatExactDecimal(company.inventoryValue)}</td>
                 <td
-                  className={`numeric value-${company.surplus >= 0 ? "up" : "down"}`}
+                  className={`numeric value-${company.surplus.startsWith("-") ? "down" : "up"}`}
                 >
-                  {formatSignedValue(company.surplus)}
+                  {formatSignedExactDecimal(company.surplus)}
                 </td>
                 <td className="numeric">{formatGrowth(company.growth)}</td>
               </tr>

@@ -14,6 +14,7 @@ from company_bench.models import (
     RetailerDecision,
     RetailerOperation,
 )
+from company_bench.precision import EconomicPrecision
 
 
 class CompanyPolicy(Protocol):
@@ -95,7 +96,9 @@ class BaselinePolicy:
                 maximum_raw_price=Decimal("1.60"),
                 process_quantity=input_quantity,
                 bottled_offer_quantity=min(
-                    input_quantity * operation.yield_rate,
+                    EconomicPrecision.floor_quantity(
+                        input_quantity * operation.yield_rate
+                    ),
                     Decimal("40"),
                 ),
                 minimum_bottled_price=Decimal("2.50"),

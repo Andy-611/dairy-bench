@@ -1,4 +1,4 @@
-"""Deterministic V3 economy engine for continuous dairy-market episodes."""
+"""Deterministic V4 economy engine for continuous dairy-market episodes."""
 
 from __future__ import annotations
 
@@ -45,6 +45,8 @@ from company_bench.models import (
     MilkProcessedEvent,
     MilkProducedEvent,
     Money,
+    PositiveMoney,
+    PositiveQuantity,
     ProcessorOperation,
     ProductId,
     PublicCompany,
@@ -55,7 +57,7 @@ from company_bench.models import (
     TradeExecutedEvent,
     WorldState,
 )
-from company_bench.precision import EconomicPrecision
+from company_bench.precision import EconomicDecimal, EconomicPrecision
 from company_bench.runtime_models import (
     CommandEnvelope,
     CommandOutcome,
@@ -100,9 +102,9 @@ class ProductionJob(StrictModel):
     started_at: SimTime
     completes_at: SimTime
     product: ProductId
-    quantity: Quantity = Field(gt=ZERO)
-    unit_cost: Money = Field(gt=ZERO)
-    cash_cost: Money = Field(gt=ZERO)
+    quantity: PositiveQuantity
+    unit_cost: PositiveMoney
+    cash_cost: PositiveMoney
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
@@ -123,10 +125,10 @@ class TransformationJob(StrictModel):
     completes_at: SimTime
     input_product: ProductId
     output_product: ProductId
-    input_quantity: Quantity = Field(gt=ZERO)
-    output_quantity: Quantity = Field(gt=ZERO)
-    processing_cost_per_input: Money
-    cash_cost: Money
+    input_quantity: PositiveQuantity
+    output_quantity: PositiveQuantity
+    processing_cost_per_input: PositiveMoney
+    cash_cost: PositiveMoney
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
@@ -212,11 +214,11 @@ class RetailPriceState(StrictModel):
 
     company_id: CompanyId
     product: ProductId
-    unit_price: Money = Field(gt=ZERO)
+    unit_price: PositiveMoney
 
 
 class EconomyState(StrictModel):
-    """Complete checkpointable state of one active V3 business day."""
+    """Complete checkpointable state of one active V4 business day."""
 
     base_state: WorldState
     day: int = Field(ge=1)
@@ -415,10 +417,10 @@ class _TradeEffects:
 
 
 class EconomyEngine:
-    """Own every V3 cash, inventory, market, operation, and delivery transition."""
+    """Own every V4 cash, inventory, market, operation, and delivery transition."""
 
     def initial_state(self, scenario: ScenarioSpec, seed: int) -> WorldState:
-        """Create an empty-inventory V3 world."""
+        """Create an empty-inventory V4 world."""
         if not scenario.uses_event_runtime:
             raise ValueError("EconomyEngine requires an event-driven scenario")
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
@@ -544,7 +546,7 @@ class EconomyEngine:
     def marked_surplus(
         economy: EconomyState,
         company_id: CompanyId,
-    ) -> Decimal:
+    ) -> EconomicDecimal:
         """Mark guaranteed owned assets against the episode's initial value."""
         company = _company_state(economy.companies, company_id)
         owned_lots = (
@@ -811,22 +813,19 @@ class EconomyEngine:
                 revenue = ZERO
             else:
                 demand = demand_curve.quantity(potential, price)
-                sold = min(
+                candidate_sale = min(
                     demand,
                     session.assets.quantity(company.company_id, operation.input_product),
                 )
+                revenue = EconomicPrecision.round(candidate_sale * price)
+                sold = candidate_sale if revenue > ZERO else ZERO
                 if sold > ZERO:
                     session.assets.reserve_inventory(
                         company.company_id,
                         operation.input_product,
                         sold,
                     )
-                    revenue = EconomicPrecision.round(sold * price)
-                    if revenue <= ZERO:
-                        raise ValueError("consumer sale revenue rounds to zero")
                     session.assets.credit_cash(company.company_id, revenue)
-                else:
-                    revenue = ZERO
             events.append(
                 ConsumerSaleEvent(
                     day=economy.day,
@@ -1217,6 +1216,8 @@ class EconomyEngine:
                     quantity=fill.quantity,
                     unit_price=fill.unit_price,
                     total_value=fill.total_value,
+                    maker_remaining_quantity=fill.maker_remaining_quantity,
+                    taker_remaining_quantity=fill.taker_remaining_quantity,
                 )
             )
             completions.append(

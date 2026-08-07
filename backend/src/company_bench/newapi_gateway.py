@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from collections.abc import Mapping
 from time import monotonic
 from urllib.parse import urlsplit
 
@@ -32,6 +33,7 @@ from company_bench.agent_models import (
 )
 from company_bench.diagnostics import bounded_error
 from company_bench.models import StrictModel
+from company_bench.precision import require_numeric_economic_schema
 from company_bench.run_models import TokenUsage
 from company_bench.runtime_models import CompanyCommand
 
@@ -42,6 +44,27 @@ _TOOL_CHOICE: ToolChoiceAnyParam = {
     "type": "any",
     "disable_parallel_tool_use": True,
 }
+_MAX_RETRY_DELAY_SECONDS = 2.0
+_PROXY_UPSTREAM_ERROR_TYPE = "bad_response_status_code"
+_UNSUPPORTED_STRICT_SCHEMA_KEYWORDS = frozenset(
+    {
+        "default",
+        "discriminator",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minProperties",
+        "minimum",
+        "multipleOf",
+        "pattern",
+        "uniqueItems",
+    }
+)
 
 
 class NewApiClaudeConfig(StrictModel):
@@ -53,7 +76,7 @@ class NewApiClaudeConfig(StrictModel):
     base_url: str = Field(default=DEFAULT_NEWAPI_BASE_URL, min_length=1)
     max_output_tokens: int = Field(default=2048, ge=128, le=32768)
     timeout_seconds: float = Field(default=60.0, gt=0, le=600)
-    max_attempts: int = Field(default=3, ge=1, le=5)
+    max_attempts: int = Field(default=10, ge=1, le=10)
 
     @field_validator("base_url")
     @classmethod
@@ -88,7 +111,7 @@ class NewApiClaudeConfig(StrictModel):
             models=models,
             max_output_tokens=int(os.getenv("DAIRY_BENCH_NEWAPI_MAX_OUTPUT_TOKENS", "2048")),
             timeout_seconds=float(os.getenv("DAIRY_BENCH_NEWAPI_TIMEOUT_SECONDS", "60")),
-            max_attempts=int(os.getenv("DAIRY_BENCH_NEWAPI_MAX_ATTEMPTS", "3")),
+            max_attempts=int(os.getenv("DAIRY_BENCH_NEWAPI_MAX_ATTEMPTS", "10")),
         )
 
     @property
@@ -229,15 +252,16 @@ class NewApiClaudeGateway:
                 if attempt == self.config.max_attempts:
                     raise _infrastructure_error(error, self.config.api_key) from error
             except APIStatusError as error:
-                if not _retryable_status(error.status_code) or attempt == self.config.max_attempts:
+                if not _retryable_status_error(error) or attempt == self.config.max_attempts:
                     raise _infrastructure_error(error, self.config.api_key) from error
-            await asyncio.sleep(0.25 * 2 ** (attempt - 1))
+            await asyncio.sleep(_retry_delay_seconds(attempt))
         raise AssertionError("bounded retry loop did not terminate")
 
 
 def _decision_tool(submission_type: type[BaseModel]) -> ToolParam:
     """Expose one forced tool whose input is the typed decision envelope."""
     schema = submission_type.model_json_schema()
+    require_numeric_economic_schema(schema)
     _normalize_schema_node(schema)
     return {
         "name": _DECISION_TOOL_NAME,
@@ -254,6 +278,7 @@ def _command_tool(name: CommandName) -> ToolParam:
     properties = schema.get("properties")
     if isinstance(properties, dict):
         properties.pop("kind", None)
+    require_numeric_economic_schema(schema)
     _normalize_schema_node(schema)
     return {
         "name": name,
@@ -264,11 +289,10 @@ def _command_tool(name: CommandName) -> ToolParam:
 
 
 def _normalize_schema_node(node: object) -> None:
-    """Normalize Pydantic output to NewAPI's strict Anthropic subset."""
+    """Normalize Pydantic output to Anthropic's strict JSON Schema subset."""
     if isinstance(node, dict):
-        node.pop("pattern", None)
-        node.pop("default", None)
-        node.pop("discriminator", None)
+        for keyword in _UNSUPPORTED_STRICT_SCHEMA_KEYWORDS:
+            node.pop(keyword, None)
         one_of = node.pop("oneOf", None)
         if one_of is not None:
             node["anyOf"] = one_of
@@ -335,6 +359,27 @@ def _output_error(
 def _retryable_status(status_code: int) -> bool:
     """Retry temporary HTTP states and provider failures."""
     return status_code in {408, 409, 429} or status_code >= 500
+
+
+def _retryable_status_error(error: APIStatusError) -> bool:
+    """Retry temporary HTTP states and NewAPI-wrapped upstream failures."""
+    return _retryable_status(error.status_code) or _error_type(error.body) == (
+        _PROXY_UPSTREAM_ERROR_TYPE
+    )
+
+
+def _error_type(body: object) -> str | None:
+    """Read the error type from either a full or unwrapped provider envelope."""
+    if not isinstance(body, Mapping):
+        return None
+    detail = body.get("error")
+    error_type = detail.get("type") if isinstance(detail, Mapping) else body.get("type")
+    return error_type if isinstance(error_type, str) else None
+
+
+def _retry_delay_seconds(completed_attempts: int) -> float:
+    """Back off briefly without making a long benchmark stall."""
+    return min(0.25 * 2 ** (completed_attempts - 1), _MAX_RETRY_DELAY_SECONDS)
 
 
 def _infrastructure_error(error: Exception, api_key: SecretStr) -> ModelInfrastructureError:

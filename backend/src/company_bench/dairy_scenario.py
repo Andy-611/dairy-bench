@@ -91,8 +91,8 @@ def _build_companies() -> tuple[CompanySpec, ...]:
 def _build_dairy_scenario() -> ScenarioSpec:
     """Build the canonical event-driven Dairy Bench scenario."""
     return ScenarioSpec(
-        scenario_id="flow.dairy.base.s9.v4",
-        version=4,
+        scenario_id="flow.dairy.base.s9.v5",
+        version=5,
         days=30,
         products=(
             ProductSpec(

@@ -34,6 +34,7 @@ from company_bench.codex_sessions import (
     CodexSessionRetention,
 )
 from company_bench.models import CompanyObservation, FarmDecision, ProductId
+from company_bench.precision import ECONOMIC_QUANTUM
 from company_bench.runtime_models import (
     AgentTurn,
     MarketSide,
@@ -42,6 +43,28 @@ from company_bench.runtime_models import (
     SimTime,
     WakeReason,
 )
+
+
+def _economic_schema_nodes(value: object) -> list[dict[str, object]]:
+    """Collect schema nodes governed by the shared economic quantum."""
+    if isinstance(value, dict):
+        nodes = (
+            [value]
+            if value.get("multipleOf") == float(ECONOMIC_QUANTUM)
+            else []
+        )
+        return nodes + [
+            node
+            for child in value.values()
+            for node in _economic_schema_nodes(child)
+        ]
+    if isinstance(value, list):
+        return [
+            node
+            for child in value
+            for node in _economic_schema_nodes(child)
+        ]
+    return []
 
 
 class _FakeThread:
@@ -311,6 +334,10 @@ def test_codex_gateway_isolates_runtime_and_validates_output(
     assert set(farm_schema["required"]) == set(farm_schema["properties"])
     assert set(no_op_schema["required"]) == set(no_op_schema["properties"])
     assert '"pattern"' not in json.dumps(output_schema)
+    economic_nodes = _economic_schema_nodes(output_schema)
+    assert economic_nodes
+    assert all(node.get("type") == "number" for node in economic_nodes)
+    assert all("anyOf" not in node for node in economic_nodes)
     assert run_options["summary"].root.value == "detailed"
 
 

@@ -1,6 +1,6 @@
 # Agent Integration
 
-## V3 agent contract
+## V4 agent contract
 
 Dairy Bench runs nine independent company agents: three farms, three
 processors, and three retailers. The scheduler wakes an agent for one closed,
@@ -34,9 +34,10 @@ Farms may produce and trade raw milk. Processors may transform and trade raw or
 bottled milk. Retailers may trade bottled milk and set its consumer price.
 
 Each `set_quote_ladder` level contains `quantity` and `limit_price`. A ladder has
-at most three levels with distinct prices; every quantity must be positive and
-an exact multiple of `0.0001` (at most four decimal places). The engine rejects
-the whole command rather than rounding it. An empty `levels` tuple withdraws all
+at most three levels with distinct prices. Every economic quantity and price
+must be an exact multiple of `0.0001` (at most four decimal places), and every
+level quantity must be positive. The engine rejects the whole command rather
+than rounding it. An empty `levels` tuple withdraws all
 of the company's quotes for that product and side.
 
 The command describes a target state, not a sequence of exchange operations.
@@ -104,11 +105,13 @@ is the source of truth.
 
 Both product markets use continuous fully collateralized limit books:
 
-1. Every level quantity is a positive exact multiple of `0.0001`; one invalid
-   level rejects the complete ladder without rounding.
+1. Every level quantity and price is an exact multiple of `0.0001`, and every
+   quantity is positive; one invalid level rejects the complete ladder without
+   rounding.
 2. The market stages the complete reconciliation. Unchanged levels keep their
    existing holds; mutable old levels release theirs inside the staged transaction.
-3. All target Bids together require full `quantity * limit_price` cash backing;
+3. All target Bids together require full four-place, half-even rounded
+   `quantity * limit_price` cash backing;
    all target Asks together require exact FEFO inventory backing. Any shortfall
    restores the complete original ladder.
 4. New or replaced levels enter the matcher from best to worst target price and
@@ -119,6 +122,14 @@ Both product markets use continuous fully collateralized limit books:
    priority; a replaced level receives a new order ID and priority.
 8. Buyer price improvement is released immediately. An empty target ladder or
    19:00 market close releases every affected unfilled hold.
+
+All persisted economic values use the same four-place quantum. After a partial
+fill, the engine recomputes the rounded commitment for the remaining quantity
+and derives the refund by cash conservation. A command is rolled back if an
+order, fill, or operation cost would settle to zero. If a valid fill leaves a
+remainder that rounds to zero or can no longer be fully backed after independent
+four-place settlement, that remainder alone is withdrawn and its collateral is
+released.
 
 Every fill pays the seller immediately and creates one automatic delivery to
 the buyer 30 virtual minutes later. Until arrival, those lots are visible as
@@ -302,7 +313,7 @@ separate completed-run verification operation.
 
 ## Adding another provider
 
-A V3 adapter implements:
+A V4 adapter implements:
 
 ```python
 class CommandGateway(Protocol):

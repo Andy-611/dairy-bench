@@ -60,7 +60,7 @@ def _llm_agent(
     memory_token_budget: int = 12_288,
     max_prompt_tokens: int = 16_384,
 ) -> tuple[LlmCompanyAgent, ScriptedModelGateway, MemoryRunRepository]:
-    """Create one isolated scripted V3 Agent and its audit repository."""
+    """Create one isolated scripted V4 Agent and its audit repository."""
     audit_repository = repository if repository is not None else MemoryRunRepository()
     gateway = ScriptedModelGateway(
         lambda _: NoOpDecision(),
@@ -76,7 +76,7 @@ def _llm_agent(
             version="3",
             kind=PolicyKind.OPENAI,
             provider="scripted",
-            model="scripted-v3",
+            model="scripted-v4",
             prompt_version=COMMAND_PROMPT_VERSION,
         ),
         memory_token_budget=memory_token_budget,
@@ -95,7 +95,7 @@ def _turn(
     pending_deliveries: tuple[IncomingDeliveryView, ...] = (),
     active_operation: OperationJobView | None = None,
 ) -> AgentTurn:
-    """Create one runtime-owned V3 company turn."""
+    """Create one runtime-owned V4 company turn."""
     return AgentTurn(
         turn_id=f"{run_id}.{observation.company_id}.t1",
         company_id=observation.company_id,
@@ -115,7 +115,7 @@ def _turn(
 
 
 def _observation(company_id: str) -> CompanyObservation:
-    """Read one company's initial V3 observation."""
+    """Read one company's initial V4 observation."""
     engine = EconomyEngine()
     world = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return next(
@@ -147,7 +147,7 @@ def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decima
     return first, second, quantity - first - second
 
 
-def test_quote_ladder_uses_the_strict_v3_command_schema() -> None:
+def test_quote_ladder_uses_the_strict_v4_command_schema() -> None:
     submission = CommandSubmission.model_validate_json(
         '{"command":{"kind":"set_quote_ladder","product":"raw_milk",'
         '"side":"sell","levels":[{"quantity":"10","limit_price":"1.20"},'
@@ -230,7 +230,7 @@ def test_quote_ladder_enforces_depth_order_and_exact_quantities() -> None:
         ),
     ),
 )
-async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
+async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
     company_id: str,
     allowed_commands: tuple[str, ...],
 ) -> None:
@@ -280,8 +280,8 @@ async def test_llm_agent_exposes_v3_commands_and_continuous_market_facts(
     assert "queue_ahead_quantity is the same-price quantity ahead" in request.instructions
     assert "marked_surplus is guaranteed marked asset value" in request.instructions
     level = prompt_input["turn"]["order_books"][0]["bids"][0]
-    assert level == {"unit_price": "1.50", "quantity": "30", "order_count": 2}
-    assert prompt_input["turn"]["marked_surplus"] == "0"
+    assert level == {"unit_price": "1.5000", "quantity": "30.0000", "order_count": 2}
+    assert prompt_input["turn"]["marked_surplus"] == "0.0000"
     assert "market_views" not in prompt_input["turn"]
     assert "remaining_operation_capacity" not in prompt_input["turn"]
     constraints = prompt_input["decision_constraints"]
@@ -371,7 +371,7 @@ async def test_baseline_floors_orders_without_overcommitting_inventory() -> None
     observation = _observation("farm_a")
     stocked = _with_inventory(
         observation,
-        raw_milk=Decimal("49.999999999999999"),
+        raw_milk=Decimal("49.9999"),
     )
 
     command = await agent.act(
@@ -389,19 +389,6 @@ async def test_baseline_floors_orders_without_overcommitting_inventory() -> None
         QuoteLevel(quantity=Decimal("10.0001"), limit_price=Decimal("1.60")),
     )
     assert sum((level.quantity for level in command.levels), Decimal()) == Decimal("49.9999")
-
-    dust = _with_inventory(observation, raw_milk=Decimal("0.00009"))
-    assert (
-        await agent.act(
-            _turn(
-                "farm_dust",
-                dust,
-                wake_reason=WakeReason.OPERATION_COMPLETED,
-            )
-        )
-        == Wait()
-    )
-
 
 @pytest.mark.asyncio
 async def test_llm_agent_accepts_a_schema_valid_quote_ladder_for_engine_audit() -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from decimal import ROUND_DOWN, Decimal
+from decimal import Decimal
 from typing import Final, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -30,7 +30,7 @@ from company_bench.models import (
     RetailerOperation,
     StrictModel,
 )
-from company_bench.precision import ECONOMIC_QUANTUM
+from company_bench.precision import ECONOMIC_QUANTUM, EconomicPrecision
 from company_bench.run_models import (
     InvocationOutcome,
     PolicyAuditSink,
@@ -51,7 +51,7 @@ from company_bench.runtime_models import (
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.6"
+COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.7"
 
 
 class CompanyAgent(Protocol):
@@ -150,7 +150,7 @@ class AgentCommandInput(StrictModel):
 
 
 class LlmCompanyAgent:
-    """Use one isolated provider gateway and Agent-owned V3 memory."""
+    """Use one isolated provider gateway and Agent-owned V4 memory."""
 
     metadata: PolicyMetadata
 
@@ -345,7 +345,7 @@ class FixedCommandAgent:
 
 
 class BaselineCompanyAgent:
-    """Transparent V3 actor for the continuous dairy market."""
+    """Transparent V4 actor for the continuous dairy market."""
 
     metadata = PolicyMetadata(
         name="event-baseline",
@@ -558,7 +558,7 @@ def _allowed_commands(turn: AgentTurn) -> tuple[CommandName, ...]:
 
 
 def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
-    """Build the stable provider-neutral V3 command prompt."""
+    """Build the stable provider-neutral V4 command prompt."""
     commands = ", ".join(allowed)
     return (
         "You are the sole Agent for one dairy company in a continuous spot market. "
@@ -581,9 +581,11 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "for a new quantity q, cash cost is C(u+q)-C(u), where "
         "C(x)=c*x+curvature*c*x^2/(2*K). Use only supplied facts and "
         "submit exactly one atomic command; never invent identity, time, or state version. "
-        "Every production, transformation, and quote-level quantity must be at least "
-        f"{ECONOMIC_QUANTUM} and use at most four decimal places (an exact multiple of "
-        f"{ECONOMIC_QUANTUM}); never submit a dust quantity. set_quote_ladder declares "
+        "Every submitted economic quantity and price must use at most four decimal "
+        f"places (an exact multiple of {ECONOMIC_QUANTUM}); every production, "
+        "transformation, and quote-level quantity must also be at least "
+        f"{ECONOMIC_QUANTUM}. Invalid precision rejects the entire command without "
+        "rounding; never submit a dust quantity. set_quote_ladder declares "
         "the complete target state for one product and side: use zero to three unique "
         "levels ordered best-to-worst (buy prices descending, sell prices ascending), "
         "and use [] to cancel that ladder. The complete update is atomic. Exact unchanged "
@@ -604,7 +606,7 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
 
 def _floor_order_quantity(value: Decimal) -> Decimal:
     """Floor a feasible baseline order to the market quantum."""
-    return value.quantize(ECONOMIC_QUANTUM, rounding=ROUND_DOWN)
+    return EconomicPrecision.floor_quantity(value)
 
 
 def _sell_ladder(

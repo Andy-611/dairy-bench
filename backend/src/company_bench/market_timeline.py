@@ -7,7 +7,15 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from company_bench.market import PriceTimeQueue
-from company_bench.models import Identifier, ProductId, ScenarioSpec, TradeExecutedEvent
+from company_bench.models import (
+    ZERO,
+    Identifier,
+    PositiveMoney,
+    ProductId,
+    Quantity,
+    ScenarioSpec,
+    TradeExecutedEvent,
+)
 from company_bench.runtime_models import (
     MarketSide,
     OpenOrderView,
@@ -50,7 +58,7 @@ class _MarketReplay:
 
     scenario: ScenarioSpec
     orders: dict[Identifier, OpenOrderView] = field(default_factory=dict)
-    last_trade_price: dict[ProductId, Decimal] = field(default_factory=dict)
+    last_trade_price: dict[ProductId, PositiveMoney] = field(default_factory=dict)
     state_version: int = 0
 
     def reset_day(self) -> None:
@@ -110,12 +118,12 @@ class _MarketReplay:
                 continue
 
             incoming = self._new_order(record, level)
-            remaining, matches = self._apply_fills(
+            remaining, matches, withdrawn_quantity = self._apply_fills(
                 incoming,
                 tuple(events_by_order.pop(incoming.order_id, ())),
             )
             remaining_quantity = (
-                remaining.remaining_quantity if remaining is not None else Decimal()
+                remaining.remaining_quantity if remaining is not None else ZERO
             )
             if remaining_quantity != level.remaining_quantity:
                 raise MarketProjectionError("quote result remaining quantity is inconsistent")
@@ -127,6 +135,7 @@ class _MarketReplay:
                 "matches": matches,
                 "matched_quantity": _matched_quantity(matches),
                 "remaining_quantity": remaining_quantity,
+                "withdrawn_quantity": withdrawn_quantity,
             }
             if level.action is QuoteLevelAction.PLACE:
                 flows.append(MarketOrderPlaced(**common))
@@ -235,28 +244,40 @@ class _MarketReplay:
         self,
         incoming: OpenOrderView,
         events: tuple[TradeExecutedEvent, ...],
-    ) -> tuple[OpenOrderView | None, tuple[MarketMatchLeg, ...]]:
+    ) -> tuple[OpenOrderView | None, tuple[MarketMatchLeg, ...], Quantity]:
         matches: list[MarketMatchLeg] = []
+        withdrawn_quantity = ZERO
         for index, event in enumerate(events):
             self._validate_trade(incoming, event)
             resting = self._resting_order(incoming, event)
+            updated_resting, maker_withdrawn = _settled_remainder(
+                resting,
+                event.quantity,
+                event.maker_remaining_quantity,
+            )
             matches.append(
                 MarketMatchLeg(
                     trade_id=event.trade_id,
                     maker_order=resting,
                     quantity=event.quantity,
                     unit_price=event.unit_price,
+                    maker_remaining_quantity=event.maker_remaining_quantity,
+                    maker_withdrawn_quantity=maker_withdrawn,
                 )
             )
-            updated_resting = _reduce(resting, event.quantity)
             if updated_resting is None:
                 self.orders.pop(resting.order_id)
             else:
                 self.orders[resting.order_id] = updated_resting
-            incoming = _reduce(incoming, event.quantity)
+            incoming, taker_withdrawn = _settled_remainder(
+                incoming,
+                event.quantity,
+                event.taker_remaining_quantity,
+            )
+            withdrawn_quantity += taker_withdrawn
             if incoming is None and index < len(events) - 1:
                 raise MarketProjectionError("an exhausted incoming order has additional fills")
-        return incoming, tuple(matches)
+        return incoming, tuple(matches), withdrawn_quantity
 
     @staticmethod
     def _validate_trade(incoming: OpenOrderView, event: TradeExecutedEvent) -> None:
@@ -407,12 +428,20 @@ def _journal_key(record: TurnRecord | SystemStepRecord) -> tuple[int, int, int]:
     return (record.occurred_at.absolute_minute, record.journal_sequence, 0)
 
 
-def _reduce(order: OpenOrderView, quantity: Decimal) -> OpenOrderView | None:
+def _settled_remainder(
+    order: OpenOrderView,
+    quantity: Decimal,
+    remaining: Quantity,
+) -> tuple[OpenOrderView | None, Quantity]:
+    """Apply one fill and preserve any persisted precision-driven withdrawal."""
     if quantity > order.remaining_quantity:
         raise MarketProjectionError("trade quantity exceeds its projected order")
-    remaining = order.remaining_quantity - quantity
-    return order.model_copy(update={"remaining_quantity": remaining}) if remaining else None
+    expected = order.remaining_quantity - quantity
+    if remaining > expected:
+        raise MarketProjectionError("trade remainder exceeds its projected order")
+    updated = order.model_copy(update={"remaining_quantity": remaining}) if remaining else None
+    return updated, expected - remaining
 
 
 def _matched_quantity(matches: tuple[MarketMatchLeg, ...]) -> Decimal:
-    return sum((match.quantity for match in matches), Decimal())
+    return sum((match.quantity for match in matches), ZERO)

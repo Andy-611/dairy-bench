@@ -24,6 +24,7 @@ from company_bench.models import (
     StrictModel,
     WorldState,
 )
+from company_bench.precision import EconomicPrecision
 from company_bench.runtime_models import (
     MarketSide,
     OpenOrderView,
@@ -36,7 +37,6 @@ from company_bench.runtime_models import (
     QuoteLevelResult,
     SimTime,
 )
-from company_bench.precision import EconomicPrecision
 
 __all__ = [
     "AssetLedger",
@@ -149,7 +149,7 @@ class MarketError(ValueError):
 @dataclass(slots=True)
 class _Account:
     company_id: CompanyId
-    cash: Decimal
+    cash: Money
     inventory: list[InventoryLot]
 
 
@@ -206,20 +206,20 @@ class AssetLedger:
         """Return the deterministic counter required by the next transaction."""
         return self._next_lot_sequence
 
-    def cash(self, company_id: CompanyId) -> Decimal:
+    def cash(self, company_id: CompanyId) -> Money:
         """Return currently available, unreserved cash."""
         return self._account(company_id).cash
 
-    def quantity(self, company_id: CompanyId, product: ProductId) -> Decimal:
+    def quantity(self, company_id: CompanyId, product: ProductId) -> Quantity:
         """Return currently available, unreserved on-hand inventory."""
         return sum(
             (lot.quantity for lot in self._account(company_id).inventory if lot.product is product),
             start=ZERO,
         )
 
-    def debit_cash(self, company_id: CompanyId, amount: Decimal) -> None:
+    def debit_cash(self, company_id: CompanyId, amount: Money) -> None:
         """Debit an exact affordable amount."""
-        EconomicPrecision.require_exact(amount)
+        amount = EconomicPrecision.normalize_exact(amount)
         account = self._account(company_id)
         if amount < ZERO:
             raise MarketError("cash debit must be nonnegative")
@@ -227,18 +227,18 @@ class AssetLedger:
             raise MarketError(f"insufficient cash: requested {amount}, available {account.cash}")
         account.cash -= amount
 
-    def credit_cash(self, company_id: CompanyId, amount: Decimal) -> None:
+    def credit_cash(self, company_id: CompanyId, amount: Money) -> None:
         """Credit an exact nonnegative amount."""
-        EconomicPrecision.require_exact(amount)
+        amount = EconomicPrecision.normalize_exact(amount)
         if amount < ZERO:
             raise MarketError("cash credit must be nonnegative")
         self._account(company_id).cash += amount
 
-    def reserve_cash(self, company_id: CompanyId, amount: Decimal) -> None:
+    def reserve_cash(self, company_id: CompanyId, amount: Money) -> None:
         """Move exact cash out of a company's available balance."""
         self.debit_cash(company_id, amount)
 
-    def restore_cash(self, company_id: CompanyId, amount: Decimal) -> None:
+    def restore_cash(self, company_id: CompanyId, amount: Money) -> None:
         """Return previously reserved cash to its owner."""
         self.credit_cash(company_id, amount)
 
@@ -246,9 +246,10 @@ class AssetLedger:
         self,
         company_id: CompanyId,
         product: ProductId,
-        quantity: Decimal,
+        quantity: PositiveQuantity,
     ) -> tuple[InventoryLot, ...]:
         """Remove an exact quantity from on-hand inventory in FEFO order."""
+        quantity = EconomicPrecision.normalize_exact(quantity)
         if quantity <= ZERO:
             raise MarketError("reserved inventory quantity must be positive")
         available = self.quantity(company_id, product)
@@ -427,6 +428,8 @@ class TradeFill(StrictModel):
     total_value: PositiveMoney
     maker_order_id: Identifier
     taker_order_id: Identifier
+    maker_remaining_quantity: Quantity
+    taker_remaining_quantity: Quantity
     delivery_lots: tuple[InventoryLot, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -644,7 +647,7 @@ class ContinuousSpotMarket:
         owner_id: CompanyId,
         side: MarketSide,
         quantity: OrderQuantity,
-        limit_price: Decimal,
+        limit_price: PositiveMoney,
         placed_at: SimTime,
         priority_sequence: int,
         trade_id_factory: TradeIdFactory,
@@ -788,7 +791,7 @@ class ContinuousSpotMarket:
         owner_id: CompanyId,
         side: MarketSide,
         quantity: OrderQuantity,
-        limit_price: Decimal,
+        limit_price: PositiveMoney,
         placed_at: SimTime,
         priority_sequence: int,
     ) -> LimitOrder:
@@ -796,6 +799,9 @@ class ContinuousSpotMarket:
             raise MarketError("order quantity must be positive")
         if limit_price <= ZERO:
             raise MarketError("order limit price must be positive")
+        commitment = _cash_value(quantity, limit_price)
+        if commitment <= ZERO:
+            raise MarketError("order commitment rounds to zero at economic precision")
         common = {
             "order_id": order_id,
             "owner_id": owner_id,
@@ -806,11 +812,8 @@ class ContinuousSpotMarket:
             "priority_sequence": priority_sequence,
         }
         if side is MarketSide.BUY:
-            reserved_cash = _cash_value(quantity, limit_price)
-            if reserved_cash <= ZERO:
-                raise MarketError("order commitment rounds to zero at economic precision")
-            self._assets.reserve_cash(owner_id, reserved_cash)
-            return BuyOrder(**common, reserved_cash=reserved_cash)
+            self._assets.reserve_cash(owner_id, commitment)
+            return BuyOrder(**common, reserved_cash=commitment)
         if side is MarketSide.SELL:
             lots = self._assets.reserve_inventory(owner_id, self._state.product, quantity)
             return SellOrder(**common, reserved_lots=lots)
@@ -843,9 +846,19 @@ class ContinuousSpotMarket:
             if value <= ZERO:
                 raise MarketError("trade value rounds to zero at economic precision")
             updated_buyer, refund = _fill_buy_order(buyer, quantity, value)
-            updated_seller, seller_lots = _fill_sell_order(seller, quantity)
+            updated_seller, seller_lots, released_lots = _fill_sell_order(
+                seller,
+                quantity,
+            )
+            updated_resting = (
+                updated_buyer if isinstance(resting, BuyOrder) else updated_seller
+            )
+            updated_incoming = (
+                updated_buyer if isinstance(active, BuyOrder) else updated_seller
+            )
             self._assets.credit_cash(seller.owner_id, value)
             self._assets.credit_cash(buyer.owner_id, refund)
+            self._assets.restore_inventory(seller.owner_id, released_lots)
             delivery_lots = self._assets.relabel_for_buyer(buyer.owner_id, seller_lots)
             fill = TradeFill(
                 trade_id=trade_id_factory(len(fills) + 1),
@@ -857,6 +870,8 @@ class ContinuousSpotMarket:
                 total_value=value,
                 maker_order_id=resting.order_id,
                 taker_order_id=active.order_id,
+                maker_remaining_quantity=_remaining_quantity(updated_resting),
+                taker_remaining_quantity=_remaining_quantity(updated_incoming),
                 delivery_lots=delivery_lots,
             )
             fills.append(fill)
@@ -864,9 +879,7 @@ class ContinuousSpotMarket:
             traded_value += value
             last_trade_price = price
 
-            updated_resting = updated_buyer if isinstance(resting, BuyOrder) else updated_seller
             _update_resting(orders, resting.order_id, updated_resting)
-            updated_incoming = updated_buyer if isinstance(active, BuyOrder) else updated_seller
             active = updated_incoming
 
         if active is not None:
@@ -912,7 +925,7 @@ class ContinuousSpotMarket:
         self,
         owner_id: CompanyId,
         side: MarketSide,
-        limit_price: Decimal,
+        limit_price: PositiveMoney,
     ) -> None:
         if any(
             order.owner_id == owner_id
@@ -962,18 +975,19 @@ def _take_fefo(
 
 def _fill_buy_order(
     order: BuyOrder,
-    quantity: Decimal,
-    trade_value: Decimal,
-) -> tuple[BuyOrder | None, Decimal]:
+    quantity: PositiveQuantity,
+    trade_value: PositiveMoney,
+) -> tuple[BuyOrder | None, Money]:
     remaining = order.remaining_quantity - quantity
-    reserved = (
-        _cash_value(remaining, order.limit_price) if remaining > ZERO else ZERO
-    )
-    refund = order.reserved_cash - reserved - trade_value
-    if refund < ZERO:
-        raise MarketError("rounded buy collateral cannot fund this partial fill")
+    available_after_trade = order.reserved_cash - trade_value
+    if available_after_trade < ZERO:
+        raise MarketError("reserved buy collateral cannot fund the trade")
     if remaining == ZERO:
-        return None, refund
+        return None, available_after_trade
+    reserved = _cash_value(remaining, order.limit_price)
+    if reserved <= ZERO or reserved > available_after_trade:
+        return None, available_after_trade
+    refund = available_after_trade - reserved
     return (
         order.model_copy(update={"remaining_quantity": remaining, "reserved_cash": reserved}),
         refund,
@@ -982,19 +996,26 @@ def _fill_buy_order(
 
 def _fill_sell_order(
     order: SellOrder,
-    quantity: Decimal,
-) -> tuple[SellOrder | None, tuple[InventoryLot, ...]]:
+    quantity: PositiveQuantity,
+) -> tuple[
+    SellOrder | None,
+    tuple[InventoryLot, ...],
+    tuple[InventoryLot, ...],
+]:
     sold, retained = _take_fefo(order.reserved_lots, order.product, quantity)
     remaining = order.remaining_quantity - quantity
     if remaining == ZERO:
         if retained:
             raise RuntimeError("filled sell order retained inventory")
-        return None, sold
+        return None, sold, ()
+    if _cash_value(remaining, order.limit_price) <= ZERO:
+        return None, sold, tuple(retained)
     return (
         order.model_copy(
             update={"remaining_quantity": remaining, "reserved_lots": tuple(retained)}
         ),
         sold,
+        (),
     )
 
 
@@ -1048,11 +1069,16 @@ def _open_order_view(
     )
 
 
-def _lot_quantity(lots: Iterable[InventoryLot]) -> Decimal:
+def _lot_quantity(lots: Iterable[InventoryLot]) -> Quantity:
     return sum((lot.quantity for lot in lots), start=ZERO)
 
 
-def _cash_value(quantity: Decimal, unit_price: Decimal) -> Decimal:
+def _remaining_quantity(order: LimitOrder | None) -> Quantity:
+    """Return a live order remainder or canonical zero after retirement."""
+    return order.remaining_quantity if order is not None else ZERO
+
+
+def _cash_value(quantity: Decimal, unit_price: Decimal) -> Money:
     """Return one cash boundary value under the shared precision contract."""
     return EconomicPrecision.round(quantity * unit_price)
 

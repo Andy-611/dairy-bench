@@ -119,7 +119,7 @@ class _PendingTurn:
 
 
 class EpisodeRuntime:
-    """Run one V3 episode with deterministic scheduling and atomic commands."""
+    """Run one V4 episode with deterministic scheduling and atomic commands."""
 
     def __init__(
         self,

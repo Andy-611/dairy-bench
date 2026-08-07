@@ -81,8 +81,11 @@ def test_order_quantity_accepts_exact_four_decimal_precision(quantity: str) -> N
 
 
 @pytest.mark.parametrize("quantity", ("1E+24", "1E+999999"))
-def test_order_quantity_accepts_large_tick_aligned_decimals(quantity: str) -> None:
-    assert require_order_quantity(Decimal(quantity)) == Decimal(quantity)
+def test_order_quantity_rejects_values_without_canonical_four_place_form(
+    quantity: str,
+) -> None:
+    with pytest.raises(InvalidOrderQuantity):
+        require_order_quantity(Decimal(quantity))
 
 
 @pytest.mark.parametrize("quantity", ("8.9E-91", "59.999999999999999"))

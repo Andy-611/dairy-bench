@@ -477,6 +477,16 @@ function OrderFlowDetail({
                         {" · "}
                         {formatExactDecimal(match.makerOrder.remainingQuantity)}
                         {" available before fill"}
+                        {" · "}
+                        {formatExactDecimal(match.makerRemainingQuantity)}
+                        {" remaining"}
+                        {!isZeroDecimal(match.makerWithdrawnQuantity) && (
+                          <>
+                            {" · "}
+                            {formatExactDecimal(match.makerWithdrawnQuantity)}
+                            {" auto-withdrawn"}
+                          </>
+                        )}
                       </small>
                     </li>
                   ))}
@@ -494,6 +504,12 @@ function OrderFlowDetail({
                   label="Remaining"
                   value={formatExactDecimal(flow.remainingQuantity)}
                 />
+                {!isZeroDecimal(flow.withdrawnQuantity) && (
+                  <MarketMeta
+                    label="Auto-withdrawn"
+                    value={formatExactDecimal(flow.withdrawnQuantity)}
+                  />
+                )}
                 <MarketMeta label="Result" value={flowResult(flow)} />
               </dl>
             </MarketDrawerSection>
@@ -602,6 +618,9 @@ function flowResult(flow: MarketOrderFlowItemView): string {
   }
   if (isZeroDecimal(flow.matchedQuantity)) {
     return "Resting";
+  }
+  if (!isZeroDecimal(flow.withdrawnQuantity)) {
+    return `${formatExactDecimal(flow.withdrawnQuantity)} remainder withdrawn`;
   }
   return isZeroDecimal(flow.remainingQuantity)
     ? "Fully matched"

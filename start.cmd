@@ -139,7 +139,7 @@ exit /b 0
 
 :start_backend
 echo [Dairy Bench] Starting backend...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\launch_backend.ps1" -RepositoryRoot "%~dp0"
+start "Dairy Bench Backend" powershell.exe -NoExit -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\launch_backend.ps1"
 exit /b %errorlevel%
 
 :start_frontend

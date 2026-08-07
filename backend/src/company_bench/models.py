@@ -15,10 +15,16 @@ from pydantic import (
     model_validator,
 )
 
-from company_bench.precision import ECONOMIC_QUANTUM, EconomicDecimal, EconomicPrecision
+from company_bench.precision import (
+    ECONOMIC_NORMALIZER,
+    ECONOMIC_QUANTUM,
+    EconomicDecimal,
+    EconomicPrecision,
+    economic_field,
+)
 
-ZERO = Decimal("0")
-ONE = Decimal("1")
+ZERO = Decimal("0.0000")
+ONE = Decimal("1.0000")
 MAX_SEED = 2_147_483_647
 
 type CompanyId = Annotated[
@@ -29,20 +35,30 @@ type Identifier = Annotated[
     str,
     StringConstraints(min_length=1, max_length=128),
 ]
-type Quantity = Annotated[EconomicDecimal, Field(ge=ZERO)]
-type PositiveQuantity = Annotated[EconomicDecimal, Field(gt=ZERO)]
-type Money = Annotated[EconomicDecimal, Field(ge=ZERO)]
-type PositiveMoney = Annotated[EconomicDecimal, Field(gt=ZERO)]
-type Rate = Annotated[EconomicDecimal, Field(ge=ZERO)]
-type Persistence = Annotated[EconomicDecimal, Field(ge=ZERO, lt=ONE)]
-type OpenUnitInterval = Annotated[EconomicDecimal, Field(ge=ZERO, lt=ONE)]
+type Quantity = Annotated[Decimal, economic_field(ge=ZERO), ECONOMIC_NORMALIZER]
+type PositiveQuantity = Annotated[Decimal, economic_field(gt=ZERO), ECONOMIC_NORMALIZER]
+type Money = Annotated[Decimal, economic_field(ge=ZERO), ECONOMIC_NORMALIZER]
+type PositiveMoney = Annotated[Decimal, economic_field(gt=ZERO), ECONOMIC_NORMALIZER]
+type Rate = Annotated[Decimal, economic_field(ge=ZERO), ECONOMIC_NORMALIZER]
+type Persistence = Annotated[
+    Decimal,
+    economic_field(ge=ZERO, lt=ONE),
+    ECONOMIC_NORMALIZER,
+]
+type OpenUnitInterval = Annotated[
+    Decimal,
+    economic_field(ge=ZERO, lt=ONE),
+    ECONOMIC_NORMALIZER,
+]
 type UnitInterval = Annotated[
-    EconomicDecimal,
-    Field(ge=ZERO, le=Decimal("1")),
+    Decimal,
+    economic_field(ge=ZERO, le=ONE),
+    ECONOMIC_NORMALIZER,
 ]
 type BenchmarkScore = Annotated[
-    EconomicDecimal,
-    Field(ge=ZERO, le=Decimal("100")),
+    Decimal,
+    economic_field(ge=ZERO, le=Decimal("100")),
+    ECONOMIC_NORMALIZER,
 ]
 type ScoreVersion = Literal["s9-enterprise-v2"]
 
@@ -51,30 +67,22 @@ class InvalidOrderQuantity(ValueError):
     """An order quantity cannot be represented at the market's fixed precision."""
 
 
-def _validate_exact_quantity(value: Decimal, label: str) -> Decimal:
-    """Validate one exact positive economic quantity."""
-    if value <= ZERO:
-        raise ValueError(f"{label} quantity must be positive and finite")
-    return EconomicPrecision.require_exact(value)
-
-
-def _validate_order_quantity(value: Decimal) -> Decimal:
-    """Validate an exact market quantity."""
-    return _validate_exact_quantity(value, "order")
-
-
 def _validate_operation_quantity(value: Decimal) -> Decimal:
-    """Validate an exact production or transformation quantity."""
-    return _validate_exact_quantity(value, "operation")
+    """Validate one exact positive operation quantity."""
+    if value <= ZERO:
+        raise ValueError("operation quantity must be positive and finite")
+    return EconomicPrecision.normalize_exact(value)
 
 
 type OrderQuantity = Annotated[
-    EconomicDecimal,
-    Field(gt=ZERO),
+    Decimal,
+    economic_field(gt=ZERO),
+    ECONOMIC_NORMALIZER,
 ]
 type OperationQuantity = Annotated[
-    EconomicDecimal,
-    Field(gt=ZERO),
+    Decimal,
+    economic_field(gt=ZERO),
+    ECONOMIC_NORMALIZER,
 ]
 
 _ORDER_QUANTITY_ADAPTER = TypeAdapter(OrderQuantity)
@@ -219,9 +227,6 @@ class CostFunction(StrictModel):
         minimum_unit_cost = self.normal_unit_cost * (ONE - self.daily_volatility)
         if EconomicPrecision.round(minimum_unit_cost) <= ZERO:
             raise ValueError("minimum daily unit cost must survive cost precision")
-        minimum_batch_cost = minimum_unit_cost * ECONOMIC_QUANTUM
-        if EconomicPrecision.round(minimum_batch_cost) <= ZERO:
-            raise ValueError("minimum operation cost must survive cash precision")
         return self
 
     def daily_base_unit_cost(self, innovation: Decimal) -> PositiveMoney:
@@ -347,7 +352,7 @@ class DailyOperationState(StrictModel):
 
     def consume(self, quantity: Decimal) -> DailyOperationState:
         """Return the state after reserving capacity for one accepted batch."""
-        _validate_operation_quantity(quantity)
+        quantity = _validate_operation_quantity(quantity)
         if quantity > self.remaining_capacity:
             raise ValueError("consumed capacity exceeds the daily remainder")
         return self.model_copy(update={"used_capacity": self.used_capacity + quantity})
@@ -373,7 +378,7 @@ class DemandSpec(StrictModel):
 class ScoringSpec(StrictModel):
     """Immutable identity of the active benchmark scoring contract."""
 
-    score_version: ScoreVersion = "s9-enterprise-v1"
+    score_version: ScoreVersion = "s9-enterprise-v2"
 
 
 class RuntimeSpec(StrictModel):
@@ -698,6 +703,8 @@ class TradeExecutedEvent(DayEvent):
     quantity: PositiveQuantity
     unit_price: PositiveMoney
     total_value: PositiveMoney
+    maker_remaining_quantity: Quantity
+    taker_remaining_quantity: Quantity
 
 
 class DeliveryCompletedEvent(CompanyEvent):

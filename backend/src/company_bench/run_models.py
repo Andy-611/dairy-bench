@@ -154,9 +154,9 @@ class CompanyRuntimeCursor(StrictModel):
 
 
 class RunCheckpoint(StrictModel):
-    """Complete atomic state needed to resume one V3 episode."""
+    """Complete atomic state needed to resume one V4 episode."""
 
-    schema_version: Literal[6] = 6
+    schema_version: Literal[7] = 7
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -301,7 +301,7 @@ class TokenUsage(StrictModel):
 
 
 class PolicyInvocation(StrictModel):
-    """Auditable provider call for a daily decision or V3 atomic turn."""
+    """Auditable provider call for a daily decision or V4 atomic turn."""
 
     invocation_id: Identifier
     run_id: Identifier

@@ -26,13 +26,7 @@ export function formatExactDecimal(value: DecimalText): string {
 }
 
 export function formatMarketPrice(value: DecimalText): string {
-  const plainDecimal = /^([+-]?)(\d+)(?:\.(\d*))?$/.exec(value);
-  if (plainDecimal === null) {
-    return value;
-  }
-  const [, sign, integer, rawFraction = ""] = plainDecimal;
-  const fraction = rawFraction.replace(/0+$/, "").padEnd(2, "0");
-  return `${sign}${integer}.${fraction}`;
+  return value;
 }
 
 export function isZeroDecimal(value: string): boolean {
@@ -52,15 +46,10 @@ export function formatSignedExactDecimal(value: DecimalText): string {
   return `+${value}`;
 }
 
-export function formatSignedValue(value: number): string {
-  const sign = value > 0 ? "+" : "";
-  return `${sign}${formatValue(value)}`;
-}
-
 export function formatPercent(value: number): string {
   return percentFormatter.format(value);
 }
 
-export function formatGrowth(value: number): string {
-  return `${value.toFixed(3)}x`;
+export function formatGrowth(value: DecimalText): string {
+  return `${value}x`;
 }

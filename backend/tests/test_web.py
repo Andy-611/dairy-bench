@@ -145,7 +145,7 @@ def test_run_list_and_detail_http_flow() -> None:
             "final_score",
         }
         assert summaries[0]["run_id"] == result.run_id
-        assert summaries[0]["scenario_id"] == "flow.dairy.base.s9.v4"
+        assert summaries[0]["scenario_id"] == "flow.dairy.base.s9.v5"
         assert summaries[0]["final_score"] == str(result.score.final_score)
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
@@ -385,7 +385,7 @@ def test_default_repository_uses_configured_database(
     assert database.is_file()
 
 
-def test_default_app_runs_the_v3_scenario(monkeypatch: MonkeyPatch) -> None:
+def test_default_app_runs_the_v4_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)

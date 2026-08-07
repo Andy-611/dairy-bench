@@ -16,6 +16,7 @@ from company_bench.models import (
     ScoreCard,
     WorldState,
 )
+from company_bench.precision import EconomicPrecision
 
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
@@ -60,21 +61,25 @@ class Evaluator:
             (company.surplus for company in company_scores),
             start=ZERO,
         )
-        efficiency_reference = self._efficiency_reference(
+        efficiency_reference_raw = self._efficiency_reference(
             scenario,
             initial_state.seed,
             demand_curve,
         )
-        efficiency_score = (
-            self._unit_interval(efficiency_raw / efficiency_reference)
-            if efficiency_reference > ZERO
+        efficiency_score_raw = (
+            self._unit_interval(efficiency_raw / efficiency_reference_raw)
+            if efficiency_reference_raw > ZERO
             else ZERO
         )
-        farm_gini = self._tier_gini(company_scores, CompanyTier.FARM)
-        processor_gini = self._tier_gini(company_scores, CompanyTier.PROCESSOR)
-        retailer_gini = self._tier_gini(company_scores, CompanyTier.RETAILER)
-        mean_gini = (farm_gini + processor_gini + retailer_gini) / Decimal("3")
-        fairness_score = self._unit_interval(_ONE - mean_gini / _S9_TIER_GINI_MAX)
+        farm_gini_raw = self._tier_gini(company_scores, CompanyTier.FARM)
+        processor_gini_raw = self._tier_gini(company_scores, CompanyTier.PROCESSOR)
+        retailer_gini_raw = self._tier_gini(company_scores, CompanyTier.RETAILER)
+        mean_gini = (
+            farm_gini_raw + processor_gini_raw + retailer_gini_raw
+        ) / Decimal("3")
+        fairness_score_raw = self._unit_interval(
+            _ONE - mean_gini / _S9_TIER_GINI_MAX
+        )
         bankrupt_company_ids = {
             company.company_id
             for snapshot in snapshots
@@ -82,22 +87,26 @@ class Evaluator:
             if company.net_worth == ZERO
         }
         bankrupt_company_count = len(bankrupt_company_ids)
-        bankruptcy_rate = Decimal(bankrupt_company_count) / Decimal(len(company_scores))
-        survival_score = _ONE - bankruptcy_rate
-        final_score = _HUNDRED * efficiency_score * (fairness_score * survival_score).sqrt()
+        bankruptcy_rate_raw = Decimal(bankrupt_company_count) / Decimal(len(company_scores))
+        survival_score = _ONE - bankruptcy_rate_raw
+        final_score = EconomicPrecision.round(
+            _HUNDRED
+            * efficiency_score_raw
+            * (fairness_score_raw * survival_score).sqrt()
+        )
 
         return ScoreCard(
             score_version=scenario.scoring.score_version,
             final_score=final_score,
             efficiency_raw=efficiency_raw,
-            efficiency_reference=efficiency_reference,
-            efficiency_score=efficiency_score,
-            farm_gini=farm_gini,
-            processor_gini=processor_gini,
-            retailer_gini=retailer_gini,
-            fairness_score=fairness_score,
+            efficiency_reference=EconomicPrecision.round(efficiency_reference_raw),
+            efficiency_score=EconomicPrecision.round(efficiency_score_raw),
+            farm_gini=EconomicPrecision.round(farm_gini_raw),
+            processor_gini=EconomicPrecision.round(processor_gini_raw),
+            retailer_gini=EconomicPrecision.round(retailer_gini_raw),
+            fairness_score=EconomicPrecision.round(fairness_score_raw),
             bankrupt_company_count=bankrupt_company_count,
-            bankruptcy_rate=bankruptcy_rate,
+            bankruptcy_rate=EconomicPrecision.round(bankruptcy_rate_raw),
             companies=company_scores,
         )
 
@@ -124,7 +133,7 @@ class Evaluator:
             final_inventory_value=final_inventory,
             final_value=final_value,
             surplus=final_value - initial_value,
-            growth=final_value / initial_value,
+            growth=EconomicPrecision.round(final_value / initial_value),
         )
 
     @classmethod
@@ -134,7 +143,13 @@ class Evaluator:
         tier: CompanyTier,
     ) -> Decimal:
         """Calculate one tier's raw Gini from final capital growth."""
-        return cls._gini(tuple(company.growth for company in companies if company.tier is tier))
+        return cls._gini(
+            tuple(
+                company.final_value / company.initial_value
+                for company in companies
+                if company.tier is tier
+            )
+        )
 
     @staticmethod
     def _gini(values: tuple[Decimal, ...]) -> Decimal:
@@ -185,7 +200,9 @@ class Evaluator:
             if sale.sold_quantity > sale.demand_quantity:
                 raise ValueError("consumer sales cannot exceed demand")
             expected_revenue = (
-                sale.sold_quantity * sale.retail_price if sale.retail_price is not None else ZERO
+                EconomicPrecision.round(sale.sold_quantity * sale.retail_price)
+                if sale.retail_price is not None
+                else ZERO
             )
             if sale.revenue != expected_revenue:
                 raise ValueError("consumer sale revenue does not match price times quantity")
@@ -262,7 +279,7 @@ class Evaluator:
                     raise ValueError("company snapshot day does not match its parent snapshot")
                 if company.tier is not scenario.company(company.company_id).tier:
                     raise ValueError("company snapshot tier does not match the scenario")
-                expected_inventory_value = (
+                expected_inventory_value = EconomicPrecision.round(
                     company.raw_milk_quantity * raw_reference
                     + company.bottled_milk_quantity * bottled_reference
                 )

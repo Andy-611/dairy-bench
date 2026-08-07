@@ -46,10 +46,10 @@ function aggregateSnapshots(
     };
     byDay.set(snapshot.day, {
       day: snapshot.day,
-      efficiency: current.efficiency + snapshot.cumulativeSurplus,
-      inventoryValue: current.inventoryValue + snapshot.inventoryValue,
+      efficiency: current.efficiency + Number(snapshot.cumulativeSurplus),
+      inventoryValue: current.inventoryValue + Number(snapshot.inventoryValue),
       consumerSales:
-        current.consumerSales + snapshot.consumerSalesQuantity,
+        current.consumerSales + Number(snapshot.consumerSalesQuantity),
     });
   }
 

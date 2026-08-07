@@ -73,7 +73,7 @@ class TimelineNotFoundError(LookupError):
 
 
 class TimelineUnsupportedError(ValueError):
-    """Raised when a run predates V3 continuous-market semantics."""
+    """Raised when a run predates V4 continuous-market semantics."""
 
 
 class TimelineSource(Protocol):
@@ -86,7 +86,7 @@ class TimelineSource(Protocol):
         """Return one lifecycle record."""
 
     def get_checkpoint(self, run_id: str) -> RunCheckpoint | None:
-        """Return one in-progress V3 checkpoint."""
+        """Return one in-progress V4 checkpoint."""
 
     def list_turns(self, run_id: str) -> tuple[TurnRecord, ...]:
         """Return one immutable Turn journal."""
@@ -247,7 +247,7 @@ class RunTimelineProjector:
         if scenario is None:
             raise TimelineNotFoundError(f"run '{run_id}' has no readable scenario")
         if not scenario.uses_event_runtime:
-            raise TimelineUnsupportedError("The operations timeline is available for V3 runs only")
+            raise TimelineUnsupportedError("The operations timeline is available for V4 runs only")
 
         turns = self._source.list_turns(run_id)
         system_steps = tuple(

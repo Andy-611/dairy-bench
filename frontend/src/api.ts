@@ -346,22 +346,22 @@ function parseEpisode(
 
 function parseScore(score: JsonRecord): ScoreView {
   return {
-    finalScore: number(score.final_score, "score.final_score"),
-    efficiencyRaw: number(score.efficiency_raw, "score.efficiency_raw"),
-    efficiencyReference: number(
+    finalScore: decimalText(score.final_score, "score.final_score"),
+    efficiencyRaw: decimalText(score.efficiency_raw, "score.efficiency_raw"),
+    efficiencyReference: decimalText(
       score.efficiency_reference,
       "score.efficiency_reference",
     ),
-    efficiencyScore: number(score.efficiency_score, "score.efficiency_score"),
-    farmGini: number(score.farm_gini, "score.farm_gini"),
-    processorGini: number(score.processor_gini, "score.processor_gini"),
-    retailerGini: number(score.retailer_gini, "score.retailer_gini"),
-    fairnessScore: number(score.fairness_score, "score.fairness_score"),
+    efficiencyScore: decimalText(score.efficiency_score, "score.efficiency_score"),
+    farmGini: decimalText(score.farm_gini, "score.farm_gini"),
+    processorGini: decimalText(score.processor_gini, "score.processor_gini"),
+    retailerGini: decimalText(score.retailer_gini, "score.retailer_gini"),
+    fairnessScore: decimalText(score.fairness_score, "score.fairness_score"),
     bankruptCompanyCount: number(
       score.bankrupt_company_count,
       "score.bankrupt_company_count",
     ),
-    bankruptcyRate: number(score.bankruptcy_rate, "score.bankruptcy_rate"),
+    bankruptcyRate: decimalText(score.bankruptcy_rate, "score.bankruptcy_rate"),
   };
 }
 
@@ -463,14 +463,14 @@ function parseCompany(
     ),
     role: role(companyScore.tier, `${path}.tier`),
     policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "Unknown policy",
-    initialCash: number(companyScore.initial_value, `${path}.initial_value`),
-    finalCash: number(companyScore.final_cash, `${path}.final_cash`),
-    inventoryValue: number(
+    initialCash: decimalText(companyScore.initial_value, `${path}.initial_value`),
+    finalCash: decimalText(companyScore.final_cash, `${path}.final_cash`),
+    inventoryValue: decimalText(
       companyScore.final_inventory_value,
       `${path}.final_inventory_value`,
     ),
-    surplus: number(companyScore.surplus, `${path}.surplus`),
-    growth: number(companyScore.growth, `${path}.growth`),
+    surplus: decimalText(companyScore.surplus, `${path}.surplus`),
+    growth: decimalText(companyScore.growth, `${path}.growth`),
   };
 }
 
@@ -486,17 +486,17 @@ function parseSnapshots(payload: unknown): readonly DailySnapshotView[] {
         return {
           day: number(snapshot.day, "snapshot.day"),
           companyId: text(snapshot.company_id, "snapshot.company_id"),
-          cash: number(snapshot.cash, "snapshot.cash"),
-          inventoryValue: number(
+          cash: decimalText(snapshot.cash, "snapshot.cash"),
+          inventoryValue: decimalText(
             snapshot.inventory_value,
             "snapshot.inventory_value",
           ),
-          cumulativeSurplus: number(snapshot.surplus, "snapshot.surplus"),
-          consumerSalesQuantity: number(
+          cumulativeSurplus: decimalText(snapshot.surplus, "snapshot.surplus"),
+          consumerSalesQuantity: decimalText(
             snapshot.daily_consumer_sales,
             "snapshot.daily_consumer_sales",
           ),
-          expiredQuantity: number(
+          expiredQuantity: decimalText(
             snapshot.daily_expired_quantity,
             "snapshot.daily_expired_quantity",
           ),
@@ -706,6 +706,10 @@ function parseMarketOrderFlow(
       flow.remaining_quantity,
       `${path}.remaining_quantity`,
     ),
+    withdrawnQuantity: decimalText(
+      flow.withdrawn_quantity,
+      `${path}.withdrawn_quantity`,
+    ),
   };
   return action === "place"
     ? { action, ...applied }
@@ -726,6 +730,14 @@ function parseMarketMatch(
     makerOrder: parseOpenOrder(match.maker_order, `${path}.maker_order`),
     quantity: decimalText(match.quantity, `${path}.quantity`),
     unitPrice: decimalText(match.unit_price, `${path}.unit_price`),
+    makerRemainingQuantity: decimalText(
+      match.maker_remaining_quantity,
+      `${path}.maker_remaining_quantity`,
+    ),
+    makerWithdrawnQuantity: decimalText(
+      match.maker_withdrawn_quantity,
+      `${path}.maker_withdrawn_quantity`,
+    ),
   };
 }
 

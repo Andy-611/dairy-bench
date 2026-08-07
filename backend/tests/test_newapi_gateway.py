@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
+from typing import get_args
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from pydantic import SecretStr
 import company_bench.newapi_gateway as gateway_module
 from company_bench.agent_models import (
     CommandModelRequest,
+    CommandName,
     ModelInfrastructureError,
     ModelOutputError,
     ModelRequest,
@@ -171,9 +173,7 @@ def _error_response(
 def _assert_strict_schema(node: object) -> None:
     """Assert recursive normalization required by NewAPI strict tools."""
     if isinstance(node, dict):
-        assert "pattern" not in node
-        assert "default" not in node
-        assert "discriminator" not in node
+        assert gateway_module._UNSUPPORTED_STRICT_SCHEMA_KEYWORDS.isdisjoint(node)
         assert "oneOf" not in node
         properties = node.get("properties")
         if isinstance(properties, dict):
@@ -192,6 +192,7 @@ def test_config_loads_allowed_models_and_fingerprint_hides_secret(
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
+    monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MAX_ATTEMPTS", raising=False)
     assert NewApiClaudeConfig.from_environment() is None
 
     monkeypatch.setenv("NEWAPI_API_KEY", "first-secret")
@@ -204,6 +205,7 @@ def test_config_loads_allowed_models_and_fingerprint_hides_secret(
     assert loaded.base_url == DEFAULT_NEWAPI_BASE_URL
     assert loaded.model == "claude-a"
     assert loaded.available_models == ("claude-a", "claude-b", "claude-legacy")
+    assert loaded.max_attempts == 10
     assert loaded.select_model("claude-b").model == "claude-b"
     with pytest.raises(ValueError, match="not configured"):
         loaded.select_model("claude-missing")
@@ -293,6 +295,26 @@ def test_newapi_gateway_sends_native_tools_and_parses_command() -> None:
     for tool in payload["tools"]:
         assert tool["strict"] is True
         _assert_strict_schema(tool["input_schema"])
+    ladder = next(tool for tool in payload["tools"] if tool["name"] == "set_quote_ladder")
+    parameters = ladder["input_schema"]
+    for definition in ("OrderQuantity", "PositiveMoney"):
+        economic_schema = parameters["$defs"][definition]
+        assert economic_schema["type"] == "number"
+        assert gateway_module._UNSUPPORTED_STRICT_SCHEMA_KEYWORDS.isdisjoint(
+            economic_schema
+        )
+        assert "anyOf" not in economic_schema
+
+
+@pytest.mark.parametrize("command_name", get_args(CommandName))
+def test_newapi_command_schemas_match_anthropic_strict_subset(
+    command_name: CommandName,
+) -> None:
+    """Keep every role's command schema acceptable to strict tool use."""
+    tool = gateway_module._command_tool(command_name)
+
+    assert tool["strict"] is True
+    _assert_strict_schema(tool["input_schema"])
 
 
 def test_newapi_gateway_generates_typed_daily_decision() -> None:
@@ -346,9 +368,17 @@ def test_newapi_gateway_generates_typed_daily_decision() -> None:
             )
         ],
         [_tool_use("produce", {"product": "raw_milk", "quantity": "-1"})],
+        [_tool_use("produce", {"product": "raw_milk", "quantity": "1.00001"})],
         [_tool_use("produce", {"kind": "produce", "product": "raw_milk", "quantity": "1"})],
     ],
-    ids=("missing", "multiple", "unauthorized", "invalid", "model-supplied-kind"),
+    ids=(
+        "missing",
+        "multiple",
+        "unauthorized",
+        "invalid",
+        "overprecision",
+        "model-supplied-kind",
+    ),
 )
 def test_newapi_gateway_rejects_invalid_command_output(
     content: list[dict[str, object]],
@@ -382,6 +412,26 @@ def test_newapi_gateway_does_not_retry_authentication_failure() -> None:
     with pytest.raises(ModelInfrastructureError, match="AuthenticationError"):
         asyncio.run(_with_gateway(handler, operation, max_attempts=3))
     assert calls == 1
+
+
+@pytest.mark.parametrize("status_code", [400, 401])
+def test_newapi_gateway_retries_proxy_upstream_failure(status_code: int) -> None:
+    observation = _observation()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _error_response(request, status_code, "bad_response_status_code")
+        return _message_response(request, [_tool_use("wait", {"until": None, "alerts": []})])
+
+    async def operation(gateway: NewApiClaudeGateway) -> object:
+        return await gateway.generate_command(_command_request(observation))
+
+    result = asyncio.run(_with_gateway(handler, operation, max_attempts=2))
+    assert result.attempts == 2
+    assert calls == 2
 
 
 def test_newapi_gateway_redacts_key_echoed_by_provider() -> None:

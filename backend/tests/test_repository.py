@@ -46,7 +46,7 @@ from company_bench.scheduler import SchedulerCheckpoint
 
 
 def run_episode(seed: int = 42) -> EpisodeResult:
-    """Create one real V3 episode through the public runtime interface."""
+    """Create one real V4 episode through the public runtime interface."""
     agents = {
         company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_SCENARIO.companies
     }
@@ -66,7 +66,7 @@ def test_memory_repository_round_trip_and_summary() -> None:
 
     repository.save(result)
 
-    assert result.score.efficiency_reference == Decimal("8316.09375")
+    assert result.score.efficiency_reference == Decimal("8316.0938")
     assert repository.get(result.run_id) == result
     assert repository.get("missing") is None
     assert repository.list()[0].run_id == result.run_id
@@ -213,10 +213,10 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
         assert connection.execute(
             "SELECT schema_version FROM run_turns"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 5
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
             "scenario_id",
@@ -240,8 +240,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 9])
-def test_sqlite_repository_rejects_non_v8_databases(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 10])
+def test_sqlite_repository_rejects_non_v9_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -270,7 +270,7 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
-    assert checkpoint.schema_version == 6
+    assert checkpoint.schema_version == 7
 
     with SQLiteRunRepository(database) as repository:
         _assert_turn_contract(repository, first, second)
@@ -283,6 +283,24 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
         reopened.clear_checkpoint(first.run_id)
         reopened.clear_checkpoint(first.run_id)
         assert reopened.get_checkpoint(first.run_id) is None
+
+
+def test_sqlite_repository_rejects_stale_journal_payload_schema(
+    tmp_path: Path,
+    first_observation: CompanyObservation,
+) -> None:
+    database = tmp_path / "stale-journal.sqlite3"
+    record = _turn_for("stale_journal", first_observation)
+    with SQLiteRunRepository(database) as repository:
+        repository.record_turn(record)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE run_turns SET schema_version = 4")
+
+    with (
+        SQLiteRunRepository(database) as repository,
+        pytest.raises(RuntimeError, match="journal payload schema version: 4"),
+    ):
+        repository.list_turns(record.run_id)
 
 
 def test_sqlite_repository_progress_is_atomic_and_checkpoint_aligned(

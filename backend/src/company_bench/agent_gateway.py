@@ -37,6 +37,7 @@ from company_bench.agent_models import (
 )
 from company_bench.diagnostics import bounded_error
 from company_bench.models import NoOpDecision, StrictModel
+from company_bench.precision import require_numeric_economic_schema
 from company_bench.run_models import TokenUsage
 from company_bench.runtime_models import CompanyCommand
 
@@ -266,7 +267,7 @@ class ScriptedModelGateway(ModelGateway):
         return CommandModelResult(
             command=command,
             provider=self.provider,
-            model="scripted-v3",
+            model="scripted-v4",
         )
 
     async def close(self) -> None:
@@ -294,6 +295,7 @@ def _command_tools(names: tuple[CommandName, ...]) -> list[dict[str, object]]:
     for name in names:
         model = command_model(name)
         schema = model.model_json_schema()
+        require_numeric_economic_schema(schema)
         properties = schema.get("properties", {})
         if isinstance(properties, dict):
             properties.pop("kind", None)

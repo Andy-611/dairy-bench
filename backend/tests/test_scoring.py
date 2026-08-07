@@ -183,7 +183,7 @@ def test_evaluator_combines_continuous_efficiency_fairness_and_survival() -> Non
 
     score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
 
-    assert score.score_version == "s9-enterprise-v1"
+    assert score.score_version == "s9-enterprise-v2"
     assert score.efficiency_raw == expected_reference / Decimal("2")
     assert score.efficiency_reference == expected_reference
     assert score.efficiency_score == Decimal("0.5")
@@ -208,11 +208,11 @@ def test_three_company_tier_gini_uses_two_thirds_maximum() -> None:
     score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
 
     assert score.efficiency_raw == ZERO
-    assert score.farm_gini == Decimal("2") / Decimal("3")
+    assert score.farm_gini == Decimal("0.6667")
     assert score.processor_gini == score.retailer_gini == ZERO
-    assert score.fairness_score == Decimal("2") / Decimal("3")
+    assert score.fairness_score == Decimal("0.6667")
     assert score.bankrupt_company_count == 2
-    assert score.bankruptcy_rate == Decimal("2") / Decimal("9")
+    assert score.bankruptcy_rate == Decimal("0.2222")
     assert score.final_score == ZERO
 
 
@@ -240,9 +240,9 @@ def test_bankruptcy_counts_any_zero_net_worth_day_even_after_recovery() -> None:
     assert score.efficiency_score == Decimal("0.5")
     assert score.fairness_score == Decimal("1")
     assert score.bankrupt_company_count == 1
-    assert score.bankruptcy_rate == Decimal("1") / Decimal("9")
+    assert score.bankruptcy_rate == Decimal("0.1111")
     expected = Decimal("50") * (Decimal("8") / Decimal("9")).sqrt()
-    assert score.final_score == expected
+    assert score.final_score == expected.quantize(Decimal("0.0001"))
 
 
 def test_evaluator_rejects_an_incomplete_company_snapshot() -> None:

@@ -1,4 +1,8 @@
-import { formatSignedValue, formatValue } from "../format";
+import {
+  formatExactDecimal,
+  formatSignedExactDecimal,
+  formatValue,
+} from "../format";
 import type { ScoreView } from "../types";
 
 interface EvaluationStandardProps {
@@ -59,12 +63,12 @@ export function EvaluationStandard({ score }: EvaluationStandardProps) {
       metrics: [
         {
           label: "E_raw",
-          value: formatSignedValue(score.efficiencyRaw),
+          value: formatSignedExactDecimal(score.efficiencyRaw),
           detail: "Realized surplus",
         },
         {
           label: "E_ref",
-          value: formatValue(score.efficiencyReference),
+          value: formatExactDecimal(score.efficiencyReference),
           detail: "Seed-specific reference",
         },
       ],
@@ -75,19 +79,19 @@ export function EvaluationStandard({ score }: EvaluationStandardProps) {
       metrics: [
         {
           label: "G_farm",
-          value: score.farmGini.toFixed(4),
+          value: formatExactDecimal(score.farmGini),
           detail: "Farm",
           tone: "farm",
         },
         {
           label: "G_processor",
-          value: score.processorGini.toFixed(4),
+          value: formatExactDecimal(score.processorGini),
           detail: "Processor",
           tone: "processor",
         },
         {
           label: "G_retailer",
-          value: score.retailerGini.toFixed(4),
+          value: formatExactDecimal(score.retailerGini),
           detail: "Retailer",
           tone: "retailer",
         },
@@ -124,7 +128,7 @@ export function EvaluationStandard({ score }: EvaluationStandardProps) {
         <article className="final-score-card">
           <span>FINAL SCORE</span>
           <div className="final-score-value">
-            <strong>{formatValue(score.finalScore)}</strong>
+            <strong>{formatExactDecimal(score.finalScore)}</strong>
             <small>/ 100</small>
           </div>
           <p>The benchmark's primary model-ranking measure</p>

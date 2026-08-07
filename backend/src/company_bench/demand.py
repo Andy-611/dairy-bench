@@ -10,6 +10,7 @@ from company_bench.models import (
     Quantity,
     StrictModel,
 )
+from company_bench.precision import EconomicPrecision
 
 __all__ = ("ConsumerDemandCurve",)
 
@@ -31,9 +32,9 @@ class ConsumerDemandCurve(StrictModel):
         if price is None:
             return potential
         adjustment = self.spec.price_sensitivity * (price - self.spec.reference_price)
-        return max(ZERO, potential - adjustment)
+        return EconomicPrecision.floor_quantity(max(ZERO, potential - adjustment))
 
-    def max_net_value(self, potential: Quantity, unit_cost: PositiveMoney) -> Money:
+    def max_net_value(self, potential: Quantity, unit_cost: PositiveMoney) -> Decimal:
         """Return the continuous maximum consumer inflow net of product cost."""
         demand_at_cost = potential + self.spec.price_sensitivity * (
             self.spec.reference_price - unit_cost

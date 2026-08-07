@@ -4,7 +4,7 @@ Dairy Bench is an event-driven multi-agent benchmark for a perishable dairy
 supply chain. Three farms, three processors, and three retailers share two spot
 markets; each of the nine companies is controlled by an independent agent.
 
-The default scenario is `flow.dairy.base.s9.v4`. An episode lasts 30 simulated
+The default scenario is `flow.dairy.base.s9.v5`. An episode lasts 30 simulated
 days, and every decision is one strongly typed atomic command:
 
 ```text
@@ -14,7 +14,7 @@ Wake -> AgentTurn -> one CompanyCommand -> EconomyEngine -> Journal -> next Wake
 Only the deterministic economy engine may mutate cash, inventory, orders, jobs,
 deliveries, or trade results. Natural-language text never settles a transaction.
 
-## V3 at a glance
+## V4 at a glance
 
 - Continuous fully collateralized limit-order books for raw and bottled milk.
   Crossing orders trade immediately with price-time priority, the maker's price,
@@ -23,8 +23,10 @@ deliveries, or trade results. Natural-language text never settles a transaction.
 - Bids reserve their full limit-price cash commitment; asks reserve exact FEFO
   inventory lots. A ladder update either reconciles every level atomically or
   leaves the original orders and collateral unchanged.
-- Order quantities use a fixed `0.0001` market tick. Non-positive, dust, or
-  over-precision quote levels are rejected without rounding.
+- Every economic Decimal uses one `0.0001` quantum. Agent quantities and prices
+  with excess precision are rejected without rounding. Derived cash values use
+  half-even rounding; derived physical quantities round down, and zero-value
+  orders, fills, or operation costs are rejected atomically.
 - Same-minute agent calls run concurrently, then commands commit in a persisted
   `SHA256(seed | minute | company)` order. Provider response latency is audited
   but cannot change the economic result.
@@ -49,7 +51,7 @@ The daily clock is:
 | 19:00-19:29 | Process only previously committed completions and deliveries |
 | 19:30 | Expire inventory and commit the end-of-day snapshot |
 
-See [V3 architecture and invariants](docs/V3_ARCHITECTURE.md) and
+See [V4 architecture and invariants](docs/V4_ARCHITECTURE.md) and
 [Agent integration](docs/AGENT_INTEGRATION.md) for the full contract.
 
 ## System outline
@@ -158,7 +160,7 @@ economic mutation.
 
 ## Data and verification
 
-The default score-v8 database is `backend/data/dairy_bench_v8.sqlite3`. Override it with
+The default score-v9 database is `backend/data/dairy_bench_v9.sqlite3`. Override it with
 `DAIRY_BENCH_DB`; override artifacts with `DAIRY_BENCH_ARTIFACTS_DIR`.
 
 ```powershell
@@ -186,8 +188,8 @@ npm.cmd run build
 
 ## Design documentation
 
-- [V3 architecture and invariants](docs/V3_ARCHITECTURE.md)
-- [V3 Agent integration](docs/AGENT_INTEGRATION.md)
+- [V4 architecture and invariants](docs/V4_ARCHITECTURE.md)
+- [V4 Agent integration](docs/AGENT_INTEGRATION.md)
 - [Historical V2 architecture](docs/V2_ARCHITECTURE.md)
 - [Historical V1 MVP framework](docs/MVP_FRAMEWORK.md)
 - [Historical V1 scenario catalog](docs/SCENARIO_CATALOG_V1.md)

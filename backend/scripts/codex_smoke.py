@@ -1,4 +1,4 @@
-"""Run one real Codex V3 company command without starting the web application."""
+"""Run one real Codex V4 company command without starting the web application."""
 
 import asyncio
 

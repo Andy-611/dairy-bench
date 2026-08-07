@@ -29,16 +29,16 @@ export type JsonValue =
   | { readonly [key: string]: JsonValue };
 
 export interface ScoreView {
-  readonly finalScore: number;
-  readonly efficiencyRaw: number;
-  readonly efficiencyReference: number;
-  readonly efficiencyScore: number;
-  readonly farmGini: number;
-  readonly processorGini: number;
-  readonly retailerGini: number;
-  readonly fairnessScore: number;
+  readonly finalScore: DecimalText;
+  readonly efficiencyRaw: DecimalText;
+  readonly efficiencyReference: DecimalText;
+  readonly efficiencyScore: DecimalText;
+  readonly farmGini: DecimalText;
+  readonly processorGini: DecimalText;
+  readonly retailerGini: DecimalText;
+  readonly fairnessScore: DecimalText;
   readonly bankruptCompanyCount: number;
-  readonly bankruptcyRate: number;
+  readonly bankruptcyRate: DecimalText;
 }
 
 export interface TokenUsageView {
@@ -62,21 +62,21 @@ export interface CompanyResultView {
   readonly companyName: string;
   readonly role: CompanyRole;
   readonly policyName: string;
-  readonly initialCash: number;
-  readonly finalCash: number;
-  readonly inventoryValue: number;
-  readonly surplus: number;
-  readonly growth: number;
+  readonly initialCash: DecimalText;
+  readonly finalCash: DecimalText;
+  readonly inventoryValue: DecimalText;
+  readonly surplus: DecimalText;
+  readonly growth: DecimalText;
 }
 
 export interface DailySnapshotView {
   readonly day: number;
   readonly companyId: string;
-  readonly cash: number;
-  readonly inventoryValue: number;
-  readonly cumulativeSurplus: number;
-  readonly consumerSalesQuantity: number;
-  readonly expiredQuantity: number;
+  readonly cash: DecimalText;
+  readonly inventoryValue: DecimalText;
+  readonly cumulativeSurplus: DecimalText;
+  readonly consumerSalesQuantity: DecimalText;
+  readonly expiredQuantity: DecimalText;
 }
 
 export interface EpisodeView {
@@ -372,6 +372,8 @@ export interface MarketMatchLegView {
   readonly makerOrder: OpenOrderView;
   readonly quantity: DecimalText;
   readonly unitPrice: DecimalText;
+  readonly makerRemainingQuantity: DecimalText;
+  readonly makerWithdrawnQuantity: DecimalText;
 }
 
 interface AppliedMarketOrderView {
@@ -380,6 +382,7 @@ interface AppliedMarketOrderView {
   readonly matches: readonly MarketMatchLegView[];
   readonly matchedQuantity: DecimalText;
   readonly remainingQuantity: DecimalText;
+  readonly withdrawnQuantity: DecimalText;
 }
 
 export interface MarketOrderPlacedView extends AppliedMarketOrderView {

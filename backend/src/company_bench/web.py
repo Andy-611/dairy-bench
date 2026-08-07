@@ -50,7 +50,7 @@ from company_bench.timeline import (
 )
 from company_bench.timeline_models import TimelineDay, TimelineDetail
 
-DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench_v8.sqlite3"
+DEFAULT_DATABASE = Path(__file__).resolve().parents[2] / "data" / "dairy_bench_v9.sqlite3"
 
 
 class RunRequest(BaseModel):
@@ -149,7 +149,7 @@ def create_app(
 
     app = FastAPI(
         title="Dairy Bench API",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.add_middleware(

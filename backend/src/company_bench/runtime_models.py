@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Final, Literal, Self
 
@@ -24,6 +23,7 @@ from company_bench.models import (
     Quantity,
     StrictModel,
 )
+from company_bench.precision import EconomicDecimal
 
 __all__ = [
     "PROTOCOL_ERROR_PREFIX",
@@ -523,7 +523,7 @@ class AgentTurn(StrictModel):
     observation: CompanyObservation
     available_cash: Money
     reserved_cash: Money = ZERO
-    marked_surplus: Decimal = Field(allow_inf_nan=False)
+    marked_surplus: EconomicDecimal
     inventory_expiry: tuple[InventoryExpiryBucket, ...] = ()
     open_orders: tuple[OpenOrderView, ...] = ()
     order_books: tuple[OrderBookView, ...] = ()

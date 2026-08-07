@@ -41,7 +41,7 @@ from company_bench.runtime_models import (
 
 @pytest.fixture
 def engine() -> EconomyEngine:
-    """Return one stateless V3 economy engine."""
+    """Return one stateless V4 economy engine."""
     return EconomyEngine()
 
 
@@ -290,8 +290,8 @@ def test_current_scenario_has_nine_typed_companies_and_balanced_nominal_capacity
     )
     reference_demand = scenario.demand.base_demand * operation_kinds.count("retailer")
 
-    assert scenario.scenario_id == "flow.dairy.base.s9.v4"
-    assert scenario.version == 4
+    assert scenario.scenario_id == "flow.dairy.base.s9.v5"
+    assert scenario.version == 5
     assert scenario.days == 30
     assert tuple(company.company_id for company in scenario.companies) == expected_ids
     assert tuple(company.initial_cash for company in scenario.companies) == (Decimal("1000"),) * 9
@@ -526,6 +526,55 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     assert unchanged == economy
 
 
+def test_transformation_floors_output_and_rejects_zero_cost_atomically(
+    engine: EconomyEngine,
+) -> None:
+    too_small = _open_with_inventory(
+        engine,
+        "processor_a",
+        ProductId.RAW_MILK,
+        Decimal("0.0001"),
+    )
+
+    unchanged, rejected = _apply(
+        engine,
+        too_small,
+        "processor_a",
+        _transform("0.0001"),
+        _at(9),
+        1,
+    )
+
+    assert not rejected.accepted and "cost rounds to zero" in rejected.reason
+    assert unchanged == too_small
+
+    economy = _open_with_inventory(
+        engine,
+        "processor_a",
+        ProductId.RAW_MILK,
+        Decimal("0.0002"),
+    )
+    economy, started = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _transform("0.0002"),
+        _at(9),
+        1,
+    )
+
+    assert started.accepted and started.job_id is not None
+    assert economy.jobs[0].output_quantity == Decimal("0.0001")
+    economy = engine.complete_operation(
+        economy,
+        started.job_id,
+        started.scheduled_completions[0].at,
+    )
+    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == Decimal(
+        "0.0001"
+    )
+
+
 @pytest.mark.parametrize(
     ("company_id", "command", "with_input_inventory"),
     [
@@ -741,41 +790,16 @@ def test_unquantized_quote_level_is_rejected_at_the_schema_boundary(
 
 
 @pytest.mark.parametrize("quantity", ("1E+24", "1E+999999"))
-def test_large_tick_aligned_order_is_rejected_without_decimal_failure(
-    engine: EconomyEngine,
-    economy: EconomyState,
+def test_large_tick_aligned_order_is_safely_rejected_at_schema_boundary(
     quantity: str,
 ) -> None:
-    unchanged, outcome = _apply(
-        engine,
-        economy,
-        "processor_a",
-        _order(MarketSide.BUY, ProductId.RAW_MILK, quantity, "1"),
-        _at(9),
-        1,
-    )
-
-    assert not outcome.accepted
-    assert "cash" in outcome.reason
-    assert unchanged == economy
+    with pytest.raises(ValidationError, match="cannot be represented"):
+        _order(MarketSide.BUY, ProductId.RAW_MILK, quantity, "1")
 
 
-def test_out_of_range_order_quantity_is_rejected_without_decimal_failure(
-    engine: EconomyEngine,
-    economy: EconomyState,
-) -> None:
-    unchanged, outcome = _apply(
-        engine,
-        economy,
-        "processor_a",
-        _order(MarketSide.BUY, ProductId.RAW_MILK, "1E+1000000", "1"),
-        _at(9),
-        1,
-    )
-
-    assert not outcome.accepted
-    assert "supported range" in outcome.reason
-    assert unchanged == economy
+def test_out_of_range_order_quantity_is_safely_rejected() -> None:
+    with pytest.raises(ValidationError, match="cannot be represented"):
+        _order(MarketSide.BUY, ProductId.RAW_MILK, "1E+1000000", "1")
 
 
 @pytest.mark.parametrize("quantity", ("8.9E-91", "59.999999999999999"))
@@ -1125,6 +1149,46 @@ def test_consumer_sales_run_after_market_close_and_day_closes_at_nineteen_thirty
     assert retailer_snapshot.surplus == Decimal("35.00")
 
 
+def test_consumer_sale_that_rounds_to_zero_is_not_executed(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_inventory(
+        engine,
+        "retailer_a",
+        ProductId.BOTTLED_MILK,
+        Decimal("0.0001"),
+    )
+    starting_cash = _company(economy, "retailer_a").cash
+    economy, outcome = _apply(
+        engine,
+        economy,
+        "retailer_a",
+        SetRetailPrice(
+            product=ProductId.BOTTLED_MILK,
+            unit_price=Decimal("0.0001"),
+        ),
+        _at(9),
+        1,
+    )
+    assert outcome.accepted
+
+    economy = engine.close_markets(economy, _at(19))
+    economy = engine.settle_consumer_sales(economy, _at(19))
+    sale = next(
+        event
+        for event in economy.events
+        if isinstance(event, ConsumerSaleEvent) and event.company_id == "retailer_a"
+    )
+
+    assert sale.demand_quantity > 0
+    assert sale.sold_quantity == Decimal("0.0000")
+    assert sale.revenue == Decimal("0.0000")
+    assert _company(economy, "retailer_a").cash == starting_cash
+    assert _quantity(economy, "retailer_a", ProductId.BOTTLED_MILK) == Decimal(
+        "0.0001"
+    )
+
+
 def test_marked_surplus_recognizes_expiry_only_at_day_close(
     engine: EconomyEngine,
 ) -> None:
@@ -1240,6 +1304,7 @@ def test_lot_sequence_is_persisted_across_business_days(engine: EconomyEngine) -
     assert day_two.next_lot_sequence == first_sequence
     assert day_one_operation.used_capacity == Decimal("1")
     assert day_two_operation.used_capacity == 0
+    assert str(day_two_operation.used_capacity) == "0.0000"
     assert day_two_operation.availability != reset_farm.availability
 
     day_two = _produce_ready(
@@ -1261,7 +1326,7 @@ def test_observation_hides_seed_and_exposes_public_rules(engine: EconomyEngine) 
     visible = observation.model_dump()
 
     assert "seed" not in visible
-    assert observation.observation_id == "flow.dairy.base.s9.v4|1|farm_a"
+    assert observation.observation_id == "flow.dairy.base.s9.v5|1|farm_a"
     assert observation.products == DAIRY_S9_SCENARIO.products
     assert observation.demand == DAIRY_S9_SCENARIO.demand
     assert observation.scoring == DAIRY_S9_SCENARIO.scoring

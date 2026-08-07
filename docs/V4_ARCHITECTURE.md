@@ -1,19 +1,19 @@
-# V3 Architecture and Invariants
+# V4 Architecture and Invariants
 
 ## Purpose
 
-V3 models nine independent companies operating a continuous dairy spot
+V4 models nine independent companies operating a continuous dairy spot
 market. It adds credible intraday price discovery and physical lead times while
 keeping the benchmark deterministic, auditable, and small enough to reason
 about.
 
-The active scenario is `flow.dairy.base.s9.v3`:
+The active scenario is `flow.dairy.base.s9.v5`:
 
 - three farms produce raw milk;
 - three processors buy raw milk, transform it, and sell bottled milk; and
 - three retailers buy bottled milk, set retail prices, and serve consumers.
 
-V2 remains documented as historical behavior. V3 carries no legacy
+V2 remains documented as historical behavior. V4 carries no legacy
 compatibility adapter.
 
 ## Module boundaries
@@ -85,11 +85,13 @@ plain DAY limit orders exist.
 ### Reservation
 
 - One `set_quote_ladder` command defines zero to three distinct target prices for
-  one product and side. Every level crosses the engine boundary only as a
-  positive `OrderQuantity`, an exact multiple of `0.0001`. Invalid raw commands
-  are rejected before a market session exists; they are never rounded.
-- A bid removes `remaining_quantity * limit_price` from available cash and
-  stores it on `BuyOrder`.
+  one product and side. Every level crosses the engine boundary only with a
+  positive `OrderQuantity` and `PositiveMoney` price, both exact multiples of
+  `0.0001`. Invalid raw commands are rejected before a market session exists;
+  they are never rounded.
+- A bid removes the four-place, half-even rounded
+  `remaining_quantity * limit_price` from available cash and stores it on
+  `BuyOrder`.
 - An ask removes exact FEFO lots from available inventory and stores them on
   `SellOrder`.
 - Production output, inbound deliveries, and lots already held by another ask
@@ -111,11 +113,15 @@ An incoming order repeatedly matches while `best_bid >= best_ask`:
 2. equal price uses the persisted `priority_sequence`;
 3. the execution price is the resting maker order's limit;
 4. execution quantity is the smaller remaining quantity; and
-5. any remainder stays on the book with its existing priority.
+5. any fully backed nonzero remainder stays on the book with its existing
+   priority; a rounding-dust or no-longer-fully-backed remainder is withdrawn.
 
 Partial fill describes quantity interaction, not under-collateralization: every
 remaining unit is still fully backed. When a bid executes below its limit, the
-unused price difference returns to available cash immediately.
+unused price difference returns to available cash immediately. With one shared
+four-place quantum, independently rounded fill and remainder amounts can differ
+by one quantum; in that boundary case the fill stands and only the remainder is
+released.
 
 The ladder is a target state. Bid targets must arrive from highest to lowest and
 Ask targets from lowest to highest; invalid ordering is rejected. Reconciliation
@@ -273,6 +279,10 @@ with `D` bankrupt companies, `B = D / 9`. The final score is:
 Score = 100 * E * sqrt(F * (1 - B))
 ```
 
+Under `s9-enterprise-v2`, these formulas retain full intermediate precision;
+each published `CompanyScore` and `ScoreCard` Decimal is normalized to four
+places only at its public boundary.
+
 Economic outcomes do not create eligibility gates. An incomplete,
 protocol-invalid, technically failed, or replay-divergent episode produces no
 score.
@@ -299,10 +309,14 @@ score.
     authority.
 14. Attention reads only the anonymous Agent market projection; observer UI
     order-book data can never wake an Agent or change economic state.
+15. Every economic Decimal crossing a domain boundary is a canonical multiple
+    of `0.0001`. External over-precision is rejected; derived cash uses
+    half-even rounding, derived physical quantity rounds down, and zero-value
+    settlements are atomically rejected.
 
 ## Deliberate non-goals
 
-V3 does not model credit, short selling, forward contracts, bilateral
+V4 does not model credit, short selling, forward contracts, bilateral
 negotiation, natural-language settlement, shipping choices, transport risk,
 consumer agents, or complex exchange order types. These features should be
 added only when they create a measurable strategic choice; they must not weaken

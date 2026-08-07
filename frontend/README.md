@@ -4,7 +4,7 @@ A single-page React and TypeScript dashboard. It creates runs, polls progress,
 and renders backend projections. Economic settlement and model credentials stay
 on the backend.
 
-V3 displays the continuous, fully collateralized spot market and its intraday
+V4 displays the continuous, fully collateralized spot market and its intraday
 lifecycle: markets open at 09:00, close before consumer sales at 19:00, and the
 day closes at 19:30. Operation and delivery completions appear as distinct
 system transitions; Agent detail includes reserved assets, live market depth,

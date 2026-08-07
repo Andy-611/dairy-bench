@@ -312,6 +312,12 @@ def test_openai_gateway_uses_exactly_one_native_command_tool(
     parameters = ladder["parameters"]
     assert set(parameters["required"]) == {"product", "side", "levels"}
     assert parameters["properties"]["levels"]["maxItems"] == 3
+    for definition in ("OrderQuantity", "PositiveMoney"):
+        economic_schema = parameters["$defs"][definition]
+        assert economic_schema["type"] == "number"
+        assert economic_schema["multipleOf"] == 0.0001
+        assert economic_schema["exclusiveMinimum"] == 0.0
+        assert "anyOf" not in economic_schema
 
 
 @pytest.mark.parametrize(

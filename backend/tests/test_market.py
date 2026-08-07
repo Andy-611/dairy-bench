@@ -136,6 +136,24 @@ def _quantity(lots: tuple[InventoryLot, ...]) -> Decimal:
     return sum((lot.quantity for lot in lots), start=Decimal("0"))
 
 
+def test_direct_ledger_mutations_normalize_or_reject_precision() -> None:
+    assets = AssetLedger.from_companies(
+        (_company("seller", cash="5", inventory=(_lot("lot_1", "5"),)),)
+    )
+    initial = assets.freeze_states()
+
+    with pytest.raises(ValueError, match=r"exact multiple of 0\.0001"):
+        assets.reserve_inventory("seller", RAW_MILK, Decimal("1.00001"))
+    assert assets.freeze_states() == initial
+
+    reserved = assets.reserve_inventory("seller", RAW_MILK, Decimal("1.00000"))
+    assets.debit_cash("seller", Decimal("1.00000"))
+
+    assert str(reserved[0].quantity) == "1.0000"
+    assert str(assets.quantity("seller", RAW_MILK)) == "4.0000"
+    assert str(assets.cash("seller")) == "4.0000"
+
+
 def test_unbacked_orders_are_rejected_without_mutating_transaction() -> None:
     market, assets = _market(
         _company("buyer", cash="5"),
@@ -235,6 +253,8 @@ def test_partial_fill_keeps_exact_reserve_and_refunds_price_improvement() -> Non
 
     assert fills[0].quantity == Decimal("3")
     assert _quantity(fills[0].delivery_lots) == Decimal("3")
+    assert fills[0].maker_remaining_quantity == Decimal("0.0000")
+    assert fills[0].taker_remaining_quantity == Decimal("2.0000")
     remaining = market.state.orders[0]
     assert isinstance(remaining, BuyOrder)
     assert remaining.remaining_quantity == Decimal("2")
@@ -243,6 +263,89 @@ def test_partial_fill_keeps_exact_reserve_and_refunds_price_improvement() -> Non
     assert assets.cash("seller") == Decimal("6")
     assert market.state.volume == Decimal("3")
     assert market.state.traded_value == Decimal("6")
+
+
+def test_trade_cash_uses_half_even_four_place_settlement() -> None:
+    market, assets = _market(
+        _company("buyer", cash="1"),
+        _company("seller", inventory=(_lot("lot_1", "0.0003"),)),
+    )
+    _place(market, "ask", "seller", MarketSide.SELL, "0.0003", "1.5", 1)
+
+    fills = _place(market, "bid", "buyer", MarketSide.BUY, "0.0003", "1.5", 2)
+
+    assert fills[0].total_value == Decimal("0.0004")
+    assert assets.cash("buyer") == Decimal("0.9996")
+    assert assets.cash("seller") == Decimal("0.0004")
+    assert market.state.traded_value == Decimal("0.0004")
+
+
+@pytest.mark.parametrize("side", (MarketSide.BUY, MarketSide.SELL))
+def test_zero_value_order_is_rejected_atomically(side: MarketSide) -> None:
+    market, assets = _market(
+        _company("buyer", cash="1"),
+        _company("seller", inventory=(_lot("lot_1", "0.0001"),)),
+    )
+    owner = "buyer" if side is MarketSide.BUY else "seller"
+    initial_state = market.state
+    initial_companies = assets.freeze_states()
+
+    with pytest.raises(MarketError, match="commitment rounds to zero"):
+        _place(market, "dust", owner, side, "0.0001", "0.0001", 1)
+
+    assert market.state == initial_state
+    assert assets.freeze_states() == initial_companies
+
+
+def test_rounding_conflicted_partial_fill_cancels_only_the_unfunded_remainder() -> None:
+    market, assets = _market(
+        _company("buyer", cash="1"),
+        _company("seller", inventory=(_lot("lot_1", "0.0001"),)),
+    )
+    _place(market, "ask", "seller", MarketSide.SELL, "0.0001", "1.5", 1)
+    fills = _place(market, "bid", "buyer", MarketSide.BUY, "0.0002", "1.5", 2)
+
+    assert fills[0].quantity == Decimal("0.0001")
+    assert fills[0].total_value == Decimal("0.0002")
+    assert fills[0].maker_remaining_quantity == Decimal("0.0000")
+    assert fills[0].taker_remaining_quantity == Decimal("0.0000")
+    assert market.state.orders == ()
+    assert assets.cash("buyer") == Decimal("0.9998")
+    assert assets.cash("seller") == Decimal("0.0002")
+
+
+def test_rounding_conflicted_resting_remainder_is_reported_as_withdrawn() -> None:
+    market, assets = _market(
+        _company("buyer", cash="1"),
+        _company("seller", inventory=(_lot("lot_1", "0.0001"),)),
+    )
+    _place(market, "bid", "buyer", MarketSide.BUY, "0.0002", "1.5", 1)
+
+    fills = _place(market, "ask", "seller", MarketSide.SELL, "0.0001", "1.5", 2)
+
+    assert fills[0].maker_remaining_quantity == Decimal("0.0000")
+    assert fills[0].taker_remaining_quantity == Decimal("0.0000")
+    assert market.state.orders == ()
+    assert assets.cash("buyer") == Decimal("0.9998")
+    assert assets.cash("seller") == Decimal("0.0002")
+
+
+def test_zero_value_sell_remainder_is_released_after_a_partial_fill() -> None:
+    market, assets = _market(
+        _company("buyer", cash="1"),
+        _company("seller", inventory=(_lot("lot_1", "0.0002"),)),
+    )
+    _place(market, "bid", "buyer", MarketSide.BUY, "0.0001", "1", 1)
+
+    fills = _place(market, "ask", "seller", MarketSide.SELL, "0.0002", "0.5", 2)
+
+    assert fills[0].quantity == Decimal("0.0001")
+    assert fills[0].total_value == Decimal("0.0001")
+    assert fills[0].maker_remaining_quantity == Decimal("0.0000")
+    assert fills[0].taker_remaining_quantity == Decimal("0.0000")
+    assert market.state.orders == ()
+    assert assets.quantity("seller", RAW_MILK) == Decimal("0.0001")
+    assert assets.cash("seller") == Decimal("0.0001")
 
 
 def test_cancel_releases_remaining_cash_and_inventory() -> None:

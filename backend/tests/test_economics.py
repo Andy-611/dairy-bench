@@ -90,8 +90,18 @@ def test_cost_function_rejects_capacity_overrun() -> None:
         )
 
 
+def test_direct_capacity_consumption_normalizes_or_rejects_precision() -> None:
+    state = OperatingEconomics(DAIRY_S9_SCENARIO, seed=7).initial_states()[0]
+
+    consumed = state.consume(Decimal("1.00000"))
+
+    assert str(consumed.used_capacity) == "1.0000"
+    with pytest.raises(ValueError, match=r"exact multiple of 0\.0001"):
+        state.consume(Decimal("1.00001"))
+
+
 def test_economic_functions_reject_configuration_lost_to_precision() -> None:
-    with pytest.raises(ValidationError, match="minimum realized capacity"):
+    with pytest.raises(ValidationError, match=r"exact multiple of 0\.0001"):
         CapacityFunction(
             normal_capacity=Decimal("0.00001"),
             persistence=Decimal("0.75"),
@@ -99,7 +109,7 @@ def test_economic_functions_reject_configuration_lost_to_precision() -> None:
             minimum_factor=Decimal("0.80"),
             maximum_factor=Decimal("1.10"),
         )
-    with pytest.raises(ValidationError, match="minimum daily unit cost"):
+    with pytest.raises(ValidationError, match=r"exact multiple of 0\.0001"):
         CostFunction(
             normal_unit_cost=Decimal("0.00001"),
             daily_volatility=Decimal("0.10"),

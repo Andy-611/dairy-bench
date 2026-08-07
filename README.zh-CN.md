@@ -3,7 +3,7 @@
 Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark。三家牧场、
 三家加工厂和三家零售商共享两个现货市场，九家企业各由一个独立 Agent 控制。
 
-默认场景为 `flow.dairy.base.s9.v4`。一个 episode 持续 30 个模拟日，每次决策只
+默认场景为 `flow.dairy.base.s9.v5`。一个 episode 持续 30 个模拟日，每次决策只
 提交一条强类型原子命令：
 
 ```text
@@ -13,15 +13,16 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
 只有确定性的经济引擎可以修改现金、库存、订单、作业、在途交付和交易结果。自然语言
 永远不能直接促成经济结算。
 
-## V3 概览
+## V4 概览
 
 - 原奶和盒装奶采用全额担保的连续限价订单簿。订单交叉时立即按价格优先、同价时间
   优先撮合，成交价取 maker 订单价格，并支持部分成交；Agent 一次模型调用即可为一个
   产品和方向设置最多三档、各自独立的目标报价。
 - 买单冻结按限价计算的全部现金，卖单冻结真实的 FEFO 库存批次。资产不足时整单
   报价阶梯原子拒绝，不产生虚假流动性，也不会留下只更新一部分的中间状态。
-- 订单数量采用固定的 `0.0001` 市场步长；非正数、尘埃数量或超过四位小数的报价
-  档位会整组拒绝，不做静默四舍五入。
+- 所有经济 Decimal 共用 `0.0001` 这一种精度。Agent 提交的数量和价格若超过四位
+  小数，会被整条命令拒绝且不会静默舍入；派生金额采用半偶舍入，派生实物数量向下
+  取整，舍入后为零的订单、成交或作业成本会被原子拒绝。
 - 同一分钟的 Agent 请求并发执行，命令随后按照持久化的
   `SHA256(seed | minute | company)` 顺序串行提交。Provider 响应延迟只用于审计，
   不影响经济结果。
@@ -44,7 +45,7 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
 | 19:00-19:29 | 只处理此前已经承诺的作业完成和到货 |
 | 19:30 | 处理库存过期并提交日终快照 |
 
-完整契约见 [V3 架构与不变量](docs/V3_ARCHITECTURE.zh-CN.md) 和
+完整契约见 [V4 架构与不变量](docs/V4_ARCHITECTURE.zh-CN.md) 和
 [Agent 接入](docs/AGENT_INTEGRATION.zh-CN.md)。
 
 ## 系统概览
@@ -120,7 +121,7 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 
 ## 数据与验证
 
-默认 score-v8 数据库为 `backend/data/dairy_bench_v8.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
+默认 score-v9 数据库为 `backend/data/dairy_bench_v9.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
 路径，用 `DAIRY_BENCH_ARTIFACTS_DIR` 覆盖产物目录。
 
 ```powershell
@@ -148,8 +149,8 @@ npm.cmd run build
 
 ## 设计文档
 
-- [V3 架构与不变量](docs/V3_ARCHITECTURE.zh-CN.md)
-- [V3 Agent 接入](docs/AGENT_INTEGRATION.zh-CN.md)
+- [V4 架构与不变量](docs/V4_ARCHITECTURE.zh-CN.md)
+- [V4 Agent 接入](docs/AGENT_INTEGRATION.zh-CN.md)
 - [历史 V2 架构](docs/V2_ARCHITECTURE.md)
 - [历史 V1 MVP 框架](docs/MVP_FRAMEWORK.md)
 - [历史 V1 场景目录](docs/SCENARIO_CATALOG_V1.md)

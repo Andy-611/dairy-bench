@@ -9,6 +9,7 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, model_validator
 
 from company_bench.models import (
+    ZERO,
     CompanyId,
     CompanyTier,
     DomainEvent,
@@ -21,6 +22,7 @@ from company_bench.models import (
     Quantity,
     StrictModel,
 )
+from company_bench.precision import EconomicDecimal
 from company_bench.run_models import InvocationOutcome, TokenUsage
 from company_bench.runtime_models import (
     CommandOutcome,
@@ -77,18 +79,18 @@ class DayTimelineSummary(StrictModel):
     wait_count: int = Field(ge=0)
     system_step_count: int = Field(ge=0)
     event_count: int = Field(ge=0)
-    trade_quantity: Decimal = Field(ge=0)
-    consumer_sales: Decimal = Field(ge=0)
-    expired_quantity: Decimal = Field(ge=0)
+    trade_quantity: Quantity
+    consumer_sales: Quantity
+    expired_quantity: Quantity
 
 
 class InventoryQuantityChange(StrictModel):
     """One product quantity before and at the current observation."""
 
     product: ProductId
-    before: Decimal | None = Field(default=None, ge=0)
-    after: Decimal = Field(ge=0)
-    change: Decimal | None = None
+    before: Quantity | None = None
+    after: Quantity
+    change: EconomicDecimal | None = None
 
 
 class ObservationFacts(StrictModel):
@@ -96,7 +98,7 @@ class ObservationFacts(StrictModel):
 
     cash: Money
     reserved_cash: Money
-    marked_surplus: Decimal
+    marked_surplus: EconomicDecimal
     inventory: tuple[InventoryPosition, ...]
     inventory_expiry: tuple[InventoryExpiryBucket, ...] = ()
     retail_price: Money | None = None
@@ -104,7 +106,7 @@ class ObservationFacts(StrictModel):
     order_books: tuple[OrderBookView, ...] = ()
     pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
     active_operation: OperationJobView | None = None
-    remaining_operation_capacity: Decimal | None = Field(default=None, ge=0)
+    remaining_operation_capacity: Quantity | None = None
     visible_events: tuple[DomainEvent, ...] = ()
     visible_event_count: int = Field(ge=0)
 
@@ -114,7 +116,7 @@ class ObservationDelta(StrictModel):
 
     cash_before: Money | None = None
     cash_after: Money
-    cash_change: Decimal | None = None
+    cash_change: EconomicDecimal | None = None
     inventory: tuple[InventoryQuantityChange, ...]
     retail_price_before: Money | None = None
     retail_price_after: Money | None = None
@@ -144,8 +146,8 @@ class OrderPlacedChange(StrictModel):
     order_id: Identifier
     side: MarketSide
     product: ProductId
-    quantity: Decimal = Field(gt=0)
-    limit_price: Decimal = Field(gt=0)
+    quantity: PositiveQuantity
+    limit_price: PositiveMoney
 
 
 class OrderCancelledChange(StrictModel):
@@ -161,8 +163,8 @@ class OrderReplacedChange(StrictModel):
     change_type: Literal["order_replaced"] = "order_replaced"
     replaced_order_id: Identifier
     order_id: Identifier
-    quantity: Decimal = Field(gt=0)
-    limit_price: Decimal = Field(gt=0)
+    quantity: PositiveQuantity
+    limit_price: PositiveMoney
 
 
 class RetailPriceChanged(StrictModel):
@@ -170,8 +172,8 @@ class RetailPriceChanged(StrictModel):
 
     change_type: Literal["retail_price_changed"] = "retail_price_changed"
     product: ProductId
-    before: Decimal | None = Field(default=None, gt=0)
-    after: Decimal = Field(gt=0)
+    before: PositiveMoney | None = None
+    after: PositiveMoney
 
 
 type CommandStateChange = Annotated[
@@ -325,6 +327,8 @@ class MarketMatchLeg(StrictModel):
     maker_order: OpenOrderView
     quantity: PositiveQuantity
     unit_price: PositiveMoney
+    maker_remaining_quantity: Quantity
+    maker_withdrawn_quantity: Quantity = ZERO
 
     @model_validator(mode="after")
     def validate_maker_fill(self) -> Self:
@@ -333,6 +337,13 @@ class MarketMatchLeg(StrictModel):
             raise ValueError("match price must equal the maker order price")
         if self.quantity > self.maker_order.remaining_quantity:
             raise ValueError("match quantity cannot exceed the maker order")
+        if (
+            self.quantity
+            + self.maker_remaining_quantity
+            + self.maker_withdrawn_quantity
+            != self.maker_order.remaining_quantity
+        ):
+            raise ValueError("maker quantity must equal matched plus remaining plus withdrawn")
         return self
 
 
@@ -344,16 +355,22 @@ class _AppliedMarketOrder(StrictModel):
     matches: tuple[MarketMatchLeg, ...] = ()
     matched_quantity: Quantity
     remaining_quantity: Quantity
+    withdrawn_quantity: Quantity = ZERO
 
     @model_validator(mode="after")
     def validate_application(self) -> Self:
-        """Require exact submitted, matched, and resting quantities."""
+        """Require exact submitted, matched, resting, and withdrawn quantities."""
         incoming = self.incoming_order
         matched = sum((match.quantity for match in self.matches), Decimal())
         if matched != self.matched_quantity:
             raise ValueError("matched quantity must equal the matching trace")
-        if matched + self.remaining_quantity != incoming.remaining_quantity:
-            raise ValueError("submitted quantity must equal matched plus remaining")
+        if (
+            matched + self.remaining_quantity + self.withdrawn_quantity
+            != incoming.remaining_quantity
+        ):
+            raise ValueError(
+                "submitted quantity must equal matched plus remaining plus withdrawn"
+            )
         trade_ids = [match.trade_id for match in self.matches]
         if len(trade_ids) != len(set(trade_ids)):
             raise ValueError("matching trace trade ids must be unique")

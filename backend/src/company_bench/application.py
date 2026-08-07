@@ -42,7 +42,7 @@ class DairyBenchmark:
         policy_timeout_seconds: float = 5.0,
     ) -> None:
         if scenario.version >= 2:
-            raise ValueError("DairyBenchmark does not implement event-driven V3 scenarios")
+            raise ValueError("DairyBenchmark does not implement event-driven V4 scenarios")
         if policy_timeout_seconds <= 0:
             raise ValueError("policy_timeout_seconds must be positive")
         self.scenario = scenario

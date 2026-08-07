@@ -22,8 +22,8 @@ from company_bench.run_models import (
 )
 from company_bench.runtime_models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 8
-_PAYLOAD_SCHEMA_VERSION = 4
+_DATABASE_SCHEMA_VERSION = 9
+_PAYLOAD_SCHEMA_VERSION = 5
 _RESUMABLE_STATUSES = (
     RunStatus.QUEUED,
     RunStatus.RUNNING,
@@ -465,14 +465,16 @@ class SQLiteRunRepository:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT payload_json
+                SELECT schema_version, payload_json
                 FROM run_turns
                 WHERE run_id = ?
                 ORDER BY sim_minute ASC, apply_sequence ASC, turn_id ASC
                 """,
                 (run_id,),
             ).fetchall()
-        return tuple(TurnRecord.model_validate_json(row["payload_json"]) for row in rows)
+        return tuple(
+            TurnRecord.model_validate_json(_current_payload(row)) for row in rows
+        )
 
     def record_system_step(self, record: SystemStepRecord) -> None:
         """Append one immutable system step, accepting exact retries only."""
@@ -484,14 +486,16 @@ class SQLiteRunRepository:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT payload_json
+                SELECT schema_version, payload_json
                 FROM run_system_steps
                 WHERE run_id = ?
                 ORDER BY sim_minute ASC, journal_sequence ASC, entry_id ASC
                 """,
                 (run_id,),
             ).fetchall()
-        return tuple(SystemStepRecord.model_validate_json(row["payload_json"]) for row in rows)
+        return tuple(
+            SystemStepRecord.model_validate_json(_current_payload(row)) for row in rows
+        )
 
     def save_checkpoint(self, checkpoint: RunCheckpoint) -> None:
         """Atomically replace the canonical versioned checkpoint payload."""
@@ -513,7 +517,7 @@ class SQLiteRunRepository:
                 self._insert_system_step(record)
             turn_rows = self._connection.execute(
                 """
-                SELECT payload_json
+                SELECT schema_version, payload_json
                 FROM run_turns
                 WHERE run_id = ?
                 """,
@@ -521,17 +525,17 @@ class SQLiteRunRepository:
             ).fetchall()
             step_rows = self._connection.execute(
                 """
-                SELECT payload_json
+                SELECT schema_version, payload_json
                 FROM run_system_steps
                 WHERE run_id = ?
                 """,
                 (checkpoint.run_id,),
             ).fetchall()
             durable_turns = (
-                TurnRecord.model_validate_json(row["payload_json"]) for row in turn_rows
+                TurnRecord.model_validate_json(_current_payload(row)) for row in turn_rows
             )
             durable_steps = (
-                SystemStepRecord.model_validate_json(row["payload_json"]) for row in step_rows
+                SystemStepRecord.model_validate_json(_current_payload(row)) for row in step_rows
             )
             _require_matching_checkpoint(durable_turns, durable_steps, checkpoint)
             self._upsert_checkpoint(checkpoint)
@@ -577,7 +581,7 @@ class SQLiteRunRepository:
         )
         row = self._connection.execute(
             """
-            SELECT payload_json
+            SELECT schema_version, payload_json
             FROM run_turns
             WHERE run_id = ? AND turn_id = ?
             """,
@@ -586,7 +590,7 @@ class SQLiteRunRepository:
         if row is None:
             raise RuntimeError("turn insert did not produce a journal row")
         _require_same_turn(
-            TurnRecord.model_validate_json(row["payload_json"]),
+            TurnRecord.model_validate_json(_current_payload(row)),
             record,
         )
 
@@ -612,7 +616,7 @@ class SQLiteRunRepository:
         )
         row = self._connection.execute(
             """
-            SELECT payload_json
+            SELECT schema_version, payload_json
             FROM run_system_steps
             WHERE run_id = ? AND entry_id = ?
             """,
@@ -621,7 +625,7 @@ class SQLiteRunRepository:
         if row is None:
             raise RuntimeError("system step insert did not produce a journal row")
         _require_same_system_step(
-            SystemStepRecord.model_validate_json(row["payload_json"]),
+            SystemStepRecord.model_validate_json(_current_payload(row)),
             record,
         )
 
@@ -663,7 +667,7 @@ class SQLiteRunRepository:
             )
 
     def _create_schema(self) -> None:
-        """Create the score-v8 schema for new benchmark databases."""
+        """Create the score-v9 schema for new benchmark databases."""
         current_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
         if current_version not in (0, _DATABASE_SCHEMA_VERSION):
             raise RuntimeError(f"unsupported database schema version: {current_version}")
@@ -1081,6 +1085,14 @@ def _to_summary(result: EpisodeResult) -> RunSummary:
         score_version=result.score.score_version,
         final_score=result.score.final_score,
     )
+
+
+def _current_payload(row: sqlite3.Row) -> str:
+    """Return a journal payload only when it uses the active contract."""
+    version = int(row["schema_version"])
+    if version != _PAYLOAD_SCHEMA_VERSION:
+        raise RuntimeError(f"unsupported journal payload schema version: {version}")
+    return str(row["payload_json"])
 
 
 def _validate_completion(

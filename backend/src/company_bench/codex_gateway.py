@@ -50,6 +50,7 @@ from company_bench.codex_sessions import (
 )
 from company_bench.diagnostics import bounded_error
 from company_bench.models import StrictModel
+from company_bench.precision import require_numeric_economic_schema
 from company_bench.run_models import TokenUsage
 
 type CodexReasoningEffort = Literal["low", "medium", "high", "xhigh"]
@@ -466,6 +467,7 @@ def _strict_output_schema(
 ) -> dict[str, object]:
     """Normalize Pydantic JSON Schema to the strict Codex subset."""
     schema = submission_type.model_json_schema()
+    require_numeric_economic_schema(schema)
     _normalize_schema_node(schema)
     return schema
 
