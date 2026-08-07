@@ -46,7 +46,7 @@ type JsonObject = dict[str, JsonValue]
 DEFAULT_NEWAPI_BASE_URL = "https://newapi.deepwisdom.ai/v1"
 _COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
-_FIXED_MAX_OUTPUT_TOKENS = 128 * 1024
+_FIXED_MAX_OUTPUT_TOKENS = 128_000
 _MAX_RETRY_DELAY_SECONDS = 2.0
 _PROXY_UPSTREAM_ERROR_TYPE = "bad_response_status_code"
 
@@ -381,7 +381,7 @@ def _single_tool_call(completion: _ChatCompletion) -> tuple[str, JsonObject]:
     calls = completion.choices[0].message.tool_calls
     if not calls:
         message = (
-            "selected NewAPI model exhausted the fixed 131072-token response budget "
+            "selected NewAPI model exhausted the fixed 128000-token response budget "
             "before returning a function call"
             if _truncated_without_tool_call(completion)
             else "selected NewAPI model did not return a required function call"

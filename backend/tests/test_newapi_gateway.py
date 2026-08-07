@@ -267,7 +267,7 @@ def test_gateway_sends_common_tools_and_parses_command() -> None:
         {"role": "user", "content": _turn(observation).model_dump_json()},
     ]
     assert payload["tool_choice"] == "required"
-    assert payload["max_tokens"] == 131_072
+    assert payload["max_tokens"] == 128_000
     assert payload["n"] == 1
     assert payload["stream"] is False
     tools = payload["tools"]
@@ -363,17 +363,17 @@ def test_gateway_reports_an_exhausted_fixed_output_budget() -> None:
             request,
             [],
             finish_reason="length",
-            completion_tokens=131_072,
-            reasoning_tokens=131_072,
+            completion_tokens=128_000,
+            reasoning_tokens=128_000,
         )
 
     async def operation(gateway: NewApiModelGateway) -> object:
         return await gateway.generate_command(_command_request(observation))
 
-    with pytest.raises(ModelCompatibilityError, match="fixed 131072-token") as raised:
+    with pytest.raises(ModelCompatibilityError, match="fixed 128000-token") as raised:
         asyncio.run(_with_gateway(handler, operation))
-    assert raised.value.usage.output_tokens == 131_072
-    assert raised.value.usage.reasoning_tokens == 131_072
+    assert raised.value.usage.output_tokens == 128_000
+    assert raised.value.usage.reasoning_tokens == 128_000
 
 
 @pytest.mark.parametrize(
