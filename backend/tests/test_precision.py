@@ -4,9 +4,9 @@ from decimal import Decimal
 import pytest
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from company_bench.models import Money, ProductId
-from company_bench.precision import ECONOMIC_QUANTUM, EconomicPrecision
-from company_bench.runtime_models import (
+from company_bench.domain.models import Money, ProductId
+from company_bench.domain.precision import ECONOMIC_QUANTUM, EconomicPrecision
+from company_bench.runtime.models import (
     Produce,
     QuoteAlert,
     QuoteLevel,

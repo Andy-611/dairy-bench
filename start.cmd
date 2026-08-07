@@ -5,8 +5,8 @@ set "DAIRY_BENCH_CODEX_ENABLED=true"
 set "DAIRY_BENCH_CODEX_MODEL=gpt-5.6-luna"
 set "DAIRY_BENCH_CODEX_REASONING_EFFORT=high"
 set "DAIRY_BENCH_CODEX_SESSION_RETENTION_DAYS=60"
-set "DAIRY_BENCH_CODEX_HOME=%~dp0.dairy-bench\codex"
-set "CODEX_HOME=%DAIRY_BENCH_CODEX_HOME%"
+set "DAIRY_BENCH_HOME=%~dp0.dairy-bench"
+set "CODEX_HOME=%DAIRY_BENCH_HOME%\codex"
 set "DAIRY_BENCH_CODEX_CLI="
 set "BACKEND_URL=http://127.0.0.1:8000"
 set "FRONTEND_URL=http://127.0.0.1:5173"
@@ -21,11 +21,11 @@ if /i "%~1"=="--configure-newapi" (
   exit /b 0
 )
 
-if not exist "%DAIRY_BENCH_CODEX_HOME%" (
-  mkdir "%DAIRY_BENCH_CODEX_HOME%" >nul 2>&1
+if not exist "%CODEX_HOME%" (
+  mkdir "%CODEX_HOME%" >nul 2>&1
   if errorlevel 1 (
     echo [Dairy Bench] Could not create the isolated Codex home:
-    echo %DAIRY_BENCH_CODEX_HOME%
+    echo %CODEX_HOME%
     pause
     exit /b 1
   )
@@ -62,7 +62,7 @@ if /i "%~1"=="--login" (
 
 if /i "%~1"=="--check" (
   echo [Dairy Bench] Codex CLI: %DAIRY_BENCH_CODEX_CLI%
-  echo [Dairy Bench] Codex home: %DAIRY_BENCH_CODEX_HOME%
+  echo [Dairy Bench] Runtime home: %DAIRY_BENCH_HOME%
   call :report_newapi_status
   where.exe python.exe
   where.exe npm.cmd
@@ -111,9 +111,9 @@ if errorlevel 1 (
 exit /b 0
 
 :report_newapi_status
-if not exist "%LOCALAPPDATA%\DairyBench\newapi-token.clixml" goto :newapi_not_configured
-if not exist "%LOCALAPPDATA%\DairyBench\newapi-claude-models.json" goto :newapi_not_configured
-echo [Dairy Bench] NewAPI: configured for this Windows user
+if not exist "%DAIRY_BENCH_HOME%\credentials\newapi-token.clixml" goto :newapi_not_configured
+if not exist "%DAIRY_BENCH_HOME%\credentials\newapi-claude-models.json" goto :newapi_not_configured
+echo [Dairy Bench] NewAPI: configured in the project runtime directory
 exit /b 0
 
 :newapi_not_configured

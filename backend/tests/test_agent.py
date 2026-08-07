@@ -7,33 +7,30 @@ from decimal import Decimal
 import pytest
 from pydantic import SecretStr
 
-from company_bench.agent_gateway import (
-    OpenAIAgentConfig,
-    ScriptedModelGateway,
-)
-from company_bench.agent_models import (
+from company_bench.agents.company import COMMAND_PROMPT_VERSION, LlmCompanyAgent
+from company_bench.agents.contracts import (
     CommandGateway,
     CommandModelRequest,
     CommandModelResult,
     ModelInfrastructureError,
     ModelOutputError,
 )
-from company_bench.agents import COMMAND_PROMPT_VERSION, LlmCompanyAgent
-from company_bench.codex_gateway import CodexAgentConfig
-from company_bench.coordinator import RunCoordinator
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.models import (
+from company_bench.agents.factory import AgentFactory
+from company_bench.agents.providers.claude import NewApiClaudeConfig
+from company_bench.agents.providers.codex.gateway import CodexAgentConfig
+from company_bench.agents.providers.openai import OpenAIAgentConfig
+from company_bench.domain.models import (
     CompanyObservation,
-    NoOpDecision,
     PolicyKind,
     PolicyMetadata,
 )
-from company_bench.newapi_gateway import NewApiClaudeConfig
-from company_bench.policy_factory import PolicyFactory
-from company_bench.repository import MemoryRunRepository
-from company_bench.run_models import InvocationOutcome, RunStatus, TokenUsage
-from company_bench.runtime import EpisodeRuntime
-from company_bench.runtime_models import AgentTurn, SimTime, Wait, WakeReason
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.runs.coordinator import RunCoordinator
+from company_bench.runs.models import InvocationOutcome, RunStatus, TokenUsage
+from company_bench.runtime.episode import EpisodeRuntime
+from company_bench.runtime.models import AgentTurn, SimTime, Wait, WakeReason
+from company_bench.storage.store import InMemoryRunStore
+from tests.support.fakes import ScriptedModelGateway
 
 
 def _config() -> OpenAIAgentConfig:
@@ -49,10 +46,7 @@ class _TrackedScriptedGateway(ScriptedModelGateway):
     """Expose adapter closure for lifecycle assertions."""
 
     def __init__(self) -> None:
-        super().__init__(
-            lambda _: NoOpDecision(),
-            command_factory=lambda _: Wait(),
-        )
+        super().__init__(lambda _: Wait())
         self.closed = False
 
     async def close(self) -> None:
@@ -110,9 +104,9 @@ class _RecordingClaudeGatewayFactory:
 
 
 def test_claude_mode_owns_nine_independent_company_gateways() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     gateway_factory = _RecordingClaudeGatewayFactory()
-    factory = PolicyFactory(
+    factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
         claude_config=NewApiClaudeConfig(
@@ -142,23 +136,13 @@ def test_claude_mode_owns_nine_independent_company_gateways() -> None:
     assert all(agent.metadata.kind is PolicyKind.CLAUDE for agent in agents)
     assert all(agent.metadata.provider == "newapi" for agent in agents)
     assert all(agent.metadata.model == "test-claude-selected" for agent in agents)
-    assert all(agent.metadata.version == "3" for agent in agents)
     assert all(agent.metadata.prompt_version == COMMAND_PROMPT_VERSION for agent in agents)
 
 
-def test_claude_mode_does_not_fall_through_to_pre_v2_replay() -> None:
-    repository = MemoryRunRepository()
-    legacy_scenario = DAIRY_S9_SCENARIO.model_copy(update={"version": 1})
-    factory = PolicyFactory(legacy_scenario, repository)
-
-    with pytest.raises(ValueError, match="do not implement pre-V2"):
-        factory.create(run_id="legacy_claude", mode=PolicyKind.CLAUDE)
-
-
 def test_codex_mode_owns_nine_independent_company_runtimes() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     gateway_factory = _RecordingCodexGatewayFactory()
-    factory = PolicyFactory(
+    factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
         codex_config=CodexAgentConfig(model="test-codex-model"),
@@ -178,7 +162,6 @@ def test_codex_mode_owns_nine_independent_company_runtimes() -> None:
     assert all(isinstance(agent, LlmCompanyAgent) for agent in agents)
     assert all(agent.metadata.kind is PolicyKind.CODEX for agent in agents)
     assert all(agent.metadata.provider == "codex" for agent in agents)
-    assert all(agent.metadata.version == "3" for agent in agents)
     assert all(agent.metadata.prompt_version == COMMAND_PROMPT_VERSION for agent in agents)
 
 
@@ -223,7 +206,7 @@ class _AuditedOutputErrorGateway:
 def test_output_failure_retains_codex_artifact_coordinates(
     first_observation: CompanyObservation,
 ) -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     turn = AgentTurn(
         turn_id="failed_run.farm_a.t1",
         company_id=first_observation.company_id,
@@ -243,7 +226,6 @@ def test_output_failure_retains_codex_artifact_coordinates(
         audit_sink=repository,
         metadata=PolicyMetadata(
             name="codex-company-agent",
-            version="3",
             kind=PolicyKind.CODEX,
             provider="codex",
             model="gpt-5.6-terra",
@@ -266,9 +248,9 @@ def test_output_failure_retains_codex_artifact_coordinates(
 
 
 def test_infrastructure_failure_marks_job_failed_without_result() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     gateway_factory = _RecordingGatewayFactory(_UnavailableGateway)
-    factory = PolicyFactory(
+    factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
         openai_config=_config(),

@@ -12,37 +12,37 @@ import pytest
 from openai_codex import ApprovalMode, Sandbox
 from openai_codex.types import TurnStatus
 
-import company_bench.codex_gateway as codex_gateway_module
-from company_bench.agent_models import (
+import company_bench.agents.providers.codex.gateway as codex_gateway_module
+from company_bench.agents.contracts import (
     CommandModelRequest,
     ModelInfrastructureError,
     ModelOutputError,
-    ModelRequest,
 )
-from company_bench.codex_artifacts import (
+from company_bench.agents.providers.codex.artifacts import (
     CodexArtifactIdentity,
     CodexArtifactView,
 )
-from company_bench.codex_gateway import (
-    DEFAULT_CODEX_HOME,
+from company_bench.agents.providers.codex.gateway import (
     CodexAgentConfig,
     CodexModelGateway,
 )
-from company_bench.codex_sessions import (
+from company_bench.agents.providers.codex.sessions import (
     CodexSessionClient,
     CodexSessionManager,
     CodexSessionRetention,
 )
-from company_bench.models import CompanyObservation, FarmDecision, ProductId
-from company_bench.precision import ECONOMIC_QUANTUM
-from company_bench.runtime_models import (
+from company_bench.domain.models import CompanyObservation, ProductId
+from company_bench.domain.precision import ECONOMIC_QUANTUM
+from company_bench.runtime.models import (
     AgentTurn,
     MarketSide,
     QuoteLevel,
     SetQuoteLadder,
     SimTime,
+    Wait,
     WakeReason,
 )
+from company_bench.settings import RuntimePaths
 
 
 def _economic_schema_nodes(value: object) -> list[dict[str, object]]:
@@ -227,29 +227,9 @@ class _TrackedSessionManager(CodexSessionManager):
         await super().close()
 
 
-def _request(observation: CompanyObservation) -> ModelRequest:
-    """Build one provider-neutral farm request."""
-    return ModelRequest(
-        invocation_id="codex_test.1.farm_a",
-        run_id="codex_test",
-        observation=observation,
-        instructions="Return one farm decision.",
-        input_text=observation.model_dump_json(),
-    )
-
-
 def _valid_response() -> str:
-    """Return one valid decision envelope."""
-    return json.dumps(
-        {
-            "decision": {
-                "kind": "farm",
-                "produce_quantity": "10",
-                "raw_offer_quantity": "8",
-                "minimum_raw_price": "1.40",
-            }
-        }
-    )
+    """Return one valid command envelope."""
+    return '{"command":{"kind":"wait","alerts":[]}}'
 
 
 def _command_request(observation: CompanyObservation) -> CommandModelRequest:
@@ -290,15 +270,11 @@ def test_codex_gateway_isolates_runtime_and_validates_output(
         artifacts,
     )
 
-    result = asyncio.run(gateway.generate(_request(first_observation), FarmDecision))
+    result = asyncio.run(gateway.generate_command(_command_request(first_observation)))
     workspace = Path(client.thread_calls[0]["cwd"])
     asyncio.run(gateway.close())
 
-    assert result.decision == FarmDecision(
-        produce_quantity="10",
-        raw_offer_quantity="8",
-        minimum_raw_price="1.40",
-    )
+    assert result.command == Wait()
     assert result.provider == "codex"
     assert result.model == "test-model"
     assert result.response_id == "turn_test"
@@ -311,8 +287,8 @@ def test_codex_gateway_isolates_runtime_and_validates_output(
     assert workspace.is_dir() is False
     assert len(artifacts.calls) == 1
     identity, _, session_path = artifacts.calls[0]
-    assert identity.invocation_id == "codex_test.1.farm_a"
-    assert identity.domain_turn_id is None
+    assert identity.invocation_id == "codex_test.farm_a.t1.provider"
+    assert identity.domain_turn_id == "codex_test.farm_a.t1"
     assert identity.thread_id == "thread_test"
     assert identity.turn_id == "turn_test"
     assert session_path == tmp_path / "session.jsonl"
@@ -329,10 +305,7 @@ def test_codex_gateway_isolates_runtime_and_validates_output(
     assert run_options["sandbox"] is Sandbox.read_only
     output_schema = run_options["output_schema"]
     assert output_schema["additionalProperties"] is False
-    farm_schema = output_schema["$defs"]["FarmDecision"]
-    no_op_schema = output_schema["$defs"]["NoOpDecision"]
-    assert set(farm_schema["required"]) == set(farm_schema["properties"])
-    assert set(no_op_schema["required"]) == set(no_op_schema["properties"])
+    assert set(output_schema["required"]) == set(output_schema["properties"])
     assert '"pattern"' not in json.dumps(output_schema)
     economic_nodes = _economic_schema_nodes(output_schema)
     assert economic_nodes
@@ -348,8 +321,8 @@ def test_codex_runtime_requests_all_public_reasoning() -> None:
 
     assert "hide_agent_reasoning=false" in overrides
     assert "show_raw_agent_reasoning=true" in overrides
-    assert config.codex_home == DEFAULT_CODEX_HOME.resolve()
-    assert runtime.env == {"CODEX_HOME": str(DEFAULT_CODEX_HOME.resolve())}
+    assert config.codex_home == RuntimePaths.from_environment().codex_home
+    assert runtime.env == {"CODEX_HOME": str(config.codex_home)}
 
 
 def test_codex_gateway_closes_its_owned_session_manager(
@@ -494,11 +467,11 @@ def test_codex_gateway_separates_auth_and_output_failures(
         _FakeArtifacts(),
     )
     with pytest.raises(ModelInfrastructureError, match="codex login"):
-        asyncio.run(missing_auth.generate(_request(first_observation), FarmDecision))
+        asyncio.run(missing_auth.generate_command(_command_request(first_observation)))
     assert unauthenticated.closed is True
 
     artifacts = _FakeArtifacts()
-    invalid_client = _FakeCodex('{"decision":{"kind":"farm"}}')
+    invalid_client = _FakeCodex("{}")
     invalid_output = CodexModelGateway(
         CodexAgentConfig(model="test-model"),
         "farm_a",
@@ -506,7 +479,7 @@ def test_codex_gateway_separates_auth_and_output_failures(
         artifacts,
     )
     with pytest.raises(ModelOutputError) as caught:
-        asyncio.run(invalid_output.generate(_request(first_observation), FarmDecision))
+        asyncio.run(invalid_output.generate_command(_command_request(first_observation)))
     assert len(artifacts.calls) == 1
     assert invalid_client.archived == ["thread_test"]
     assert caught.value.request_id == "thread_test"
@@ -527,7 +500,7 @@ def test_artifact_failure_never_repeats_the_model_call(
     )
 
     with pytest.raises(ModelInfrastructureError, match="artifact disk timed out"):
-        asyncio.run(gateway.generate(_request(first_observation), FarmDecision))
+        asyncio.run(gateway.generate_command(_command_request(first_observation)))
 
     assert len(client.thread_calls) == 1
     assert len(client.thread.run_calls) == 1
@@ -548,7 +521,7 @@ def test_archive_failure_never_repeats_the_export_or_model_call(
     )
 
     with pytest.raises(ModelInfrastructureError, match="Session archive timed out"):
-        asyncio.run(gateway.generate(_request(first_observation), FarmDecision))
+        asyncio.run(gateway.generate_command(_command_request(first_observation)))
 
     assert len(client.thread.run_calls) == 1
     assert len(artifacts.calls) == 1

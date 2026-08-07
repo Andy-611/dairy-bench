@@ -2,7 +2,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $newApiBaseUrl = "https://newapi.deepwisdom.ai"
-$newApiStateDirectory = Join-Path $env:LOCALAPPDATA "DairyBench"
+$backendDirectory = Split-Path -Parent $PSScriptRoot
+$runtimePathsScript = Join-Path $PSScriptRoot "runtime_paths.ps1"
+. $runtimePathsScript
+$runtimeHome = Get-DairyBenchRuntimeHome -BackendDirectory $backendDirectory
+$newApiStateDirectory = Join-Path $runtimeHome "credentials"
 $newApiCredentialPath = Join-Path $newApiStateDirectory "newapi-token.clixml"
 $newApiModelsPath = Join-Path $newApiStateDirectory "newapi-claude-models.json"
 $newApiSecureKey = Read-Host "NewAPI API key" -AsSecureString
@@ -33,7 +37,7 @@ try {
     ConvertTo-Json -InputObject ([string[]]$newApiModels) |
         Set-Content -LiteralPath $newApiModelsPath -Encoding UTF8
 
-    Write-Host "[Dairy Bench] NewAPI credential saved for the current Windows user."
+    Write-Host "[Dairy Bench] NewAPI credential saved under the project runtime directory."
     Write-Host "[Dairy Bench] Claude models available in the UI:"
     $newApiModels | ForEach-Object { Write-Host "  $_" }
     Write-Host "[Dairy Bench] Restart a running backend, then launch start.cmd."

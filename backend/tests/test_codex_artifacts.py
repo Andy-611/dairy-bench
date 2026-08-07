@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 from openai_codex.types import ThreadItem
 
-from company_bench.codex_artifacts import (
+from company_bench.agents.providers.codex.artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
 )
@@ -120,7 +120,7 @@ def test_exports_only_reasoning_summary_and_final_output(tmp_path: Path) -> None
         },
     ]
     _write_session(session, records)
-    store = CodexArtifactStore(tmp_path / "run_artifacts")
+    store = CodexArtifactStore(tmp_path / "artifacts")
 
     exported = store.export(
         _identity(),
@@ -128,8 +128,8 @@ def test_exports_only_reasoning_summary_and_final_output(tmp_path: Path) -> None
         session,
     )
 
-    reasoning_path = tmp_path / "run_artifacts" / "run_test" / "reasoning" / "day-001__farm_a.md"
-    output_path = tmp_path / "run_artifacts" / "run_test" / "final_outputs" / "day-001__farm_a.json"
+    reasoning_path = tmp_path / "artifacts" / "run_test" / "reasoning" / "day-001__farm_a.md"
+    output_path = tmp_path / "artifacts" / "run_test" / "final_outputs" / "day-001__farm_a.json"
     assert reasoning_path.is_file()
     assert output_path.is_file()
     assert exported.reasoning_markdown == reasoning_path.read_text(encoding="utf-8").rstrip()
@@ -156,7 +156,7 @@ def test_falls_back_to_completed_sdk_items_without_a_session(tmp_path: Path) -> 
             "summary": ["SDK reasoning summary"],
         }
     )
-    store = CodexArtifactStore(tmp_path / "run_artifacts")
+    store = CodexArtifactStore(tmp_path / "artifacts")
 
     exported = store.export(
         _identity(),
@@ -171,8 +171,8 @@ def test_falls_back_to_completed_sdk_items_without_a_session(tmp_path: Path) -> 
     assert json.loads(exported.final_output) == {"decision": {"kind": "farm"}}
 
 
-def test_v2_turns_use_distinct_files_within_one_company_day(tmp_path: Path) -> None:
-    store = CodexArtifactStore(tmp_path / "run_artifacts")
+def test_turns_use_distinct_files_within_one_company_day(tmp_path: Path) -> None:
+    store = CodexArtifactStore(tmp_path / "artifacts")
     first = _identity().model_copy(
         update={
             "invocation_id": "run_test.farm_a.t1.provider",
@@ -191,7 +191,7 @@ def test_v2_turns_use_distinct_files_within_one_company_day(tmp_path: Path) -> N
     first_view = store.export(first, _result('{"command":{"kind":"produce"}}'), None)
     second_view = store.export(second, _result('{"command":{"kind":"wait"}}'), None)
 
-    output_root = tmp_path / "run_artifacts" / "run_test" / "final_outputs"
+    output_root = tmp_path / "artifacts" / "run_test" / "final_outputs"
     assert (output_root / "day-001__farm_a__turn-0001.json").is_file()
     assert (output_root / "day-001__farm_a__turn-0002.json").is_file()
     assert store.read(first) == first_view
@@ -200,8 +200,8 @@ def test_v2_turns_use_distinct_files_within_one_company_day(tmp_path: Path) -> N
     assert first_view.final_output != second_view.final_output
 
 
-def test_v2_retried_turn_preserves_each_physical_call(tmp_path: Path) -> None:
-    store = CodexArtifactStore(tmp_path / "run_artifacts")
+def test_retried_turn_preserves_each_physical_call(tmp_path: Path) -> None:
+    store = CodexArtifactStore(tmp_path / "artifacts")
     first = _identity().model_copy(
         update={
             "invocation_id": "inv_first",
@@ -221,7 +221,7 @@ def test_v2_retried_turn_preserves_each_physical_call(tmp_path: Path) -> None:
     first_view = store.export(first, _result('{"command":{"kind":"produce"}}'), None)
     second_view = store.export(second, _result('{"command":{"kind":"wait"}}'), None)
 
-    output_root = tmp_path / "run_artifacts" / "run_test" / "final_outputs"
+    output_root = tmp_path / "artifacts" / "run_test" / "final_outputs"
     outputs = tuple(output_root.glob("day-001__farm_a__turn-0001*.json"))
     assert len(outputs) == 2
     assert store.read(first) == first_view
@@ -230,7 +230,7 @@ def test_v2_retried_turn_preserves_each_physical_call(tmp_path: Path) -> None:
 
 
 def test_uses_english_placeholder_when_summary_is_unavailable(tmp_path: Path) -> None:
-    store = CodexArtifactStore(tmp_path / "run_artifacts")
+    store = CodexArtifactStore(tmp_path / "artifacts")
 
     exported = store.export(
         _identity(),

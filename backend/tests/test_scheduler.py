@@ -5,12 +5,12 @@ from decimal import Decimal
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from company_bench.models import (
+from company_bench.domain.models import (
     CompanyObservation,
     InvalidOrderQuantity,
     require_order_quantity,
 )
-from company_bench.runtime_models import (
+from company_bench.runtime.models import (
     AgentTurn,
     CommandEnvelope,
     CommandOutcome,
@@ -29,7 +29,7 @@ from company_bench.runtime_models import (
     WakeReason,
     WakeSignal,
 )
-from company_bench.scheduler import Scheduler, SchedulerCheckpoint
+from company_bench.runtime.scheduler import Scheduler, SchedulerCheckpoint
 
 
 def test_sim_time_is_absolute_and_immutable() -> None:

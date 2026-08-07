@@ -233,7 +233,7 @@ After a turn, Dairy Bench exports the public reasoning summary and final
 structured output, then archives the source session only after export succeeds:
 
 ```text
-run_artifacts/<run_id>/
+.dairy-bench/artifacts/<run_id>/
 |-- reasoning/day-001__farm_a__turn-0001.md
 `-- final_outputs/day-001__farm_a__turn-0001.json
 ```
@@ -254,7 +254,7 @@ $env:DAIRY_BENCH_OPENAI_MAX_OUTPUT_TOKENS="2048"
 $env:DAIRY_BENCH_OPENAI_TIMEOUT_SECONDS="60"
 $env:DAIRY_BENCH_OPENAI_MAX_ATTEMPTS="3"
 
-python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
+python -m uvicorn company_bench.web.app:create_app --factory --app-dir src --host 127.0.0.1 --port 8000
 ```
 
 Only the backend reads `OPENAI_API_KEY`; it never enters the browser, journal,
@@ -274,7 +274,7 @@ start.cmd
 The first command reads the key with hidden input, validates it through the
 fixed `https://newapi.deepwisdom.ai/v1/models` endpoint, and writes a DPAPI-
 encrypted credential plus a safe Claude model catalog under
-`%LOCALAPPDATA%\DairyBench`. Normal startup decrypts the key only into the
+`.dairy-bench/credentials`. Normal startup decrypts the key only into the
 backend child process environment. The browser receives only the model catalog;
 the selected model is persisted in `RunJob` and policy audit metadata. Re-run
 the configuration command to replace the key or refresh its models.
@@ -325,7 +325,7 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`PolicyFactory` creates one gateway per company. The adapter validates output
+`AgentFactory` creates one gateway per company. The adapter validates output
 into an authorized `CompanyCommand`, maps content failures to
 `ModelOutputError`, and maps infrastructure failures to
 `ModelInfrastructureError`. It must not access `EconomyEngine` or another

@@ -45,7 +45,7 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
 | 19:00-19:29 | 只处理此前已经承诺的作业完成和到货 |
 | 19:30 | 处理库存过期并提交日终快照 |
 
-完整契约见 [V4 架构与不变量](docs/V4_ARCHITECTURE.zh-CN.md) 和
+完整契约见 [V4 架构与不变量](docs/ARCHITECTURE.zh-CN.md) 和
 [Agent 接入](docs/AGENT_INTEGRATION.zh-CN.md)。
 
 ## 系统概览
@@ -53,8 +53,8 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
 ```text
 React -> FastAPI -> RunCoordinator -> EpisodeRuntime -> Scheduler + EconomyEngine
                          |                 `-> Evaluator
-                         |-> PolicyFactory -> CompanyAgent x 9
-                         `-> LifecycleRepository -> Journal + Checkpoint + SQLite
+                         |-> AgentFactory -> CompanyAgent x 9
+                         `-> RunStore -> Journal + Checkpoint + SQLite
 ```
 
 Agent 可使用规则基线、Codex、OpenAI 或精确 Replay。OpenAI 使用原生函数工具，
@@ -102,7 +102,7 @@ Run 仍处于活动状态时，同一个主按钮会变为 `Stop run`。停止�
 使用隔离 thread。公开推理摘要和最终结构化输出导出到：
 
 ```text
-run_artifacts/<run_id>/
+.dairy-bench/artifacts/<run_id>/
 |-- reasoning/
 `-- final_outputs/
 ```
@@ -113,7 +113,7 @@ run_artifacts/<run_id>/
 $env:OPENAI_API_KEY="your-key"
 $env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"  # 可选
 
-python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
+python -m uvicorn company_bench.web.app:create_app --factory --app-dir src --host 127.0.0.1 --port 8000
 ```
 
 密钥不会进入浏览器、Journal 或 Benchmark 数据库。Provider 基础设施故障会使运行
@@ -121,8 +121,10 @@ python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port
 
 ## 数据与验证
 
-默认 score-v9 数据库为 `backend/data/dairy_bench_v9.sqlite3`。可用 `DAIRY_BENCH_DB` 覆盖数据库
-路径，用 `DAIRY_BENCH_ARTIFACTS_DIR` 覆盖产物目录。
+所有可变运行状态统一存放在 Git 忽略的项目目录 `.dairy-bench/`：数据库位于
+`data/runs.sqlite3`，Agent 证据位于 `artifacts/`，隔离的 Codex 状态位于
+`codex/`，加密的 NewAPI 凭据位于 `credentials/`。如确有需要，只用
+`DAIRY_BENCH_HOME` 覆盖整个运行目录。
 
 ```powershell
 cd backend
@@ -145,12 +147,8 @@ npm.cmd run build
 - `GET /api/runs/{run_id}/turns`
 - `GET /api/runs/{run_id}/invocations`
 - `GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts`
-- `GET /api/runs`
 
 ## 设计文档
 
-- [V4 架构与不变量](docs/V4_ARCHITECTURE.zh-CN.md)
+- [V4 架构与不变量](docs/ARCHITECTURE.zh-CN.md)
 - [V4 Agent 接入](docs/AGENT_INTEGRATION.zh-CN.md)
-- [历史 V2 架构](docs/V2_ARCHITECTURE.md)
-- [历史 V1 MVP 框架](docs/MVP_FRAMEWORK.md)
-- [历史 V1 场景目录](docs/SCENARIO_CATALOG_V1.md)

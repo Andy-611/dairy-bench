@@ -2,21 +2,20 @@ from decimal import Decimal
 
 import pytest
 
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.engine import EconomyEngine
-from company_bench.models import (
+from company_bench.domain.models import (
     ZERO,
     CompanySnapshot,
     ConsumerSaleEvent,
     DaySnapshot,
     DomainEvent,
     RetailerOperation,
-    RunSummary,
     ScenarioSpec,
     ScoreCard,
     WorldState,
 )
-from company_bench.scoring import Evaluator
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.engine import EconomyEngine
+from company_bench.economy.scoring import Evaluator
 
 
 def _scenario(days: int = 1) -> ScenarioSpec:
@@ -160,17 +159,6 @@ def test_score_card_exposes_only_the_official_s9_contract() -> None:
         "bankruptcy_rate",
         "companies",
     }
-
-    assert set(RunSummary.model_fields) == {
-        "run_id",
-        "scenario_id",
-        "seed",
-        "started_at",
-        "finished_at",
-        "score_version",
-        "final_score",
-    }
-
 
 def test_evaluator_combines_continuous_efficiency_fairness_and_survival() -> None:
     scenario = _scenario()

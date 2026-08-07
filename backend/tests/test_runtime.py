@@ -11,10 +11,9 @@ from typing import ClassVar
 import pytest
 from pydantic import ValidationError
 
-from company_bench.agent_models import ModelOutputError
-from company_bench.agents import CompanyAgent, ReplayCompanyAgent
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.models import (
+from company_bench.agents.company import CompanyAgent, ReplayCompanyAgent
+from company_bench.agents.contracts import ModelOutputError
+from company_bench.domain.models import (
     ConsumerSaleEvent,
     DeliveryCompletedEvent,
     MilkProducedEvent,
@@ -24,10 +23,10 @@ from company_bench.models import (
     ScenarioSpec,
     TradeExecutedEvent,
 )
-from company_bench.repository import MemoryRunRepository
-from company_bench.run_models import RunCheckpoint
-from company_bench.runtime import EpisodeExecution, EpisodeProtocolError, EpisodeRuntime
-from company_bench.runtime_models import (
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.runs.models import RunCheckpoint, RunRecovery
+from company_bench.runtime.episode import EpisodeExecution, EpisodeProtocolError, EpisodeRuntime
+from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
     CompanyCommand,
@@ -44,6 +43,7 @@ from company_bench.runtime_models import (
     Wait,
     WakeReason,
 )
+from company_bench.storage.store import InMemoryRunStore
 
 _OPEN = 9 * 60
 _MARKET_CLOSE = 19 * 60
@@ -58,8 +58,7 @@ class _ScriptedAgent:
     delay_seconds: float = 0.0
 
     metadata: ClassVar[PolicyMetadata] = PolicyMetadata(
-        name="runtime-v3-test",
-        version="3",
+        name="runtime-test",
         kind=PolicyKind.BASELINE,
     )
 
@@ -72,7 +71,7 @@ class _ScriptedAgent:
 
 @dataclass(slots=True)
 class _InterruptOnCommit:
-    repository: MemoryRunRepository
+    repository: InMemoryRunStore
     kind: SystemEventKind
     interrupted: bool = False
 
@@ -96,7 +95,7 @@ class _InterruptOnCommit:
 
 @dataclass(slots=True)
 class _InterruptOnAttention:
-    repository: MemoryRunRepository
+    repository: InMemoryRunStore
     interrupted: bool = False
 
     def save_progress(
@@ -134,7 +133,7 @@ def _scenario(
     )
     return DAIRY_S9_SCENARIO.model_copy(
         update={
-            "scenario_id": "test.runtime.s3.v3",
+            "scenario_id": "test.runtime.current",
             "days": 1,
             "companies": companies,
             "runtime": DAIRY_S9_SCENARIO.runtime.model_copy(
@@ -287,7 +286,7 @@ def _assert_one_turn_per_company_minute(execution: EpisodeExecution) -> None:
 @pytest.mark.asyncio
 async def test_runtime_orders_open_market_close_consumer_sales_and_day_close() -> None:
     scenario = _scenario(max_turns=1)
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
     await EpisodeRuntime(scenario).run(
         _agents(scenario, _wait),
@@ -317,7 +316,7 @@ async def test_runtime_orders_open_market_close_consumer_sales_and_day_close() -
 @pytest.mark.asyncio
 async def test_turn_limit_journals_each_suppressed_wake_with_its_cause() -> None:
     scenario = _scenario(max_turns=1, company_ids=("farm_a",))
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
     def produce_once(turn: AgentTurn) -> CompanyCommand:
         return Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY)
@@ -610,7 +609,7 @@ async def test_delivery_boundary_controls_same_day_consumer_inventory(
         bottled_farm=True,
     )
     run_id = f"delivery_{arrival_minute}"
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     execution = await EpisodeRuntime(scenario).run(
         _timed_retail_agents(scenario, trade_minute),
         31,
@@ -666,7 +665,7 @@ async def test_atomic_completion_checkpoint_resumes_each_commitment_exactly_once
         37,
         run_id=run_id,
     )
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     store = _InterruptOnCommit(repository, completion_kind)
 
     with pytest.raises(RuntimeError, match="durable commitment"):
@@ -676,8 +675,9 @@ async def test_atomic_completion_checkpoint_resumes_each_commitment_exactly_once
             run_id=run_id,
             store=store,
         )
-    checkpoint = repository.get_checkpoint(run_id)
-    assert checkpoint is not None
+    recovery = repository.load_recovery(run_id)
+    assert recovery is not None
+    checkpoint = recovery.checkpoint
     commitments = (
         checkpoint.economy.jobs
         if completion_kind is SystemEventKind.OPERATION_COMPLETED
@@ -710,7 +710,7 @@ async def test_atomic_completion_checkpoint_resumes_each_commitment_exactly_once
     assert completion_events[0].at == completes_at
     assert any(
         scheduled.reference_id == commitment_id
-        for record in checkpoint.turns
+        for record in recovery.turns
         for scheduled in record.outcome.scheduled_completions
     )
 
@@ -719,7 +719,7 @@ async def test_atomic_completion_checkpoint_resumes_each_commitment_exactly_once
         37,
         run_id=run_id,
         store=repository,
-        checkpoint=checkpoint,
+        recovery=recovery,
     )
     completion_type = (
         MilkProducedEvent
@@ -742,7 +742,7 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
     runtime = EpisodeRuntime(scenario)
     agents = _agents(scenario, _wait)
     expected = await runtime.run(agents, 39, run_id=run_id)
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     store = _InterruptOnAttention(repository)
 
     with pytest.raises(RuntimeError, match="durable attention plan"):
@@ -752,8 +752,9 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
             run_id=run_id,
             store=store,
         )
-    checkpoint = repository.get_checkpoint(run_id)
-    assert checkpoint is not None
+    recovery = repository.load_recovery(run_id)
+    assert recovery is not None
+    checkpoint = recovery.checkpoint
     assert all(cursor.active_wait is not None for cursor in checkpoint.cursors)
     wait_expiries = tuple(
         event
@@ -782,7 +783,7 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
         )
         if record.turn.turn_id == target_plan.source_turn_id
         else record
-        for record in checkpoint.turns
+        for record in recovery.turns
     )
     invalid_events = tuple(
         event.model_copy(update={"at": invalid_review})
@@ -794,19 +795,22 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
     invalid_checkpoint = checkpoint.model_copy(
         update={
             "cursors": invalid_cursors,
-            "turns": invalid_turns,
             "scheduler": checkpoint.scheduler.model_copy(update={"pending_events": invalid_events}),
         }
     )
     with pytest.raises(ValidationError, match="active wait must match"):
-        RunCheckpoint.model_validate(invalid_checkpoint.model_dump())
+        RunRecovery(
+            checkpoint=invalid_checkpoint,
+            turns=invalid_turns,
+            system_steps=recovery.system_steps,
+        )
 
     resumed = await runtime.run(
         _agents(scenario, _wait),
         39,
         run_id=run_id,
         store=repository,
-        checkpoint=checkpoint,
+        recovery=recovery,
     )
 
     assert resumed.turns == expected.turns

@@ -4,7 +4,8 @@ from decimal import Decimal
 
 import pytest
 
-from company_bench.market import (
+from company_bench.domain.models import CompanyState, InventoryLot, ProductId
+from company_bench.economy.market import (
     AssetLedger,
     BuyOrder,
     ContinuousSpotMarket,
@@ -15,8 +16,7 @@ from company_bench.market import (
     SellOrder,
     TradeFill,
 )
-from company_bench.models import CompanyState, InventoryLot, ProductId
-from company_bench.runtime_models import MarketSide, QuoteLadder, QuoteLevel, SimTime
+from company_bench.runtime.models import MarketSide, QuoteLadder, QuoteLevel, SimTime
 
 RAW_MILK = ProductId.RAW_MILK
 

@@ -6,33 +6,28 @@ from pathlib import Path
 
 import pytest
 
-from company_bench.agents import BaselineCompanyAgent
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.engine import EconomyEngine
-from company_bench.memory import AgentCheckpoint
-from company_bench.models import (
+from company_bench.agents.company import BaselineCompanyAgent
+from company_bench.agents.memory import AgentCheckpoint
+from company_bench.domain.models import (
     CompanyObservation,
     EpisodeResult,
-    NoOpDecision,
     PolicyDescriptor,
     PolicyKind,
 )
-from company_bench.repository import (
-    LifecycleRepository,
-    MemoryRunRepository,
-    SQLiteRunRepository,
-)
-from company_bench.run_models import (
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.engine import EconomyEngine
+from company_bench.runs.models import (
     CompanyRuntimeCursor,
     InvocationOutcome,
     PolicyInvocation,
     ReplaySource,
     RunCheckpoint,
     RunJob,
+    RunRecovery,
     RunStatus,
 )
-from company_bench.runtime import EpisodeRuntime
-from company_bench.runtime_models import (
+from company_bench.runtime.episode import EpisodeRuntime
+from company_bench.runtime.models import (
     AgentTurn,
     CommandEnvelope,
     CommandOutcome,
@@ -42,7 +37,12 @@ from company_bench.runtime_models import (
     Wait,
     WakeReason,
 )
-from company_bench.scheduler import SchedulerCheckpoint
+from company_bench.runtime.scheduler import SchedulerCheckpoint
+from company_bench.storage.store import (
+    InMemoryRunStore,
+    RunStore,
+    SQLiteRunStore,
+)
 
 
 def run_episode(seed: int = 42) -> EpisodeResult:
@@ -60,28 +60,26 @@ def run_episode(seed: int = 42) -> EpisodeResult:
     return execution.episode
 
 
-def test_memory_repository_round_trip_and_summary() -> None:
-    repository = MemoryRunRepository()
+def test_memory_repository_completed_episode_round_trip() -> None:
+    repository = InMemoryRunStore()
     result = run_episode()
 
-    repository.save(result)
+    repository.complete_job(result, _completed_job_for(result))
 
     assert result.score.efficiency_reference == Decimal("8316.0938")
     assert repository.get(result.run_id) == result
     assert repository.get("missing") is None
-    assert repository.list()[0].run_id == result.run_id
-    assert repository.list(0) == ()
 
 
 def test_memory_repository_lists_every_job_status_newest_first() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     jobs = _history_jobs()
 
     _assert_job_history(repository, jobs)
 
 
 def test_memory_repository_lists_completed_replay_sources() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
     _assert_replay_sources(repository)
 
@@ -90,10 +88,10 @@ def test_sqlite_repository_job_history_survives_reopen(tmp_path: Path) -> None:
     database = tmp_path / "job-history.sqlite3"
     jobs = _history_jobs()
 
-    with SQLiteRunRepository(database) as repository:
+    with SQLiteRunStore(database) as repository:
         _assert_job_history(repository, jobs)
 
-    with SQLiteRunRepository(database) as reopened:
+    with SQLiteRunStore(database) as reopened:
         assert reopened.list_jobs() == tuple(reversed(jobs))
         assert reopened.list_jobs(2) == tuple(reversed(jobs[-2:]))
 
@@ -101,29 +99,30 @@ def test_sqlite_repository_job_history_survives_reopen(tmp_path: Path) -> None:
 def test_sqlite_repository_lists_completed_replay_sources(tmp_path: Path) -> None:
     database = tmp_path / "replay-sources.sqlite3"
 
-    with SQLiteRunRepository(database) as repository:
+    with SQLiteRunStore(database) as repository:
         expected = _assert_replay_sources(repository)
 
-    with SQLiteRunRepository(database) as reopened:
+    with SQLiteRunStore(database) as reopened:
         assert reopened.list_replay_sources() == expected
 
 
 def test_memory_repository_turn_journal_and_checkpoint_contract(
     first_observation: CompanyObservation,
 ) -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     first = _turn_for("memory_run", first_observation, sequence=1)
     second = _turn_for("memory_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
 
     _assert_turn_contract(repository, first, second)
+    repository = InMemoryRunStore()
     _assert_checkpoint_contract(repository, checkpoint, first, second)
 
 
 def test_checkpoint_accepts_claude_as_a_memory_owning_policy(
     first_observation: CompanyObservation,
 ) -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     turn = _turn_for("claude_checkpoint", first_observation, sequence=1)
     checkpoint = _checkpoint_for(
         turn,
@@ -131,9 +130,12 @@ def test_checkpoint_accepts_claude_as_a_memory_owning_policy(
         policy_kind=PolicyKind.CLAUDE,
     )
 
-    repository.save_checkpoint(checkpoint)
+    repository.save_progress((turn,), (), checkpoint)
 
-    assert repository.get_checkpoint(turn.run_id) == checkpoint
+    assert repository.load_recovery(turn.run_id) == RunRecovery(
+        checkpoint=checkpoint,
+        turns=(turn,),
+    )
     policy = next(
         candidate
         for candidate in checkpoint.policies
@@ -146,15 +148,15 @@ def test_checkpoint_accepts_claude_as_a_memory_owning_policy(
 def test_memory_repository_progress_is_atomic_and_checkpoint_aligned(
     first_observation: CompanyObservation,
 ) -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
     _assert_progress_contract(repository, first_observation, "memory_progress")
 
 
-def test_memory_repository_orders_v2_invocations_by_turn_application(
+def test_memory_repository_orders_invocations_by_turn_application(
     first_observation: CompanyObservation,
 ) -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
     _assert_invocation_order(repository, first_observation, "memory_invocations")
 
@@ -170,7 +172,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
     completion_turn = _turn_for(result.run_id, first_observation)
     completion_checkpoint = _checkpoint_for(completion_turn, first_observation)
 
-    with SQLiteRunRepository(database) as repository:
+    with SQLiteRunStore(database) as repository:
         repository.save_job(queued_job)
         repository.record_invocation(invocation)
         repository.record_invocation(invocation)
@@ -195,17 +197,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert repository.get_checkpoint(result.run_id) is None
         assert repository.list_turns(result.run_id) == (completion_turn,)
         assert repository.get("missing") is None
-        summaries = repository.list()
-        assert len(summaries) == 1
-        assert summaries[0].run_id == result.run_id
-        assert summaries[0].final_score == result.score.final_score
-
     expected_rows = {
         "runs": 1,
-        "run_company_results": len(result.score.companies),
-        "run_daily_snapshots": sum(len(snapshot.companies) for snapshot in result.snapshots),
-        "run_decisions": len(result.decisions),
-        "run_events": len(result.events),
         "run_jobs": 1,
         "policy_invocations": 1,
         "run_checkpoints": 0,
@@ -213,35 +206,27 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
         assert connection.execute(
             "SELECT schema_version FROM run_turns"
         ).fetchone()[0] == 5
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
-            "scenario_id",
-            "scenario_version",
-            "scenario_json",
-            "seed",
-            "started_at",
-            "finished_at",
-            "score_version",
-            "final_score",
             "result_json",
         )
         for table, expected in expected_rows.items():
             actual = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             assert actual == expected
 
-    with SQLiteRunRepository(database) as reopened:
+    with SQLiteRunStore(database) as reopened:
         assert reopened.get(result.run_id) == result
         assert reopened.get_job(result.run_id) == completed_job
         assert reopened.list_invocations(result.run_id) == (invocation,)
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 10])
-def test_sqlite_repository_rejects_non_v9_databases(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
+def test_sqlite_repository_rejects_non_v11_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -250,7 +235,7 @@ def test_sqlite_repository_rejects_non_v9_databases(
         connection.execute(f"PRAGMA user_version = {version}")
 
     with pytest.raises(RuntimeError, match=f"unsupported database schema version: {version}"):
-        SQLiteRunRepository(database)
+        SQLiteRunStore(database)
 
 
 def test_sqlite_repository_rejects_unversioned_existing_schema(tmp_path: Path) -> None:
@@ -259,27 +244,33 @@ def test_sqlite_repository_rejects_unversioned_existing_schema(tmp_path: Path) -
         connection.execute("CREATE TABLE runs (run_id TEXT PRIMARY KEY)")
 
     with pytest.raises(RuntimeError, match="unversioned existing databases are unsupported"):
-        SQLiteRunRepository(database)
+        SQLiteRunStore(database)
 
 
 def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     tmp_path: Path,
     first_observation: CompanyObservation,
 ) -> None:
-    database = tmp_path / "v2-state.sqlite3"
+    database = tmp_path / "recovery-state.sqlite3"
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
-    assert checkpoint.schema_version == 7
+    assert checkpoint.schema_version == 8
 
-    with SQLiteRunRepository(database) as repository:
-        _assert_turn_contract(repository, first, second)
-        repository.save_checkpoint(checkpoint)
-        assert repository.get_checkpoint(first.run_id) == checkpoint
+    with SQLiteRunStore(database) as repository:
+        repository.save_progress((first,), (), checkpoint)
+        cursor = checkpoint.cursors[0].model_copy(update={"next_turn_sequence": 3})
+        final_checkpoint = checkpoint.model_copy(
+            update={"cursors": (cursor, *checkpoint.cursors[1:])}
+        )
+        repository.save_progress((second,), (), final_checkpoint)
 
-    with SQLiteRunRepository(database) as reopened:
+    with SQLiteRunStore(database) as reopened:
         assert reopened.list_turns(first.run_id) == (first, second)
-        assert reopened.get_checkpoint(first.run_id) == checkpoint
+        assert reopened.load_recovery(first.run_id) == RunRecovery(
+            checkpoint=final_checkpoint,
+            turns=(first, second),
+        )
         reopened.clear_checkpoint(first.run_id)
         reopened.clear_checkpoint(first.run_id)
         assert reopened.get_checkpoint(first.run_id) is None
@@ -291,13 +282,13 @@ def test_sqlite_repository_rejects_stale_journal_payload_schema(
 ) -> None:
     database = tmp_path / "stale-journal.sqlite3"
     record = _turn_for("stale_journal", first_observation)
-    with SQLiteRunRepository(database) as repository:
+    with SQLiteRunStore(database) as repository:
         repository.record_turn(record)
     with sqlite3.connect(database) as connection:
         connection.execute("UPDATE run_turns SET schema_version = 4")
 
     with (
-        SQLiteRunRepository(database) as repository,
+        SQLiteRunStore(database) as repository,
         pytest.raises(RuntimeError, match="journal payload schema version: 4"),
     ):
         repository.list_turns(record.run_id)
@@ -307,20 +298,20 @@ def test_sqlite_repository_progress_is_atomic_and_checkpoint_aligned(
     tmp_path: Path,
     first_observation: CompanyObservation,
 ) -> None:
-    with SQLiteRunRepository(tmp_path / "progress.sqlite3") as repository:
+    with SQLiteRunStore(tmp_path / "progress.sqlite3") as repository:
         _assert_progress_contract(repository, first_observation, "sqlite_progress")
 
 
-def test_sqlite_repository_orders_v2_invocations_by_turn_application(
+def test_sqlite_repository_orders_invocations_by_turn_application(
     tmp_path: Path,
     first_observation: CompanyObservation,
 ) -> None:
-    with SQLiteRunRepository(tmp_path / "invocations.sqlite3") as repository:
+    with SQLiteRunStore(tmp_path / "invocations.sqlite3") as repository:
         _assert_invocation_order(repository, first_observation, "sqlite_invocations")
 
 
 def _assert_turn_contract(
-    repository: LifecycleRepository,
+    repository: RunStore,
     first: TurnRecord,
     second: TurnRecord,
 ) -> None:
@@ -337,7 +328,7 @@ def _assert_turn_contract(
 
 
 def _assert_job_history(
-    repository: LifecycleRepository,
+    repository: RunStore,
     jobs: tuple[RunJob, ...],
 ) -> None:
     """Exercise all-state discovery, ordering, and limit semantics."""
@@ -369,7 +360,7 @@ def _history_jobs() -> tuple[RunJob, ...]:
     )
 
 
-def _assert_replay_sources(repository: LifecycleRepository) -> tuple[ReplaySource, ...]:
+def _assert_replay_sources(repository: RunStore) -> tuple[ReplaySource, ...]:
     """Exercise completed-only discovery and submission ordering."""
     base_time = datetime(2026, 1, 1, tzinfo=UTC)
     older = RunJob(
@@ -413,33 +404,44 @@ def _assert_replay_sources(repository: LifecycleRepository) -> tuple[ReplaySourc
 
 
 def _assert_checkpoint_contract(
-    repository: LifecycleRepository,
+    repository: RunStore,
     checkpoint: RunCheckpoint,
     first: TurnRecord,
     second: TurnRecord,
 ) -> None:
     """Exercise atomic replacement and idempotent checkpoint removal."""
-    repository.save_checkpoint(checkpoint)
-    assert repository.get_checkpoint(checkpoint.run_id) == checkpoint
+    repository.save_progress((first,), (), checkpoint)
+    assert repository.load_recovery(checkpoint.run_id) == RunRecovery(
+        checkpoint=checkpoint,
+        turns=(first,),
+    )
 
     cursor = checkpoint.cursors[0].model_copy(update={"next_turn_sequence": 3})
     replacement = checkpoint.model_copy(
         update={
-            "turns": (first, second),
             "cursors": (cursor, *checkpoint.cursors[1:]),
         }
     )
-    repository.save_checkpoint(replacement)
-    assert repository.get_checkpoint(checkpoint.run_id) == replacement
+    repository.save_progress((second,), (), replacement)
+    assert repository.load_recovery(checkpoint.run_id) == RunRecovery(
+        checkpoint=replacement,
+        turns=(first, second),
+    )
 
     repository.clear_checkpoint(checkpoint.run_id)
     repository.clear_checkpoint(checkpoint.run_id)
     assert repository.get_checkpoint(checkpoint.run_id) is None
 
-    invalid_sequence = checkpoint.model_dump()
-    invalid_sequence["cursors"][0]["next_turn_sequence"] = 99
+    invalid_sequence = checkpoint.model_copy(
+        update={
+            "cursors": (
+                checkpoint.cursors[0].model_copy(update={"next_turn_sequence": 99}),
+                *checkpoint.cursors[1:],
+            )
+        }
+    )
     with pytest.raises(ValueError, match="follow completed company turns"):
-        RunCheckpoint.model_validate(invalid_sequence)
+        RunRecovery(checkpoint=invalid_sequence, turns=(first,))
 
     invalid_visibility = checkpoint.model_dump()
     invalid_visibility["cursors"][0]["last_visible_event_sequence"] = 1
@@ -448,7 +450,7 @@ def _assert_checkpoint_contract(
 
 
 def _assert_progress_contract(
-    repository: LifecycleRepository,
+    repository: RunStore,
     observation: CompanyObservation,
     run_id: str,
 ) -> None:
@@ -462,18 +464,20 @@ def _assert_progress_contract(
     cursor = first_checkpoint.cursors[0].model_copy(update={"next_turn_sequence": 3})
     second_checkpoint = first_checkpoint.model_copy(
         update={
-            "turns": (first, second),
             "cursors": (cursor, *first_checkpoint.cursors[1:]),
         }
     )
     repository.save_progress((second,), (), second_checkpoint)
     repository.save_progress((second,), (), second_checkpoint)
     assert repository.list_turns(run_id) == (first, second)
-    assert repository.get_checkpoint(run_id) == second_checkpoint
+    assert repository.load_recovery(run_id) == RunRecovery(
+        checkpoint=second_checkpoint,
+        turns=(first, second),
+    )
 
-    with pytest.raises(ValueError, match="progress turns must match checkpoint turns"):
+    with pytest.raises(ValueError, match="follow completed company turns"):
         repository.save_progress((third,), (), second_checkpoint)
-    with pytest.raises(ValueError, match="checkpoint turns must match the durable journal"):
+    with pytest.raises(ValueError, match="follow completed company turns"):
         repository.save_progress((), (), first_checkpoint)
 
     assert repository.list_turns(run_id) == (first, second)
@@ -481,13 +485,13 @@ def _assert_progress_contract(
 
 
 def _assert_invocation_order(
-    repository: LifecycleRepository,
+    repository: RunStore,
     observation: CompanyObservation,
     run_id: str,
 ) -> None:
     """Require provider completion order not to affect the audit projection."""
-    first = _v2_invocation_for(_turn_for(run_id, observation, sequence=1), observation)
-    second = _v2_invocation_for(_turn_for(run_id, observation, sequence=2), observation)
+    first = _invocation_for_turn(_turn_for(run_id, observation, sequence=1), observation)
+    second = _invocation_for_turn(_turn_for(run_id, observation, sequence=2), observation)
 
     repository.record_invocation(second)
     repository.record_invocation(first)
@@ -583,7 +587,6 @@ def _checkpoint_for(
                 chars_per_token=4,
             ),
         ),
-        turns=(record,),
         cursors=tuple(
             CompanyRuntimeCursor(
                 company_id=company.company_id,
@@ -606,34 +609,31 @@ def _job_for(result: EpisodeResult) -> RunJob:
     )
 
 
+def _completed_job_for(result: EpisodeResult) -> RunJob:
+    """Build a completed lifecycle record matching an episode."""
+    return _job_for(result).model_copy(
+        update={
+            "status": RunStatus.COMPLETED,
+            "current_day": result.scenario.days,
+            "started_at": result.started_at,
+            "finished_at": result.finished_at,
+        }
+    )
+
+
 def _invocation_for(
     run_id: str,
     observation: CompanyObservation,
 ) -> PolicyInvocation:
     """Build one typed Agent audit row for adapter round-trip tests."""
-    now = datetime.now(UTC)
-    return PolicyInvocation(
-        invocation_id=f"{run_id}.1.{observation.company_id}",
-        run_id=run_id,
-        company_id=observation.company_id,
-        day=1,
-        observation=observation,
-        provider="scripted",
-        model="scripted-v1",
-        prompt_version="test-v1",
-        prompt_hash="test-hash",
-        started_at=now,
-        finished_at=now,
-        outcome=InvocationOutcome.SUCCESS,
-        decision=NoOpDecision(reason="test"),
-    )
+    return _invocation_for_turn(_turn_for(run_id, observation), observation)
 
 
-def _v2_invocation_for(
+def _invocation_for_turn(
     record: TurnRecord,
     observation: CompanyObservation,
 ) -> PolicyInvocation:
-    """Build one completed V2 command audit tied to its applied turn."""
+    """Build one completed command audit tied to its applied turn."""
     now = datetime.now(UTC)
     return PolicyInvocation(
         invocation_id=f"{record.turn.turn_id}.invocation",
@@ -642,8 +642,8 @@ def _v2_invocation_for(
         day=observation.day,
         observation=observation,
         provider="scripted",
-        model="scripted-v2",
-        prompt_version="test-v2",
+        model="scripted-current",
+        prompt_version="test-current",
         prompt_hash=f"hash-{record.turn.turn_id}",
         started_at=now,
         finished_at=now,

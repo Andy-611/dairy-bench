@@ -2,14 +2,14 @@
 
 import asyncio
 
-from company_bench.agent_models import PolicyInfrastructureError
-from company_bench.agents import COMMAND_PROMPT_VERSION, LlmCompanyAgent
-from company_bench.codex_gateway import CodexAgentConfig, CodexModelGateway
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.engine import EconomyEngine
-from company_bench.models import PolicyKind, PolicyMetadata
-from company_bench.repository import MemoryRunRepository
-from company_bench.runtime_models import AgentTurn, SimTime, WakeReason
+from company_bench.agents.company import COMMAND_PROMPT_VERSION, LlmCompanyAgent
+from company_bench.agents.contracts import PolicyInfrastructureError
+from company_bench.agents.providers.codex.gateway import CodexAgentConfig, CodexModelGateway
+from company_bench.domain.models import PolicyKind, PolicyMetadata
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.engine import EconomyEngine
+from company_bench.runtime.models import AgentTurn, SimTime, WakeReason
+from company_bench.storage.store import InMemoryRunStore
 
 
 async def main() -> None:
@@ -18,7 +18,7 @@ async def main() -> None:
     if config is None:
         raise SystemExit("Set DAIRY_BENCH_CODEX_ENABLED=true before running this smoke test.")
 
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     engine = EconomyEngine()
     scenario = DAIRY_S9_SCENARIO
     economy = engine.open_day(engine.initial_state(scenario, seed=42))

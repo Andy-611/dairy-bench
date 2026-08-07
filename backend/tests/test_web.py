@@ -7,36 +7,36 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch, raises
 
-import company_bench.web as web_module
-from company_bench.codex_artifacts import (
+import company_bench.application as application_module
+from company_bench.agents.factory import AgentFactory
+from company_bench.agents.providers.codex.artifacts import (
     CodexArtifactIdentity,
     CodexArtifactStore,
 )
-from company_bench.codex_sessions import (
+from company_bench.agents.providers.codex.sessions import (
     CodexSessionManager,
     CodexSessionRetention,
 )
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.models import (
+from company_bench.application import BenchmarkApplication
+from company_bench.domain.models import (
     CompanyObservation,
     EpisodeResult,
-    NoOpDecision,
     PolicyKind,
 )
-from company_bench.policy_factory import PolicyFactory
-from company_bench.repository import MemoryRunRepository
-from company_bench.run_models import (
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.runs.models import (
     InvocationOutcome,
     PolicyInvocation,
     ReplaySource,
     RunJob,
     RunStatus,
 )
-from company_bench.runtime_models import Produce
-from company_bench.web import create_app
+from company_bench.runtime.models import Produce
+from company_bench.storage.store import InMemoryRunStore
+from company_bench.web.app import create_app
 
 
-class _TrackedOwnedRepository(MemoryRunRepository):
+class _TrackedOwnedRepository(InMemoryRunStore):
     """Expose whether the Web lifespan released its owned repository."""
 
     def __init__(self) -> None:
@@ -61,10 +61,10 @@ class _TrackedWebSessionManager(CodexSessionManager):
         await super().close()
 
 
-def _app(repository: MemoryRunRepository) -> FastAPI:
+def _app(repository: InMemoryRunStore) -> FastAPI:
     """Create an app with deterministic server-side policy availability."""
-    factory = PolicyFactory(DAIRY_S9_SCENARIO, repository)
-    return create_app(repository, factory)
+    factory = AgentFactory(DAIRY_S9_SCENARIO, repository)
+    return create_app(BenchmarkApplication.create(repository, factory))
 
 
 def _wait_for_terminal_job(
@@ -85,7 +85,7 @@ def _wait_for_terminal_job(
 
 
 def test_run_list_and_detail_http_flow() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     with TestClient(_app(repository)) as client:
         assert client.get("/api/health").json() == {"status": "ok"}
 
@@ -123,7 +123,6 @@ def test_run_list_and_detail_http_flow() -> None:
         assert result.seed == 42
         assert result.scenario == DAIRY_S9_SCENARIO
         assert len(result.scenario.companies) == 9
-        assert result.decisions == ()
         assert len(result.snapshots) == 30
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
         assert len(turns) > (DAIRY_S9_SCENARIO.days * len(DAIRY_S9_SCENARIO.companies))
@@ -133,20 +132,6 @@ def test_run_list_and_detail_http_flow() -> None:
             "set_quote_ladder",
             "set_retail_price",
         }
-
-        summaries = client.get("/api/runs").json()
-        assert set(summaries[0]) == {
-            "run_id",
-            "scenario_id",
-            "seed",
-            "started_at",
-            "finished_at",
-            "score_version",
-            "final_score",
-        }
-        assert summaries[0]["run_id"] == result.run_id
-        assert summaries[0]["scenario_id"] == "flow.dairy.base.s9.v5"
-        assert summaries[0]["final_score"] == str(result.score.final_score)
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -181,7 +166,6 @@ def test_run_list_and_detail_http_flow() -> None:
         )
         replay = EpisodeResult.model_validate(client.get(f"/api/runs/{replay_job.run_id}").json())
         assert replay.seed == result.seed
-        assert replay.decisions == result.decisions
         assert replay.events == result.events
         assert replay.snapshots == result.snapshots
         assert replay.score == result.score
@@ -193,7 +177,7 @@ def test_run_list_and_detail_http_flow() -> None:
 
 
 def test_run_job_history_http_lists_all_states_newest_first() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
 
     with TestClient(_app(repository)) as client:
@@ -225,7 +209,7 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
 
 
 def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     stopped = RunJob(
         run_id="http_stopped",
         mode=PolicyKind.BASELINE,
@@ -248,7 +232,7 @@ def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
 
 
 def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
     completed_jobs = tuple(
         RunJob(
@@ -287,7 +271,7 @@ def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
 
 
 def test_http_validation_and_localhost_cors() -> None:
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
     with TestClient(_app(repository)) as client:
         assert (
             client.post(
@@ -353,7 +337,6 @@ def test_http_validation_and_localhost_cors() -> None:
             ).status_code
             == 409
         )
-        assert client.get("/api/runs", params={"limit": 0}).status_code == 422
         assert client.get("/api/run-jobs", params={"limit": 0}).status_code == 422
 
         response = client.options(
@@ -371,8 +354,8 @@ def test_default_repository_uses_configured_database(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    database = tmp_path / "configured.sqlite3"
-    monkeypatch.setenv("DAIRY_BENCH_DB", str(database))
+    database = tmp_path / "data" / "runs.sqlite3"
+    monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
     monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
@@ -391,9 +374,9 @@ def test_default_app_runs_the_v4_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
-    with TestClient(create_app(repository)) as client:
+    with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         submitted = RunJob.model_validate(
             client.post(
                 "/api/runs",
@@ -413,9 +396,9 @@ def test_codex_profile_can_be_enabled_without_exposing_credentials(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DAIRY_BENCH_CODEX_ENABLED", "true")
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
-    with TestClient(create_app(repository)) as client:
+    with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         profiles = client.get("/api/policy-profiles").json()
 
     codex = next(profile for profile in profiles if profile["mode"] == "codex")
@@ -441,9 +424,9 @@ def test_claude_profile_can_be_enabled_without_exposing_credentials(
         "DAIRY_BENCH_NEWAPI_MODELS",
         "claude-default-model,claude-second-model",
     )
-    repository = MemoryRunRepository()
+    repository = InMemoryRunStore()
 
-    with TestClient(create_app(repository)) as client:
+    with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         profiles = client.get("/api/policy-profiles").json()
 
     claude = next(profile for profile in profiles if profile["mode"] == "claude")
@@ -476,9 +459,9 @@ def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(
         raise RuntimeError("coordinator close failed")
 
     monkeypatch.setenv("DAIRY_BENCH_CODEX_ENABLED", "true")
-    monkeypatch.setattr(web_module, "SQLiteRunRepository", lambda _: repository)
-    monkeypatch.setattr(web_module, "CodexSessionManager", create_manager)
-    monkeypatch.setattr(web_module.RunCoordinator, "close", fail_coordinator_close)
+    monkeypatch.setattr(application_module, "SQLiteRunStore", lambda _: repository)
+    monkeypatch.setattr(application_module, "CodexSessionManager", create_manager)
+    monkeypatch.setattr(application_module.RunCoordinator, "close", fail_coordinator_close)
 
     with (
         raises(RuntimeError, match="coordinator close failed"),
@@ -491,83 +474,16 @@ def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(
     assert repository.close_calls == 1
 
 
-def test_codex_artifacts_are_loaded_lazily_from_run_files(
+def test_codex_artifacts_are_resolved_by_domain_turn(
     first_observation: CompanyObservation,
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    artifacts_root = tmp_path / "run_artifacts"
-    monkeypatch.setenv("DAIRY_BENCH_ARTIFACTS_DIR", str(artifacts_root))
-    repository = MemoryRunRepository()
+    artifacts_root = tmp_path / "artifacts"
+    monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
+    repository = InMemoryRunStore()
     now = datetime.now(UTC)
     run_id = "run_trace"
-    invocation_id = f"{run_id}.1.{first_observation.company_id}"
-    repository.save_job(
-        RunJob(
-            run_id=run_id,
-            mode=PolicyKind.CODEX,
-            seed=42,
-            scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-            total_days=DAIRY_S9_SCENARIO.days,
-            submitted_at=now,
-        )
-    )
-    repository.record_invocation(
-        PolicyInvocation(
-            invocation_id=invocation_id,
-            run_id=run_id,
-            company_id=first_observation.company_id,
-            day=1,
-            observation=first_observation,
-            provider="codex",
-            model="gpt-5.6-terra",
-            prompt_version="test",
-            prompt_hash="hash",
-            started_at=now,
-            finished_at=now,
-            outcome=InvocationOutcome.SUCCESS,
-            decision=NoOpDecision(reason="test"),
-            request_id="thread_trace",
-            response_id="turn_trace",
-        )
-    )
-    identity = CodexArtifactIdentity(
-        invocation_id=invocation_id,
-        run_id=run_id,
-        company_id=first_observation.company_id,
-        day=1,
-        model="gpt-5.6-terra",
-        thread_id="thread_trace",
-        turn_id="turn_trace",
-    )
-    CodexArtifactStore(artifacts_root).export(
-        identity,
-        SimpleNamespace(
-            final_response='{"decision":{"kind":"no_op","reason":"test"}}',
-            items=[],
-        ),
-        None,
-    )
-
-    with TestClient(_app(repository)) as client:
-        response = client.get(f"/api/runs/{run_id}/invocations/{invocation_id}/artifacts")
-
-    assert response.status_code == 200
-    assert response.json()["thread_id"] == "thread_trace"
-    assert response.json()["turn_id"] == "turn_trace"
-    assert '"kind": "no_op"' in response.json()["final_output"]
-
-
-def test_v2_codex_artifacts_are_resolved_by_domain_turn(
-    first_observation: CompanyObservation,
-    monkeypatch: MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    artifacts_root = tmp_path / "run_artifacts"
-    monkeypatch.setenv("DAIRY_BENCH_ARTIFACTS_DIR", str(artifacts_root))
-    repository = MemoryRunRepository()
-    now = datetime.now(UTC)
-    run_id = "run_v2_trace"
     domain_turn_id = f"{run_id}.{first_observation.company_id}.t1"
     invocation_id = f"{domain_turn_id}.provider"
     repository.save_job(
@@ -598,8 +514,8 @@ def test_v2_codex_artifacts_are_resolved_by_domain_turn(
             sim_minute=540,
             state_version=0,
             command=Produce(product="raw_milk", quantity="1"),
-            request_id="thread_v2_trace",
-            provider_turn_id="provider_turn_v2_trace",
+            request_id="thread_trace",
+            provider_turn_id="provider_turn_trace",
         )
     )
     identity = CodexArtifactIdentity(
@@ -608,8 +524,8 @@ def test_v2_codex_artifacts_are_resolved_by_domain_turn(
         company_id=first_observation.company_id,
         day=1,
         model="gpt-5.6-terra",
-        thread_id="thread_v2_trace",
-        turn_id="provider_turn_v2_trace",
+        thread_id="thread_trace",
+        turn_id="provider_turn_trace",
         domain_turn_id=domain_turn_id,
     )
     CodexArtifactStore(artifacts_root).export(

@@ -15,12 +15,9 @@ htmlcov/
 .tmp/
 .tmp_pytest/
 .test-artifacts/
-backend/data/
 *.db
 *.sqlite
 *.sqlite3
-run_artifacts/*
-!run_artifacts/README.md
 
 # Frontend
 frontend/dist/

@@ -51,16 +51,16 @@ The daily clock is:
 | 19:00-19:29 | Process only previously committed completions and deliveries |
 | 19:30 | Expire inventory and commit the end-of-day snapshot |
 
-See [V4 architecture and invariants](docs/V4_ARCHITECTURE.md) and
+See [Architecture and invariants](docs/ARCHITECTURE.md) and
 [Agent integration](docs/AGENT_INTEGRATION.md) for the full contract.
 
 ## System outline
 
 ```text
-React -> FastAPI -> RunCoordinator -> EpisodeRuntime -> Scheduler + EconomyEngine
-                         |                 `-> Evaluator
-                         |-> PolicyFactory -> CompanyAgent x 9
-                         `-> LifecycleRepository -> Journal + Checkpoint + SQLite
+React -> FastAPI -> BenchmarkApplication -> RunCoordinator -> EpisodeRuntime
+                              |                    |-> Scheduler + EconomyEngine
+                              |                    `-> AgentFactory -> CompanyAgent x 9
+                              `-> RunStore -> Journal + Checkpoint + SQLite
 ```
 
 Agents may use the rule baseline, Codex, OpenAI, Claude through NewAPI, or exact
@@ -115,7 +115,7 @@ private memory; every Codex turn uses an isolated thread. Public reasoning
 summaries and final structured outputs are exported under:
 
 ```text
-run_artifacts/<run_id>/
+.dairy-bench/artifacts/<run_id>/
 |-- reasoning/
 `-- final_outputs/
 ```
@@ -126,7 +126,7 @@ For OpenAI agents, set the key in the shell that starts the backend:
 $env:OPENAI_API_KEY="your-key"
 $env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"  # optional
 
-python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
+python -m uvicorn company_bench.web.app:create_app --factory --app-dir src --host 127.0.0.1 --port 8000
 ```
 
 Configure Claude agents through NewAPI once from the repository root:
@@ -137,7 +137,7 @@ start.cmd --configure-newapi
 
 The prompt hides the key, validates it against NewAPI's `/v1/models` endpoint,
 and stores a Windows-user-encrypted credential plus a non-secret Claude model
-catalog under `%LOCALAPPDATA%\DairyBench`. Then start normally:
+catalog under `.dairy-bench/credentials`. Then start normally:
 
 ```bat
 start.cmd
@@ -160,8 +160,11 @@ economic mutation.
 
 ## Data and verification
 
-The default score-v9 database is `backend/data/dairy_bench_v9.sqlite3`. Override it with
-`DAIRY_BENCH_DB`; override artifacts with `DAIRY_BENCH_ARTIFACTS_DIR`.
+All mutable runtime state stays in the Git-ignored project directory
+`.dairy-bench/`: the database is `data/runs.sqlite3`, Agent evidence is under
+`artifacts/`, isolated Codex state is under `codex/`, and encrypted NewAPI
+credentials are under `credentials/`. Override the root only when necessary
+with `DAIRY_BENCH_HOME`.
 
 ```powershell
 cd backend
@@ -184,12 +187,8 @@ npm.cmd run build
 - `GET /api/runs/{run_id}/turns`
 - `GET /api/runs/{run_id}/invocations`
 - `GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts`
-- `GET /api/runs`
 
 ## Design documentation
 
-- [V4 architecture and invariants](docs/V4_ARCHITECTURE.md)
-- [V4 Agent integration](docs/AGENT_INTEGRATION.md)
-- [Historical V2 architecture](docs/V2_ARCHITECTURE.md)
-- [Historical V1 MVP framework](docs/MVP_FRAMEWORK.md)
-- [Historical V1 scenario catalog](docs/SCENARIO_CATALOG_V1.md)
+- [Architecture and invariants](docs/ARCHITECTURE.md)
+- [Agent integration](docs/AGENT_INTEGRATION.md)

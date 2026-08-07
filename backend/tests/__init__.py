@@ -1,1 +1,1 @@
-"""Shared test support for Dairy Bench."""
+"""Dairy Bench test suite."""

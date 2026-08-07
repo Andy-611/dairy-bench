@@ -1,219 +1,176 @@
-"""Episode orchestration and application use cases."""
+"""Application facade for benchmark lifecycle and observer use cases."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable, Mapping
-from datetime import UTC, datetime
-from uuid import uuid4
+from functools import partial
 
-from pydantic import TypeAdapter
-
-from company_bench.agent_models import PolicyInfrastructureError
-from company_bench.engine import EconomyEngine
-from company_bench.models import (
-    CompanyDecision,
-    CompanyObservation,
-    EpisodeResult,
-    EventRecord,
-    NoOpDecision,
-    PolicyDescriptor,
-    PolicyFailedEvent,
-    RecordedDecision,
-    RunSummary,
-    ScenarioSpec,
+from company_bench.agents.factory import AgentFactory
+from company_bench.agents.providers.claude import NewApiClaudeConfig
+from company_bench.agents.providers.codex.artifacts import (
+    CodexArtifactIdentity,
+    CodexArtifactStore,
+    CodexArtifactView,
 )
-from company_bench.policies import BaselinePolicy, CompanyPolicy
-from company_bench.repository import RunRepository
-from company_bench.scoring import Evaluator
+from company_bench.agents.providers.codex.gateway import CodexAgentConfig, CodexModelGateway
+from company_bench.agents.providers.codex.sessions import CodexSessionManager
+from company_bench.agents.providers.openai import OpenAIAgentConfig
+from company_bench.domain.models import EpisodeResult, PolicyKind
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.runs.coordinator import RunCoordinator
+from company_bench.runs.models import (
+    PolicyInvocation,
+    PolicyProfileView,
+    ReplaySource,
+    RunJob,
+)
+from company_bench.runtime.episode import EpisodeRuntime
+from company_bench.runtime.models import TurnRecord
+from company_bench.settings import RuntimePaths
+from company_bench.storage.store import RunStore, SQLiteRunStore
+from company_bench.timeline.models import TimelineDay, TimelineDetail
+from company_bench.timeline.projector import RunTimelineProjector
 
-_DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 
-
-class DairyBenchmark:
-    """Run one explicit legacy daily-decision scenario."""
+class BenchmarkApplication:
+    """Hide run orchestration, persistence, providers, and projections behind one facade."""
 
     def __init__(
         self,
-        scenario: ScenarioSpec,
+        store: RunStore,
+        agent_factory: AgentFactory,
+        artifacts: CodexArtifactStore,
         *,
-        engine: EconomyEngine | None = None,
-        evaluator: Evaluator | None = None,
-        policy_timeout_seconds: float = 5.0,
+        owned_store: SQLiteRunStore | None = None,
+        owned_codex_sessions: CodexSessionManager | None = None,
     ) -> None:
-        if scenario.version >= 2:
-            raise ValueError("DairyBenchmark does not implement event-driven V4 scenarios")
-        if policy_timeout_seconds <= 0:
-            raise ValueError("policy_timeout_seconds must be positive")
-        self.scenario = scenario
-        self._engine = engine or EconomyEngine()
-        self._evaluator = evaluator or Evaluator()
-        self._policy_timeout_seconds = policy_timeout_seconds
+        runtime = EpisodeRuntime(
+            agent_factory.scenario,
+            agent_timeout_seconds=agent_factory.policy_timeout_seconds,
+        )
+        self._store = store
+        self._coordinator = RunCoordinator(store, agent_factory, runtime)
+        self._timeline = RunTimelineProjector(store, artifacts)
+        self._artifacts = artifacts
+        self._owned_store = owned_store
+        self._owned_codex_sessions = owned_codex_sessions
 
-    async def run(
-        self,
-        policies: Mapping[str, CompanyPolicy],
-        seed: int,
-        *,
-        run_id: str | None = None,
-        on_day_completed: Callable[[int], Awaitable[None]] | None = None,
-    ) -> EpisodeResult:
-        """Run all companies for the configured number of days."""
-        self._validate_policy_set(policies)
-        started_at = datetime.now(UTC)
-        initial_state = self._engine.initial_state(self.scenario, seed)
-        state = initial_state
-        decisions: list[RecordedDecision] = []
-        event_records: list[EventRecord] = []
-        snapshots = []
-
-        while state.day < self.scenario.days:
-            observations = self._engine.observe(state)
-            daily_decisions, policy_events = await self._collect_decisions(
-                observations,
-                policies,
+    @classmethod
+    def create(
+        cls,
+        store: RunStore | None = None,
+        agent_factory: AgentFactory | None = None,
+        artifacts: CodexArtifactStore | None = None,
+    ) -> BenchmarkApplication:
+        """Compose production Adapters while retaining explicit test seams."""
+        paths = RuntimePaths.from_environment()
+        owned_store = SQLiteRunStore(paths.database) if store is None else None
+        active_store = owned_store or store
+        if active_store is None:
+            raise AssertionError("application composition requires a RunStore")
+        active_artifacts = artifacts or CodexArtifactStore.from_environment()
+        owned_sessions: CodexSessionManager | None = None
+        if agent_factory is None:
+            codex_config = CodexAgentConfig.from_environment()
+            owned_sessions = (
+                CodexSessionManager(codex_config.session_retention)
+                if codex_config is not None
+                else None
             )
-            day_result = self._engine.step(state, daily_decisions)
-            decisions.extend(daily_decisions)
-            for event in (*policy_events, *day_result.events):
-                event_records.append(
-                    EventRecord(
-                        sequence=len(event_records) + 1,
-                        event=event,
-                    )
-                )
-            snapshots.append(day_result.snapshot)
-            state = day_result.state
-            if on_day_completed is not None:
-                await on_day_completed(state.day)
-
-        score = self._evaluator.evaluate(
-            self.scenario,
-            initial_state,
-            state,
-            tuple(snapshots),
-            tuple(record.event for record in event_records),
-        )
-        finished_at = datetime.now(UTC)
-        return EpisodeResult(
-            run_id=run_id or f"run_{uuid4().hex}",
-            scenario=self.scenario,
-            seed=seed,
-            started_at=started_at,
-            finished_at=finished_at,
-            policies=tuple(
-                PolicyDescriptor(
-                    company_id=company.company_id,
-                    **policies[company.company_id].metadata.model_dump(),
-                )
-                for company in self.scenario.companies
-            ),
-            decisions=tuple(decisions),
-            events=tuple(event_records),
-            snapshots=tuple(snapshots),
-            score=score,
-        )
-
-    def _validate_policy_set(
-        self,
-        policies: Mapping[str, CompanyPolicy],
-    ) -> None:
-        expected = {company.company_id for company in self.scenario.companies}
-        actual = set(policies)
-        if actual != expected:
-            missing = sorted(expected - actual)
-            unexpected = sorted(actual - expected)
-            raise ValueError(
-                f"policies must match scenario companies; "
-                f"missing={missing}, unexpected={unexpected}"
+            agent_factory = AgentFactory(
+                scenario=DAIRY_S9_SCENARIO,
+                audit_sink=active_store,
+                claude_config=NewApiClaudeConfig.from_environment(),
+                codex_config=codex_config,
+                codex_gateway_factory=partial(
+                    CodexModelGateway,
+                    artifact_sink=active_artifacts,
+                    session_manager=owned_sessions,
+                ),
+                openai_config=OpenAIAgentConfig.from_environment(),
             )
-
-    async def _collect_decisions(
-        self,
-        observations: tuple[CompanyObservation, ...],
-        policies: Mapping[str, CompanyPolicy],
-    ) -> tuple[tuple[RecordedDecision, ...], tuple[PolicyFailedEvent, ...]]:
-        results = await asyncio.gather(
-            *(
-                self._ask_policy(observation, policies[observation.company_id])
-                for observation in observations
-            )
-        )
-        return (
-            tuple(result[0] for result in results),
-            tuple(result[1] for result in results if result[1] is not None),
+        return cls(
+            active_store,
+            agent_factory,
+            active_artifacts,
+            owned_store=owned_store,
+            owned_codex_sessions=owned_sessions,
         )
 
-    async def _ask_policy(
-        self,
-        observation: CompanyObservation,
-        policy: CompanyPolicy,
-    ) -> tuple[RecordedDecision, PolicyFailedEvent | None]:
-        failure: PolicyFailedEvent | None = None
+    async def start(self) -> None:
+        """Resume eligible jobs and accept new submissions."""
+        await self._coordinator.start()
+
+    async def close(self) -> None:
+        """Release every application-owned resource even after a partial failure."""
         try:
-            decision = await asyncio.wait_for(
-                policy.decide(observation),
-                timeout=self._policy_timeout_seconds,
-            )
-            decision = _DECISION_ADAPTER.validate_python(decision)
-        except PolicyInfrastructureError:
-            raise
-        except Exception as error:  # Policies are untrusted adapters.
-            reason = self._safe_failure_reason(error)
-            decision = NoOpDecision(reason="policy_failed")
-            failure = PolicyFailedEvent(
-                day=observation.day,
-                company_id=observation.company_id,
-                reason=reason,
-            )
-        return (
-            RecordedDecision(
-                observation_id=observation.observation_id,
-                day=observation.day,
-                company_id=observation.company_id,
-                decision=decision,
-            ),
-            failure,
+            await self._coordinator.close()
+        finally:
+            try:
+                if self._owned_codex_sessions is not None:
+                    await self._owned_codex_sessions.close()
+            finally:
+                if self._owned_store is not None:
+                    self._owned_store.close()
+
+    def profiles(self) -> tuple[PolicyProfileView, ...]:
+        return self._coordinator.profiles()
+
+    async def submit(
+        self,
+        *,
+        mode: PolicyKind,
+        model: str | None,
+        seed: int | None,
+        source_run_id: str | None,
+    ) -> RunJob:
+        return await self._coordinator.submit(
+            mode=mode,
+            model=model,
+            seed=seed,
+            source_run_id=source_run_id,
         )
 
-    @staticmethod
-    def _safe_failure_reason(error: Exception) -> str:
-        """Return bounded, stable diagnostic text for an adapter failure."""
-        detail = str(error).strip()
-        message = f"{type(error).__name__}: {detail[:240]}" if detail else type(error).__name__
-        return message[:300]
+    async def stop(self, run_id: str) -> RunJob:
+        return await self._coordinator.stop(run_id)
 
+    def job(self, run_id: str) -> RunJob | None:
+        return self._coordinator.get_job(run_id)
 
-class RunService:
-    """Persist episodes produced by an explicit legacy benchmark."""
+    def jobs(self, limit: int) -> tuple[RunJob, ...]:
+        return self._store.list_jobs(limit)
 
-    def __init__(
-        self,
-        repository: RunRepository,
-        benchmark: DairyBenchmark,
-    ) -> None:
-        self._repository = repository
-        self._benchmark = benchmark
+    def replay_sources(self) -> tuple[ReplaySource, ...]:
+        return self._store.list_replay_sources()
 
-    async def run(
-        self,
-        seed: int,
-        policies: Mapping[str, CompanyPolicy] | None = None,
-    ) -> EpisodeResult:
-        """Run and atomically persist one completed episode."""
-        active_policies = (
-            {company.company_id: BaselinePolicy() for company in self._benchmark.scenario.companies}
-            if policies is None
-            else policies
+    def run(self, run_id: str) -> EpisodeResult | None:
+        return self._store.get(run_id)
+
+    def invocations(self, run_id: str) -> tuple[PolicyInvocation, ...]:
+        return self._store.list_invocations(run_id)
+
+    def turns(self, run_id: str) -> tuple[TurnRecord, ...]:
+        return self._store.list_turns(run_id)
+
+    def timeline_day(self, run_id: str, day: int) -> TimelineDay:
+        return self._timeline.read_day(run_id, day)
+
+    def timeline_detail(self, run_id: str, entry_id: str) -> TimelineDetail:
+        return self._timeline.read_detail(run_id, entry_id)
+
+    def artifacts(self, invocation: PolicyInvocation) -> CodexArtifactView | None:
+        """Load Codex evidence only when the invocation carries complete coordinates."""
+        turn_id = invocation.provider_turn_id or invocation.response_id
+        if invocation.provider != "codex" or invocation.request_id is None or turn_id is None:
+            return None
+        return self._artifacts.read(
+            CodexArtifactIdentity(
+                invocation_id=invocation.invocation_id,
+                run_id=invocation.run_id,
+                company_id=invocation.company_id,
+                day=invocation.day,
+                model=invocation.model,
+                thread_id=invocation.request_id,
+                turn_id=turn_id,
+                domain_turn_id=invocation.domain_turn_id,
+            )
         )
-        result = await self._benchmark.run(active_policies, seed)
-        self._repository.save(result)
-        return result
-
-    def list_runs(self, limit: int = 50) -> tuple[RunSummary, ...]:
-        """List the latest completed episodes."""
-        return self._repository.list(limit)
-
-    def get_run(self, run_id: str) -> EpisodeResult | None:
-        """Get one completed episode by identity."""
-        return self._repository.get(run_id)

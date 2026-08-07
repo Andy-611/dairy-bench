@@ -2,8 +2,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $backendDirectory = Split-Path -Parent $PSScriptRoot
-$backendSourceDirectory = Join-Path $backendDirectory "src"
-$newApiStateDirectory = Join-Path $env:LOCALAPPDATA "DairyBench"
+$runtimePathsScript = Join-Path $PSScriptRoot "runtime_paths.ps1"
+. $runtimePathsScript
+$runtimeHome = Get-DairyBenchRuntimeHome -BackendDirectory $backendDirectory
+$newApiStateDirectory = Join-Path $runtimeHome "credentials"
 $newApiCredentialPath = Join-Path $newApiStateDirectory "newapi-token.clixml"
 $newApiModelsPath = Join-Path $newApiStateDirectory "newapi-claude-models.json"
 $newApiPlainKey = $null
@@ -27,10 +29,9 @@ try {
         }
     }
 
-    $env:PYTHONPATH = $backendSourceDirectory
     Set-Location -LiteralPath $backendDirectory
-    & python -m uvicorn company_bench.web:create_app --factory `
-        --host 127.0.0.1 --port 8000
+    & python -m uvicorn company_bench.web.app:create_app --factory `
+        --app-dir src --host 127.0.0.1 --port 8000
     if ($LASTEXITCODE -ne 0) {
         throw "Dairy Bench backend exited with code $LASTEXITCODE."
     }
@@ -39,6 +40,5 @@ finally {
     Remove-Item Env:NEWAPI_API_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:DAIRY_BENCH_NEWAPI_MODELS -ErrorAction SilentlyContinue
     Remove-Item Env:DAIRY_BENCH_NEWAPI_MODEL -ErrorAction SilentlyContinue
-    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
     $newApiPlainKey = $null
 }

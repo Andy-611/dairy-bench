@@ -3,9 +3,9 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from company_bench.attention import AgentAttention, ArmedWait, AttentionRejected
-from company_bench.models import CompanyObservation, ProductId, RuntimeSpec
-from company_bench.runtime_models import (
+from company_bench.domain.models import CompanyObservation, ProductId, RuntimeSpec
+from company_bench.runtime.attention import AgentAttention, ArmedWait, AttentionRejected
+from company_bench.runtime.models import (
     AgentTurn,
     OrderBookView,
     PriceLevelView,

@@ -3,9 +3,9 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.economics import OperatingEconomics
-from company_bench.models import CapacityFunction, CostFunction
+from company_bench.domain.models import CapacityFunction, CostFunction
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.operations import OperatingEconomics
 
 
 def _capacity_function() -> CapacityFunction:

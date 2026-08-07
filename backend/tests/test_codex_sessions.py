@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from openai_codex.types import SortDirection, ThreadSortKey
 
-from company_bench.codex_sessions import (
+from company_bench.agents.providers.codex.sessions import (
     CodexSessionManager,
     CodexSessionRetention,
 )

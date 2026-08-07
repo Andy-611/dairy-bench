@@ -7,16 +7,16 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from company_bench.dairy_scenario import DAIRY_S9_SCENARIO
-from company_bench.engine import EconomyEngine
-from company_bench.memory import (
+from company_bench.agents.memory import (
     AgentCheckpoint,
     ConversationMemory,
     MemoryExchange,
     MemorySummary,
 )
-from company_bench.models import CompanyObservation
-from company_bench.runtime_models import (
+from company_bench.domain.models import CompanyObservation
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.engine import EconomyEngine
+from company_bench.runtime.models import (
     AgentTurn,
     CommandEnvelope,
     CommandOutcome,

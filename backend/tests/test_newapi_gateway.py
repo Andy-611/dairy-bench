@@ -11,21 +11,20 @@ import pytest
 from anthropic import AsyncAnthropic
 from pydantic import SecretStr
 
-import company_bench.newapi_gateway as gateway_module
-from company_bench.agent_models import (
+import company_bench.agents.providers.claude as gateway_module
+from company_bench.agents.contracts import (
     CommandModelRequest,
     CommandName,
     ModelInfrastructureError,
     ModelOutputError,
-    ModelRequest,
 )
-from company_bench.models import CompanyObservation, FarmDecision, ProductId
-from company_bench.newapi_gateway import (
+from company_bench.agents.providers.claude import (
     DEFAULT_NEWAPI_BASE_URL,
     NewApiClaudeConfig,
     NewApiClaudeGateway,
 )
-from company_bench.runtime_models import (
+from company_bench.domain.models import CompanyObservation, ProductId
+from company_bench.runtime.models import (
     AgentTurn,
     MarketSide,
     QuoteLevel,
@@ -85,17 +84,6 @@ def _command_request(observation: CompanyObservation) -> CommandModelRequest:
         instructions="Call exactly one authorized tool.",
         input_text=turn.model_dump_json(),
         allowed_commands=("produce", "set_quote_ladder", "wait"),
-    )
-
-
-def _model_request(observation: CompanyObservation) -> ModelRequest:
-    """Build one legacy daily-decision request."""
-    return ModelRequest.model_construct(
-        invocation_id="newapi_test.farm_a.daily",
-        run_id="newapi_test",
-        observation=observation,
-        instructions="Return one structured farm decision.",
-        input_text=observation.model_dump_json(),
     )
 
 
@@ -199,12 +187,12 @@ def test_config_loads_allowed_models_and_fingerprint_hides_secret(
     assert NewApiClaudeConfig.from_environment() is None
 
     monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODELS", "claude-a, claude-b,claude-a")
-    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL", "claude-legacy")
+    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL", "claude-fallback")
     loaded = NewApiClaudeConfig.from_environment()
     assert loaded is not None
     assert loaded.base_url == DEFAULT_NEWAPI_BASE_URL
     assert loaded.model == "claude-a"
-    assert loaded.available_models == ("claude-a", "claude-b", "claude-legacy")
+    assert loaded.available_models == ("claude-a", "claude-b", "claude-fallback")
     assert loaded.max_attempts == 10
     assert loaded.select_model("claude-b").model == "claude-b"
     with pytest.raises(ValueError, match="not configured"):
@@ -315,41 +303,6 @@ def test_newapi_command_schemas_match_anthropic_strict_subset(
 
     assert tool["strict"] is True
     _assert_strict_schema(tool["input_schema"])
-
-
-def test_newapi_gateway_generates_typed_daily_decision() -> None:
-    observation = _observation()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        tool = json.loads(request.content)["tools"][0]
-        assert tool["strict"] is True
-        _assert_strict_schema(tool["input_schema"])
-        return _message_response(
-            request,
-            [
-                _tool_use(
-                    "submit_decision",
-                    {
-                        "decision": {
-                            "kind": "farm",
-                            "produce_quantity": "10",
-                            "raw_offer_quantity": "8",
-                            "minimum_raw_price": "1.40",
-                        }
-                    },
-                )
-            ],
-        )
-
-    async def operation(gateway: NewApiClaudeGateway) -> object:
-        return await gateway.generate(_model_request(observation), FarmDecision)
-
-    result = asyncio.run(_with_gateway(handler, operation))
-    assert result.decision == FarmDecision(
-        produce_quantity="10",
-        raw_offer_quantity="8",
-        minimum_raw_price="1.40",
-    )
 
 
 @pytest.mark.parametrize(
