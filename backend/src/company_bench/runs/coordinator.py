@@ -6,10 +6,11 @@ import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from company_bench.agents.contracts import PolicyInfrastructureError
 from company_bench.agents.factory import AgentFactory
 from company_bench.diagnostics import bounded_error
 from company_bench.domain.models import MAX_SEED, PolicyKind
-from company_bench.runs.models import PolicyProfileView, RunJob
+from company_bench.runs.models import PolicyProfileView, RunJob, RunStatus
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.storage.store import RunStore
 
@@ -42,7 +43,7 @@ class RunCoordinator:
 
     async def start(self) -> None:
         """Restart jobs whose process ended before a terminal state."""
-        for job in self._repository.list_resumable_jobs():
+        for job in self._repository.list_auto_resume_jobs():
             self._schedule(job)
 
     async def submit(
@@ -95,7 +96,7 @@ class RunCoordinator:
         return self._repository.get_job(run_id)
 
     async def stop(self, run_id: str) -> RunJob:
-        """Permanently stop one run after its owned resources are released."""
+        """Stop one run until an explicit resume request."""
         job = self._repository.get_job(run_id)
         if job is None:
             raise LookupError(f"Run job '{run_id}' was not found")
@@ -119,6 +120,29 @@ class RunCoordinator:
         stopped = current.mark_stopped(datetime.now(UTC))
         self._repository.save_job(stopped)
         return stopped
+
+    async def resume(self, run_id: str) -> RunJob:
+        """Continue one recoverable run under its original identity."""
+        job = self._repository.get_job(run_id)
+        if job is None:
+            raise LookupError(f"Run job '{run_id}' was not found")
+        if not job.status.resumable:
+            raise ValueError(f"a {job.status.value} run cannot be resumed")
+
+        task = self._tasks.get(run_id)
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+        current = self._repository.get_job(run_id) or job
+        if (
+            current.status is RunStatus.FAILED
+            and self._repository.get_checkpoint(run_id) is None
+        ):
+            raise ValueError("a failed run can only resume from a saved checkpoint")
+
+        queued = current.queue_for_resume()
+        self._repository.save_job(queued)
+        self._schedule(queued)
+        return queued
 
     async def close(self) -> None:
         """Cancel active work and persist an interrupted state."""
@@ -201,6 +225,15 @@ class RunCoordinator:
                     )
                 self._repository.save_job(current)
             raise
+        except PolicyInfrastructureError as error:
+            current = self._repository.get_job(job.run_id) or job
+            if not current.status.terminal:
+                self._repository.save_job(
+                    current.mark_interrupted(
+                        datetime.now(UTC),
+                        bounded_error(error),
+                    )
+                )
         except Exception as error:
             current = self._repository.get_job(job.run_id) or job
             if not current.status.terminal:

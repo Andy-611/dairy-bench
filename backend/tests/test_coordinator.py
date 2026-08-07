@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 
@@ -8,7 +9,7 @@ from company_bench.domain.models import PolicyKind
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
 from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus
-from company_bench.runtime.episode import EpisodeRuntime
+from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import AgentTurn, CompanyCommand, SystemStepRecord, TurnRecord
 from company_bench.storage.store import InMemoryRunStore
 from company_bench.timeline.projector import RunTimelineProjector
@@ -141,7 +142,7 @@ def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_is_permanent_and_preserves_partial_audit_state() -> None:
+async def test_stop_preserves_resumable_partial_audit_state() -> None:
     coordinator, repository, submitted, gateway = await _start_blocked_run()
     turns = repository.list_turns(submitted.run_id)
     checkpoint = repository.get_checkpoint(submitted.run_id)
@@ -157,7 +158,7 @@ async def test_stop_is_permanent_and_preserves_partial_audit_state() -> None:
     assert repository.get(submitted.run_id) is None
     assert repository.list_turns(submitted.run_id) == turns
     assert repository.get_checkpoint(submitted.run_id) == checkpoint
-    assert repository.list_resumable_jobs() == ()
+    assert repository.list_auto_resume_jobs() == ()
     assert gateway.close_calls == 1
     assert await coordinator.stop(submitted.run_id) == stopped
     with pytest.raises(LookupError, match="was not found"):
@@ -220,7 +221,7 @@ async def test_backend_close_remains_a_resumable_interruption() -> None:
     interrupted = repository.get_job(submitted.run_id)
     assert interrupted is not None
     assert interrupted.status is RunStatus.INTERRUPTED
-    assert repository.list_resumable_jobs() == (interrupted,)
+    assert repository.list_auto_resume_jobs() == (interrupted,)
     assert repository.get_checkpoint(submitted.run_id) is not None
     assert gateway.close_calls == 1
 
@@ -333,16 +334,18 @@ class _InterruptAfterCheckpoint:
         raise RuntimeError("simulated process stop")
 
 
-@pytest.mark.asyncio
-async def test_start_resumes_a_checkpoint_to_completion() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
-    runtime = EpisodeRuntime(scenario)
-    seed = 18
-    run_id = "restart_resume"
+async def _save_checkpointed_job(
+    repository: InMemoryRunStore,
+    runtime: EpisodeRuntime,
+    *,
+    run_id: str,
+    seed: int,
+    status: RunStatus,
+) -> tuple[EpisodeExecution, RunJob]:
+    """Persist one partial run alongside its deterministic completed reference."""
+    scenario = runtime.scenario
     agents = {company.company_id: BaselineCompanyAgent() for company in scenario.companies}
     expected = await runtime.run(agents, seed, run_id=run_id)
-    repository = InMemoryRunStore()
-
     with pytest.raises(RuntimeError, match="simulated process stop"):
         await runtime.run(
             {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -352,19 +355,36 @@ async def test_start_resumes_a_checkpoint_to_completion() -> None:
         )
     checkpoint = repository.get_checkpoint(run_id)
     assert checkpoint is not None
-    repository.save_job(
-        RunJob(
-            run_id=run_id,
-            mode=PolicyKind.BASELINE,
-            status=RunStatus.INTERRUPTED,
-            seed=seed,
-            scenario_id=scenario.scenario_id,
-            current_day=len(checkpoint.snapshots),
-            total_days=scenario.days,
-            submitted_at=checkpoint.episode_started_at,
-            started_at=checkpoint.episode_started_at,
-            error_message="simulated process stop",
-        )
+    job = RunJob(
+        run_id=run_id,
+        mode=PolicyKind.BASELINE,
+        status=status,
+        seed=seed,
+        scenario_id=scenario.scenario_id,
+        current_day=len(checkpoint.snapshots),
+        total_days=scenario.days,
+        submitted_at=checkpoint.episode_started_at,
+        started_at=checkpoint.episode_started_at,
+        finished_at=checkpoint.episode_started_at,
+        error_message=None if status is RunStatus.STOPPED else "simulated interruption",
+    )
+    repository.save_job(job)
+    return expected, job
+
+
+@pytest.mark.asyncio
+async def test_start_resumes_a_checkpoint_to_completion() -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    runtime = EpisodeRuntime(scenario)
+    seed = 18
+    run_id = "restart_resume"
+    repository = InMemoryRunStore()
+    expected, _ = await _save_checkpointed_job(
+        repository,
+        runtime,
+        run_id=run_id,
+        seed=seed,
+        status=RunStatus.INTERRUPTED,
     )
     coordinator = RunCoordinator(
         repository,
@@ -389,3 +409,114 @@ async def test_start_resumes_a_checkpoint_to_completion() -> None:
     assert result.snapshots == expected.episode.snapshots
     assert result.score == expected.episode.score
     assert repository.get_checkpoint(run_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    (RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.STOPPED),
+)
+async def test_explicit_resume_continues_the_same_checkpointed_run(
+    status: RunStatus,
+) -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    runtime = EpisodeRuntime(scenario)
+    repository = InMemoryRunStore()
+    run_id = f"explicit_resume_{status.value}"
+    expected, suspended = await _save_checkpointed_job(
+        repository,
+        runtime,
+        run_id=run_id,
+        seed=19,
+        status=status,
+    )
+    coordinator = RunCoordinator(
+        repository,
+        AgentFactory(scenario, repository),
+        runtime=runtime,
+    )
+
+    if status is not RunStatus.INTERRUPTED:
+        await coordinator.start()
+        await asyncio.sleep(0)
+        assert repository.get_job(run_id) == suspended
+
+    try:
+        queued = await coordinator.resume(run_id)
+        completed = await _wait_for_terminal(repository, run_id)
+    finally:
+        await coordinator.close()
+
+    result = repository.get(run_id)
+    assert queued.run_id == suspended.run_id
+    assert queued.status is RunStatus.QUEUED
+    assert queued.current_day == suspended.current_day
+    assert queued.finished_at is None
+    assert queued.error_message is None
+    assert completed.status is RunStatus.COMPLETED
+    assert result is not None
+    assert repository.list_turns(run_id) == expected.turns
+    assert result.score == expected.episode.score
+    assert repository.get_checkpoint(run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    repository = InMemoryRunStore()
+    job = RunJob(
+        run_id="resume_from_start",
+        mode=PolicyKind.BASELINE,
+        status=RunStatus.STOPPED,
+        seed=20,
+        scenario_id=scenario.scenario_id,
+        total_days=scenario.days,
+        submitted_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+    )
+    repository.save_job(job)
+    coordinator = RunCoordinator(
+        repository,
+        AgentFactory(scenario, repository),
+        runtime=EpisodeRuntime(scenario),
+    )
+
+    try:
+        queued = await coordinator.resume(job.run_id)
+        completed = await _wait_for_terminal(repository, job.run_id)
+    finally:
+        await coordinator.close()
+
+    assert queued.run_id == job.run_id
+    assert completed.status is RunStatus.COMPLETED
+    assert repository.get(job.run_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_irrecoverable_or_completed_runs() -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    repository = InMemoryRunStore()
+    base = RunJob(
+        run_id="resume_rejected",
+        mode=PolicyKind.BASELINE,
+        status=RunStatus.FAILED,
+        seed=21,
+        scenario_id=scenario.scenario_id,
+        total_days=scenario.days,
+        submitted_at=datetime.now(UTC),
+    )
+    repository.save_job(base)
+    coordinator = RunCoordinator(
+        repository,
+        AgentFactory(scenario, repository),
+        runtime=EpisodeRuntime(scenario),
+    )
+
+    with pytest.raises(ValueError, match="saved checkpoint"):
+        await coordinator.resume(base.run_id)
+    repository.save_job(base.model_copy(update={"status": RunStatus.COMPLETED}))
+    with pytest.raises(ValueError, match="completed run cannot be resumed"):
+        await coordinator.resume(base.run_id)
+    with pytest.raises(LookupError, match="was not found"):
+        await coordinator.resume("missing")
+    await coordinator.close()

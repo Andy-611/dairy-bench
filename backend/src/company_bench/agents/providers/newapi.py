@@ -29,6 +29,7 @@ from company_bench.agents.contracts import (
     CommandModelResult,
     CommandName,
     ModelCompatibilityError,
+    ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
     command_model,
@@ -496,10 +497,11 @@ def _response_error(
     api_key: SecretStr,
     attempts: int,
     latency_ms: int,
-) -> ModelCompatibilityError | ModelInfrastructureError:
+) -> ModelCompatibilityError | ModelConfigurationError | ModelInfrastructureError:
     """Classify a bounded HTTP failure without exposing credentials."""
     message = _safe_error_message(response, api_key)
-    if _error_type(response) != _PROXY_UPSTREAM_ERROR_TYPE and response.status_code in {
+    error_type = _error_type(response)
+    if error_type != _PROXY_UPSTREAM_ERROR_TYPE and response.status_code in {
         400,
         404,
         405,
@@ -511,7 +513,14 @@ def _response_error(
             attempts=attempts,
             latency_ms=latency_ms,
         )
-    return ModelInfrastructureError(
+    error_class = (
+        ModelInfrastructureError
+        if error_type == _PROXY_UPSTREAM_ERROR_TYPE
+        or response.status_code in {408, 409, 429}
+        or response.status_code >= 500
+        else ModelConfigurationError
+    )
+    return error_class(
         message,
         request_id=_request_id(response),
         attempts=attempts,

@@ -1,9 +1,9 @@
 import type { RunStatus } from "./api/types";
 
 export function isActiveRun(status: RunStatus): boolean {
-  return status === "queued" || status === "running" || status === "interrupted";
+  return status === "queued" || status === "running";
 }
 
-export function isGracefulRunTerminal(status: RunStatus): boolean {
-  return status === "completed" || status === "stopped";
+export function isResumableRun(status: RunStatus): boolean {
+  return status === "failed" || status === "interrupted" || status === "stopped";
 }

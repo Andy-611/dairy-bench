@@ -14,8 +14,12 @@ from company_bench.agents.contracts import (
     CommandName,
     ModelCallError,
     ModelCompatibilityError,
+    ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
+    PolicyCompatibilityError,
+    PolicyConfigurationError,
+    PolicyExecutionError,
     PolicyInfrastructureError,
 )
 from company_bench.agents.memory import AgentCheckpoint, ConversationMemory, MemoryExchange
@@ -214,14 +218,23 @@ class LlmCompanyAgent:
             ):
                 raise ModelOutputError("Agent context exceeds the configured prompt-token limit")
             result = await self._gateway.generate_command(request)
-        except ModelCompatibilityError as error:
+        except (ModelCompatibilityError, ModelConfigurationError) as error:
             self._record_failure(
                 request,
                 started_at,
-                InvocationOutcome.AGENT_ERROR,
+                (
+                    InvocationOutcome.AGENT_ERROR
+                    if isinstance(error, ModelCompatibilityError)
+                    else InvocationOutcome.INFRASTRUCTURE_ERROR
+                ),
                 error,
             )
-            raise PolicyInfrastructureError(str(error)) from error
+            policy_error = (
+                PolicyCompatibilityError(str(error))
+                if isinstance(error, ModelCompatibilityError)
+                else PolicyConfigurationError(str(error))
+            )
+            raise policy_error from error
         except ModelOutputError as error:
             self._record_failure(
                 request,
@@ -245,7 +258,7 @@ class LlmCompanyAgent:
                 InvocationOutcome.INFRASTRUCTURE_ERROR,
                 error,
             )
-            raise PolicyInfrastructureError(
+            raise PolicyExecutionError(
                 f"unexpected model gateway failure: {type(error).__name__}"
             ) from error
 

@@ -208,6 +208,41 @@ button:disabled {
   outline-color: rgb(191 75 66 / 28%);
 }
 
+.all-runs-field {
+  flex: 1 1 440px;
+}
+
+.all-runs-field select {
+  width: 100%;
+}
+
+.history-action {
+  height: 42px;
+  padding: 0 13px;
+  color: var(--green-dark);
+  border: 1px solid #cddbd3;
+  border-radius: 9px;
+  background: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.history-action:hover:not(:disabled) {
+  border-color: var(--green);
+  background: var(--green-soft);
+}
+
+.resume-run-button {
+  color: #fff;
+  border-color: var(--green);
+  background: var(--green);
+}
+
+.resume-run-button:hover:not(:disabled) {
+  color: var(--green-dark);
+}
+
 .hero {
   position: relative;
   display: grid;
@@ -1185,6 +1220,10 @@ footer {
   .run-form {
     align-items: end;
     justify-content: stretch;
+  }
+
+  .all-runs-field {
+    flex-basis: 100%;
   }
 
   .run-field {
@@ -2860,4 +2899,5 @@ footer {
   .market-detail-grid.compact {
     grid-template-columns: 1fr;
   }
+
 }

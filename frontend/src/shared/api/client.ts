@@ -1,6 +1,6 @@
 import { companyLabel } from "../labels";
 import { isAbortError } from "../requestErrors";
-import { isActiveRun, isGracefulRunTerminal } from "../runStatus";
+import { isActiveRun } from "../runStatus";
 import type {
   AgentUsageSummaryView,
   AgentTraceView,
@@ -77,43 +77,35 @@ export class DairyBenchApi {
     onProgress: ProgressListener,
     signal?: AbortSignal,
   ): Promise<RunJobView> {
-    const response = await fetch(`${this.baseUrl}/api/runs`, {
-      body: JSON.stringify(runRequestPayload(request)),
-      headers: { "Content-Type": "application/json" },
-      method: "POST",
+    const progress = await this.postJob(
+      "/api/runs",
       signal,
-    });
-    const payload = await readJsonBody(response, signal);
+      runRequestPayload(request),
+    );
+    return this.monitorJob(progress, onProgress, signal);
+  }
 
-    if (!response.ok) {
-      throw new ApiError(errorMessage(payload, response.status), response.status);
-    }
-
-    let progress = parseRunJob(payload);
-    onProgress(progress);
-    while (isActiveRun(progress.status)) {
-      await delay(POLL_INTERVAL_MS, signal);
-      progress = parseRunJob(
-        await this.getJson(`/api/run-jobs/${progress.runId}`, signal),
-      );
-      onProgress(progress);
-    }
-
-    if (!isGracefulRunTerminal(progress.status)) {
-      throw new ApiError(
-        progress.errorMessage ?? "The run did not complete. Check the backend log.",
-        500,
-      );
-    }
-
-    return progress;
+  public async resumeRun(
+    runId: string,
+    onProgress: ProgressListener,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    const progress = await this.postJob(
+      `/api/run-jobs/${encodeURIComponent(runId)}/resume`,
+      signal,
+    );
+    return this.monitorJob(progress, onProgress, signal);
   }
 
   public async runJobs(
     limit = 100,
+    offset = 0,
     signal?: AbortSignal,
   ): Promise<readonly RunJobView[]> {
-    const payload = await this.getJson(`/api/run-jobs?limit=${limit}`, signal);
+    const payload = await this.getJson(
+      `/api/run-jobs?limit=${limit}&offset=${offset}`,
+      signal,
+    );
     return array(payload, "RunJob[]").map(parseRunJob);
   }
 
@@ -139,15 +131,35 @@ export class DairyBenchApi {
     runId: string,
     signal?: AbortSignal,
   ): Promise<RunJobView> {
-    const response = await fetch(
-      `${this.baseUrl}/api/run-jobs/${encodeURIComponent(runId)}/stop`,
-      { method: "POST", signal },
+    return this.postJob(
+      `/api/run-jobs/${encodeURIComponent(runId)}/stop`,
+      signal,
     );
-    const payload = await readJsonBody(response, signal);
-    if (!response.ok) {
-      throw new ApiError(errorMessage(payload, response.status), response.status);
+  }
+
+  private async monitorJob(
+    initial: RunJobView,
+    onProgress: ProgressListener,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    let progress = initial;
+    onProgress(progress);
+    while (isActiveRun(progress.status)) {
+      await delay(POLL_INTERVAL_MS, signal);
+      progress = parseRunJob(
+        await this.getJson(`/api/run-jobs/${progress.runId}`, signal),
+      );
+      onProgress(progress);
     }
-    return parseRunJob(payload);
+
+    if (progress.status === "failed") {
+      throw new ApiError(
+        progress.errorMessage ?? "The run did not complete. Check the backend log.",
+        500,
+      );
+    }
+
+    return progress;
   }
 
   public async episode(
@@ -193,6 +205,24 @@ export class DairyBenchApi {
       throw new ApiError(errorMessage(payload, response.status), response.status);
     }
     return payload;
+  }
+
+  private async postJob(
+    path: string,
+    signal?: AbortSignal,
+    body?: Readonly<Record<string, unknown>>,
+  ): Promise<RunJobView> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      method: "POST",
+      signal,
+    });
+    const payload = await readJsonBody(response, signal);
+    if (!response.ok) {
+      throw new ApiError(errorMessage(payload, response.status), response.status);
+    }
+    return parseRunJob(payload);
   }
 }
 

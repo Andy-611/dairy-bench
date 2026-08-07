@@ -4,7 +4,11 @@ import { CompanyTable } from "../features/evaluation/CompanyTable";
 import { EvaluationStandard } from "../features/evaluation/EvaluationStandard";
 import { MetricChart } from "../features/evaluation/MetricChart";
 import { TokenSummary } from "../features/evaluation/TokenSummary";
-import { RunForm, type RunControl } from "../features/runs/RunForm";
+import {
+  RunForm,
+  type RunControl,
+  type RunFormMode,
+} from "../features/runs/RunForm";
 import { OperationsTimeline } from "../features/timeline/OperationsTimeline";
 import { DairyBenchApi } from "../shared/api/client";
 import type {
@@ -33,12 +37,17 @@ interface RunNotice {
 
 type RunTransition = Extract<
   RunControl,
-  { readonly state: "starting" | "stopping" }
+  { readonly state: "resuming" | "starting" | "stopping" }
 >;
+
+type RunStream = (
+  onProgress: (job: RunJobView) => void,
+  signal: AbortSignal,
+) => Promise<RunJobView>;
 
 export function App() {
   const workspace = useRunWorkspace(api);
-  const [mode, setMode] = useState<PolicyMode>("baseline");
+  const [mode, setMode] = useState<RunFormMode>("baseline");
   const [profiles, setProfiles] = useState<readonly PolicyProfileView[]>([]);
   const [model, setModel] = useState("");
   const [seed, setSeed] = useState("42");
@@ -102,7 +111,66 @@ export function App() {
     workspace.selectedRunId,
   ]);
 
+  async function streamRun(
+    transition: RunTransition,
+    errorHeading: string,
+    operation: RunStream,
+  ): Promise<void> {
+    const controller = new AbortController();
+    activeRequest.current?.abort();
+    activeRequest.current = controller;
+    setError(null);
+    setNotice(null);
+    setProgress(null);
+    setRunTransition(transition);
+    let selectedSubmittedRun = false;
+    let streamedRunId = "";
+
+    try {
+      const result = await operation(
+        (job) => {
+          streamedRunId = job.runId;
+          setProgress(job);
+          setRunTransition((current) =>
+            current === transition ? null : current,
+          );
+          const selectLatestDay = !selectedSubmittedRun || !isActiveRun(job.status);
+          workspace.trackJob(job, selectLatestDay);
+          selectedSubmittedRun = true;
+        },
+        controller.signal,
+      );
+      const message = runNotice(result);
+      if (message) {
+        setNotice({ message, runId: result.runId });
+      }
+    } catch (reason: unknown) {
+      if (isAbortError(reason)) {
+        return;
+      }
+      setProgress(null);
+      setError({
+        heading: errorHeading,
+        message: requestErrorMessage(reason, {
+          fallback:
+            "The run stopped before completion. Its persisted timeline remains available below.",
+          network:
+            "Could not reach the backend. Confirm FastAPI is running at 127.0.0.1:8000.",
+        }),
+      });
+    } finally {
+      setRunTransition((current) => (current === transition ? null : current));
+      workspace.releaseJobStream(streamedRunId);
+      if (activeRequest.current === controller) {
+        activeRequest.current = null;
+      }
+    }
+  }
+
   async function runBenchmark(): Promise<void> {
+    if (mode === "all-runs") {
+      return;
+    }
     const request = buildRunRequest(
       mode,
       model,
@@ -113,60 +181,19 @@ export function App() {
       setError({ heading: "The run could not be started", message: request });
       return;
     }
+    await streamRun(
+      { state: "starting" },
+      "The run could not be completed",
+      (onProgress, signal) => api.run(request, onProgress, signal),
+    );
+  }
 
-    const controller = new AbortController();
-    activeRequest.current?.abort();
-    activeRequest.current = controller;
-    setError(null);
-    setNotice(null);
-    setProgress(null);
-    setRunTransition({ state: "starting" });
-    let selectedSubmittedRun = false;
-    let streamedRunId = "";
-
-    try {
-      const result = await api.run(
-        request,
-        (job) => {
-          streamedRunId = job.runId;
-          setProgress(job);
-          setRunTransition((current) =>
-            current?.state === "starting" ? null : current,
-          );
-          const selectLatestDay =
-            !selectedSubmittedRun ||
-            !isActiveRun(job.status);
-          workspace.trackJob(job, selectLatestDay);
-          selectedSubmittedRun = true;
-        },
-        controller.signal,
-      );
-      if (result.status === "stopped") {
-        setNotice({ message: stopNotice(result), runId: result.runId });
-      }
-    } catch (reason: unknown) {
-      if (isAbortError(reason)) {
-        return;
-      }
-      setProgress(null);
-      setError({
-        heading: "The run could not be completed",
-        message: requestErrorMessage(reason, {
-          fallback:
-            "The run stopped before completion. Its persisted timeline remains available below.",
-          network:
-            "Could not reach the backend. Confirm FastAPI is running at 127.0.0.1:8000.",
-        }),
-      });
-    } finally {
-      setRunTransition((current) =>
-        current?.state === "starting" ? null : current,
-      );
-      workspace.releaseJobStream(streamedRunId);
-      if (activeRequest.current === controller) {
-        activeRequest.current = null;
-      }
-    }
+  async function resumeBenchmark(runId: string): Promise<void> {
+    await streamRun(
+      { state: "resuming", runId },
+      "The run could not be resumed",
+      (onProgress, signal) => api.resumeRun(runId, onProgress, signal),
+    );
   }
 
   async function stopBenchmark(runId: string): Promise<void> {
@@ -203,12 +230,18 @@ export function App() {
   const { selectedDay, selectedJob } = workspace;
   const replaySourceError =
     mode === "replay" ? workspace.replaySourceError : null;
-  const displayedError = error?.message ?? workspace.error ?? replaySourceError;
+  const selectedFailure =
+    selectedJob?.status === "failed" ? selectedJob.errorMessage : null;
+  const displayedError =
+    error?.message ?? workspace.error ?? replaySourceError ?? selectedFailure;
+  const errorCanBeDismissed = Boolean(error || workspace.error || replaySourceError);
   const errorHeading =
     error?.heading ??
     (workspace.error
       ? "Run data could not be loaded"
-      : "Replay sources could not be loaded");
+      : replaySourceError
+        ? "Completed replay sources could not be loaded"
+        : "The selected run failed");
   const episode =
     workspace.episode?.runId === selectedJob?.runId ? workspace.episode : null;
   const activeProgress =
@@ -222,9 +255,11 @@ export function App() {
     (notice !== null && notice.runId === selectedJob?.runId
       ? notice.message
       : null) ??
-    (selectedJob?.status === "stopped" && selectedJob.startedAt === null
+    (selectedJob?.status === "stopped"
       ? stopNotice(selectedJob)
-      : null);
+      : selectedJob?.status === "interrupted"
+        ? interruptionNotice(selectedJob)
+        : null);
   const timelineDay =
     selectedJob?.status === "stopped" && selectedJob.startedAt === null
       ? null
@@ -243,19 +278,26 @@ export function App() {
           </span>
         </div>
         <RunForm
+          canLoadMoreRuns={workspace.canLoadMoreRuns}
+          jobs={workspace.jobs}
           model={model}
           control={runControl}
           mode={mode}
           onModeChange={setMode}
+          onLoadMoreRuns={workspace.loadMoreRuns}
           onModelChange={setModel}
           onRun={() => void runBenchmark()}
           onSeedChange={setSeed}
           onSourceRunIdChange={workspace.selectReplaySource}
+          onResume={(runId) => void resumeBenchmark(runId)}
+          onRunSelect={workspace.selectRun}
           onStop={(runId) => void stopBenchmark(runId)}
           profiles={profiles}
           replaySources={workspace.replaySources}
           replaySourcesLoading={workspace.isReplaySourceLoading}
+          runHistoryLoading={workspace.isRunHistoryLoading}
           seed={seed}
+          selectedJob={selectedJob}
           sourceRunId={workspace.selectedReplaySourceId}
         />
       </header>
@@ -299,15 +341,17 @@ export function App() {
                 <strong>{errorHeading}</strong>
                 <p>{displayedError}</p>
               </div>
-              <button
-                onClick={() => {
-                  setError(null);
-                  workspace.clearError();
-                }}
-                type="button"
-              >
-                Dismiss
-              </button>
+              {errorCanBeDismissed && (
+                <button
+                  onClick={() => {
+                    setError(null);
+                    workspace.clearError();
+                  }}
+                  type="button"
+                >
+                  Dismiss
+                </button>
+              )}
             </div>
           )}
           {displayedNotice && (
@@ -392,7 +436,7 @@ function buildRunRequest(
   if (mode === "replay") {
     return sourceRunId
       ? { policyMode: mode, sourceRunId }
-      : "Exact replay requires a completed source run ID.";
+      : "Completed Run Replay requires a completed source run ID.";
   }
 
   const parsedSeed = Number(seed);
@@ -414,22 +458,34 @@ function progressText(
   if (control.state === "starting") {
     return "Starting run…";
   }
+  if (control.state === "resuming") {
+    return "Restoring the saved checkpoint…";
+  }
   if (control.state === "stopping") {
     return "Stopping run…";
   }
   if (!progress || progress.status === "queued") {
     return "Run queued. Preparing independent company agents…";
   }
-  if (progress.status === "interrupted") {
-    return "Resuming an interrupted run…";
-  }
   return `Running day ${progress.currentDay} of ${progress.totalDays}`;
 }
 
 function stopNotice(job: RunJobView): string {
   return job.startedAt === null
-    ? "Run stopped before execution began. No timeline was produced."
-    : "Run stopped. Its recorded timeline remains available below.";
+    ? "Run stopped before execution began. It can be resumed from the beginning."
+    : "Run stopped. Its timeline and checkpoint remain available for resume.";
+}
+
+function interruptionNotice(job: RunJobView): string {
+  const reason = job.errorMessage ? ` ${job.errorMessage}` : "";
+  return `Run interrupted by a temporary infrastructure issue.${reason} Its timeline and checkpoint remain available for resume.`;
+}
+
+function runNotice(job: RunJobView): string | null {
+  if (job.status === "stopped") {
+    return stopNotice(job);
+  }
+  return job.status === "interrupted" ? interruptionNotice(job) : null;
 }
 
 function loadTimelineDay(

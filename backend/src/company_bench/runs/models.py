@@ -51,6 +51,11 @@ class RunStatus(StrEnum):
         """Return whether no more work is scheduled for this job."""
         return self in {self.COMPLETED, self.FAILED, self.STOPPED}
 
+    @property
+    def resumable(self) -> bool:
+        """Return whether the same run may be explicitly continued."""
+        return self in {self.FAILED, self.INTERRUPTED, self.STOPPED}
+
 
 class RunJob(StrictModel):
     """Progress record returned immediately by the run API."""
@@ -120,10 +125,20 @@ class RunJob(StrictModel):
         )
 
     def mark_stopped(self, finished_at: datetime) -> Self:
-        """Permanently stop the job without inventing a result or an error."""
+        """Pause the job by explicit user request without inventing a result."""
         return self._advance(
             status=RunStatus.STOPPED,
             finished_at=finished_at,
+            error_message=None,
+        )
+
+    def queue_for_resume(self) -> Self:
+        """Queue an explicitly resumable run while preserving its identity and progress."""
+        if not self.status.resumable:
+            raise ValueError(f"a {self.status.value} run cannot be resumed")
+        return self._advance(
+            status=RunStatus.QUEUED,
+            finished_at=None,
             error_message=None,
         )
 
@@ -136,7 +151,7 @@ class RunJob(StrictModel):
 
 
 class ReplaySource(StrictModel):
-    """Completed run identity available as an exact-replay source."""
+    """Completed run identity available for deterministic replay."""
 
     run_id: Identifier
     submitted_at: datetime

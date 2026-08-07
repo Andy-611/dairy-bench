@@ -97,11 +97,14 @@ class BenchmarkApplication:
     async def stop(self, run_id: str) -> RunJob:
         return await self._coordinator.stop(run_id)
 
+    async def resume(self, run_id: str) -> RunJob:
+        return await self._coordinator.resume(run_id)
+
     def job(self, run_id: str) -> RunJob | None:
         return self._coordinator.get_job(run_id)
 
-    def jobs(self, limit: int) -> tuple[RunJob, ...]:
-        return self._store.list_jobs(limit)
+    def jobs(self, limit: int, offset: int) -> tuple[RunJob, ...]:
+        return self._store.list_jobs(limit, offset)
 
     def replay_sources(self) -> tuple[ReplaySource, ...]:
         return self._store.list_replay_sources()

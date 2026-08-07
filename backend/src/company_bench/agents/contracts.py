@@ -92,12 +92,32 @@ class ModelCompatibilityError(ModelOutputError):
     """The selected model cannot satisfy the required command protocol."""
 
 
+class ModelConfigurationError(ModelCallError):
+    """The provider permanently rejected the configured request or credential."""
+
+
 class ModelInfrastructureError(ModelCallError):
     """The provider could not reliably execute the request."""
 
 
+class PolicyTerminalError(RuntimeError):
+    """A policy failure that cannot be fixed by retrying the same run automatically."""
+
+
+class PolicyCompatibilityError(PolicyTerminalError):
+    """The selected policy cannot satisfy the benchmark command protocol."""
+
+
+class PolicyConfigurationError(PolicyTerminalError):
+    """The selected policy has a permanently rejected provider configuration."""
+
+
+class PolicyExecutionError(PolicyTerminalError):
+    """The policy implementation failed outside a recognized provider condition."""
+
+
 class PolicyInfrastructureError(RuntimeError):
-    """A provider failure that must fail, not silently alter, a run."""
+    """A transient provider failure that interrupts a recoverable run."""
 
 
 class CommandGateway(Protocol):

@@ -213,7 +213,7 @@ company availability, events, snapshots, memories, cursors, and fixed policy
 fingerprints.
 
 Recovery resumes only from that boundary and rejects provider, model, prompt,
-scenario, or configuration drift. Exact replay creates no provider gateway: it
+scenario, or configuration drift. Completed Run Replay creates no provider gateway: it
 verifies every observation hash, reproduces each recorded command or protocol
 rejection, compares every outcome and system step, and finally requires equal
 events, snapshots, and score.
@@ -253,15 +253,17 @@ fails the run as an audited compatibility error.
 | Invalid model command | Protocol rejection; economy unchanged; correction may be attempted on the next virtual minute |
 | Selected model cannot return a required function call | Run fails immediately with an audited compatibility error |
 | Role, collateral, ownership, capacity, or time rule fails | Typed engine rejection; run continues |
-| Authentication or retry-exhausted provider failure | Entire run fails; no misleading score is emitted |
+| Authentication or permanent provider configuration failure | Run fails; no misleading score is emitted |
+| DNS, connection, timeout, 408, 409, 429, or retry-exhausted 5xx failure | Run is interrupted with its checkpoint preserved |
 | Journal failure or runtime invariant violation | Current transaction rolls back and the run fails |
 
 ## Audit interfaces
 
 ```text
-GET /api/run-jobs
+GET /api/run-jobs?limit={limit}&offset={offset}
 GET /api/run-jobs/{run_id}
 POST /api/run-jobs/{run_id}/stop
+POST /api/run-jobs/{run_id}/resume
 GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
@@ -271,10 +273,11 @@ GET /api/runs/{run_id}/invocations
 `turns` is the authoritative business journal. `invocations` audits provider
 calls, latency, and tokens. `timeline` is a causal human-readable projection.
 The operations timeline remains readable from committed journal and checkpoint
-evidence even when a run has no final episode or score. `stopped` is a permanent
-terminal status and is never resumed or offered as an Exact Replay source;
-`interrupted` remains the recoverable backend-shutdown status. Exact Replay is a
-separate completed-run verification operation.
+evidence even when a run has no final episode or score. **All Runs** includes
+every persisted lifecycle state. `stopped`, `interrupted`, and checkpointed
+`failed` jobs support explicit resume under the same run ID; only `interrupted`
+jobs auto-resume after backend restart. **Completed Run Replay** remains a
+separate completed-only verification operation.
 
 ## Model adapter boundary
 
@@ -293,6 +296,8 @@ class CommandGateway(Protocol):
 `AgentFactory` creates one NewAPI gateway per company. The adapter validates
 output into an authorized `CompanyCommand`, maps content failures to
 `ModelOutputError`, compatibility failures to `ModelCompatibilityError`, and
-transport or authentication failures to `ModelInfrastructureError`. It cannot
+permanent credential/configuration failures to `ModelConfigurationError`.
+Transient transport, timeout, rate-limit, and server failures map to
+`ModelInfrastructureError`. It cannot
 access `EconomyEngine` or another company's state. Supporting a new model means
 exposing it through NewAPI, not adding a direct provider adapter.

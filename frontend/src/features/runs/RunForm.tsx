@@ -4,46 +4,65 @@ import type {
   PolicyMode,
   PolicyProfileView,
   ReplaySourceView,
+  RunJobView,
 } from "../../shared/api/types";
+import { AllRuns } from "./AllRuns";
+
+export type RunFormMode = PolicyMode | "all-runs";
 
 export type RunControl =
   | { readonly state: "idle" }
   | { readonly state: "starting" }
+  | { readonly state: "resuming"; readonly runId: string }
   | { readonly state: "running"; readonly runId: string }
   | { readonly state: "stopping"; readonly runId: string };
 
 interface RunFormProps {
+  readonly canLoadMoreRuns: boolean;
+  readonly jobs: readonly RunJobView[];
   readonly model: string;
-  readonly mode: PolicyMode;
+  readonly mode: RunFormMode;
   readonly profiles: readonly PolicyProfileView[];
   readonly replaySources: readonly ReplaySourceView[];
   readonly replaySourcesLoading: boolean;
   readonly seed: string;
+  readonly selectedJob: RunJobView | null;
   readonly sourceRunId: string;
   readonly control: RunControl;
-  readonly onModeChange: (mode: PolicyMode) => void;
+  readonly onLoadMoreRuns: () => void;
+  readonly onModeChange: (mode: RunFormMode) => void;
   readonly onModelChange: (model: string) => void;
   readonly onSeedChange: (seed: string) => void;
   readonly onSourceRunIdChange: (runId: string) => void;
   readonly onRun: () => void;
+  readonly onRunSelect: (runId: string) => void;
+  readonly onResume: (runId: string) => void;
   readonly onStop: (runId: string) => void;
+  readonly runHistoryLoading: boolean;
 }
 
 export function RunForm({
+  canLoadMoreRuns,
+  jobs,
   model,
   mode,
   profiles,
   replaySources,
   replaySourcesLoading,
   seed,
+  selectedJob,
   sourceRunId,
   control,
+  onLoadMoreRuns,
   onModelChange,
   onModeChange,
   onSeedChange,
   onSourceRunIdChange,
   onRun,
+  onRunSelect,
+  onResume,
   onStop,
+  runHistoryLoading,
 }: RunFormProps) {
   const selectedProfile = profiles.find((profile) => profile.mode === mode);
   const formLocked = control.state !== "idle";
@@ -65,7 +84,7 @@ export function RunForm({
         <span>Company policy</span>
         <select
           disabled={formLocked}
-          onChange={(event) => onModeChange(event.target.value as PolicyMode)}
+          onChange={(event) => onModeChange(event.target.value as RunFormMode)}
           value={mode}
         >
           {profiles.map((profile) => (
@@ -78,10 +97,23 @@ export function RunForm({
               {!profile.available ? " (not configured)" : ""}
             </option>
           ))}
+          <option value="all-runs">All Runs</option>
         </select>
       </label>
 
-      {mode === "replay" ? (
+      {mode === "all-runs" ? (
+        <AllRuns
+          busy={formLocked}
+          canLoadMore={canLoadMoreRuns}
+          jobs={jobs}
+          loading={runHistoryLoading}
+          onLoadMore={onLoadMoreRuns}
+          onResume={onResume}
+          onSelect={onRunSelect}
+          resumingRunId={control.state === "resuming" ? control.runId : null}
+          selectedJob={selectedJob}
+        />
+      ) : mode === "replay" ? (
         <label className="run-field replay-field">
           <span>Source run ID</span>
           <select
@@ -148,12 +180,21 @@ export function RunForm({
       <span className="sr-only" id="seed-help">
         Use the same seed to reproduce the economic environment.
       </span>
-      <RunActionButton
-        canStart={canStart}
-        control={control}
-        exactReplay={mode === "replay"}
-        onStop={onStop}
-      />
+      {(mode !== "all-runs" ||
+        control.state === "running" ||
+        control.state === "stopping") && (
+        <RunActionButton
+          canStart={canStart}
+          completedReplay={mode === "replay"}
+          control={control}
+          onStop={onStop}
+        />
+      )}
+      {mode === "all-runs" && (
+        <span className="profile-hint">
+          Browse every persisted run, including incomplete runs.
+        </span>
+      )}
       {selectedProfile && (
         <span className="profile-hint" title={selectedProfile.description}>
           {mode === "replay"
@@ -172,15 +213,15 @@ export function RunForm({
 
 interface RunActionButtonProps {
   readonly canStart: boolean;
+  readonly completedReplay: boolean;
   readonly control: RunControl;
-  readonly exactReplay: boolean;
   readonly onStop: (runId: string) => void;
 }
 
 function RunActionButton({
   canStart,
+  completedReplay,
   control,
-  exactReplay,
   onStop,
 }: RunActionButtonProps) {
   if (control.state === "running") {
@@ -196,11 +237,19 @@ function RunActionButton({
     );
   }
 
-  if (control.state === "starting" || control.state === "stopping") {
+  if (
+    control.state === "starting" ||
+    control.state === "resuming" ||
+    control.state === "stopping"
+  ) {
     return (
       <button className="run-button" disabled type="button">
         <span aria-hidden="true" className="spinner" />
-        {control.state === "starting" ? "Starting…" : "Stopping…"}
+        {control.state === "starting"
+          ? "Starting…"
+          : control.state === "resuming"
+            ? "Resuming…"
+            : "Stopping…"}
       </button>
     );
   }
@@ -208,7 +257,7 @@ function RunActionButton({
   return (
     <button className="run-button" disabled={!canStart} type="submit">
       <span aria-hidden="true">▶</span>
-      {exactReplay ? "Start exact replay" : "Run 30 days"}
+      {completedReplay ? "Start completed replay" : "Run 30 days"}
     </button>
   );
 }
@@ -216,7 +265,7 @@ function RunActionButton({
 function confirmStop(runId: string, onStop: (runId: string) => void): void {
   if (
     window.confirm(
-      "Stop this run? Recorded activity will remain available, but the run cannot be resumed.",
+      "Stop this run? Recorded activity and its checkpoint will remain available for resume.",
     )
   ) {
     onStop(runId);

@@ -90,9 +90,9 @@ class AgentFactory:
             ),
             PolicyProfileView(
                 mode=PolicyKind.REPLAY,
-                label="Exact replay",
+                label="Completed Run Replay",
                 available=True,
-                description="Replay a completed persisted run without calling models.",
+                description="Deterministically replay a completed run without calling models.",
             ),
         )
 
@@ -164,7 +164,7 @@ class AgentFactory:
     ) -> AgentBundle:
         """Build replay actors at the persisted per-company cursor."""
         if not source_turns:
-            raise ValueError("exact replay requires a source turn journal")
+            raise ValueError("Completed Run Replay requires a source turn journal")
         completed_by_company = {
             company.company_id: sum(
                 record.turn.company_id == company.company_id for record in completed_turns

@@ -12,6 +12,7 @@ from pydantic import SecretStr
 from company_bench.agents.contracts import (
     CommandModelRequest,
     ModelCompatibilityError,
+    ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
 )
@@ -440,7 +441,7 @@ def test_gateway_does_not_retry_authentication_failure() -> None:
     async def operation(gateway: NewApiModelGateway) -> object:
         return await gateway.generate_command(_command_request(observation))
 
-    with pytest.raises(ModelInfrastructureError, match="NewAPI HTTP 401"):
+    with pytest.raises(ModelConfigurationError, match="NewAPI HTTP 401"):
         asyncio.run(_with_gateway(handler, operation, max_attempts=3))
     assert calls == 1
 
@@ -512,7 +513,7 @@ def test_gateway_redacts_key_echoed_by_provider() -> None:
     async def operation(gateway: NewApiModelGateway) -> object:
         return await gateway.generate_command(_command_request(observation))
 
-    with pytest.raises(ModelInfrastructureError) as raised:
+    with pytest.raises(ModelConfigurationError) as raised:
         asyncio.run(_with_gateway(handler, operation))
     assert "test-key" not in str(raised.value)
     assert "[REDACTED]" in str(raised.value)

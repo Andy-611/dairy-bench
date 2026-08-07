@@ -8,8 +8,12 @@ The dashboard exposes exactly three policy modes:
 
 - **Rule baseline** — deterministic and credential-free.
 - **Model agents via NewAPI** — selects any configured NewAPI model.
-- **Exact replay** — reproduces a completed source Turn Journal without model
+- **Completed Run Replay** — reproduces a completed source Turn Journal without model
   calls.
+
+**All Runs** browses every persisted lifecycle state. Stopped, interrupted, and
+checkpointed failed runs expose an explicit resume action without changing the
+run ID.
 
 `/api/policy-profiles` is the source of truth for availability and the model
 catalog. Every API response is parsed from `unknown` into typed view models;

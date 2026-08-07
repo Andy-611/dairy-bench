@@ -118,6 +118,9 @@ def test_run_list_and_detail_http_flow() -> None:
             next(profile for profile in profiles if profile["mode"] == "model")["available"]
             is False
         )
+        assert next(profile for profile in profiles if profile["mode"] == "replay")["label"] == (
+            "Completed Run Replay"
+        )
 
         replayed = client.post(
             "/api/runs",
@@ -162,6 +165,10 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
 
         history_response = client.get("/api/run-jobs")
         limited_response = client.get("/api/run-jobs", params={"limit": 3})
+        offset_response = client.get(
+            "/api/run-jobs",
+            params={"limit": 2, "offset": 2},
+        )
 
     assert history_response.status_code == 200
     history = tuple(RunJob.model_validate(item) for item in history_response.json())
@@ -170,6 +177,8 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
     assert limited_response.status_code == 200
     limited = tuple(RunJob.model_validate(item) for item in limited_response.json())
     assert limited == history[:3]
+    offset = tuple(RunJob.model_validate(item) for item in offset_response.json())
+    assert offset == history[2:4]
 
 
 def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
@@ -193,6 +202,43 @@ def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
     assert response.status_code == 200
     assert RunJob.model_validate(response.json()) == stopped
     assert missing.status_code == 404
+
+
+def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> None:
+    repository = InMemoryRunStore()
+    submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
+    stopped = RunJob(
+        run_id="http_resume_stopped",
+        mode=PolicyKind.BASELINE,
+        status=RunStatus.STOPPED,
+        seed=42,
+        scenario_id=DAIRY_S9_SCENARIO.scenario_id,
+        total_days=DAIRY_S9_SCENARIO.days,
+        submitted_at=submitted_at,
+        finished_at=submitted_at,
+    )
+    failed = stopped.model_copy(
+        update={"run_id": "http_resume_failed", "status": RunStatus.FAILED}
+    )
+    completed = stopped.model_copy(
+        update={"run_id": "http_resume_completed", "status": RunStatus.COMPLETED}
+    )
+    for job in (stopped, failed, completed):
+        repository.save_job(job)
+
+    with TestClient(_app(repository)) as client:
+        resumed_response = client.post(f"/api/run-jobs/{stopped.run_id}/resume")
+        failed_response = client.post(f"/api/run-jobs/{failed.run_id}/resume")
+        completed_response = client.post(f"/api/run-jobs/{completed.run_id}/resume")
+        missing_response = client.post("/api/run-jobs/missing/resume")
+
+    resumed = RunJob.model_validate(resumed_response.json())
+    assert resumed_response.status_code == 202
+    assert resumed.run_id == stopped.run_id
+    assert resumed.status is RunStatus.QUEUED
+    assert failed_response.status_code == 409
+    assert completed_response.status_code == 409
+    assert missing_response.status_code == 404
 
 
 def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
@@ -290,6 +336,7 @@ def test_http_validation_and_localhost_cors() -> None:
             == 409
         )
         assert client.get("/api/run-jobs", params={"limit": 0}).status_code == 422
+        assert client.get("/api/run-jobs", params={"offset": -1}).status_code == 422
 
         response = client.options(
             "/api/runs",

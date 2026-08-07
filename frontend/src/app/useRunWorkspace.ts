@@ -16,12 +16,16 @@ interface LocationSelection {
 
 export interface RunWorkspace {
   readonly activeJob: RunJobView | null;
+  readonly canLoadMoreRuns: boolean;
   readonly clearError: () => void;
   readonly episode: EpisodeView | null;
   readonly episodeError: string | null;
   readonly error: string | null;
   readonly isEpisodeLoading: boolean;
   readonly isReplaySourceLoading: boolean;
+  readonly isRunHistoryLoading: boolean;
+  readonly jobs: readonly RunJobView[];
+  readonly loadMoreRuns: () => void;
   readonly releaseJobStream: (runId: string) => void;
   readonly replaySourceError: string | null;
   readonly replaySources: readonly ReplaySourceView[];
@@ -31,11 +35,13 @@ export interface RunWorkspace {
   readonly selectedRunId: string;
   readonly selectDay: (day: number) => void;
   readonly selectReplaySource: (runId: string) => void;
+  readonly selectRun: (runId: string) => void;
   readonly timelineRevision: number;
   readonly trackJob: (job: RunJobView, select: boolean) => void;
 }
 
 const ACTIVE_RUN_POLL_INTERVAL_MS = 500;
+const RUN_HISTORY_PAGE_SIZE = 100;
 const REPLAY_SOURCE_REFRESH_INTERVAL_MS = 30_000;
 const TIMELINE_REFRESH_INTERVAL_MS = 5_000;
 
@@ -57,6 +63,8 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
   const [isJobListLoading, setIsJobListLoading] = useState(true);
   const [isEpisodeLoading, setIsEpisodeLoading] = useState(false);
   const [isReplaySourceLoading, setIsReplaySourceLoading] = useState(true);
+  const [canLoadMoreRuns, setCanLoadMoreRuns] = useState(false);
+  const [runHistoryOffset, setRunHistoryOffset] = useState(0);
   const [replaySourceRevision, setReplaySourceRevision] = useState(0);
   const [jobStreamRevision, setJobStreamRevision] = useState(0);
   const [timelineRevision, setTimelineRevision] = useState(0);
@@ -143,8 +151,12 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     setIsJobListLoading(true);
     setJobListError(null);
     void api
-      .runJobs(100, controller.signal)
-      .then((nextJobs) => setJobs((current) => mergeJobs(current, nextJobs)))
+      .runJobs(RUN_HISTORY_PAGE_SIZE, 0, controller.signal)
+      .then((nextJobs) => {
+        setJobs((current) => mergeJobs(current, nextJobs));
+        setRunHistoryOffset(nextJobs.length);
+        setCanLoadMoreRuns(nextJobs.length === RUN_HISTORY_PAGE_SIZE);
+      })
       .catch((reason: unknown) => {
         if (!isAbortError(reason)) {
           setJobListError(
@@ -161,6 +173,31 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
       });
     return () => controller.abort();
   }, [api]);
+
+  const loadMoreRuns = useCallback(() => {
+    if (isJobListLoading || !canLoadMoreRuns) {
+      return;
+    }
+    setIsJobListLoading(true);
+    setJobListError(null);
+    void api
+      .runJobs(RUN_HISTORY_PAGE_SIZE, runHistoryOffset)
+      .then((nextJobs) => {
+        setJobs((current) => mergeJobs(current, nextJobs));
+        setRunHistoryOffset((offset) => offset + nextJobs.length);
+        setCanLoadMoreRuns(nextJobs.length === RUN_HISTORY_PAGE_SIZE);
+      })
+      .catch((reason: unknown) => {
+        if (!isAbortError(reason)) {
+          setJobListError(
+            requestErrorMessage(reason, {
+              fallback: "More run history could not be loaded.",
+            }),
+          );
+        }
+      })
+      .finally(() => setIsJobListLoading(false));
+  }, [api, canLoadMoreRuns, isJobListLoading, runHistoryOffset]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -201,22 +238,17 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
   }, []);
 
   useEffect(() => {
-    if (
-      selectedRunId ||
-      isJobListLoading ||
-      isReplaySourceLoading
-    ) {
+    if (selectedRunId || isJobListLoading) {
       return;
     }
-    const runId = activeJob?.runId ?? replaySources[0]?.runId;
+    const runId = activeJob?.runId ?? jobs[0]?.runId;
     if (runId) {
       selectRun(runId, "replace");
     }
   }, [
     isJobListLoading,
-    isReplaySourceLoading,
     activeJob?.runId,
-    replaySources,
+    jobs,
     selectRun,
     selectedRunId,
   ]);
@@ -367,12 +399,16 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
 
   return {
     activeJob,
+    canLoadMoreRuns,
     clearError,
     episode,
     episodeError,
     error: jobListError ?? selectionError,
     isEpisodeLoading,
     isReplaySourceLoading,
+    isRunHistoryLoading: isJobListLoading,
+    jobs,
+    loadMoreRuns,
     releaseJobStream,
     replaySourceError,
     replaySources,
@@ -382,6 +418,7 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     selectedRunId,
     selectDay,
     selectReplaySource,
+    selectRun,
     timelineRevision,
     trackJob,
   };
@@ -407,7 +444,6 @@ function selectActiveJob(jobs: readonly RunJobView[]): RunJobView | null {
   return (
     jobs.find((job) => job.status === "running") ??
     jobs.find((job) => job.status === "queued") ??
-    jobs.find((job) => job.status === "interrupted") ??
     null
   );
 }

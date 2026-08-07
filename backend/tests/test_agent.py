@@ -12,6 +12,8 @@ from company_bench.agents.contracts import (
     CommandGateway,
     CommandModelRequest,
     CommandModelResult,
+    ModelCompatibilityError,
+    ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
 )
@@ -20,7 +22,7 @@ from company_bench.agents.providers.newapi import NewApiConfig
 from company_bench.domain.models import CompanyObservation, PolicyKind, PolicyMetadata
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
-from company_bench.runs.models import InvocationOutcome, RunStatus, TokenUsage
+from company_bench.runs.models import InvocationOutcome, RunJob, RunStatus, TokenUsage
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import AgentTurn, SimTime, Wait, WakeReason
 from company_bench.storage.store import InMemoryRunStore
@@ -120,6 +122,39 @@ class _UnavailableGateway:
         self.closed = True
 
 
+class _IncompatibleGateway(_UnavailableGateway):
+    """Reject the benchmark's required command protocol."""
+
+    async def generate_command(
+        self,
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
+        self.command_requests.append(request)
+        raise ModelCompatibilityError("required function call is unsupported")
+
+
+class _MisconfiguredGateway(_UnavailableGateway):
+    """Reject a permanent provider configuration."""
+
+    async def generate_command(
+        self,
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
+        self.command_requests.append(request)
+        raise ModelConfigurationError("credential rejected")
+
+
+class _BrokenGateway(_UnavailableGateway):
+    """Raise an unclassified implementation failure."""
+
+    async def generate_command(
+        self,
+        request: CommandModelRequest,
+    ) -> CommandModelResult:
+        self.command_requests.append(request)
+        raise RuntimeError("adapter bug")
+
+
 class _AuditedOutputErrorGateway:
     """Return a schema failure that still identifies the completed model call."""
 
@@ -184,7 +219,35 @@ def test_output_failure_retains_provider_audit_coordinates(
     assert invocation.prompt_version == COMMAND_PROMPT_VERSION
 
 
-def test_infrastructure_failure_marks_job_failed_without_result() -> None:
+async def _run_model_job_until(
+    repository: InMemoryRunStore,
+    factory: AgentFactory,
+    expected_status: RunStatus,
+) -> RunJob:
+    """Run one model job until it reaches the expected non-active status."""
+    coordinator = RunCoordinator(
+        repository,
+        factory,
+        runtime=EpisodeRuntime(DAIRY_S9_SCENARIO),
+    )
+    await coordinator.start()
+    try:
+        submitted = await coordinator.submit(
+            mode=PolicyKind.MODEL,
+            model="gpt-test-default",
+            seed=42,
+        )
+        async with asyncio.timeout(2):
+            while True:
+                job = repository.get_job(submitted.run_id)
+                if job is not None and job.status is expected_status:
+                    return job
+                await asyncio.sleep(0)
+    finally:
+        await coordinator.close()
+
+
+def test_infrastructure_failure_interrupts_job_without_result() -> None:
     repository = InMemoryRunStore()
     gateway_factory = _RecordingGatewayFactory(_UnavailableGateway)
     factory = AgentFactory(
@@ -194,38 +257,16 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
         gateway_factory=gateway_factory,
     )
 
-    async def run_failed_job():
-        coordinator = RunCoordinator(
-            repository,
-            factory,
-            runtime=EpisodeRuntime(DAIRY_S9_SCENARIO),
-        )
-        await coordinator.start()
-        try:
-            submitted = await coordinator.submit(
-                mode=PolicyKind.MODEL,
-                model="gpt-test-default",
-                seed=42,
-            )
+    interrupted = asyncio.run(
+        _run_model_job_until(repository, factory, RunStatus.INTERRUPTED)
+    )
 
-            async def wait_until_terminal():
-                while True:
-                    job = repository.get_job(submitted.run_id)
-                    if job is not None and job.status.terminal:
-                        return job
-                    await asyncio.sleep(0)
-
-            return await asyncio.wait_for(wait_until_terminal(), timeout=2)
-        finally:
-            await coordinator.close()
-
-    failed = asyncio.run(run_failed_job())
-
-    assert failed.status is RunStatus.FAILED
-    assert failed.current_day == 0
-    assert "PolicyInfrastructureError" in (failed.error_message or "")
-    assert repository.get(failed.run_id) is None
-    invocations = repository.list_invocations(failed.run_id)
+    assert interrupted.status is RunStatus.INTERRUPTED
+    assert interrupted.current_day == 0
+    assert "PolicyInfrastructureError" in (interrupted.error_message or "")
+    assert repository.get(interrupted.run_id) is None
+    assert repository.get_checkpoint(interrupted.run_id) is not None
+    invocations = repository.list_invocations(interrupted.run_id)
     assert invocations
     assert all(
         invocation.outcome is InvocationOutcome.INFRASTRUCTURE_ERROR for invocation in invocations
@@ -243,3 +284,45 @@ def test_infrastructure_failure_marks_job_failed_without_result() -> None:
     assert {gateway.command_requests[0].turn.company_id for gateway in gateways} == {
         company.company_id for company in DAIRY_S9_SCENARIO.companies
     }
+
+
+@pytest.mark.parametrize(
+    ("gateway_type", "expected_error", "outcome"),
+    (
+        (_IncompatibleGateway, "PolicyCompatibilityError", InvocationOutcome.AGENT_ERROR),
+        (
+            _MisconfiguredGateway,
+            "PolicyConfigurationError",
+            InvocationOutcome.INFRASTRUCTURE_ERROR,
+        ),
+        (
+            _BrokenGateway,
+            "PolicyExecutionError",
+            InvocationOutcome.INFRASTRUCTURE_ERROR,
+        ),
+    ),
+)
+def test_permanent_model_failure_marks_job_failed_without_result(
+    gateway_type: Callable[[], CommandGateway],
+    expected_error: str,
+    outcome: InvocationOutcome,
+) -> None:
+    repository = InMemoryRunStore()
+    gateway_factory = _RecordingGatewayFactory(gateway_type)
+    factory = AgentFactory(
+        DAIRY_S9_SCENARIO,
+        repository,
+        newapi_config=_config(),
+        gateway_factory=gateway_factory,
+    )
+
+    failed = asyncio.run(_run_model_job_until(repository, factory, RunStatus.FAILED))
+
+    assert failed.status is RunStatus.FAILED
+    assert expected_error in (failed.error_message or "")
+    assert repository.get(failed.run_id) is None
+    assert repository.get_checkpoint(failed.run_id) is not None
+    assert all(
+        invocation.outcome is outcome
+        for invocation in repository.list_invocations(failed.run_id)
+    )

@@ -178,7 +178,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         repository.record_invocation(invocation)
         repository.save_progress((completion_turn,), (), completion_checkpoint)
         assert repository.get_job(result.run_id) == queued_job
-        assert repository.list_resumable_jobs() == (queued_job,)
+        assert repository.list_auto_resume_jobs() == (queued_job,)
         assert repository.list_invocations(result.run_id) == (invocation,)
         assert repository.get_checkpoint(result.run_id) is not None
 
@@ -193,7 +193,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         repository.complete_job(result, completed_job)
         assert repository.get(result.run_id) == result
         assert repository.get_job(result.run_id) == completed_job
-        assert repository.list_resumable_jobs() == ()
+        assert repository.list_auto_resume_jobs() == ()
         assert repository.get_checkpoint(result.run_id) is None
         assert repository.list_turns(result.run_id) == (completion_turn,)
         assert repository.get("missing") is None
@@ -338,9 +338,18 @@ def _assert_job_history(
     expected = tuple(reversed(jobs))
     assert repository.list_jobs() == expected
     assert repository.list_jobs(2) == expected[:2]
+    assert repository.list_jobs(2, 2) == expected[2:4]
     assert repository.list_jobs(0) == ()
+    assert repository.list_jobs(2, -1) == ()
     assert {job.status for job in repository.list_jobs()} == set(RunStatus)
-    assert repository.list_resumable_jobs() == tuple(job for job in jobs if not job.status.terminal)
+    auto_resume_statuses = {
+        RunStatus.INTERRUPTED,
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    }
+    assert repository.list_auto_resume_jobs() == tuple(
+        job for job in jobs if job.status in auto_resume_statuses
+    )
 
 
 def _history_jobs() -> tuple[RunJob, ...]:

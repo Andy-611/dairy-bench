@@ -22,7 +22,7 @@ Dairy Bench exposes exactly three modes:
 - **Model agents via NewAPI** — one isolated Agent and NewAPI HTTP client per
   company. The configured catalog may contain any model family that supports
   function calls through NewAPI's common Chat Completions interface.
-- **Exact replay** — reproduces a completed Turn Journal without calling a
+- **Completed Run Replay** — reproduces a completed Turn Journal without calling a
   model and rejects observation or outcome drift.
 
 There is no direct model-provider path. All model-backed runs go through the
@@ -37,7 +37,7 @@ single NewAPI adapter and validate into the same Pydantic command union.
   command application order.
 - Thirty-minute production, transformation, and delivery events.
 - Private per-company memory, immutable journals, atomic checkpoints, recovery,
-  and exact replay.
+  and deterministic completed-run replay.
 
 The daily clock is:
 
@@ -104,10 +104,12 @@ enters the browser, journal, or SQLite database.
 ## Runs and data
 
 The selected run and day live in `?run=...&day=...`, so refresh and browser
-navigation preserve the view. Exact Replay uses a completed source run and
-inherits its seed. Stopping is permanent: existing journals and timeline data
-remain readable, but the run receives no final score and cannot become a replay
-source.
+navigation preserve the view. **All Runs** browses every persisted lifecycle
+state and its committed timeline. **Completed Run Replay** uses only a completed
+source run and inherits its seed. Stopped, interrupted, and checkpointed failed
+runs can resume under the same run ID; only interrupted work auto-resumes after
+a backend restart. Incomplete runs receive no final score and cannot become
+replay sources.
 
 All mutable state stays under the Git-ignored `.dairy-bench/` directory:
 

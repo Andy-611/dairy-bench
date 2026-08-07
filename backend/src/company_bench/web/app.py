@@ -129,8 +129,9 @@ def create_app(
     )
     def list_jobs(
         limit: Annotated[int, Query(ge=1, le=500)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
     ) -> tuple[RunJob, ...]:
-        return active_application.jobs(limit)
+        return active_application.jobs(limit, offset)
 
     @app.get(
         "/api/replay-sources",
@@ -161,6 +162,23 @@ def create_app(
             return await active_application.stop(run_id)
         except LookupError as error:
             raise _not_found("Run job", run_id) from error
+
+    @app.post(
+        "/api/run-jobs/{run_id}/resume",
+        response_model=RunJob,
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["runs"],
+    )
+    async def resume_job(run_id: str) -> RunJob:
+        try:
+            return await active_application.resume(run_id)
+        except LookupError as error:
+            raise _not_found("Run job", run_id) from error
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(error),
+            ) from error
 
     @app.get(
         "/api/runs/{run_id}/invocations",

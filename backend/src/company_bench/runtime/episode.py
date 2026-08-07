@@ -20,7 +20,12 @@ from company_bench.agents.company import (
     TurnMemory,
     observation_hash,
 )
-from company_bench.agents.contracts import ModelOutputError, PolicyInfrastructureError
+from company_bench.agents.contracts import (
+    ModelOutputError,
+    PolicyExecutionError,
+    PolicyInfrastructureError,
+    PolicyTerminalError,
+)
 from company_bench.domain.models import (
     CompanyEvent,
     CompanyId,
@@ -888,7 +893,7 @@ class EpisodeRuntime:
                 turn=turn,
                 command=_COMMAND_ADAPTER.validate_python(command),
             )
-        except (PolicyInfrastructureError, ReplayDriftError):
+        except (PolicyInfrastructureError, PolicyTerminalError, ReplayDriftError):
             raise
         except TimeoutError as error:
             raise PolicyInfrastructureError(
@@ -908,7 +913,7 @@ class EpisodeRuntime:
                 protocol_error=reason or type(error).__name__,
             )
         except Exception as error:
-            raise PolicyInfrastructureError(
+            raise PolicyExecutionError(
                 f"unexpected Agent failure: {type(error).__name__}"
             ) from error
 

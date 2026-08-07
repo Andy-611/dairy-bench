@@ -204,15 +204,17 @@ Token 预算内仍未返回函数调用，系统会先记录调用审计，再�
 | 模型命令无效 | 协议拒绝；经济状态不变；可在下一虚拟分钟尝试修正 |
 | 所选模型无法返回必选函数调用 | 记录兼容性错误并立即结束运行 |
 | 角色、担保、所有权、产能或时间规则失败 | 强类型引擎拒绝；运行继续 |
-| 认证失败或重试耗尽的 Provider 故障 | 整个运行失败，不产生误导性分数 |
+| 认证或永久 Provider 配置故障 | 整个运行失败，不产生误导性分数 |
+| DNS、连接、超时、408、409、429 或重试耗尽的 5xx 故障 | 中断运行并保留 Checkpoint |
 | Journal 故障或 Runtime 不变量被破坏 | 当前事务回滚，运行失败 |
 
 ## 审计接口
 
 ```text
-GET /api/run-jobs
+GET /api/run-jobs?limit={limit}&offset={offset}
 GET /api/run-jobs/{run_id}
 POST /api/run-jobs/{run_id}/stop
+POST /api/run-jobs/{run_id}/resume
 GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
@@ -221,10 +223,11 @@ GET /api/runs/{run_id}/invocations
 
 `turns` 是权威业务 Journal；`invocations` 审计 Provider 调用、延迟和 token；
 `timeline` 是可读的因果投影。
-页面会自动打开刚提交或仍在运行的 Run。Exact Replay 下拉框只列出全部 completed Run；
-选择来源即可读取其 Journal、Checkpoint 和最终 Episode，启动 Replay 才会执行确定性验证。
-`stopped` 是不可恢复的永久终态：保留已提交的 Journal、Checkpoint 和时间线，但没有
-最终分数，也不会进入 Exact Replay 来源；`interrupted` 仍专门表示可恢复的后端中断。
+页面的 **All Runs** 包含所有已持久化状态，并可读取它们已提交的时间线；
+**Completed Run Replay** 下拉框只列出 completed Run，启动后才执行确定性验证。
+`stopped`、`interrupted` 和拥有 Checkpoint 的 `failed` Run 都支持沿用原 run ID 显式恢复；
+只有 `interrupted` 会在后端重启时自动恢复。未完成 Run 没有最终分数，也不会进入
+Completed Run Replay 来源。
 
 ## 模型适配边界
 
@@ -242,6 +245,7 @@ class CommandGateway(Protocol):
 
 `AgentFactory` 为每家公司创建独立 NewAPI Gateway。Adapter 把输出校验为已授权的
 `CompanyCommand`，将内容错误映射为 `ModelOutputError`，将兼容性错误映射为
-`ModelCompatibilityError`，并将传输或认证故障映射为 `ModelInfrastructureError`。
+`ModelCompatibilityError`，将认证等永久配置故障映射为 `ModelConfigurationError`，
+并将 DNS、连接、超时、限流或 5xx 等临时故障映射为 `ModelInfrastructureError`。
 它不能访问 `EconomyEngine` 或其他公司的状态。支持新模型时应把模型接入 NewAPI，
 而不是新增直连 Provider Adapter。

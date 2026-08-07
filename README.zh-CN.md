@@ -21,7 +21,7 @@ Dairy Bench 只保留三种模式：
 - **Model agents via NewAPI**：每家公司拥有独立 Agent 和 NewAPI HTTP Client。模型
   目录可以包含任意家族，但所选模型必须能通过 NewAPI 通用 Chat Completions 接口返回
   函数调用。
-- **Exact replay**：不调用模型，重放已完成 Run 的 Turn Journal，并检查观察与结果漂移。
+- **Completed Run Replay**：不调用模型，重放已完成 Run 的 Turn Journal，并检查观察与结果漂移。
 
 项目不再保留任何模型厂商直连接口；所有模型运行统一通过唯一的 NewAPI Adapter，
 并校验为同一个 Pydantic 命令联合类型。
@@ -33,7 +33,7 @@ Dairy Bench 只保留三种模式：
 - FEFO 库存冻结和统一的 `0.0001` 经济精度。
 - 同一分钟并发模型推理，随后按持久化的确定性顺序串行应用命令。
 - 生产、加工和到货均为 30 个虚拟分钟的事件。
-- 每家企业拥有私有记忆；Journal、Checkpoint、恢复与 Exact Replay 保持权威性。
+- 每家企业拥有私有记忆；Journal、Checkpoint、恢复与确定性重放保持权威性。
 
 每日时间表：
 
@@ -95,9 +95,10 @@ UI 的模型下拉框来自 NewAPI 模型目录。由于 `/v1/models` 本身不�
 
 ## Run 与数据
 
-当前 Run 和日期保存在 `?run=...&day=...`。Exact Replay 选择一个 completed 来源并
-继承其 seed。停止 Run 是永久操作：已经提交的 Journal 和时间线仍可读取，但不会生成
-最终分数，也不能成为 Replay 来源。
+当前 Run 和日期保存在 `?run=...&day=...`。**All Runs** 包含所有持久化状态及其已提交
+时间线；**Completed Run Replay** 只选择 completed 来源并继承其 seed。stopped、
+interrupted，以及拥有 Checkpoint 的 failed Run 都会沿用原 run ID 断点续跑；只有
+interrupted 会在后端重启时自动恢复。未完成 Run 不生成最终分数，也不能成为 Replay 来源。
 
 所有可变状态位于 Git 忽略的 `.dairy-bench/`：
 

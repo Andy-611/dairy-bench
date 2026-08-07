@@ -24,7 +24,7 @@ from company_bench.runtime.models import SystemStepRecord, TurnRecord
 
 _DATABASE_SCHEMA_VERSION = 11
 _PAYLOAD_SCHEMA_VERSION = 5
-_RESUMABLE_STATUSES = (
+_AUTO_RESUME_STATUSES = (
     RunStatus.QUEUED,
     RunStatus.RUNNING,
     RunStatus.INTERRUPTED,
@@ -46,11 +46,11 @@ class RunStore(PolicyAuditSink, Protocol):
     def get_job(self, run_id: str) -> RunJob | None:
         """Return one lifecycle record when present."""
 
-    def list_jobs(self, limit: int = 50) -> tuple[RunJob, ...]:
+    def list_jobs(self, limit: int = 50, offset: int = 0) -> tuple[RunJob, ...]:
         """Return the most recently submitted lifecycle records first."""
 
-    def list_resumable_jobs(self) -> tuple[RunJob, ...]:
-        """Return jobs that may safely be scheduled after startup."""
+    def list_auto_resume_jobs(self) -> tuple[RunJob, ...]:
+        """Return jobs that should be scheduled automatically after startup."""
 
     def list_invocations(self, run_id: str) -> tuple[PolicyInvocation, ...]:
         """Return one run's Agent invocations in decision order."""
@@ -122,9 +122,9 @@ class InMemoryRunStore:
         with self._lock:
             return self._jobs.get(run_id)
 
-    def list_jobs(self, limit: int = 50) -> tuple[RunJob, ...]:
+    def list_jobs(self, limit: int = 50, offset: int = 0) -> tuple[RunJob, ...]:
         """Return all lifecycle states from newest submission to oldest."""
-        if limit <= 0:
+        if limit <= 0 or offset < 0:
             return ()
         with self._lock:
             newest_first = reversed(self._jobs.values())
@@ -133,7 +133,7 @@ class InMemoryRunStore:
                 key=lambda job: job.submitted_at,
                 reverse=True,
             )
-            return tuple(jobs[:limit])
+            return tuple(jobs[offset : offset + limit])
 
     def list_replay_sources(self) -> tuple[ReplaySource, ...]:
         """Return every completed run from newest submission to oldest."""
@@ -151,10 +151,14 @@ class InMemoryRunStore:
                 )
             )
 
-    def list_resumable_jobs(self) -> tuple[RunJob, ...]:
-        """Return resumable jobs from oldest to newest."""
+    def list_auto_resume_jobs(self) -> tuple[RunJob, ...]:
+        """Return automatic startup jobs from oldest to newest."""
         with self._lock:
-            jobs = (job for job in self._jobs.values() if job.status in _RESUMABLE_STATUSES)
+            jobs = (
+                job
+                for job in self._jobs.values()
+                if job.status in _AUTO_RESUME_STATUSES
+            )
             return tuple(sorted(jobs, key=lambda job: job.submitted_at))
 
     def record_invocation(self, invocation: PolicyInvocation) -> None:
@@ -373,9 +377,9 @@ class SQLiteRunStore:
             ).fetchone()
         return RunJob.model_validate_json(row["payload_json"]) if row is not None else None
 
-    def list_jobs(self, limit: int = 50) -> tuple[RunJob, ...]:
+    def list_jobs(self, limit: int = 50, offset: int = 0) -> tuple[RunJob, ...]:
         """Return all lifecycle states from newest submission to oldest."""
-        if limit <= 0:
+        if limit <= 0 or offset < 0:
             return ()
         with self._lock:
             rows = self._connection.execute(
@@ -383,9 +387,9 @@ class SQLiteRunStore:
                 SELECT payload_json
                 FROM run_jobs
                 ORDER BY submitted_at DESC, rowid DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
         return tuple(RunJob.model_validate_json(row["payload_json"]) for row in rows)
 
@@ -403,9 +407,9 @@ class SQLiteRunStore:
             ).fetchall()
         return tuple(ReplaySource.model_validate(dict(row)) for row in rows)
 
-    def list_resumable_jobs(self) -> tuple[RunJob, ...]:
-        """Return resumable jobs from oldest to newest."""
-        statuses = tuple(status.value for status in _RESUMABLE_STATUSES)
+    def list_auto_resume_jobs(self) -> tuple[RunJob, ...]:
+        """Return automatic startup jobs from oldest to newest."""
+        statuses = tuple(status.value for status in _AUTO_RESUME_STATUSES)
         with self._lock:
             rows = self._connection.execute(
                 """
