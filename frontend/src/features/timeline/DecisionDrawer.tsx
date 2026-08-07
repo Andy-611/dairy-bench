@@ -585,49 +585,10 @@ function TraceProvenance({
                 value={`${formatValue(trace.preview.latencyMs)} ms · ${trace.preview.attempts} ${plural(trace.preview.attempts, "attempt")}`}
               />
             </dl>
-            {trace.artifactStatus === "available" ? (
-              <div className="trace-copy-grid">
-                <TraceCopy
-                  empty="No public reasoning summary is available."
-                  label="Public reasoning summary"
-                  value={trace.reasoningMarkdown}
-                />
-                <TraceCopy
-                  empty="No final model output is available."
-                  label="Final output"
-                  value={trace.finalOutput}
-                />
-              </div>
-            ) : (
-              <p className="inline-empty">
-                Trace artifact unavailable:{" "}
-                {artifactUnavailableReasonLabel(
-                  trace.artifactUnavailableReason,
-                )}
-                . Provider-call metadata remains auditable above.
-              </p>
-            )}
           </article>
         ))
       )}
     </div>
-  );
-}
-
-function TraceCopy({
-  empty,
-  label,
-  value,
-}: {
-  readonly empty: string;
-  readonly label: string;
-  readonly value: string | null;
-}) {
-  return (
-    <section>
-      <h4>{label}</h4>
-      {value?.trim() ? <pre>{value}</pre> : <p>{empty}</p>}
-    </section>
   );
 }
 
@@ -723,23 +684,4 @@ function detailTitle(detail: TimelineDetailView): string {
   return detail.entry.entryType === "turn"
     ? `${detail.entry.companyName} · ${clockTime(detail.entry.simMinute)}`
     : `${systemLabel(detail.entry.kind)} · ${clockTime(detail.entry.simMinute)}`;
-}
-
-function artifactUnavailableReasonLabel(
-  reason: TimelineDetailView["traces"][number]["artifactUnavailableReason"],
-): string {
-  switch (reason) {
-    case "store_not_configured":
-      return "the artifact store is not configured";
-    case "provider_not_supported":
-      return "this provider does not emit a readable artifact";
-    case "identity_unavailable":
-      return "the provider artifact identity was not recorded";
-    case "not_found":
-      return "the recorded artifact could not be found";
-    case "read_error":
-      return "the recorded artifact could not be read";
-    default:
-      return "no reason was recorded";
-  }
 }

@@ -40,7 +40,7 @@ export function App() {
   const workspace = useRunWorkspace(api);
   const [mode, setMode] = useState<PolicyMode>("baseline");
   const [profiles, setProfiles] = useState<readonly PolicyProfileView[]>([]);
-  const [claudeModel, setClaudeModel] = useState("");
+  const [model, setModel] = useState("");
   const [seed, setSeed] = useState("42");
   const [progress, setProgress] = useState<RunJobView | null>(null);
   const [runTransition, setRunTransition] = useState<RunTransition | null>(null);
@@ -55,8 +55,13 @@ export function App() {
       .policyProfiles(controller.signal)
       .then((loadedProfiles) => {
         setProfiles(loadedProfiles);
-        const claude = loadedProfiles.find((profile) => profile.mode === "claude");
-        setClaudeModel((current) => current || claude?.model || claude?.models[0] || "");
+        const modelProfile = loadedProfiles.find(
+          (profile) => profile.mode === "model",
+        );
+        setModel(
+          (current) =>
+            current || modelProfile?.model || modelProfile?.models[0] || "",
+        );
       })
       .catch((reason: unknown) => {
         if (!isAbortError(reason)) {
@@ -100,7 +105,7 @@ export function App() {
   async function runBenchmark(): Promise<void> {
     const request = buildRunRequest(
       mode,
-      claudeModel,
+      model,
       seed,
       workspace.selectedReplaySourceId,
     );
@@ -238,11 +243,11 @@ export function App() {
           </span>
         </div>
         <RunForm
-          claudeModel={claudeModel}
+          model={model}
           control={runControl}
           mode={mode}
           onModeChange={setMode}
-          onClaudeModelChange={setClaudeModel}
+          onModelChange={setModel}
           onRun={() => void runBenchmark()}
           onSeedChange={setSeed}
           onSourceRunIdChange={workspace.selectReplaySource}
@@ -372,7 +377,7 @@ export function App() {
 
       <footer>
         <span>Dairy Bench V4</span>
-        <span>API keys and Codex credentials remain on the backend.</span>
+        <span>NewAPI credentials remain on the backend.</span>
       </footer>
     </div>
   );
@@ -380,7 +385,7 @@ export function App() {
 
 function buildRunRequest(
   mode: PolicyMode,
-  claudeModel: string,
+  model: string,
   seed: string,
   sourceRunId: string,
 ): RunRequest | string {
@@ -394,10 +399,10 @@ function buildRunRequest(
   if (!Number.isInteger(parsedSeed) || parsedSeed < 0 || parsedSeed > MAX_SEED) {
     return `The random seed must be an integer from 0 to ${MAX_SEED}.`;
   }
-  if (mode === "claude") {
-    return claudeModel
-      ? { policyMode: mode, model: claudeModel, seed: parsedSeed }
-      : "Claude mode requires a configured model.";
+  if (mode === "model") {
+    return model
+      ? { policyMode: mode, model, seed: parsedSeed }
+      : "Model mode requires a configured NewAPI model.";
   }
   return { policyMode: mode, seed: parsedSeed };
 }

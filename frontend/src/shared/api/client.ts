@@ -222,7 +222,7 @@ function runRequestPayload(request: RunRequest): Readonly<Record<string, unknown
       source_run_id: request.sourceRunId,
     };
   }
-  return request.policyMode === "claude"
+  return request.policyMode === "model"
     ? { mode: request.policyMode, model: request.model, seed: request.seed }
     : { mode: request.policyMode, seed: request.seed };
 }
@@ -240,10 +240,6 @@ function parsePolicyProfile(
     model: nullableText(profile.model, `${path}.model`),
     models: array(profile.models, `${path}.models`).map((model, index) =>
       text(model, `${path}.models[${index}]`),
-    ),
-    reasoningEffort: nullableText(
-      profile.reasoning_effort,
-      `${path}.reasoning_effort`,
     ),
     description: text(profile.description, `${path}.description`),
     unavailableReason: nullableText(
@@ -1539,78 +1535,7 @@ function parseCommandStateChange(
 
 function parseAgentTrace(payload: unknown, path: string): AgentTraceView {
   const trace = record(payload, path);
-  const preview = parseTracePreview(trace.preview, `${path}.preview`);
-  const artifactStatus = text(
-    trace.artifact_status,
-    `${path}.artifact_status`,
-  );
-  const artifactUnavailableReason = parseArtifactUnavailableReason(
-    trace.artifact_unavailable_reason,
-    `${path}.artifact_unavailable_reason`,
-  );
-  if (artifactStatus !== "available" && artifactStatus !== "unavailable") {
-    throw new Error(`Backend field ${path}.artifact_status is unknown.`);
-  }
-  const reasoningMarkdown = nullableText(
-    trace.reasoning_markdown,
-    `${path}.reasoning_markdown`,
-  );
-  const finalOutput = nullableText(
-    trace.final_output,
-    `${path}.final_output`,
-  );
-  if (artifactStatus === "available") {
-    if (
-      artifactUnavailableReason !== null ||
-      reasoningMarkdown === null ||
-      finalOutput === null
-    ) {
-      throw new Error(
-        `Backend trace artifact fields at ${path} are inconsistent.`,
-      );
-    }
-    return {
-      preview,
-      artifactStatus,
-      artifactUnavailableReason: null,
-      reasoningMarkdown,
-      finalOutput,
-    };
-  }
-  if (
-    artifactUnavailableReason === null ||
-    reasoningMarkdown !== null ||
-    finalOutput !== null
-  ) {
-    throw new Error(
-      `Backend trace artifact fields at ${path} are inconsistent.`,
-    );
-  }
-  return {
-    preview,
-    artifactStatus,
-    artifactUnavailableReason,
-    reasoningMarkdown: null,
-    finalOutput: null,
-  };
-}
-
-function parseArtifactUnavailableReason(
-  value: unknown,
-  path: string,
-): AgentTraceView["artifactUnavailableReason"] {
-  const reason = nullableText(value, path);
-  switch (reason) {
-    case null:
-    case "store_not_configured":
-    case "provider_not_supported":
-    case "identity_unavailable":
-    case "not_found":
-    case "read_error":
-      return reason;
-    default:
-      throw new Error(`Backend field ${path} is unknown.`);
-  }
+  return { preview: parseTracePreview(trace.preview, `${path}.preview`) };
 }
 
 function simMinute(payload: unknown, path: string): number {
@@ -1713,9 +1638,7 @@ function commandDispositionSource(
 function policyMode(value: unknown, path: string): PolicyMode {
   if (
     value === "baseline" ||
-    value === "codex" ||
-    value === "openai" ||
-    value === "claude" ||
+    value === "model" ||
     value === "replay"
   ) {
     return value;

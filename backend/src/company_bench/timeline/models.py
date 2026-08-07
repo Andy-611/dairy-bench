@@ -535,45 +535,10 @@ class TimelineDay(StrictModel):
     moments: tuple[TimelineMoment, ...]
 
 
-class ArtifactStatus(StrEnum):
-    """Whether a trace's optional exported artifact is readable."""
-
-    AVAILABLE = "available"
-    UNAVAILABLE = "unavailable"
-
-
-class ArtifactUnavailableReason(StrEnum):
-    """Typed reason why an optional trace artifact cannot be displayed."""
-
-    STORE_NOT_CONFIGURED = "store_not_configured"
-    PROVIDER_NOT_SUPPORTED = "provider_not_supported"
-    IDENTITY_UNAVAILABLE = "identity_unavailable"
-    NOT_FOUND = "not_found"
-    READ_ERROR = "read_error"
-
-
 class AgentTraceDetail(StrictModel):
-    """Readable public trace material for one physical provider call."""
+    """Auditable metadata for one physical provider call."""
 
     preview: AgentTracePreview
-    artifact_status: ArtifactStatus
-    artifact_unavailable_reason: ArtifactUnavailableReason | None = None
-    reasoning_markdown: str | None = None
-    final_output: str | None = None
-
-    @model_validator(mode="after")
-    def validate_artifact_state(self) -> Self:
-        """Keep artifact availability, reason, and content mutually consistent."""
-        available = self.artifact_status is ArtifactStatus.AVAILABLE
-        if available and self.artifact_unavailable_reason is not None:
-            raise ValueError("available artifacts cannot have an unavailable reason")
-        if available and (self.reasoning_markdown is None or self.final_output is None):
-            raise ValueError("available artifacts require reasoning and final output")
-        if not available and self.artifact_unavailable_reason is None:
-            raise ValueError("unavailable artifacts require a reason")
-        if not available and (self.reasoning_markdown is not None or self.final_output is not None):
-            raise ValueError("unavailable artifacts cannot expose partial content")
-        return self
 
 
 class TimelineDetail(StrictModel):

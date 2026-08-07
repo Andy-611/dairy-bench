@@ -13,7 +13,7 @@ export type RunControl =
   | { readonly state: "stopping"; readonly runId: string };
 
 interface RunFormProps {
-  readonly claudeModel: string;
+  readonly model: string;
   readonly mode: PolicyMode;
   readonly profiles: readonly PolicyProfileView[];
   readonly replaySources: readonly ReplaySourceView[];
@@ -22,7 +22,7 @@ interface RunFormProps {
   readonly sourceRunId: string;
   readonly control: RunControl;
   readonly onModeChange: (mode: PolicyMode) => void;
-  readonly onClaudeModelChange: (model: string) => void;
+  readonly onModelChange: (model: string) => void;
   readonly onSeedChange: (seed: string) => void;
   readonly onSourceRunIdChange: (runId: string) => void;
   readonly onRun: () => void;
@@ -30,7 +30,7 @@ interface RunFormProps {
 }
 
 export function RunForm({
-  claudeModel,
+  model,
   mode,
   profiles,
   replaySources,
@@ -38,7 +38,7 @@ export function RunForm({
   seed,
   sourceRunId,
   control,
-  onClaudeModelChange,
+  onModelChange,
   onModeChange,
   onSeedChange,
   onSourceRunIdChange,
@@ -50,7 +50,7 @@ export function RunForm({
   const canStart =
     Boolean(selectedProfile?.available) &&
     (mode !== "replay" || Boolean(sourceRunId)) &&
-    (mode !== "claude" || Boolean(claudeModel));
+    (mode !== "model" || Boolean(model));
 
   function handleSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
@@ -126,15 +126,15 @@ export function RunForm({
         </label>
       )}
 
-      {mode === "claude" && selectedProfile && (
+      {mode === "model" && selectedProfile && (
         <label className="run-field model-field">
-          <span>Claude model</span>
+          <span>Model</span>
           <select
             disabled={formLocked || selectedProfile.models.length === 0}
-            name="claudeModel"
-            onChange={(event) => onClaudeModelChange(event.target.value)}
+            name="model"
+            onChange={(event) => onModelChange(event.target.value)}
             required
-            value={claudeModel}
+            value={model}
           >
             {selectedProfile.models.map((model) => (
               <option key={model} value={model}>
@@ -158,16 +158,8 @@ export function RunForm({
         <span className="profile-hint" title={selectedProfile.description}>
           {mode === "replay"
             ? "Creates a new deterministic run from a completed source; no agents are called."
-            : mode === "claude" && claudeModel
-            ? [selectedProfile.provider, claudeModel].filter(Boolean).join(" / ")
-            : selectedProfile.model
-            ? [
-                selectedProfile.provider,
-                selectedProfile.model,
-                selectedProfile.reasoningEffort,
-              ]
-                .filter(Boolean)
-                .join(" · ")
+            : mode === "model" && model
+            ? [selectedProfile.provider, model].filter(Boolean).join(" / ")
             : selectedProfile.description}
           {!selectedProfile.available && selectedProfile.unavailableReason
             ? `: ${selectedProfile.unavailableReason}`

@@ -63,12 +63,15 @@ An accepted `CommandOutcome.quote_ladder_result` reports every target level's
 post-match remaining quantity, plus separately cancelled order IDs. Fill events
 and scheduled deliveries remain in the outcome's normal event fields.
 
-OpenAI uses Responses API function tools with one required, non-parallel tool
-call. Claude models reached through NewAPI use the native Anthropic Messages
-`/v1/messages` tool-use format. Codex uses a strict structured-output envelope.
-All provider paths validate against the same discriminated Pydantic
-`CompanyCommand` union. Missing, multiple, unknown, unauthorized, or malformed
-calls become explicit protocol rejections; they do not mutate the economy.
+Every model-backed run uses NewAPI's common Chat Completions interface and
+requires exactly one authorized function call. The adapter prefers
+`tool_choice="required"`; if a provider explicitly rejects that optional hint,
+it retries without the field while retaining the complete tools schema and the
+same output checks. Every request fixes `max_tokens` at 131,072; there is no
+adaptive output-budget growth or environment override. Every model family is
+validated against the same discriminated Pydantic `CompanyCommand` union.
+Missing, multiple, unknown, unauthorized, or malformed calls cannot mutate the
+economy.
 
 ## What an agent observes
 
@@ -215,56 +218,11 @@ verifies every observation hash, reproduces each recorded command or protocol
 rejection, compares every outcome and system step, and finally requires equal
 events, snapshots, and score.
 
-## Running Codex agents
+## Running model agents through NewAPI
 
-From the repository root:
-
-```powershell
-.\start.cmd
-```
-
-The launcher sets `CODEX_HOME=.dairy-bench/codex`, isolated from the user's
-personal `%USERPROFILE%\.codex`. All nine companies receive independent
-`AsyncCodex` runtimes and each turn uses an isolated thread. The benchmark
-runtime is read-only with shell, search, plugins, Codex memory, and multi-agent
-features disabled.
-
-After a turn, Dairy Bench exports the public reasoning summary and final
-structured output, then archives the source session only after export succeeds:
-
-```text
-.dairy-bench/artifacts/<run_id>/
-|-- reasoning/day-001__farm_a__turn-0001.md
-`-- final_outputs/day-001__farm_a__turn-0001.json
-```
-
-The project never reads or stores `auth.json`, hidden chain-of-thought, or
-encrypted reasoning content.
-
-## Running OpenAI agents
-
-```powershell
-cd backend
-$env:OPENAI_API_KEY="your OpenAI API key"
-
-# Optional
-$env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"
-$env:DAIRY_BENCH_OPENAI_REASONING_EFFORT="medium"
-$env:DAIRY_BENCH_OPENAI_MAX_OUTPUT_TOKENS="2048"
-$env:DAIRY_BENCH_OPENAI_TIMEOUT_SECONDS="60"
-$env:DAIRY_BENCH_OPENAI_MAX_ATTEMPTS="3"
-
-python -m uvicorn company_bench.web.app:create_app --factory --app-dir src --host 127.0.0.1 --port 8000
-```
-
-Only the backend reads `OPENAI_API_KEY`; it never enters the browser, journal,
-or database. `DAIRY_BENCH_OPENAI_BASE_URL` may target a compatible service.
-
-## Running Claude agents through NewAPI
-
-This mode connects a Claude model to the existing Dairy Bench company Agent. It
-uses NewAPI's native Anthropic Messages `/v1/messages` interface; it does not
-launch Claude Code or expose Claude Code's filesystem, shell, or coding tools.
+NewAPI is the only model-provider boundary. The model catalog may include GPT,
+Claude, Gemini, DeepSeek, or any other family that implements function calls
+through the common endpoint.
 
 ```bat
 start.cmd --configure-newapi
@@ -273,18 +231,27 @@ start.cmd
 
 The first command reads the key with hidden input, validates it through the
 fixed `https://newapi.deepwisdom.ai/v1/models` endpoint, and writes a DPAPI-
-encrypted credential plus a safe Claude model catalog under
+encrypted credential plus the non-secret model catalog under
 `.dairy-bench/credentials`. Normal startup decrypts the key only into the
-backend child process environment. The browser receives only the model catalog;
-the selected model is persisted in `RunJob` and policy audit metadata. Re-run
-the configuration command to replace the key or refresh its models.
-Restart an already-running backend after either operation.
+backend child process environment. The browser receives only the catalog; the
+selected model is persisted in `RunJob` and policy audit metadata. Re-run the
+configuration command to replace the key or refresh models, then restart an
+already-running backend.
+
+Each company owns a separate `NewApiModelGateway` and HTTP client. Calls go to
+`/v1/chat/completions`; there is no provider-specific SDK or fallback route.
+The model-list endpoint does not certify tool support. A gateway initially asks
+for a required tool call, remembers an explicit provider rejection of
+`tool_choice`, and omits only that field on the retry and later calls. A selected
+model that still returns no function call within the fixed 131,072-token budget
+fails the run as an audited compatibility error.
 
 ## Failure semantics
 
 | Condition | Result |
 |---|---|
-| Missing or invalid model command | Protocol rejection; economy unchanged; correction may be attempted on the next virtual minute |
+| Invalid model command | Protocol rejection; economy unchanged; correction may be attempted on the next virtual minute |
+| Selected model cannot return a required function call | Run fails immediately with an audited compatibility error |
 | Role, collateral, ownership, capacity, or time rule fails | Typed engine rejection; run continues |
 | Authentication or retry-exhausted provider failure | Entire run fails; no misleading score is emitted |
 | Journal failure or runtime invariant violation | Current transaction rolls back and the run fails |
@@ -299,19 +266,17 @@ GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
 GET /api/runs/{run_id}/invocations
-GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts
 ```
 
 `turns` is the authoritative business journal. `invocations` audits provider
 calls, latency, and tokens. `timeline` is a causal human-readable projection.
-Exported `artifacts` are source evidence and never trigger another model call.
 The operations timeline remains readable from committed journal and checkpoint
 evidence even when a run has no final episode or score. `stopped` is a permanent
 terminal status and is never resumed or offered as an Exact Replay source;
 `interrupted` remains the recoverable backend-shutdown status. Exact Replay is a
 separate completed-run verification operation.
 
-## Adding another provider
+## Model adapter boundary
 
 A V4 adapter implements:
 
@@ -325,8 +290,9 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`AgentFactory` creates one gateway per company. The adapter validates output
-into an authorized `CompanyCommand`, maps content failures to
-`ModelOutputError`, and maps infrastructure failures to
-`ModelInfrastructureError`. It must not access `EconomyEngine` or another
-company's state.
+`AgentFactory` creates one NewAPI gateway per company. The adapter validates
+output into an authorized `CompanyCommand`, maps content failures to
+`ModelOutputError`, compatibility failures to `ModelCompatibilityError`, and
+transport or authentication failures to `ModelInfrastructureError`. It cannot
+access `EconomyEngine` or another company's state. Supporting a new model means
+exposing it through NewAPI, not adding a direct provider adapter.

@@ -54,11 +54,12 @@ Agent 不提交整日计划，也不能自行提供身份、时间、状态版�
 或 `place` 动作、结果订单 ID 与优先级、立即撮合后的剩余数量，以及单独 Cancel 的订单
 ID；成交事件和计划到货仍使用 Outcome 原有的事件字段。
 
-OpenAI 使用一次必选、不可并行的 Responses API 函数工具调用；通过 NewAPI 接入的
-Claude 模型使用原生 Anthropic Messages `/v1/messages` tool-use 格式；Codex 使用严格
-的结构化输出 envelope。所有 Provider 路径都按照同一个带判别字段的 Pydantic
-`CompanyCommand` 联合类型校验。缺失、多条、未知、未授权或参数错误的调用会成为
-明确的协议拒绝，且不修改经济状态。
+所有模型运行统一使用 NewAPI 的 Chat Completions 接口，并要求恰好一个已授权函数调用。
+Adapter 优先设置 `tool_choice="required"`；若 Provider 明确拒绝这个可选提示，则只省略
+该字段重试，同时保留完整 tools schema 和同样的输出校验。所有请求的 `max_tokens`
+固定为 131,072，不进行阶梯式预算增长，也不提供环境变量覆盖。无论模型属于哪个家族，
+输出都按同一个带判别字段的 Pydantic `CompanyCommand` 联合类型校验。缺失、多条、
+未知、未授权或参数错误的调用都不能改变经济状态。
 
 ## Agent 可以看到什么
 
@@ -173,54 +174,10 @@ Scheduler、企业可用时间、事件、快照、记忆、游标和固定策�
 Replay 不创建 Provider Gateway：它校验每次观察哈希，重现记录的命令或协议拒绝，
 比较每个结果与 System Step，并最终要求事件、快照和得分完全相同。
 
-## 运行 Codex Agent
+## 通过 NewAPI 运行模型 Agent
 
-从仓库根目录运行：
-
-```powershell
-.\start.cmd
-```
-
-启动器设置 `CODEX_HOME=.dairy-bench/codex`，与个人
-`%USERPROFILE%\.codex` 隔离。九家公司各有独立的 `AsyncCodex` Runtime，每个
-Turn 使用隔离 thread。Benchmark Runtime 为只读模式，并关闭 shell、搜索、插件、
-Codex memory 和多 Agent 功能。
-
-每个 Turn 完成后，Dairy Bench 导出公开推理摘要和最终结构化输出；仅在导出成功后
-归档源 session：
-
-```text
-.dairy-bench/artifacts/<run_id>/
-|-- reasoning/day-001__farm_a__turn-0001.md
-`-- final_outputs/day-001__farm_a__turn-0001.json
-```
-
-项目不会读取或存储 `auth.json`、隐藏思维链或加密推理内容。
-
-## 运行 OpenAI Agent
-
-```powershell
-cd backend
-$env:OPENAI_API_KEY="your OpenAI API key"
-
-# 可选
-$env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"
-$env:DAIRY_BENCH_OPENAI_REASONING_EFFORT="medium"
-$env:DAIRY_BENCH_OPENAI_MAX_OUTPUT_TOKENS="2048"
-$env:DAIRY_BENCH_OPENAI_TIMEOUT_SECONDS="60"
-$env:DAIRY_BENCH_OPENAI_MAX_ATTEMPTS="3"
-
-python -m uvicorn company_bench.web.app:create_app --factory --app-dir src --host 127.0.0.1 --port 8000
-```
-
-只有后端读取 `OPENAI_API_KEY`；密钥不会进入浏览器、Journal 或数据库。可用
-`DAIRY_BENCH_OPENAI_BASE_URL` 指向兼容服务。
-
-## 通过 NewAPI 运行 Claude Agent
-
-该模式把 Claude 模型接入现有 Dairy Bench 企业 Agent，通过 NewAPI 原生 Anthropic
-Messages `/v1/messages` 接口调用；它不会启动 Claude Code，也不会向模型开放 Claude
-Code 的文件系统、Shell 或编程工具。
+NewAPI 是唯一模型调用边界。模型目录可以包含 GPT、Claude、Gemini、DeepSeek，或任意
+能够通过通用接口返回函数调用的模型家族。
 
 ```bat
 start.cmd --configure-newapi
@@ -228,18 +185,24 @@ start.cmd
 ```
 
 第一条命令会隐藏输入密钥，通过固定的
-`https://newapi.deepwisdom.ai/v1/models` 校验并获取 Claude 模型列表，然后把凭据以
-当前 Windows 用户的 DPAPI 加密格式保存在 `.dairy-bench/credentials`，同时保存
-不含密钥的模型目录。正常启动时，密钥只解密到后端子进程环境；浏览器只能收到模型
-目录。UI 选中的模型会写入 `RunJob` 和 Policy 审计元数据，恢复运行仍使用同一模型。
-替换密钥或刷新模型列表时，重新执行配置命令即可。
-如果后端已经在运行，配置后需要关闭并重新启动后端进程。
+`https://newapi.deepwisdom.ai/v1/models` 校验并获取完整模型列表，然后把凭据以当前
+Windows 用户的 DPAPI 加密格式保存在 `.dairy-bench/credentials`，同时保存不含密钥
+的模型目录。正常启动时，密钥只解密到后端子进程环境；浏览器只能收到模型目录。UI
+选中的模型会写入 `RunJob` 和 Policy 审计元数据，恢复运行仍使用同一模型。替换密钥
+或刷新模型列表时重新执行配置命令；若后端已运行，配置后需要重启。
+
+每家公司拥有独立的 `NewApiModelGateway` 和 HTTP Client。调用统一进入
+`/v1/chat/completions`，不存在模型厂商专用 SDK 或回退路径。模型目录本身不能证明
+工具调用兼容性。Gateway 首次要求必选工具调用；若 Provider 明确拒绝 `tool_choice`，
+它会记住该能力，并在重试和后续调用中只省略这个字段。若所选模型在固定的 131,072
+Token 预算内仍未返回函数调用，系统会先记录调用审计，再以明确的兼容性错误结束运行。
 
 ## 失败语义
 
 | 情况 | 结果 |
 |---|---|
-| 模型命令缺失或无效 | 协议拒绝；经济状态不变；可在下一虚拟分钟尝试修正 |
+| 模型命令无效 | 协议拒绝；经济状态不变；可在下一虚拟分钟尝试修正 |
+| 所选模型无法返回必选函数调用 | 记录兼容性错误并立即结束运行 |
 | 角色、担保、所有权、产能或时间规则失败 | 强类型引擎拒绝；运行继续 |
 | 认证失败或重试耗尽的 Provider 故障 | 整个运行失败，不产生误导性分数 |
 | Journal 故障或 Runtime 不变量被破坏 | 当前事务回滚，运行失败 |
@@ -254,17 +217,16 @@ GET /api/runs/{run_id}/timeline?day={day}
 GET /api/runs/{run_id}/timeline/{entry_id}
 GET /api/runs/{run_id}/turns
 GET /api/runs/{run_id}/invocations
-GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts
 ```
 
 `turns` 是权威业务 Journal；`invocations` 审计 Provider 调用、延迟和 token；
-`timeline` 是可读的因果投影；导出的 `artifacts` 只是源证据，不会触发模型调用。
+`timeline` 是可读的因果投影。
 页面会自动打开刚提交或仍在运行的 Run。Exact Replay 下拉框只列出全部 completed Run；
 选择来源即可读取其 Journal、Checkpoint 和最终 Episode，启动 Replay 才会执行确定性验证。
 `stopped` 是不可恢复的永久终态：保留已提交的 Journal、Checkpoint 和时间线，但没有
 最终分数，也不会进入 Exact Replay 来源；`interrupted` 仍专门表示可恢复的后端中断。
 
-## 添加其他 Provider
+## 模型适配边界
 
 V4 Adapter 实现：
 
@@ -278,6 +240,8 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`AgentFactory` 为每家公司创建独立 Gateway。Adapter 把输出校验为已授权的
-`CompanyCommand`，将内容错误映射为 `ModelOutputError`，将基础设施错误映射为
-`ModelInfrastructureError`。它不能访问 `EconomyEngine` 或其他公司的状态。
+`AgentFactory` 为每家公司创建独立 NewAPI Gateway。Adapter 把输出校验为已授权的
+`CompanyCommand`，将内容错误映射为 `ModelOutputError`，将兼容性错误映射为
+`ModelCompatibilityError`，并将传输或认证故障映射为 `ModelInfrastructureError`。
+它不能访问 `EconomyEngine` 或其他公司的状态。支持新模型时应把模型接入 NewAPI，
+而不是新增直连 Provider Adapter。

@@ -7,7 +7,7 @@ $runtimePathsScript = Join-Path $PSScriptRoot "runtime_paths.ps1"
 $runtimeHome = Get-DairyBenchRuntimeHome -BackendDirectory $backendDirectory
 $newApiStateDirectory = Join-Path $runtimeHome "credentials"
 $newApiCredentialPath = Join-Path $newApiStateDirectory "newapi-token.clixml"
-$newApiModelsPath = Join-Path $newApiStateDirectory "newapi-claude-models.json"
+$newApiModelsPath = Join-Path $newApiStateDirectory "newapi-models.json"
 $newApiPlainKey = $null
 
 try {

@@ -2,18 +2,8 @@
 
 from __future__ import annotations
 
-from functools import partial
-
 from company_bench.agents.factory import AgentFactory
-from company_bench.agents.providers.claude import NewApiClaudeConfig
-from company_bench.agents.providers.codex.artifacts import (
-    CodexArtifactIdentity,
-    CodexArtifactStore,
-    CodexArtifactView,
-)
-from company_bench.agents.providers.codex.gateway import CodexAgentConfig, CodexModelGateway
-from company_bench.agents.providers.codex.sessions import CodexSessionManager
-from company_bench.agents.providers.openai import OpenAIAgentConfig
+from company_bench.agents.providers.newapi import NewApiConfig
 from company_bench.domain.models import EpisodeResult, PolicyKind
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
@@ -38,10 +28,8 @@ class BenchmarkApplication:
         self,
         store: RunStore,
         agent_factory: AgentFactory,
-        artifacts: CodexArtifactStore,
         *,
         owned_store: SQLiteRunStore | None = None,
-        owned_codex_sessions: CodexSessionManager | None = None,
     ) -> None:
         runtime = EpisodeRuntime(
             agent_factory.scenario,
@@ -49,17 +37,14 @@ class BenchmarkApplication:
         )
         self._store = store
         self._coordinator = RunCoordinator(store, agent_factory, runtime)
-        self._timeline = RunTimelineProjector(store, artifacts)
-        self._artifacts = artifacts
+        self._timeline = RunTimelineProjector(store)
         self._owned_store = owned_store
-        self._owned_codex_sessions = owned_codex_sessions
 
     @classmethod
     def create(
         cls,
         store: RunStore | None = None,
         agent_factory: AgentFactory | None = None,
-        artifacts: CodexArtifactStore | None = None,
     ) -> BenchmarkApplication:
         """Compose production Adapters while retaining explicit test seams."""
         paths = RuntimePaths.from_environment()
@@ -67,33 +52,16 @@ class BenchmarkApplication:
         active_store = owned_store or store
         if active_store is None:
             raise AssertionError("application composition requires a RunStore")
-        active_artifacts = artifacts or CodexArtifactStore.from_environment()
-        owned_sessions: CodexSessionManager | None = None
         if agent_factory is None:
-            codex_config = CodexAgentConfig.from_environment()
-            owned_sessions = (
-                CodexSessionManager(codex_config.session_retention)
-                if codex_config is not None
-                else None
-            )
             agent_factory = AgentFactory(
                 scenario=DAIRY_S9_SCENARIO,
                 audit_sink=active_store,
-                claude_config=NewApiClaudeConfig.from_environment(),
-                codex_config=codex_config,
-                codex_gateway_factory=partial(
-                    CodexModelGateway,
-                    artifact_sink=active_artifacts,
-                    session_manager=owned_sessions,
-                ),
-                openai_config=OpenAIAgentConfig.from_environment(),
+                newapi_config=NewApiConfig.from_environment(),
             )
         return cls(
             active_store,
             agent_factory,
-            active_artifacts,
             owned_store=owned_store,
-            owned_codex_sessions=owned_sessions,
         )
 
     async def start(self) -> None:
@@ -105,12 +73,8 @@ class BenchmarkApplication:
         try:
             await self._coordinator.close()
         finally:
-            try:
-                if self._owned_codex_sessions is not None:
-                    await self._owned_codex_sessions.close()
-            finally:
-                if self._owned_store is not None:
-                    self._owned_store.close()
+            if self._owned_store is not None:
+                self._owned_store.close()
 
     def profiles(self) -> tuple[PolicyProfileView, ...]:
         return self._coordinator.profiles()
@@ -156,21 +120,3 @@ class BenchmarkApplication:
 
     def timeline_detail(self, run_id: str, entry_id: str) -> TimelineDetail:
         return self._timeline.read_detail(run_id, entry_id)
-
-    def artifacts(self, invocation: PolicyInvocation) -> CodexArtifactView | None:
-        """Load Codex evidence only when the invocation carries complete coordinates."""
-        turn_id = invocation.provider_turn_id or invocation.response_id
-        if invocation.provider != "codex" or invocation.request_id is None or turn_id is None:
-            return None
-        return self._artifacts.read(
-            CodexArtifactIdentity(
-                invocation_id=invocation.invocation_id,
-                run_id=invocation.run_id,
-                company_id=invocation.company_id,
-                day=invocation.day,
-                model=invocation.model,
-                thread_id=invocation.request_id,
-                turn_id=turn_id,
-                domain_turn_id=invocation.domain_turn_id,
-            )
-        )

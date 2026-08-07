@@ -2705,30 +2705,6 @@ footer {
   margin: 10px;
 }
 
-.trace-copy-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  border-top: 1px solid #edf1ee;
-}
-
-.trace-copy-grid section {
-  min-width: 0;
-  padding: 11px;
-}
-
-.trace-copy-grid section + section {
-  border-left: 1px solid #edf1ee;
-}
-
-.trace-copy-grid h4 {
-  margin: 0 0 7px;
-  color: var(--muted);
-  font-size: 9px;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-}
-
-.trace-copy-grid pre,
 .raw-audit pre {
   max-height: 300px;
   overflow: auto;
@@ -2743,7 +2719,6 @@ footer {
   white-space: pre-wrap;
 }
 
-.trace-copy-grid p,
 .inline-empty {
   margin: 0;
   color: var(--muted);
@@ -2882,13 +2857,7 @@ footer {
   .inventory-deltas,
   .command-outcome-detail,
   .market-detail-grid,
-  .market-detail-grid.compact,
-  .trace-copy-grid {
+  .market-detail-grid.compact {
     grid-template-columns: 1fr;
-  }
-
-  .trace-copy-grid section + section {
-    border-top: 1px solid #edf1ee;
-    border-left: 0;
   }
 }

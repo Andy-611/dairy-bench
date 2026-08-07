@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from company_bench.agents.factory import PolicyUnavailableError
-from company_bench.agents.providers.codex.artifacts import CodexArtifactView
 from company_bench.application import BenchmarkApplication
 from company_bench.domain.models import (
     MAX_SEED,
@@ -52,10 +51,10 @@ class RunRequest(BaseModel):
                 raise ValueError("replay mode inherits the source seed")
         elif self.source_run_id is not None:
             raise ValueError("source_run_id is only valid in replay mode")
-        if self.mode is PolicyKind.CLAUDE and self.model is None:
-            raise ValueError("Claude mode requires model")
-        if self.mode is not PolicyKind.CLAUDE and self.model is not None:
-            raise ValueError("model is only valid in Claude mode")
+        if self.mode is PolicyKind.MODEL and self.model is None:
+            raise ValueError("Model Agent mode requires model")
+        if self.mode is not PolicyKind.MODEL and self.model is not None:
+            raise ValueError("model is only valid in Model Agent mode")
         return self
 
 
@@ -207,32 +206,6 @@ def create_app(
             return active_application.timeline_detail(run_id, entry_id)
         except (TimelineNotFoundError, TimelineUnsupportedError, ValueError) as error:
             raise _timeline_http_error(error) from error
-
-    @app.get(
-        "/api/runs/{run_id}/invocations/{invocation_id}/artifacts",
-        response_model=CodexArtifactView,
-        tags=["runs"],
-    )
-    def get_invocation_artifacts(
-        run_id: str,
-        invocation_id: str,
-    ) -> CodexArtifactView:
-        if active_application.job(run_id) is None:
-            raise _not_found("Run job", run_id)
-        invocation = next(
-            (
-                candidate
-                for candidate in active_application.invocations(run_id)
-                if candidate.invocation_id == invocation_id
-            ),
-            None,
-        )
-        if invocation is None:
-            raise _not_found("Codex artifacts", invocation_id)
-        artifacts = active_application.artifacts(invocation)
-        if artifacts is None:
-            raise _not_found("Codex artifacts", invocation_id)
-        return artifacts
 
     @app.get(
         "/api/runs/{run_id}",

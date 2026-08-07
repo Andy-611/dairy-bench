@@ -1,10 +1,5 @@
 export type CompanyRole = "farm" | "processor" | "retailer";
-export type PolicyMode =
-  | "baseline"
-  | "codex"
-  | "openai"
-  | "claude"
-  | "replay";
+export type PolicyMode = "baseline" | "model" | "replay";
 export type InvocationOutcome =
   | "success"
   | "agent_error"
@@ -97,7 +92,6 @@ export interface PolicyProfileView {
   readonly provider: string | null;
   readonly model: string | null;
   readonly models: readonly string[];
-  readonly reasoningEffort: string | null;
   readonly description: string;
   readonly unavailableReason: string | null;
 }
@@ -546,32 +540,9 @@ export interface TimelineDayView {
   readonly moments: readonly TimelineMomentView[];
 }
 
-interface AgentTraceBaseView {
+export interface AgentTraceView {
   readonly preview: TracePreviewView;
 }
-
-export type ArtifactUnavailableReason =
-  | "store_not_configured"
-  | "provider_not_supported"
-  | "identity_unavailable"
-  | "not_found"
-  | "read_error";
-
-export type AgentTraceView = AgentTraceBaseView &
-  (
-    | {
-        readonly artifactStatus: "available";
-        readonly artifactUnavailableReason: null;
-        readonly reasoningMarkdown: string;
-        readonly finalOutput: string;
-      }
-    | {
-        readonly artifactStatus: "unavailable";
-        readonly artifactUnavailableReason: ArtifactUnavailableReason;
-        readonly reasoningMarkdown: null;
-        readonly finalOutput: null;
-      }
-  );
 
 export interface TimelineDetailView {
   readonly entry: TurnTimelineItemView | SystemTimelineItemView;
@@ -583,11 +554,11 @@ export interface TimelineDetailView {
 
 export type RunRequest =
   | {
-      readonly policyMode: "baseline" | "codex" | "openai";
+      readonly policyMode: "baseline";
       readonly seed: number;
     }
   | {
-      readonly policyMode: "claude";
+      readonly policyMode: "model";
       readonly model: string;
       readonly seed: number;
     }

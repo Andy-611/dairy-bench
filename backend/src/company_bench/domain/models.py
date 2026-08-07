@@ -140,9 +140,7 @@ class PolicyKind(StrEnum):
     """Controller implementation used by one company."""
 
     BASELINE = "baseline"
-    CODEX = "codex"
-    OPENAI = "openai"
-    CLAUDE = "claude"
+    MODEL = "model"
     REPLAY = "replay"
 
 

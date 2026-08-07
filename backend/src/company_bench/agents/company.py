@@ -12,6 +12,8 @@ from company_bench.agents.contracts import (
     CommandGateway,
     CommandModelRequest,
     CommandName,
+    ModelCallError,
+    ModelCompatibilityError,
     ModelInfrastructureError,
     ModelOutputError,
     PolicyInfrastructureError,
@@ -212,6 +214,14 @@ class LlmCompanyAgent:
             ):
                 raise ModelOutputError("Agent context exceeds the configured prompt-token limit")
             result = await self._gateway.generate_command(request)
+        except ModelCompatibilityError as error:
+            self._record_failure(
+                request,
+                started_at,
+                InvocationOutcome.AGENT_ERROR,
+                error,
+            )
+            raise PolicyInfrastructureError(str(error)) from error
         except ModelOutputError as error:
             self._record_failure(
                 request,
@@ -245,7 +255,6 @@ class LlmCompanyAgent:
             outcome=InvocationOutcome.SUCCESS,
             command=result.command,
             response_id=result.response_id,
-            provider_turn_id=result.response_id,
             request_id=result.request_id,
             usage=result.usage,
             attempts=result.attempts,
@@ -282,7 +291,7 @@ class LlmCompanyAgent:
         outcome: InvocationOutcome,
         error: Exception,
     ) -> None:
-        model_error = error if isinstance(error, ModelOutputError) else None
+        call_error = error if isinstance(error, ModelCallError) else None
         self._audit_sink.record_invocation(
             PolicyInvocation(
                 **self._invocation_fields(request, started_at),
@@ -290,12 +299,11 @@ class LlmCompanyAgent:
                 outcome=outcome,
                 error_kind=type(error).__name__,
                 error_message=bounded_error(error),
-                response_id=model_error.response_id if model_error else None,
-                provider_turn_id=model_error.response_id if model_error else None,
-                request_id=model_error.request_id if model_error else None,
-                usage=model_error.usage if model_error else TokenUsage(),
-                attempts=model_error.attempts if model_error else 1,
-                latency_ms=model_error.latency_ms if model_error else 0,
+                response_id=call_error.response_id if call_error else None,
+                request_id=call_error.request_id if call_error else None,
+                usage=call_error.usage if call_error else TokenUsage(),
+                attempts=call_error.attempts if call_error else 1,
+                latency_ms=call_error.latency_ms if call_error else 0,
             )
         )
 

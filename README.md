@@ -2,80 +2,65 @@
 
 Dairy Bench is an event-driven multi-agent benchmark for a perishable dairy
 supply chain. Three farms, three processors, and three retailers share two spot
-markets; each of the nine companies is controlled by an independent agent.
+markets; each company is controlled by an independent Agent.
 
-The default scenario is `flow.dairy.base.s9.v5`. An episode lasts 30 simulated
-days, and every decision is one strongly typed atomic command:
+The default scenario is `flow.dairy.base.s9.v5`. One episode lasts 30 simulated
+days, and every decision follows one typed boundary:
 
 ```text
 Wake -> AgentTurn -> one CompanyCommand -> EconomyEngine -> Journal -> next Wake
 ```
 
-Only the deterministic economy engine may mutate cash, inventory, orders, jobs,
-deliveries, or trade results. Natural-language text never settles a transaction.
+Only `EconomyEngine` may mutate cash, inventory, orders, jobs, deliveries, or
+trade results. Model text never settles a transaction.
 
-## V4 at a glance
+## Policy modes
 
-- Continuous fully collateralized limit-order books for raw and bottled milk.
-  Crossing orders trade immediately with price-time priority, the maker's price,
-  and partial fills. In one model call, an agent may set a target ladder of up
-  to three independent price levels for one product and side.
-- Bids reserve their full limit-price cash commitment; asks reserve exact FEFO
-  inventory lots. A ladder update either reconciles every level atomically or
-  leaves the original orders and collateral unchanged.
-- Every economic Decimal uses one `0.0001` quantum. Agent quantities and prices
-  with excess precision are rejected without rounding. Derived cash values use
-  half-even rounding; derived physical quantities round down, and zero-value
-  orders, fills, or operation costs are rejected atomically.
-- Same-minute agent calls run concurrently, then commands commit in a persisted
-  `SHA256(seed | minute | company)` order. Provider response latency is audited
-  but cannot change the economic result.
-- `produce` and `transform` occupy the company's physical resource for 30 virtual
-  minutes. Market and retail-price commands remain instantaneous, subject to the
-  one-decision-per-virtual-minute throttle.
-- A trade pays the seller immediately and schedules automatic buyer delivery 30
-  minutes later. There is no manual dispatch, route, carrier, or escrow workflow.
-- Each agent sees every anonymous aggregated price level, its own queue-aware
-  orders, expiry-aware available and reserved assets, inbound deliveries, its
-  active operation, and remaining daily operation capacity.
-- Every company has private token-budgeted memory. Immutable journals, atomic
-  checkpoints, crash recovery, and exact replay remain the durable authority.
+Dairy Bench exposes exactly three modes:
+
+- **Rule baseline** — deterministic rules; no model call.
+- **Model agents via NewAPI** — one isolated Agent and NewAPI HTTP client per
+  company. The configured catalog may contain any model family that supports
+  function calls through NewAPI's common Chat Completions interface.
+- **Exact replay** — reproduces a completed Turn Journal without calling a
+  model and rejects observation or outcome drift.
+
+There is no direct model-provider path. All model-backed runs go through the
+single NewAPI adapter and validate into the same Pydantic command union.
+
+## V4 behavior
+
+- Continuous, fully collateralized limit-order books for raw and bottled milk.
+- Atomic target ladders with up to three price levels and price-time priority.
+- FEFO inventory reservation and a shared `0.0001` economic quantum.
+- Concurrent same-minute model inference followed by deterministic persisted
+  command application order.
+- Thirty-minute production, transformation, and delivery events.
+- Private per-company memory, immutable journals, atomic checkpoints, recovery,
+  and exact replay.
 
 The daily clock is:
 
 | Time | Event |
 |---|---|
-| 09:00 | Open both markets and wake all companies |
-| 09:00-18:59 | Accept company decisions and continuously match orders |
-| 19:00 | Complete due jobs and deliveries, close books, release DAY-order holds, then run consumer sales |
-| 19:00-19:29 | Process only previously committed completions and deliveries |
-| 19:30 | Expire inventory and commit the end-of-day snapshot |
+| 09:00 | Open markets and wake all companies |
+| 09:00–18:59 | Accept decisions and continuously match orders |
+| 19:00 | Complete due work, close books, then run consumer sales |
+| 19:00–19:29 | Process previously committed completions and deliveries |
+| 19:30 | Expire inventory and commit the daily snapshot |
 
 See [Architecture and invariants](docs/ARCHITECTURE.md) and
-[Agent integration](docs/AGENT_INTEGRATION.md) for the full contract.
+[Agent integration](docs/AGENT_INTEGRATION.md) for the full contracts.
 
-## System outline
+## Install and start
 
-```text
-React -> FastAPI -> BenchmarkApplication -> RunCoordinator -> EpisodeRuntime
-                              |                    |-> Scheduler + EconomyEngine
-                              |                    `-> AgentFactory -> CompanyAgent x 9
-                              `-> RunStore -> Journal + Checkpoint + SQLite
-```
-
-Agents may use the rule baseline, Codex, OpenAI, Claude through NewAPI, or exact
-replay. OpenAI uses Responses API function tools, Claude uses native Anthropic
-Messages tools, and Codex uses an equivalent strict structured-output adapter.
-Every provider path validates into the same Pydantic command union.
-
-## Requirements and startup
+Requirements:
 
 - Python 3.12+
 - Node.js 20.19+
-- Codex login, an OpenAI API key, or a NewAPI key only for the corresponding
-  agent mode
+- A NewAPI key only for model-backed runs
 
-Install once from the repository root:
+Install once:
 
 ```powershell
 cd backend
@@ -86,85 +71,55 @@ npm.cmd install
 cd ..
 ```
 
-Start FastAPI and Vite:
-
-```powershell
-.\start.cmd
-```
-
-The launcher opens `http://127.0.0.1:5173`. The rule baseline needs no model
-credentials.
-
-The page automatically opens a newly submitted or active run. The current run
-and day live in `?run=...&day=...`, so refresh and browser navigation preserve
-the view. Selecting `Exact Replay` replaces the seed with a source dropdown that
-lists every completed run from newest to oldest. Choosing a source opens its
-persisted results and timeline; starting the replay makes no model calls and
-verifies deterministic equality.
-
-While a run is active, the same primary action becomes `Stop run`.
-Stopping is permanent: committed journals, checkpoints, and timeline evidence
-remain readable, but the run receives no final score, cannot resume, and is not
-an Exact Replay source.
-
-## Model-backed agents
-
-`start.cmd` uses the repository-owned `.dairy-bench/codex` directory instead
-of `%USERPROFILE%\.codex`. Each company receives an independent runtime and
-private memory; every Codex turn uses an isolated thread. Public reasoning
-summaries and final structured outputs are exported under:
-
-```text
-.dairy-bench/artifacts/<run_id>/
-|-- reasoning/
-`-- final_outputs/
-```
-
-For OpenAI agents, set the key in the shell that starts the backend:
-
-```powershell
-$env:OPENAI_API_KEY="your-key"
-$env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"  # optional
-
-python -m uvicorn company_bench.web.app:create_app --factory --app-dir src --host 127.0.0.1 --port 8000
-```
-
-Configure Claude agents through NewAPI once from the repository root:
+Configure or replace the NewAPI key from the repository root:
 
 ```bat
 start.cmd --configure-newapi
 ```
 
-The prompt hides the key, validates it against NewAPI's `/v1/models` endpoint,
-and stores a Windows-user-encrypted credential plus a non-secret Claude model
-catalog under `.dairy-bench/credentials`. Then start normally:
+The configuration command validates the key through `/v1/models`, stores a
+Windows-user-encrypted credential, and saves the complete non-secret model
+catalog under `.dairy-bench/credentials/`. Run it again whenever the key or
+catalog changes. If the backend is already open, restart it after configuration.
+
+Start the application:
 
 ```bat
 start.cmd
 ```
 
-If Dairy Bench was already running during configuration, close its backend
-window first so the restarted process can load the credential.
+The launcher opens `http://127.0.0.1:5173`. Use `start.cmd --check` to inspect
+local prerequisites and NewAPI configuration without starting services.
 
-Choose the Claude model in the Run form. The choice is persisted with that Run,
-so an interrupted Run resumes with the same model. Run the configuration command
-again to replace the key or refresh the model catalog. This mode calls NewAPI's
-native `/v1/messages` interface; it does not launch Claude Code or grant coding
-tools.
+The model selector is populated from the NewAPI catalog. Because `/v1/models`
+does not prove command-tool compatibility, Dairy Bench still requires exactly
+one authorized function call. The adapter prefers `tool_choice="required"` and
+omits that hint only when the provider explicitly rejects it, as some thinking
+models do. Every request uses a fixed `max_tokens=131072` output budget. It never
+falls back to unstructured text or another provider.
 
-The decrypted key exists only in the backend process environment and never
-enters the browser, journal, or benchmark database. Provider infrastructure
-failure fails the run rather than fabricating an economic action.
-Invalid structured output becomes an explicit protocol rejection with no
-economic mutation.
+The decrypted key exists only in the backend process environment. It never
+enters the browser, journal, or SQLite database.
 
-## Data and verification
+## Runs and data
 
-All mutable runtime state stays in the Git-ignored project directory
-`.dairy-bench/`: the database is `data/runs.sqlite3`, Agent evidence is under
-`artifacts/`, isolated Codex state is under `codex/`, and encrypted NewAPI
-credentials are under `credentials/`. Override the root only when necessary
-with `DAIRY_BENCH_HOME`.
+The selected run and day live in `?run=...&day=...`, so refresh and browser
+navigation preserve the view. Exact Replay uses a completed source run and
+inherits its seed. Stopping is permanent: existing journals and timeline data
+remain readable, but the run receives no final score and cannot become a replay
+source.
+
+All mutable state stays under the Git-ignored `.dairy-bench/` directory:
+
+```text
+.dairy-bench/
+|-- credentials/
+`-- data/runs.sqlite3
+```
+
+Override the root only when necessary with `DAIRY_BENCH_HOME`.
+
+## Verification
 
 ```powershell
 cd backend
@@ -186,9 +141,3 @@ npm.cmd run build
 - `GET /api/runs/{run_id}/timeline/{entry_id}`
 - `GET /api/runs/{run_id}/turns`
 - `GET /api/runs/{run_id}/invocations`
-- `GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts`
-
-## Design documentation
-
-- [Architecture and invariants](docs/ARCHITECTURE.md)
-- [Agent integration](docs/AGENT_INTEGRATION.md)

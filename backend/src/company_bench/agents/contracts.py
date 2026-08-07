@@ -39,12 +39,6 @@ def command_model(name: CommandName) -> type[BaseModel]:
     return _COMMAND_MODELS[name]
 
 
-class CommandSubmission(StrictModel):
-    """Structured command envelope for providers without native tool calls."""
-
-    command: CompanyCommand
-
-
 class CommandModelRequest(StrictModel):
     """Complete provider-neutral request for one atomic company command."""
 
@@ -69,8 +63,8 @@ class CommandModelResult(StrictModel):
     latency_ms: int = Field(default=0, ge=0)
 
 
-class ModelOutputError(RuntimeError):
-    """The Agent returned no schema-valid command."""
+class ModelCallError(RuntimeError):
+    """A model call failed after producing auditable provider metadata."""
 
     def __init__(
         self,
@@ -90,7 +84,15 @@ class ModelOutputError(RuntimeError):
         self.latency_ms = latency_ms
 
 
-class ModelInfrastructureError(RuntimeError):
+class ModelOutputError(ModelCallError):
+    """The Agent returned no schema-valid command."""
+
+
+class ModelCompatibilityError(ModelOutputError):
+    """The selected model cannot satisfy the required command protocol."""
+
+
+class ModelInfrastructureError(ModelCallError):
     """The provider could not reliably execute the request."""
 
 

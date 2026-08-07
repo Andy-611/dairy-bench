@@ -75,10 +75,10 @@ class RunJob(StrictModel):
         """Keep reported progress inside the scenario duration."""
         if self.current_day > self.total_days:
             raise ValueError("current_day must not exceed total_days")
-        if self.mode is PolicyKind.CLAUDE and self.model is None:
-            raise ValueError("Claude jobs require a model")
-        if self.mode is not PolicyKind.CLAUDE and self.model is not None:
-            raise ValueError("model is only valid for Claude jobs")
+        if self.mode is PolicyKind.MODEL and self.model is None:
+            raise ValueError("Model Agent jobs require a model")
+        if self.mode is not PolicyKind.MODEL and self.model is not None:
+            raise ValueError("model is only valid for Model Agent jobs")
         return self
 
     def mark_running(self, started_at: datetime) -> Self:
@@ -180,7 +180,7 @@ class RunCheckpoint(StrictModel):
         expected_memory_ids = [
             policy.company_id
             for policy in self.policies
-            if policy.kind in {PolicyKind.CLAUDE, PolicyKind.CODEX, PolicyKind.OPENAI}
+            if policy.kind is PolicyKind.MODEL
         ]
         if company_ids != expected_memory_ids:
             raise ValueError(
@@ -283,7 +283,6 @@ class PolicyProfileView(StrictModel):
     provider: str | None = None
     model: str | None = None
     models: tuple[str, ...] = ()
-    reasoning_effort: str | None = None
     description: str
     unavailable_reason: str | None = None
 
@@ -330,7 +329,6 @@ class PolicyInvocation(StrictModel):
     error_kind: str | None = None
     error_message: str | None = Field(default=None, max_length=500)
     response_id: str | None = None
-    provider_turn_id: str | None = None
     request_id: str | None = None
     usage: TokenUsage = TokenUsage()
     attempts: int = Field(default=1, ge=1)

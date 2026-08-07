@@ -1,7 +1,6 @@
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -9,29 +8,17 @@ from pytest import MonkeyPatch, raises
 
 import company_bench.application as application_module
 from company_bench.agents.factory import AgentFactory
-from company_bench.agents.providers.codex.artifacts import (
-    CodexArtifactIdentity,
-    CodexArtifactStore,
-)
-from company_bench.agents.providers.codex.sessions import (
-    CodexSessionManager,
-    CodexSessionRetention,
-)
 from company_bench.application import BenchmarkApplication
 from company_bench.domain.models import (
-    CompanyObservation,
     EpisodeResult,
     PolicyKind,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
-    InvocationOutcome,
-    PolicyInvocation,
     ReplaySource,
     RunJob,
     RunStatus,
 )
-from company_bench.runtime.models import Produce
 from company_bench.storage.store import InMemoryRunStore
 from company_bench.web.app import create_app
 
@@ -46,19 +33,6 @@ class _TrackedOwnedRepository(InMemoryRunStore):
     def close(self) -> None:
         """Record application-owned repository cleanup."""
         self.close_calls += 1
-
-
-class _TrackedWebSessionManager(CodexSessionManager):
-    """Expose whether the Web lifespan released its shared Session manager."""
-
-    def __init__(self, retention: CodexSessionRetention) -> None:
-        super().__init__(retention)
-        self.close_calls = 0
-
-    async def close(self) -> None:
-        """Record application-owned Session manager cleanup."""
-        self.close_calls += 1
-        await super().close()
 
 
 def _app(repository: InMemoryRunStore) -> FastAPI:
@@ -137,21 +111,11 @@ def test_run_list_and_detail_http_flow() -> None:
         profiles = client.get("/api/policy-profiles").json()
         assert [profile["mode"] for profile in profiles] == [
             "baseline",
-            "codex",
-            "openai",
-            "claude",
+            "model",
             "replay",
         ]
         assert (
-            next(profile for profile in profiles if profile["mode"] == "codex")["available"]
-            is False
-        )
-        assert (
-            next(profile for profile in profiles if profile["mode"] == "openai")["available"]
-            is False
-        )
-        assert (
-            next(profile for profile in profiles if profile["mode"] == "claude")["available"]
+            next(profile for profile in profiles if profile["mode"] == "model")["available"]
             is False
         )
 
@@ -309,31 +273,19 @@ def test_http_validation_and_localhost_cors() -> None:
             ).status_code
             == 422
         )
+        for retired_mode in ("codex", "openai", "claude"):
+            assert (
+                client.post(
+                    "/api/runs",
+                    json={"mode": retired_mode, "seed": 42},
+                ).status_code
+                == 422
+            )
+        assert client.post("/api/runs", json={"mode": "model", "seed": 42}).status_code == 422
         assert (
             client.post(
                 "/api/runs",
-                json={"mode": "codex", "seed": 42},
-            ).status_code
-            == 409
-        )
-        assert (
-            client.post(
-                "/api/runs",
-                json={"mode": "openai", "seed": 42},
-            ).status_code
-            == 409
-        )
-        assert (
-            client.post(
-                "/api/runs",
-                json={"mode": "claude", "seed": 42},
-            ).status_code
-            == 422
-        )
-        assert (
-            client.post(
-                "/api/runs",
-                json={"mode": "claude", "model": "claude-test", "seed": 42},
+                json={"mode": "model", "model": "gpt-test", "seed": 42},
             ).status_code
             == 409
         )
@@ -356,11 +308,9 @@ def test_default_repository_uses_configured_database(
 ) -> None:
     database = tmp_path / "data" / "runs.sqlite3"
     monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
-    monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     with TestClient(create_app()) as client:
         assert client.get("/api/health").status_code == 200
@@ -369,11 +319,9 @@ def test_default_repository_uses_configured_database(
 
 
 def test_default_app_runs_the_v4_scenario(monkeypatch: MonkeyPatch) -> None:
-    monkeypatch.delenv("DAIRY_BENCH_CODEX_ENABLED", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     repository = InMemoryRunStore()
 
     with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
@@ -392,53 +340,34 @@ def test_default_app_runs_the_v4_scenario(monkeypatch: MonkeyPatch) -> None:
     assert len(turns) > (DAIRY_S9_SCENARIO.days * len(DAIRY_S9_SCENARIO.companies))
 
 
-def test_codex_profile_can_be_enabled_without_exposing_credentials(
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DAIRY_BENCH_CODEX_ENABLED", "true")
-    repository = InMemoryRunStore()
-
-    with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
-        profiles = client.get("/api/policy-profiles").json()
-
-    codex = next(profile for profile in profiles if profile["mode"] == "codex")
-    assert codex == {
-        "mode": "codex",
-        "label": "Codex company agents",
-        "available": True,
-        "provider": "codex",
-        "model": "gpt-5.6-luna",
-        "models": [],
-        "reasoning_effort": "high",
-        "description": "Each company is controlled by an independent Codex runtime.",
-        "unavailable_reason": None,
-    }
-
-
-def test_claude_profile_can_be_enabled_without_exposing_credentials(
+def test_model_profile_exposes_the_full_newapi_catalog_without_credentials(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("NEWAPI_API_KEY", "secret-newapi-key")
-    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL", "claude-default-model")
+    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL", "gpt-default-model")
     monkeypatch.setenv(
         "DAIRY_BENCH_NEWAPI_MODELS",
-        "claude-default-model,claude-second-model",
+        "gpt-default-model,claude-model,gemini-model,deepseek-model",
     )
     repository = InMemoryRunStore()
 
     with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         profiles = client.get("/api/policy-profiles").json()
 
-    claude = next(profile for profile in profiles if profile["mode"] == "claude")
-    assert claude == {
-        "mode": "claude",
-        "label": "Claude via NewAPI",
+    model = next(profile for profile in profiles if profile["mode"] == "model")
+    assert model == {
+        "mode": "model",
+        "label": "Model agents via NewAPI",
         "available": True,
         "provider": "newapi",
-        "model": "claude-default-model",
-        "models": ["claude-default-model", "claude-second-model"],
-        "reasoning_effort": None,
-        "description": "Each company is controlled by an independent Claude model through NewAPI.",
+        "model": "gpt-default-model",
+        "models": [
+            "gpt-default-model",
+            "claude-model",
+            "gemini-model",
+            "deepseek-model",
+        ],
+        "description": "Each company is controlled by an independent model through NewAPI.",
         "unavailable_reason": None,
     }
     assert "secret-newapi-key" not in str(profiles)
@@ -448,98 +377,17 @@ def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(
     monkeypatch: MonkeyPatch,
 ) -> None:
     repository = _TrackedOwnedRepository()
-    managers: list[_TrackedWebSessionManager] = []
-
-    def create_manager(retention: CodexSessionRetention) -> _TrackedWebSessionManager:
-        manager = _TrackedWebSessionManager(retention)
-        managers.append(manager)
-        return manager
 
     async def fail_coordinator_close(_: object) -> None:
         raise RuntimeError("coordinator close failed")
 
-    monkeypatch.setenv("DAIRY_BENCH_CODEX_ENABLED", "true")
     monkeypatch.setattr(application_module, "SQLiteRunStore", lambda _: repository)
-    monkeypatch.setattr(application_module, "CodexSessionManager", create_manager)
     monkeypatch.setattr(application_module.RunCoordinator, "close", fail_coordinator_close)
 
     with (
         raises(RuntimeError, match="coordinator close failed"),
         TestClient(create_app()),
     ):
-        assert len(managers) == 1
-        assert managers[0].close_calls == 0
+        assert repository.close_calls == 0
 
-    assert managers[0].close_calls == 1
     assert repository.close_calls == 1
-
-
-def test_codex_artifacts_are_resolved_by_domain_turn(
-    first_observation: CompanyObservation,
-    monkeypatch: MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    artifacts_root = tmp_path / "artifacts"
-    monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
-    repository = InMemoryRunStore()
-    now = datetime.now(UTC)
-    run_id = "run_trace"
-    domain_turn_id = f"{run_id}.{first_observation.company_id}.t1"
-    invocation_id = f"{domain_turn_id}.provider"
-    repository.save_job(
-        RunJob(
-            run_id=run_id,
-            mode=PolicyKind.CODEX,
-            seed=42,
-            scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-            total_days=DAIRY_S9_SCENARIO.days,
-            submitted_at=now,
-        )
-    )
-    repository.record_invocation(
-        PolicyInvocation(
-            invocation_id=invocation_id,
-            run_id=run_id,
-            company_id=first_observation.company_id,
-            day=1,
-            observation=first_observation,
-            provider="codex",
-            model="gpt-5.6-terra",
-            prompt_version="test",
-            prompt_hash="hash",
-            started_at=now,
-            finished_at=now,
-            outcome=InvocationOutcome.SUCCESS,
-            domain_turn_id=domain_turn_id,
-            sim_minute=540,
-            state_version=0,
-            command=Produce(product="raw_milk", quantity="1"),
-            request_id="thread_trace",
-            provider_turn_id="provider_turn_trace",
-        )
-    )
-    identity = CodexArtifactIdentity(
-        invocation_id=invocation_id,
-        run_id=run_id,
-        company_id=first_observation.company_id,
-        day=1,
-        model="gpt-5.6-terra",
-        thread_id="thread_trace",
-        turn_id="provider_turn_trace",
-        domain_turn_id=domain_turn_id,
-    )
-    CodexArtifactStore(artifacts_root).export(
-        identity,
-        SimpleNamespace(
-            final_response='{"command":{"kind":"produce","quantity":"1"}}',
-            items=[],
-        ),
-        None,
-    )
-
-    with TestClient(_app(repository)) as client:
-        response = client.get(f"/api/runs/{run_id}/invocations/{invocation_id}/artifacts")
-
-    assert response.status_code == 200
-    assert response.json()["domain_turn_id"] == domain_turn_id
-    assert '"kind": "produce"' in response.json()["final_output"]

@@ -8,7 +8,7 @@ $runtimePathsScript = Join-Path $PSScriptRoot "runtime_paths.ps1"
 $runtimeHome = Get-DairyBenchRuntimeHome -BackendDirectory $backendDirectory
 $newApiStateDirectory = Join-Path $runtimeHome "credentials"
 $newApiCredentialPath = Join-Path $newApiStateDirectory "newapi-token.clixml"
-$newApiModelsPath = Join-Path $newApiStateDirectory "newapi-claude-models.json"
+$newApiModelsPath = Join-Path $newApiStateDirectory "newapi-models.json"
 $newApiSecureKey = Read-Host "NewAPI API key" -AsSecureString
 $newApiCredential = [PSCredential]::new("newapi", $newApiSecureKey)
 $newApiPlainKey = $newApiCredential.GetNetworkCredential().Password
@@ -25,11 +25,11 @@ try {
     $newApiModels = @(
         $newApiResponse.data |
             ForEach-Object { [string]$_.id } |
-            Where-Object { $_ -match "claude" } |
+            Where-Object { $_ } |
             Sort-Object -Unique
     )
     if ($newApiModels.Count -eq 0) {
-        throw "The NewAPI credential exposes no Claude models."
+        throw "The NewAPI credential exposes no models."
     }
 
     New-Item -ItemType Directory -Path $newApiStateDirectory -Force | Out-Null
@@ -38,7 +38,7 @@ try {
         Set-Content -LiteralPath $newApiModelsPath -Encoding UTF8
 
     Write-Host "[Dairy Bench] NewAPI credential saved under the project runtime directory."
-    Write-Host "[Dairy Bench] Claude models available in the UI:"
+    Write-Host "[Dairy Bench] Models available in the UI:"
     $newApiModels | ForEach-Object { Write-Host "  $_" }
     Write-Host "[Dairy Bench] Restart a running backend, then launch start.cmd."
 }

@@ -14,11 +14,6 @@ from company_bench.agents.company import (
     ReplayCompanyAgent,
 )
 from company_bench.agents.contracts import CommandModelRequest, CommandModelResult
-from company_bench.agents.providers.codex.artifacts import (
-    CodexArtifactIdentity,
-    CodexArtifactStore,
-    CodexArtifactView,
-)
 from company_bench.domain.models import PolicyKind, PolicyMetadata, ProductId, TradeExecutedEvent
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
@@ -46,8 +41,6 @@ from company_bench.runtime.models import (
 from company_bench.storage.store import InMemoryRunStore, SQLiteRunStore
 from company_bench.timeline.market import MarketProjectionError, MarketTimelineProjector
 from company_bench.timeline.models import (
-    ArtifactStatus,
-    ArtifactUnavailableReason,
     CommandDispositionSource,
     MarketOrderCancelled,
     MarketOrderPlaced,
@@ -69,9 +62,10 @@ def _complete(
     repository.complete_job(
         result,
         RunJob(
-            run_id=result.run_id,
-            mode=mode,
-            status=RunStatus.COMPLETED,
+                run_id=result.run_id,
+                mode=mode,
+                model="test-model" if mode is PolicyKind.MODEL else None,
+                status=RunStatus.COMPLETED,
             seed=result.seed,
             source_run_id=source_run_id,
             scenario_id=result.scenario.scenario_id,
@@ -82,18 +76,6 @@ def _complete(
             finished_at=result.finished_at,
         ),
     )
-
-
-class _UnreadableArtifactStore(CodexArtifactStore):
-    """Artifact store seam that simulates one optional read failure."""
-
-    def __init__(self, root: Path, failure: OSError | UnicodeError) -> None:
-        super().__init__(root)
-        self._failure = failure
-
-    def read(self, identity: CodexArtifactIdentity) -> CodexArtifactView | None:
-        """Raise the configured filesystem or decoding failure."""
-        raise self._failure
 
 
 def _ladder(
@@ -622,7 +604,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
         run_id="trace_source",
         store=repository,
     )
-    _complete(repository, source, mode=PolicyKind.CODEX)
+    _complete(repository, source, mode=PolicyKind.MODEL)
     source_turn = source.turns[0]
     started_at = datetime.now(UTC)
     for index, applied in enumerate((False, True), start=1):
@@ -633,7 +615,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
                 company_id=source_turn.turn.company_id,
                 day=source_turn.turn.observation.day,
                 observation=source_turn.turn.observation,
-                provider="codex",
+                provider="newapi",
                 model="test-model",
                 prompt_version="current",
                 prompt_hash=f"hash_{index}",
@@ -688,70 +670,6 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
     assert detail.item.replay_origin.source_turn_id == source_turn.turn.turn_id
     assert len(detail.traces) == 2
     assert sum(trace.preview.applied_to_committed_turn for trace in detail.traces) == 1
-
-
-@pytest.mark.asyncio
-async def test_trace_detail_degrades_when_optional_artifact_is_missing_or_unreadable(
-    tmp_path: Path,
-) -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
-    repository = InMemoryRunStore()
-    execution = await EpisodeRuntime(scenario).run(
-        {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
-        13,
-        run_id="artifact_degradation",
-        store=repository,
-    )
-    _complete(repository, execution, mode=PolicyKind.CODEX)
-    record = execution.turns[0]
-    now = datetime.now(UTC)
-    repository.record_invocation(
-        PolicyInvocation(
-            invocation_id="artifact_invocation",
-            run_id=execution.episode.run_id,
-            company_id=record.turn.company_id,
-            day=record.turn.observation.day,
-            observation=record.turn.observation,
-            provider="codex",
-            model="test-model",
-            prompt_version="current",
-            prompt_hash="artifact_hash",
-            started_at=now,
-            finished_at=now,
-            outcome=InvocationOutcome.SUCCESS,
-            domain_turn_id=record.turn.turn_id,
-            sim_minute=record.turn.sim_time.absolute_minute,
-            state_version=record.turn.state_version,
-            apply_sequence=record.outcome.apply_sequence,
-            command=record.envelope.command,
-            command_outcome=record.outcome,
-            request_id="thread-id",
-            provider_turn_id="provider-turn-id",
-        )
-    )
-
-    missing_detail = RunTimelineProjector(
-        repository,
-        CodexArtifactStore(tmp_path / "missing"),
-    ).read_detail(execution.episode.run_id, record.turn.turn_id)
-    missing_trace = missing_detail.traces[0]
-
-    assert missing_trace.artifact_status is ArtifactStatus.UNAVAILABLE
-    assert missing_trace.artifact_unavailable_reason is ArtifactUnavailableReason.NOT_FOUND
-    assert missing_trace.reasoning_markdown is None
-    assert missing_trace.final_output is None
-
-    for failure in (OSError("disk unavailable"), UnicodeError("invalid UTF-8")):
-        unreadable_detail = RunTimelineProjector(
-            repository,
-            _UnreadableArtifactStore(tmp_path / "unreadable", failure),
-        ).read_detail(execution.episode.run_id, record.turn.turn_id)
-        unreadable_trace = unreadable_detail.traces[0]
-
-        assert unreadable_trace.artifact_status is ArtifactStatus.UNAVAILABLE
-        assert unreadable_trace.artifact_unavailable_reason is ArtifactUnavailableReason.READ_ERROR
-        assert unreadable_trace.reasoning_markdown is None
-        assert unreadable_trace.final_output is None
 
 
 @pytest.mark.asyncio
@@ -832,7 +750,7 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
         audit_sink=repository,
         metadata=PolicyMetadata(
             name="audited-unauthorized-ladder",
-            kind=PolicyKind.OPENAI,
+            kind=PolicyKind.MODEL,
             provider="scripted",
             model="rejection-model",
             prompt_version=COMMAND_PROMPT_VERSION,
@@ -850,9 +768,10 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
     assert checkpoint is not None
     repository.save_job(
         RunJob(
-            run_id=run_id,
-            mode=PolicyKind.OPENAI,
-            status=RunStatus.FAILED,
+                run_id=run_id,
+                mode=PolicyKind.MODEL,
+                model="rejection-model",
+                status=RunStatus.FAILED,
             seed=17,
             scenario_id=scenario.scenario_id,
             total_days=scenario.days,
@@ -953,7 +872,7 @@ async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
         run_id="ultimate_source",
         store=repository,
     )
-    _complete(repository, source, mode=PolicyKind.CODEX)
+    _complete(repository, source, mode=PolicyKind.MODEL)
 
     first = await runtime.run(
         {

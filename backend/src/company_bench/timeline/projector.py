@@ -8,11 +8,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
 
-from company_bench.agents.providers.codex.artifacts import (
-    CodexArtifactIdentity,
-    CodexArtifactStore,
-    CodexArtifactView,
-)
 from company_bench.domain.models import (
     CompanyEvent,
     CompanyId,
@@ -48,8 +43,6 @@ from company_bench.timeline.market import MarketTimelineProjector
 from company_bench.timeline.models import (
     AgentTraceDetail,
     AgentTracePreview,
-    ArtifactStatus,
-    ArtifactUnavailableReason,
     CommandDispositionSource,
     DayTimelineSummary,
     InventoryQuantityChange,
@@ -113,37 +106,11 @@ class _TimelineData:
     context: TimelineRunContext
 
 
-@dataclass(frozen=True, slots=True)
-class _ArtifactResolution:
-    """One optional trace-artifact lookup without leaking storage failures."""
-
-    view: CodexArtifactView | None
-    unavailable_reason: ArtifactUnavailableReason | None
-
-    @classmethod
-    def available(cls, view: CodexArtifactView) -> _ArtifactResolution:
-        """Build a successful artifact resolution."""
-        return cls(view=view, unavailable_reason=None)
-
-    @classmethod
-    def unavailable(
-        cls,
-        reason: ArtifactUnavailableReason,
-    ) -> _ArtifactResolution:
-        """Build a typed unavailable artifact resolution."""
-        return cls(view=None, unavailable_reason=reason)
-
-
 class RunTimelineProjector:
     """Project journals, replay lineage, and traces into one operations view."""
 
-    def __init__(
-        self,
-        source: TimelineSource,
-        artifacts: CodexArtifactStore | None = None,
-    ) -> None:
+    def __init__(self, source: TimelineSource) -> None:
         self._source = source
-        self._artifacts = artifacts
         self._market = MarketTimelineProjector()
 
     def read_day(self, run_id: str, day: int) -> TimelineDay:
@@ -212,8 +179,8 @@ class RunTimelineProjector:
                 item=item,
                 turn=record,
                 traces=tuple(
-                    self._trace_detail(invocation, preview)
-                    for invocation, preview in self._trace_pairs(data, record)
+                    AgentTraceDetail(preview=preview)
+                    for _, preview in self._trace_pairs(data, record)
                 ),
             )
         step = next(
@@ -443,63 +410,6 @@ class RunTimelineProjector:
                 ),
             )
             for invocation in invocations
-        )
-
-    def _trace_detail(
-        self,
-        invocation: PolicyInvocation,
-        preview: AgentTracePreview,
-    ) -> AgentTraceDetail:
-        artifact = self._artifact(invocation)
-        return AgentTraceDetail(
-            preview=preview,
-            artifact_status=(
-                ArtifactStatus.AVAILABLE
-                if artifact.view is not None
-                else ArtifactStatus.UNAVAILABLE
-            ),
-            artifact_unavailable_reason=artifact.unavailable_reason,
-            reasoning_markdown=(
-                artifact.view.reasoning_markdown if artifact.view is not None else None
-            ),
-            final_output=artifact.view.final_output if artifact.view is not None else None,
-        )
-
-    def _artifact(self, invocation: PolicyInvocation) -> _ArtifactResolution:
-        if invocation.provider != "codex":
-            return _ArtifactResolution.unavailable(ArtifactUnavailableReason.PROVIDER_NOT_SUPPORTED)
-        identity = self._artifact_identity(invocation)
-        if identity is None:
-            return _ArtifactResolution.unavailable(ArtifactUnavailableReason.IDENTITY_UNAVAILABLE)
-        if self._artifacts is None:
-            return _ArtifactResolution.unavailable(ArtifactUnavailableReason.STORE_NOT_CONFIGURED)
-        try:
-            view = self._artifacts.read(identity)
-        except (OSError, UnicodeError):
-            return _ArtifactResolution.unavailable(ArtifactUnavailableReason.READ_ERROR)
-        if view is None:
-            return _ArtifactResolution.unavailable(ArtifactUnavailableReason.NOT_FOUND)
-        return _ArtifactResolution.available(view)
-
-    @staticmethod
-    def _artifact_identity(
-        invocation: PolicyInvocation,
-    ) -> CodexArtifactIdentity | None:
-        if (
-            invocation.provider != "codex"
-            or invocation.request_id is None
-            or (invocation.provider_turn_id or invocation.response_id) is None
-        ):
-            return None
-        return CodexArtifactIdentity(
-            invocation_id=invocation.invocation_id,
-            run_id=invocation.run_id,
-            company_id=invocation.company_id,
-            day=invocation.day,
-            model=invocation.model,
-            thread_id=invocation.request_id,
-            turn_id=invocation.provider_turn_id or invocation.response_id,
-            domain_turn_id=invocation.domain_turn_id,
         )
 
     @staticmethod

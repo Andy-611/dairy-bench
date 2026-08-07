@@ -2,7 +2,7 @@ import json
 from decimal import Decimal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from company_bench.agents.company import (
     COMMAND_PROMPT_VERSION,
@@ -11,7 +11,7 @@ from company_bench.agents.company import (
     LlmCompanyAgent,
     observation_hash,
 )
-from company_bench.agents.contracts import CommandSubmission, ModelOutputError
+from company_bench.agents.contracts import ModelOutputError
 from company_bench.domain.models import (
     CompanyObservation,
     InventoryPosition,
@@ -69,7 +69,7 @@ def _llm_agent(
         audit_sink=audit_repository,
         metadata=PolicyMetadata(
             name="bounded-agent",
-            kind=PolicyKind.OPENAI,
+            kind=PolicyKind.MODEL,
             provider="scripted",
             model="scripted-v4",
             prompt_version=COMMAND_PROMPT_VERSION,
@@ -143,13 +143,14 @@ def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decima
 
 
 def test_quote_ladder_uses_the_strict_v4_command_schema() -> None:
-    submission = CommandSubmission.model_validate_json(
-        '{"command":{"kind":"set_quote_ladder","product":"raw_milk",'
+    adapter = TypeAdapter(CompanyCommand)
+    command = adapter.validate_json(
+        '{"kind":"set_quote_ladder","product":"raw_milk",'
         '"side":"sell","levels":[{"quantity":"10","limit_price":"1.20"},'
-        '{"quantity":"5","limit_price":"1.40"}]}}'
+        '{"quantity":"5","limit_price":"1.40"}]}'
     )
 
-    assert submission.command == SetQuoteLadder(
+    assert command == SetQuoteLadder(
         product=ProductId.RAW_MILK,
         side=MarketSide.SELL,
         levels=(
@@ -158,15 +159,13 @@ def test_quote_ladder_uses_the_strict_v4_command_schema() -> None:
         ),
     )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-        CommandSubmission.model_validate(
+        adapter.validate_python(
             {
-                "command": {
-                    "kind": "set_quote_ladder",
-                    "product": "raw_milk",
-                    "side": "sell",
-                    "levels": [],
-                    "order_id": "order_7",
-                }
+                "kind": "set_quote_ladder",
+                "product": "raw_milk",
+                "side": "sell",
+                "levels": [],
+                "order_id": "order_7",
             }
         )
 
