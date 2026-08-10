@@ -4,14 +4,14 @@ import pytest
 from pydantic import ValidationError
 
 from company_bench.domain.models import CompanyObservation, ProductId, RuntimeSpec
-from company_bench.runtime.attention import AgentAttention, ArmedWait, AttentionRejected
+from company_bench.runtime.attention import AgentAttention, ArmedAttention, AttentionRejected
 from company_bench.runtime.models import (
     AgentTurn,
+    AttentionPlan,
     OrderBookView,
     PriceLevelView,
     QuoteAlert,
     SimTime,
-    Wait,
     WakeReason,
 )
 
@@ -66,21 +66,21 @@ def _level(price: str) -> PriceLevelView:
 def test_runtime_defaults_bound_attention_without_periodic_order_review() -> None:
     runtime = RuntimeSpec()
 
-    assert runtime.max_wait_minutes == 120
+    assert runtime.max_review_minutes == 120
     assert runtime.max_turns_per_company_day == 25
     assert "order_review_interval_minutes" not in RuntimeSpec.model_fields
 
 
-def test_wait_accepts_at_most_three_typed_alerts() -> None:
+def test_attention_accepts_at_most_three_typed_alerts() -> None:
     alerts = (
         _alert(price="1.10"),
         _alert(quote="best_bid", operator="at_least", price="1.40"),
         _alert(product=ProductId.BOTTLED_MILK, price="2.20"),
     )
 
-    assert Wait(alerts=alerts).alerts == alerts
+    assert AttentionPlan(alerts=alerts).alerts == alerts
     with pytest.raises(ValidationError, match="at most 3 items"):
-        Wait(alerts=(*alerts, _alert(price="1.20")))
+        AttentionPlan(alerts=(*alerts, _alert(price="1.20")))
 
 
 def test_agent_turn_exposes_a_consistent_daily_budget(
@@ -111,7 +111,7 @@ def test_arm_uses_the_bounded_default_review(
 ) -> None:
     turn = _turn(first_observation)
 
-    plan = AgentAttention().arm(Wait(), turn)
+    plan = AgentAttention().arm(AttentionPlan(), turn)
 
     assert plan.source_turn_id == turn.turn_id
     assert plan.armed_at == turn.sim_time
@@ -124,16 +124,16 @@ def test_default_review_does_not_cross_market_close(
 ) -> None:
     turn = _turn(first_observation, minute=17 * 60)
 
-    assert AgentAttention().arm(Wait(), turn).review_at is None
+    assert AgentAttention().arm(AttentionPlan(), turn).review_at is None
 
 
-def test_explicit_review_must_obey_wait_bound(
+def test_explicit_review_must_obey_attention_bound(
     first_observation: CompanyObservation,
 ) -> None:
     turn = _turn(first_observation)
 
     with pytest.raises(AttentionRejected, match="cannot exceed 120 minutes"):
-        AgentAttention().arm(Wait(review_after_minutes=121), turn)
+        AgentAttention().arm(AttentionPlan(review_after_minutes=121), turn)
 
 
 def test_explicit_review_must_remain_inside_business_day(
@@ -141,8 +141,8 @@ def test_explicit_review_must_remain_inside_business_day(
 ) -> None:
     turn = _turn(first_observation, minute=17 * 60)
 
-    with pytest.raises(AttentionRejected, match="current business day"):
-        AgentAttention().arm(Wait(review_after_minutes=120), turn)
+    with pytest.raises(AttentionRejected, match="business day"):
+        AgentAttention().arm(AttentionPlan(review_after_minutes=120), turn)
 
 
 def test_explicit_review_accepts_the_exact_maximum(
@@ -150,7 +150,7 @@ def test_explicit_review_accepts_the_exact_maximum(
 ) -> None:
     turn = _turn(first_observation)
 
-    assert AgentAttention().arm(Wait(review_after_minutes=120), turn).review_at == (
+    assert AgentAttention().arm(AttentionPlan(review_after_minutes=120), turn).review_at == (
         SimTime.at(day=0, hour=11)
     )
 
@@ -164,19 +164,19 @@ def test_arm_rejects_hidden_duplicate_and_already_true_alerts(
 
     with pytest.raises(AttentionRejected, match="not visible"):
         AgentAttention().arm(
-            Wait(alerts=(_alert(product=ProductId.BOTTLED_MILK),)),
+            AttentionPlan(alerts=(_alert(product=ProductId.BOTTLED_MILK),)),
             turn,
         )
     with pytest.raises(AttentionRejected, match="must be unique"):
-        AgentAttention().arm(Wait(alerts=(duplicate, duplicate)), turn)
+        AgentAttention().arm(AttentionPlan(alerts=(duplicate, duplicate)), turn)
     with pytest.raises(ValidationError, match="must be unique"):
-        ArmedWait(
+        ArmedAttention(
             source_turn_id=turn.turn_id,
             armed_at=turn.sim_time,
             alerts=(duplicate, duplicate),
         )
     with pytest.raises(AttentionRejected, match="must be false"):
-        AgentAttention().arm(Wait(alerts=(_alert(price="1.40"),)), turn)
+        AgentAttention().arm(AttentionPlan(alerts=(_alert(price="1.40"),)), turn)
 
 
 def test_missing_quote_is_false_and_matching_uses_or_semantics(
@@ -192,7 +192,7 @@ def test_missing_quote_is_false_and_matching_uses_or_semantics(
         operator="at_least",
         price="2.20",
     )
-    plan = AgentAttention().arm(Wait(alerts=(raw_alert, bottled_alert)), turn)
+    plan = AgentAttention().arm(AttentionPlan(alerts=(raw_alert, bottled_alert)), turn)
 
     assert AgentAttention().evaluate(plan, (raw_book, bottled_book)) is None
 
@@ -214,7 +214,7 @@ def test_evaluate_treats_an_absent_product_as_not_matching(
 ) -> None:
     book = OrderBookView(product=ProductId.RAW_MILK)
     plan = AgentAttention().arm(
-        Wait(alerts=(_alert(price="1.30"),)),
+        AttentionPlan(alerts=(_alert(price="1.30"),)),
         _turn(first_observation, order_books=(book,)),
     )
 

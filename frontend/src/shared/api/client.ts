@@ -3,12 +3,14 @@ import { isAbortError } from "../requestErrors";
 import type {
   AgentUsageSummaryView,
   AgentTraceView,
-  CommandDispositionSource,
-  CommandStateChangeView,
+  AttentionPlanView,
   CompanyResultView,
   CompanyRole,
   DailySnapshotView,
   DecimalText,
+  DecisionDispositionSource,
+  DecisionStateChangeView,
+  EconomicActionView,
   EconomicEffectView,
   EpisodeQualityView,
   EpisodeView,
@@ -26,8 +28,8 @@ import type {
   RunStatus,
   ScoreView,
   SystemTimelineItemView,
-  TimelineCommandView,
   TimelineContextView,
+  TimelineDecisionView,
   TimelineDaySummaryView,
   TimelineDayView,
   TimelineDetailView,
@@ -640,9 +642,9 @@ function parseRunDiagnostics(
       diagnostics.economic_rejections,
       `${path}.economic_rejections`,
     ),
-    waitPlanRejections: number(
-      diagnostics.wait_plan_rejections,
-      `${path}.wait_plan_rejections`,
+    attentionRejections: number(
+      diagnostics.attention_rejections,
+      `${path}.attention_rejections`,
     ),
     tradeCount: number(diagnostics.trade_count, `${path}.trade_count`),
     lastTradeDay: nullableNumber(diagnostics.last_trade_day, `${path}.last_trade_day`),
@@ -679,7 +681,7 @@ function parseTimelineDaySummary(
     turnCount: number(summary.turn_count, `${path}.turn_count`),
     acceptedCount: number(summary.accepted_count, `${path}.accepted_count`),
     rejectedCount: number(summary.rejected_count, `${path}.rejected_count`),
-    waitCount: number(summary.wait_count, `${path}.wait_count`),
+    idleCount: number(summary.idle_count, `${path}.idle_count`),
     systemStepCount: number(
       summary.system_step_count,
       `${path}.system_step_count`,
@@ -920,9 +922,9 @@ function parseTurnTimelineItem(
       item.observation_delta,
       `${path}.observation_delta`,
     ),
-    command: parseTimelineCommand(item.command, `${path}.command`),
+    decision: parseTimelineDecision(item.decision, `${path}.decision`),
     accepted: boolean(outcome.accepted, `${path}.outcome.accepted`),
-    dispositionSource: commandDispositionSource(
+    dispositionSource: decisionDispositionSource(
       item.disposition_source,
       `${path}.disposition_source`,
     ),
@@ -942,12 +944,16 @@ function parseTurnTimelineItem(
     effects: parseTimelineEffects(item.effects, `${path}.effects`),
     stateChanges: array(item.state_changes, `${path}.state_changes`).map(
       (value, index) =>
-        parseCommandStateChange(value, `${path}.state_changes[${index}]`),
+        parseDecisionStateChange(value, `${path}.state_changes[${index}]`),
     ),
     nextAvailableMinute:
       item.next_available_at === null
         ? null
         : simMinute(item.next_available_at, `${path}.next_available_at`),
+    reviewMinute:
+      item.review_at === null
+        ? null
+        : simMinute(item.review_at, `${path}.review_at`),
     sourceRunId:
       replayOrigin === null
         ? null
@@ -1397,40 +1403,70 @@ function parseTimelineEffects(
   });
 }
 
-function parseTimelineCommand(
+function parseTimelineDecision(
   payload: unknown,
   path: string,
-): TimelineCommandView {
-  const command = record(payload, path);
-  const kind = text(command.kind, `${path}.kind`);
+): TimelineDecisionView {
+  const decision = record(payload, path);
+  const kind = text(decision.kind, `${path}.kind`);
+  const attention = parseAttentionPlan(decision.attention, `${path}.attention`);
+  if (kind === "action") {
+    return {
+      kind,
+      action: parseEconomicAction(decision.action, `${path}.action`),
+      attention,
+    };
+  }
+  if (kind === "idle") {
+    return { kind, attention };
+  }
+  throw new Error(`Backend field ${path}.kind is not a company decision.`);
+}
+
+function parseAttentionPlan(payload: unknown, path: string): AttentionPlanView {
+  const attention = record(payload, path);
+  return {
+    reviewAfterMinutes: nullableNumber(
+      attention.review_after_minutes,
+      `${path}.review_after_minutes`,
+    ),
+    alerts: array(attention.alerts, `${path}.alerts`).map((value, index) =>
+      parseQuoteAlert(value, `${path}.alerts[${index}]`),
+    ),
+  };
+}
+
+function parseEconomicAction(payload: unknown, path: string): EconomicActionView {
+  const action = record(payload, path);
+  const kind = text(action.kind, `${path}.kind`);
   if (kind === "produce") {
     return {
       kind,
-      product: text(command.product, `${path}.product`),
-      quantity: decimalText(command.quantity, `${path}.quantity`),
+      product: text(action.product, `${path}.product`),
+      quantity: decimalText(action.quantity, `${path}.quantity`),
     };
   }
   if (kind === "transform") {
     return {
       kind,
-      inputProduct: text(command.input_product, `${path}.input_product`),
-      outputProduct: text(command.output_product, `${path}.output_product`),
+      inputProduct: text(action.input_product, `${path}.input_product`),
+      outputProduct: text(action.output_product, `${path}.output_product`),
       inputQuantity: decimalText(
-        command.input_quantity,
+        action.input_quantity,
         `${path}.input_quantity`,
       ),
     };
   }
   if (kind === "set_quote_ladder") {
-    const side = text(command.side, `${path}.side`);
+    const side = text(action.side, `${path}.side`);
     if (side !== "buy" && side !== "sell") {
       throw new Error(`Backend field ${path}.side is not a market side.`);
     }
     return {
       kind,
       side,
-      product: text(command.product, `${path}.product`),
-      levels: array(command.levels, `${path}.levels`).map((value, index) =>
+      product: text(action.product, `${path}.product`),
+      levels: array(action.levels, `${path}.levels`).map((value, index) =>
         parseQuoteLevel(value, `${path}.levels[${index}]`),
       ),
     };
@@ -1438,30 +1474,18 @@ function parseTimelineCommand(
   if (kind === "set_retail_price") {
     return {
       kind,
-      product: text(command.product, `${path}.product`),
-      unitPrice: decimalText(command.unit_price, `${path}.unit_price`),
+      product: text(action.product, `${path}.product`),
+      unitPrice: decimalText(action.unit_price, `${path}.unit_price`),
     };
   }
-  if (kind === "wait") {
-    return {
-      kind,
-      reviewAfterMinutes: nullableNumber(
-        command.review_after_minutes,
-        `${path}.review_after_minutes`,
-      ),
-      alerts: array(command.alerts, `${path}.alerts`).map((value, index) =>
-        parseQuoteAlert(value, `${path}.alerts[${index}]`),
-      ),
-    };
-  }
-  throw new Error(`Backend field ${path}.kind is not an atomic command.`);
+  throw new Error(`Backend field ${path}.kind is not an economic action.`);
 }
 
 function parseQuoteLevel(
   payload: unknown,
   path: string,
 ): Extract<
-  TimelineCommandView,
+  EconomicActionView,
   { readonly kind: "set_quote_ladder" }
 >["levels"][number] {
   const level = record(payload, path);
@@ -1553,10 +1577,10 @@ function parseTracePreview(
   };
 }
 
-function parseCommandStateChange(
+function parseDecisionStateChange(
   payload: unknown,
   path: string,
-): CommandStateChangeView {
+): DecisionStateChangeView {
   const change = record(payload, path);
   const changeType = text(change.change_type, `${path}.change_type`);
   if (changeType === "order_placed") {
@@ -1693,10 +1717,10 @@ function role(value: unknown, path: string): CompanyRole {
   throw new Error(`Backend field ${path} is not a known company tier.`);
 }
 
-function commandDispositionSource(
+function decisionDispositionSource(
   value: unknown,
   path: string,
-): CommandDispositionSource {
+): DecisionDispositionSource {
   if (
     value === "economic_engine" ||
     value === "runtime_attention" ||
@@ -1750,7 +1774,7 @@ function protocolIssueKind(value: unknown, path: string): ProtocolIssueKind {
     value === "invalid_response" ||
     value === "missing_tool_call" ||
     value === "multiple_tool_calls" ||
-    value === "unauthorized_command"
+    value === "unauthorized_decision_tool"
   ) {
     return value;
   }

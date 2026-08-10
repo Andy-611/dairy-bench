@@ -140,7 +140,7 @@ export function EvaluationStandard({
           <p>
             {benchmarkEligible
               ? "The benchmark's primary model-ranking measure"
-              : "Excluded from model rankings because the command protocol was violated"}
+              : "Excluded from model rankings because the decision protocol was violated"}
           </p>
         </article>
 

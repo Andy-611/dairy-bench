@@ -54,7 +54,7 @@ class _TurnMarketProjection:
 
 @dataclass(slots=True)
 class _MarketReplay:
-    """Maintain exact active orders from authoritative command and trade facts."""
+    """Maintain exact active orders from authoritative action and trade facts."""
 
     scenario: ScenarioSpec
     orders: dict[Identifier, OpenOrderView] = field(default_factory=dict)
@@ -75,21 +75,21 @@ class _MarketReplay:
         self.state_version = step.state_version_after
 
     def apply_turn(self, record: TurnRecord) -> _TurnMarketProjection:
-        """Apply one accepted order command and return its exact audit projection."""
+        """Apply one accepted market action and return its exact audit projection."""
         self.state_version = record.outcome.resulting_state_version
         if not record.outcome.accepted:
             return _TurnMarketProjection()
 
-        command = record.envelope.command
+        action = record.envelope.action
         events = tuple(
             event for event in record.outcome.events if isinstance(event, TradeExecutedEvent)
         )
-        if not isinstance(command, SetQuoteLadder):
+        if not isinstance(action, SetQuoteLadder):
             if events or record.outcome.quote_ladder_result is not None:
                 raise MarketProjectionError("only a quote ladder may carry market results")
             return _TurnMarketProjection()
         result = record.outcome.quote_ladder_result
-        if result is None or tuple(level.level for level in result.levels) != command.levels:
+        if result is None or tuple(level.level for level in result.levels) != action.levels:
             raise MarketProjectionError("accepted quote ladder has no matching result")
 
         retired_ids = (
@@ -122,9 +122,7 @@ class _MarketReplay:
                 incoming,
                 tuple(events_by_order.pop(incoming.order_id, ())),
             )
-            remaining_quantity = (
-                remaining.remaining_quantity if remaining is not None else ZERO
-            )
+            remaining_quantity = remaining.remaining_quantity if remaining is not None else ZERO
             if remaining_quantity != level.remaining_quantity:
                 raise MarketProjectionError("quote result remaining quantity is inconsistent")
             if remaining is not None:
@@ -199,14 +197,14 @@ class _MarketReplay:
         record: TurnRecord,
         result: QuoteLevelResult,
     ) -> OpenOrderView:
-        command = record.envelope.command
-        if not isinstance(command, SetQuoteLadder):
-            raise MarketProjectionError("new quote requires a ladder command")
+        action = record.envelope.action
+        if not isinstance(action, SetQuoteLadder):
+            raise MarketProjectionError("new quote requires a ladder action")
         order = OpenOrderView(
             order_id=result.order_id,
             owner_id=record.turn.company_id,
-            side=command.side,
-            product=command.product,
+            side=action.side,
+            product=action.product,
             remaining_quantity=result.level.quantity,
             limit_price=result.level.limit_price,
             placed_at=record.envelope.issued_at,
@@ -221,17 +219,17 @@ class _MarketReplay:
         result: QuoteLevelResult,
     ) -> OpenOrderView:
         """Validate one exact retained quote against the reconstructed book."""
-        command = record.envelope.command
-        if not isinstance(command, SetQuoteLadder):
-            raise MarketProjectionError("kept quote requires a ladder command")
+        action = record.envelope.action
+        if not isinstance(action, SetQuoteLadder):
+            raise MarketProjectionError("kept quote requires a ladder action")
         try:
             order = self.orders[result.order_id]
         except KeyError as error:
             raise MarketProjectionError("kept quote is not active") from error
         if (
             order.owner_id != record.turn.company_id
-            or order.side is not command.side
-            or order.product is not command.product
+            or order.side is not action.side
+            or order.product is not action.product
             or order.remaining_quantity != result.level.quantity
             or order.limit_price != result.level.limit_price
             or order.priority_sequence != result.priority_sequence

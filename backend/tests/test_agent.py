@@ -7,11 +7,11 @@ from decimal import Decimal
 import pytest
 from pydantic import SecretStr
 
-from company_bench.agents.company import COMMAND_PROMPT_VERSION, LlmCompanyAgent
+from company_bench.agents.company import DECISION_PROMPT_VERSION, LlmCompanyAgent
 from company_bench.agents.contracts import (
-    CommandGateway,
-    CommandModelRequest,
-    CommandModelResult,
+    DecisionGateway,
+    DecisionModelRequest,
+    DecisionModelResult,
     ModelCompatibilityError,
     ModelConfigurationError,
     ModelInfrastructureError,
@@ -33,17 +33,22 @@ from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
+    AttentionPlan,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
+    IdleDecision,
     RejectionCategory,
     SimTime,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 from company_bench.storage.store import InMemoryRunStore
-from tests.support.fakes import ScriptedModelGateway, model_capability_catalog
+from tests.support.fakes import (
+    ScriptedDecisionGateway,
+    company_decision,
+    model_capability_catalog,
+)
 
 
 def _config() -> NewApiConfig:
@@ -66,11 +71,11 @@ def _capabilities() -> ModelCapabilityCatalog:
     )
 
 
-class _TrackedScriptedGateway(ScriptedModelGateway):
+class _TrackedScriptedGateway(ScriptedDecisionGateway):
     """Expose adapter closure for lifecycle assertions."""
 
     def __init__(self) -> None:
-        super().__init__(lambda _: Wait())
+        super().__init__(lambda _: company_decision())
         self.closed = False
 
     async def close(self) -> None:
@@ -82,12 +87,12 @@ class _TrackedScriptedGateway(ScriptedModelGateway):
 class _RecordingGatewayFactory:
     """Create and retain one observable gateway per company Agent."""
 
-    def __init__(self, create: Callable[[], CommandGateway] = _TrackedScriptedGateway) -> None:
+    def __init__(self, create: Callable[[], DecisionGateway] = _TrackedScriptedGateway) -> None:
         self._create = create
         self.configs: list[NewApiModelConfig] = []
-        self.gateways: list[CommandGateway] = []
+        self.gateways: list[DecisionGateway] = []
 
-    def __call__(self, config: NewApiModelConfig) -> CommandGateway:
+    def __call__(self, config: NewApiModelConfig) -> DecisionGateway:
         """Create a fresh gateway for one company Agent."""
         gateway = self._create()
         self.configs.append(config)
@@ -125,7 +130,7 @@ def test_model_mode_owns_nine_independent_newapi_gateways() -> None:
     assert all(agent.metadata.kind is PolicyKind.MODEL for agent in agents)
     assert all(agent.metadata.provider == "newapi" for agent in agents)
     assert all(agent.metadata.model == "gemini-test-selected" for agent in agents)
-    assert all(agent.metadata.prompt_version == COMMAND_PROMPT_VERSION for agent in agents)
+    assert all(agent.metadata.prompt_version == DECISION_PROMPT_VERSION for agent in agents)
 
 
 class _UnavailableGateway:
@@ -133,13 +138,13 @@ class _UnavailableGateway:
 
     def __init__(self) -> None:
         self.closed = False
-        self.command_requests: list[CommandModelRequest] = []
+        self.decision_requests: list[DecisionModelRequest] = []
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
-        self.command_requests.append(request)
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        self.decision_requests.append(request)
         raise ModelInfrastructureError(
             "provider unavailable",
             attempts=3,
@@ -151,45 +156,45 @@ class _UnavailableGateway:
 
 
 class _IncompatibleGateway(_UnavailableGateway):
-    """Reject the benchmark's required command protocol."""
+    """Reject the benchmark's required decision protocol."""
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
-        self.command_requests.append(request)
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        self.decision_requests.append(request)
         raise ModelCompatibilityError("required function call is unsupported")
 
 
 class _MisconfiguredGateway(_UnavailableGateway):
     """Reject a permanent provider configuration."""
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
-        self.command_requests.append(request)
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        self.decision_requests.append(request)
         raise ModelConfigurationError("credential rejected")
 
 
 class _BrokenGateway(_UnavailableGateway):
     """Raise an unclassified implementation failure."""
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
-        self.command_requests.append(request)
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        self.decision_requests.append(request)
         raise RuntimeError("adapter bug")
 
 
 class _AuditedOutputErrorGateway:
     """Return a schema failure that still identifies the completed model call."""
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
         raise ModelOutputError(
             "invalid output",
             request_id="request_failed",
@@ -229,7 +234,7 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
             kind=PolicyKind.MODEL,
             provider="newapi",
             model="gpt-test",
-            prompt_version=COMMAND_PROMPT_VERSION,
+            prompt_version=DECISION_PROMPT_VERSION,
         ),
     )
 
@@ -244,24 +249,24 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
     assert invocation.latency_ms == 123
     assert invocation.domain_turn_id == turn.turn_id
     assert invocation.sim_minute == turn.sim_time.absolute_minute
-    assert invocation.prompt_version == COMMAND_PROMPT_VERSION
+    assert invocation.prompt_version == DECISION_PROMPT_VERSION
 
     protocol_error = "ModelOutputError: invalid output"
-    command = Wait()
-    envelope = CommandEnvelope(
+    decision = IdleDecision(attention=AttentionPlan())
+    envelope = DecisionEnvelope(
         turn_id=turn.turn_id,
-        command_id="failed_command",
+        decision_id="failed_decision",
         company_id=turn.company_id,
         issued_at=turn.sim_time,
         state_version=turn.state_version,
-        command=command,
+        decision=decision,
     )
-    outcome = CommandOutcome(
+    outcome = DecisionOutcome(
         turn_id=turn.turn_id,
-        command_id=envelope.command_id,
+        decision_id=envelope.decision_id,
         company_id=turn.company_id,
         occurred_at=turn.sim_time,
-        status=CommandStatus.REJECTED,
+        status=DecisionStatus.REJECTED,
         accepted=False,
         rejection_category=RejectionCategory.PROTOCOL,
         reason=f"{PROTOCOL_ERROR_PREFIX}{protocol_error}",
@@ -282,8 +287,8 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
     )
 
     completed = repository.list_invocations("failed_run")[0]
-    assert completed.command == command
-    assert completed.command_outcome == outcome
+    assert completed.decision == decision
+    assert completed.decision_outcome == outcome
     assert completed.apply_sequence == outcome.apply_sequence
 
 
@@ -326,9 +331,7 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
         gateway_factory=gateway_factory,
     )
 
-    interrupted = asyncio.run(
-        _run_model_job_until(repository, factory, RunStatus.INTERRUPTED)
-    )
+    interrupted = asyncio.run(_run_model_job_until(repository, factory, RunStatus.INTERRUPTED))
 
     assert interrupted.status is RunStatus.INTERRUPTED
     assert interrupted.current_day == 0
@@ -349,8 +352,8 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     assert len(gateways) == expected_count
     assert len({id(gateway) for gateway in gateways}) == expected_count
     assert all(gateway.closed for gateway in gateways)
-    assert all(len(gateway.command_requests) == 1 for gateway in gateways)
-    assert {gateway.command_requests[0].turn.company_id for gateway in gateways} == {
+    assert all(len(gateway.decision_requests) == 1 for gateway in gateways)
+    assert {gateway.decision_requests[0].turn.company_id for gateway in gateways} == {
         company.company_id for company in DAIRY_S9_SCENARIO.companies
     }
 
@@ -372,7 +375,7 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     ),
 )
 def test_permanent_model_failure_marks_job_failed_without_result(
-    gateway_type: Callable[[], CommandGateway],
+    gateway_type: Callable[[], DecisionGateway],
     expected_error: str,
     outcome: InvocationOutcome,
 ) -> None:
@@ -393,6 +396,5 @@ def test_permanent_model_failure_marks_job_failed_without_result(
     assert repository.get(failed.run_id) is None
     assert repository.get_checkpoint(failed.run_id) is not None
     assert all(
-        invocation.outcome is outcome
-        for invocation in repository.list_invocations(failed.run_id)
+        invocation.outcome is outcome for invocation in repository.list_invocations(failed.run_id)
     )

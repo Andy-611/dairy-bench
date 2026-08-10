@@ -103,11 +103,14 @@ def test_run_list_and_detail_http_flow() -> None:
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
         assert len(turns) > (DAIRY_S9_SCENARIO.days * len(DAIRY_S9_SCENARIO.companies))
         assert turns[0]["turn"]["state_version"] == 0
-        assert turns[0]["envelope"]["command"]["kind"] in {
+        decision = turns[0]["envelope"]["decision"]
+        assert decision["kind"] == "action"
+        assert decision["action"]["kind"] in {
             "produce",
             "set_quote_ladder",
             "set_retail_price",
         }
+        assert "attention" in decision
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -220,9 +223,7 @@ def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> No
         submitted_at=submitted_at,
         finished_at=submitted_at,
     )
-    failed = stopped.model_copy(
-        update={"run_id": "http_resume_failed", "status": RunStatus.FAILED}
-    )
+    failed = stopped.model_copy(update={"run_id": "http_resume_failed", "status": RunStatus.FAILED})
     completed = stopped.model_copy(
         update={
             "run_id": "http_resume_completed",

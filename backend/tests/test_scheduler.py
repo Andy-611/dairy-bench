@@ -1,4 +1,4 @@
-"""Behavioral tests for runtime commands and the deterministic scheduler."""
+"""Behavioral tests for runtime decisions and the deterministic scheduler."""
 
 from decimal import Decimal
 
@@ -11,11 +11,15 @@ from company_bench.domain.models import (
     require_order_quantity,
 )
 from company_bench.runtime.models import (
+    ActionDecision,
     AgentTurn,
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
-    CompanyCommand,
+    AttentionPlan,
+    CompanyDecision,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
+    EconomicCommand,
+    IdleDecision,
     MarketSide,
     Produce,
     QuoteLevel,
@@ -25,7 +29,6 @@ from company_bench.runtime.models import (
     SystemEventKind,
     Transform,
     TurnRecord,
-    Wait,
     WakeReason,
     WakeSignal,
 )
@@ -42,35 +45,46 @@ def test_sim_time_is_absolute_and_immutable() -> None:
         SimTime(absolute_minute=-1)
 
 
-def test_company_command_is_discriminated_and_identity_free() -> None:
-    adapter = TypeAdapter(CompanyCommand)
-    command = adapter.validate_python(
+def test_company_decision_is_discriminated_and_identity_free() -> None:
+    adapter = TypeAdapter(CompanyDecision)
+    decision = adapter.validate_python(
         {
-            "kind": "set_quote_ladder",
-            "side": "buy",
-            "product": "raw_milk",
-            "levels": [
-                {"quantity": "7.5", "limit_price": "4.20"},
-                {"quantity": "5", "limit_price": "4.00"},
-            ],
+            "kind": "action",
+            "action": {
+                "kind": "set_quote_ladder",
+                "side": "buy",
+                "product": "raw_milk",
+                "levels": [
+                    {"quantity": "7.5", "limit_price": "4.20"},
+                    {"quantity": "5", "limit_price": "4.00"},
+                ],
+            },
+            "attention": {"review_after_minutes": 30},
         }
     )
 
-    assert command == SetQuoteLadder(
-        product="raw_milk",
-        side=MarketSide.BUY,
-        levels=(
-            QuoteLevel(quantity=Decimal("7.5"), limit_price=Decimal("4.20")),
-            QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("4.00")),
+    assert decision == ActionDecision(
+        action=SetQuoteLadder(
+            product="raw_milk",
+            side=MarketSide.BUY,
+            levels=(
+                QuoteLevel(quantity=Decimal("7.5"), limit_price=Decimal("4.20")),
+                QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("4.00")),
+            ),
         ),
+        attention=AttentionPlan(review_after_minutes=30),
     )
     with pytest.raises(ValidationError):
         adapter.validate_python(
             {
-                "kind": "produce",
-                "company_id": "farm_a",
-                "product": "raw_milk",
-                "quantity": "10",
+                "kind": "action",
+                "action": {
+                    "kind": "produce",
+                    "company_id": "farm_a",
+                    "product": "raw_milk",
+                    "quantity": "10",
+                },
+                "attention": {},
             }
         )
 
@@ -97,7 +111,7 @@ def test_order_quantity_rejects_dust_and_excess_precision(quantity: str) -> None
 @pytest.mark.parametrize("kind", ("place_order", "replace_order", "cancel_order"))
 def test_removed_imperative_order_commands_are_rejected(kind: str) -> None:
     with pytest.raises(ValidationError, match="Input tag"):
-        TypeAdapter(CompanyCommand).validate_python({"kind": kind})
+        TypeAdapter(EconomicCommand).validate_python({"kind": kind})
 
 
 @pytest.mark.parametrize(
@@ -136,16 +150,26 @@ def test_removed_imperative_order_commands_are_rejected(kind: str) -> None:
             },
             SetRetailPrice,
         ),
-        ({"kind": "wait"}, Wait),
     ],
 )
-def test_every_company_command_has_a_discriminated_variant(
+def test_every_economic_command_has_a_discriminated_variant(
     payload: dict[str, str],
     expected_type: type,
 ) -> None:
-    command = TypeAdapter(CompanyCommand).validate_python(payload)
+    command = TypeAdapter(EconomicCommand).validate_python(payload)
 
     assert isinstance(command, expected_type)
+
+
+def test_company_decision_distinguishes_action_from_idle() -> None:
+    action = ActionDecision(
+        action=Produce(product="raw_milk", quantity="10"),
+        attention=AttentionPlan(review_after_minutes=30),
+    )
+    idle = IdleDecision(attention=AttentionPlan(review_after_minutes=60))
+
+    assert action.kind == "action"
+    assert idle.kind == "idle"
 
 
 def test_turn_record_requires_runtime_identity_consistency(
@@ -164,20 +188,24 @@ def test_turn_record_requires_runtime_identity_consistency(
         available_cash=first_observation.cash,
         marked_surplus=Decimal(),
     )
-    envelope = CommandEnvelope(
+    decision = ActionDecision(
+        action=Produce(product="raw_milk", quantity=Decimal("10")),
+        attention=AttentionPlan(review_after_minutes=30),
+    )
+    envelope = DecisionEnvelope(
         turn_id="turn_1",
-        command_id="command_1",
+        decision_id="decision_1",
         company_id="farm_a",
         issued_at=at,
         state_version=0,
-        command=Produce(product="raw_milk", quantity=Decimal("10")),
+        decision=decision,
     )
-    outcome = CommandOutcome(
+    outcome = DecisionOutcome(
         turn_id="turn_1",
-        command_id="command_1",
+        decision_id="decision_1",
         company_id="farm_a",
         occurred_at=at,
-        status=CommandStatus.ACCEPTED,
+        status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=1,
         apply_sequence=1,
@@ -340,17 +368,17 @@ def test_scheduler_cancels_superseded_company_wake_timers() -> None:
     scheduler.schedule_wake(
         "farm_a",
         SimTime(absolute_minute=600),
-        WakeReason.WAIT_EXPIRED,
+        WakeReason.REVIEW_DUE,
     )
     scheduler.schedule_wake(
         "farm_a",
         SimTime(absolute_minute=630),
-        WakeReason.CONTINUE,
+        WakeReason.DECISION_REJECTED,
     )
     retained = scheduler.schedule_wake(
         "farm_b",
         SimTime(absolute_minute=620),
-        WakeReason.CONTINUE,
+        WakeReason.DECISION_REJECTED,
     )
 
     scheduler.cancel_company_wakes("farm_a")
@@ -363,7 +391,7 @@ def test_scheduler_cancels_superseded_company_wake_timers() -> None:
 def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
     scheduler = Scheduler()
     at = SimTime(absolute_minute=600)
-    scheduler.schedule_wake("farm_a", at, WakeReason.WAIT_EXPIRED)
+    scheduler.schedule_wake("farm_a", at, WakeReason.REVIEW_DUE)
     retained = scheduler.schedule_wake(
         "farm_a",
         at,
@@ -371,8 +399,8 @@ def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
         reference_ids=("trade_1",),
     )
 
-    scheduler.cancel_wake("farm_a", at, WakeReason.WAIT_EXPIRED)
-    scheduler.cancel_wake("farm_a", at, WakeReason.WAIT_EXPIRED)
+    scheduler.cancel_wake("farm_a", at, WakeReason.REVIEW_DUE)
+    scheduler.cancel_wake("farm_a", at, WakeReason.REVIEW_DUE)
 
     pending = scheduler.checkpoint().pending_events
     assert len(pending) == 1
@@ -381,22 +409,21 @@ def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
     assert scheduler.pop_bucket() == pending
 
 
-def test_wait_can_target_time_but_cannot_spoof_runtime_fields() -> None:
-    command = Wait(review_after_minutes=60)
-    envelope = CommandEnvelope(
-        turn_id="turn_wait_1",
-        command_id="wait_1",
+def test_attention_can_target_time_but_cannot_spoof_runtime_fields() -> None:
+    decision = IdleDecision(attention=AttentionPlan(review_after_minutes=60))
+    envelope = DecisionEnvelope(
+        turn_id="turn_idle_1",
+        decision_id="idle_1",
         company_id="retailer_a",
         issued_at=SimTime(absolute_minute=900),
         state_version=4,
-        command=command,
+        decision=decision,
     )
 
-    assert envelope.command.review_after_minutes == 60
+    assert envelope.decision.attention.review_after_minutes == 60
     with pytest.raises(ValidationError):
-        Wait.model_validate(
+        AttentionPlan.model_validate(
             {
-                "kind": "wait",
                 "until": {"absolute_minute": 1_140},
                 "company_id": "retailer_b",
             }

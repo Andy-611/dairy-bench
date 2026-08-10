@@ -10,7 +10,7 @@ const ISSUE_LABELS: Readonly<Record<ProtocolIssueKind, string>> = {
   invalid_response: "invalid provider response",
   missing_tool_call: "missing tool call",
   multiple_tool_calls: "multiple tool calls",
-  unauthorized_command: "unauthorized command",
+  unauthorized_decision_tool: "unauthorized decision tool",
 };
 
 export function RunQualityBanner({ quality }: RunQualityBannerProps) {
@@ -26,7 +26,7 @@ export function RunQualityBanner({ quality }: RunQualityBannerProps) {
       <div>
         <strong>
           Run completed, but {quality.invalidTurnCount} of {quality.totalTurnCount}{" "}
-          turns violated the model-command protocol
+          turns violated the model-decision protocol
         </strong>
         <p>
           The economic result is preserved for diagnosis but excluded from benchmark

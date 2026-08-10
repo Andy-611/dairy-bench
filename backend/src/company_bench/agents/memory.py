@@ -10,12 +10,12 @@ from pydantic import Field, model_validator
 
 from company_bench.domain.models import CompanyId, Identifier, StrictModel
 from company_bench.runtime.models import (
-    CompanyCommand,
+    CompanyDecision,
     RejectionCategory,
     TurnRecord,
 )
 
-_CHECKPOINT_SCHEMA_VERSION: Final = 6
+_CHECKPOINT_SCHEMA_VERSION: Final = 7
 _DEFAULT_MAX_TOKENS: Final = 16_384
 _DEFAULT_CHARS_PER_TOKEN: Final = 2
 _SUMMARY_OMISSION: Final = "[older memory omitted]"
@@ -43,7 +43,7 @@ class MemoryExchange(StrictModel):
     sim_minute: int = Field(ge=0)
     apply_sequence: int = Field(ge=1)
     resulting_state_version: int = Field(ge=0)
-    command: CompanyCommand
+    decision: CompanyDecision
     accepted: bool
     rejection_category: RejectionCategory | None = None
     reason: str | None = Field(default=None, max_length=500)
@@ -72,7 +72,7 @@ class MemoryExchange(StrictModel):
             sim_minute=record.turn.sim_time.absolute_minute,
             apply_sequence=record.outcome.apply_sequence,
             resulting_state_version=record.outcome.resulting_state_version,
-            command=record.envelope.command,
+            decision=record.envelope.decision,
             accepted=record.outcome.accepted,
             rejection_category=record.outcome.rejection_category,
             reason=record.outcome.reason,
@@ -89,7 +89,7 @@ type MemorySummarizer = Callable[
 class AgentCheckpoint(StrictModel):
     """Portable state required to restore one company's memory exactly."""
 
-    schema_version: Literal[6] = _CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[7] = _CHECKPOINT_SCHEMA_VERSION
     run_id: Identifier
     company_id: CompanyId
     revision: int = Field(ge=0)
@@ -237,9 +237,13 @@ class ConversationMemory:
 
     def context_json(self) -> str:
         """Render only Agent-visible memory state for a provider request."""
-        return self.checkpoint().provider_view().model_dump_json(
-            exclude_defaults=True,
-            exclude_none=True,
+        return (
+            self.checkpoint()
+            .provider_view()
+            .model_dump_json(
+                exclude_defaults=True,
+                exclude_none=True,
+            )
         )
 
     def checkpoint(self) -> AgentCheckpoint:
@@ -340,7 +344,7 @@ def deterministic_summary(
     previous: MemorySummary | None,
     exchanges: tuple[MemoryExchange, ...],
 ) -> str:
-    """Summarize exact command outcomes without an LLM or hidden state."""
+    """Summarize exact decision outcomes without an LLM or hidden state."""
     lines = [previous.content] if previous is not None else []
     lines.extend(_exchange_line(exchange) for exchange in exchanges)
     return "\n".join(lines)
@@ -352,7 +356,7 @@ def _exchange_line(exchange: MemoryExchange) -> str:
     detail = " ".join(detail.split())
     return (
         f"{exchange.turn_id}@{exchange.sim_minute}:"
-        f"{exchange.command.model_dump_json()}"
+        f"{exchange.decision.model_dump_json()}"
         f"=>{'accepted' if exchange.accepted else 'rejected'}"
         f"[state={exchange.resulting_state_version},"
         f"apply={exchange.apply_sequence},detail={detail}]"

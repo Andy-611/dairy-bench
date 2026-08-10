@@ -5,7 +5,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from company_bench.agents.company import (
-    COMMAND_PROMPT_VERSION,
+    DECISION_PROMPT_VERSION,
     AgentDecisionConstraints,
     BaselineCompanyAgent,
     LlmCompanyAgent,
@@ -24,12 +24,14 @@ from company_bench.economy.engine import EconomyEngine
 from company_bench.runs.models import InvocationOutcome
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import (
+    ActionDecision,
     AgentTurn,
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
-    CompanyCommand,
+    CompanyDecision,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
     DeliveryExpiryBucket,
+    EconomicCommand,
     IncomingDeliveryView,
     MarketSide,
     OpenOrderView,
@@ -43,24 +45,23 @@ from company_bench.runtime.models import (
     SimTime,
     Transform,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 from company_bench.storage.store import InMemoryRunStore
-from tests.support.fakes import ScriptedModelGateway
+from tests.support.fakes import ScriptedDecisionGateway, company_decision
 
 
 def _llm_agent(
     run_id: str,
-    command: CompanyCommand,
+    decision: CompanyDecision,
     *,
     company_id: str = "farm_a",
     repository: InMemoryRunStore | None = None,
     memory_token_budget: int = 12_288,
-) -> tuple[LlmCompanyAgent, ScriptedModelGateway, InMemoryRunStore]:
+) -> tuple[LlmCompanyAgent, ScriptedDecisionGateway, InMemoryRunStore]:
     """Create one isolated scripted V4 Agent and its audit repository."""
     audit_repository = repository if repository is not None else InMemoryRunStore()
-    gateway = ScriptedModelGateway(lambda _: command)
+    gateway = ScriptedDecisionGateway(lambda _: decision)
     agent = LlmCompanyAgent(
         run_id=run_id,
         company_id=company_id,
@@ -71,7 +72,7 @@ def _llm_agent(
             kind=PolicyKind.MODEL,
             provider="scripted",
             model="scripted-v4",
-            prompt_version=COMMAND_PROMPT_VERSION,
+            prompt_version=DECISION_PROMPT_VERSION,
         ),
         memory_token_budget=memory_token_budget,
     )
@@ -140,8 +141,8 @@ def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decima
     return first, second, quantity - first - second
 
 
-def test_quote_ladder_uses_the_strict_v4_command_schema() -> None:
-    adapter = TypeAdapter(CompanyCommand)
+def test_quote_ladder_uses_the_strict_v4_action_schema() -> None:
+    adapter = TypeAdapter(EconomicCommand)
     command = adapter.validate_json(
         '{"kind":"set_quote_ladder","product":"raw_milk",'
         '"side":"sell","levels":[{"quantity":"10","limit_price":"1.20"},'
@@ -202,34 +203,34 @@ def test_quote_ladder_enforces_depth_order_and_exact_quantities() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("company_id", "allowed_commands"),
+    ("company_id", "allowed_tools"),
     (
         (
             "farm_a",
-            ("produce", "set_quote_ladder", "wait"),
+            ("produce", "set_quote_ladder", "idle"),
         ),
         (
             "processor_a",
-            ("transform", "set_quote_ladder", "wait"),
+            ("transform", "set_quote_ladder", "idle"),
         ),
         (
             "retailer_a",
             (
                 "set_quote_ladder",
                 "set_retail_price",
-                "wait",
+                "idle",
             ),
         ),
     ),
 )
 async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
     company_id: str,
-    allowed_commands: tuple[str, ...],
+    allowed_tools: tuple[str, ...],
 ) -> None:
     observation = _observation(company_id)
     agent, gateway, _ = _llm_agent(
         "v3_prompt",
-        Wait(),
+        company_decision(),
         company_id=company_id,
     )
     market = OrderBookView(
@@ -252,9 +253,9 @@ async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
 
     await agent.act(_turn("v3_prompt", observation, order_books=(market,)))
 
-    request = gateway.command_requests[0]
+    request = gateway.decision_requests[0]
     prompt_input = json.loads(request.input_text)
-    assert request.allowed_commands == allowed_commands
+    assert request.allowed_tools == allowed_tools
     assert "continuous spot market" in request.instructions
     assert "Your sole objective is to maximize your own company's profit." in request.instructions
     assert "resting price" in request.instructions
@@ -288,7 +289,7 @@ async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
     assert constraints["decision_interval_minutes"] == (
         observation.runtime.decision_interval_minutes
     )
-    assert constraints["max_wait_minutes"] == observation.runtime.max_wait_minutes
+    assert constraints["max_review_minutes"] == observation.runtime.max_review_minutes
     observed_payload = prompt_input["turn"]["observation"]
     if observation.daily_operation is None:
         assert "daily_operation" not in observed_payload
@@ -304,7 +305,7 @@ async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
         assert constraints["remaining_operation_capacity"] == str(
             observation.daily_operation.remaining_capacity
         )
-    assert agent.metadata.prompt_version == COMMAND_PROMPT_VERSION
+    assert agent.metadata.prompt_version == DECISION_PROMPT_VERSION
 
 
 def test_decision_constraints_derive_current_remaining_capacity() -> None:
@@ -313,11 +314,7 @@ def test_decision_constraints_derive_current_remaining_capacity() -> None:
     assert operation is not None
     used_capacity = Decimal("10.1234")
     observation = observation.model_copy(
-        update={
-            "daily_operation": operation.model_copy(
-                update={"used_capacity": used_capacity}
-            )
-        }
+        update={"daily_operation": operation.model_copy(update={"used_capacity": used_capacity})}
     )
     turn = _turn("capacity_projection", observation)
 
@@ -333,9 +330,9 @@ async def test_baseline_farm_produces_then_offers_completed_inventory() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("farm_a")
 
-    assert await agent.act(_turn("farm_open", observation)) == Produce(
-        product=ProductId.RAW_MILK,
-        quantity=Decimal("50"),
+    assert await agent.act(_turn("farm_open", observation)) == company_decision(
+        Produce(product=ProductId.RAW_MILK, quantity=Decimal("50")),
+        review_after_minutes=30,
     )
 
     stocked = _with_inventory(observation, raw_milk=Decimal("50"))
@@ -345,14 +342,17 @@ async def test_baseline_farm_produces_then_offers_completed_inventory() -> None:
             stocked,
             wake_reason=WakeReason.OPERATION_COMPLETED,
         )
-    ) == SetQuoteLadder(
-        product=ProductId.RAW_MILK,
-        side=MarketSide.SELL,
-        levels=(
-            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.20")),
-            QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.40")),
-            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.60")),
+    ) == company_decision(
+        SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.SELL,
+            levels=(
+                QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.20")),
+                QuoteLevel(quantity=Decimal("20"), limit_price=Decimal("1.40")),
+                QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.60")),
+            ),
         ),
+        review_after_minutes=30,
     )
 
 
@@ -365,7 +365,7 @@ async def test_baseline_floors_orders_without_overcommitting_inventory() -> None
         raw_milk=Decimal("49.9999"),
     )
 
-    command = await agent.act(
+    decision = await agent.act(
         _turn(
             "farm_precision",
             stocked,
@@ -373,13 +373,17 @@ async def test_baseline_floors_orders_without_overcommitting_inventory() -> None
         )
     )
 
-    assert isinstance(command, SetQuoteLadder)
-    assert command.levels == (
+    assert isinstance(decision, ActionDecision)
+    assert isinstance(decision.action, SetQuoteLadder)
+    assert decision.action.levels == (
         QuoteLevel(quantity=Decimal("19.9999"), limit_price=Decimal("1.20")),
         QuoteLevel(quantity=Decimal("19.9999"), limit_price=Decimal("1.40")),
         QuoteLevel(quantity=Decimal("10.0001"), limit_price=Decimal("1.60")),
     )
-    assert sum((level.quantity for level in command.levels), Decimal()) == Decimal("49.9999")
+    assert sum((level.quantity for level in decision.action.levels), Decimal()) == Decimal(
+        "49.9999"
+    )
+
 
 @pytest.mark.asyncio
 async def test_llm_agent_accepts_a_schema_valid_quote_ladder_for_engine_audit() -> None:
@@ -388,11 +392,12 @@ async def test_llm_agent_accepts_a_schema_valid_quote_ladder_for_engine_audit() 
         side=MarketSide.SELL,
         levels=(QuoteLevel(quantity=Decimal("0.0001"), limit_price=Decimal("1.40")),),
     )
-    agent, _, repository = _llm_agent("dust_output", command)
+    expected = company_decision(command)
+    agent, _, repository = _llm_agent("dust_output", expected)
 
     submitted = await agent.act(_turn("dust_output", _observation("farm_a")))
 
-    assert submitted == command
+    assert submitted == expected
     assert repository.list_invocations("dust_output")[0].outcome is InvocationOutcome.SUCCESS
 
 
@@ -404,14 +409,17 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
     capacity = min(observation.daily_operation.daily_capacity, Decimal("50"))
     first, second, third = _three_level_quantities(capacity)
 
-    assert await agent.act(_turn("processor_procure", observation)) == SetQuoteLadder(
-        product=ProductId.RAW_MILK,
-        side=MarketSide.BUY,
-        levels=(
-            QuoteLevel(quantity=first, limit_price=Decimal("1.60")),
-            QuoteLevel(quantity=second, limit_price=Decimal("1.50")),
-            QuoteLevel(quantity=third, limit_price=Decimal("1.40")),
+    assert await agent.act(_turn("processor_procure", observation)) == company_decision(
+        SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.BUY,
+            levels=(
+                QuoteLevel(quantity=first, limit_price=Decimal("1.60")),
+                QuoteLevel(quantity=second, limit_price=Decimal("1.50")),
+                QuoteLevel(quantity=third, limit_price=Decimal("1.40")),
+            ),
         ),
+        review_after_minutes=30,
     )
 
     raw_stock = _with_inventory(observation, raw_milk=Decimal("50"))
@@ -421,10 +429,13 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
             raw_stock,
             wake_reason=WakeReason.DELIVERY_COMPLETED,
         )
-    ) == Transform(
-        input_product=ProductId.RAW_MILK,
-        output_product=ProductId.BOTTLED_MILK,
-        input_quantity=capacity,
+    ) == company_decision(
+        Transform(
+            input_product=ProductId.RAW_MILK,
+            output_product=ProductId.BOTTLED_MILK,
+            input_quantity=capacity,
+        ),
+        review_after_minutes=30,
     )
 
     bottled_stock = _with_inventory(observation, bottled_milk=Decimal("20"))
@@ -442,14 +453,17 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
             wake_reason=WakeReason.PRICE_ALERT,
             active_operation=active_operation,
         )
-    ) == SetQuoteLadder(
-        product=ProductId.BOTTLED_MILK,
-        side=MarketSide.SELL,
-        levels=(
-            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("2.50")),
-            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("2.65")),
-            QuoteLevel(quantity=Decimal("4"), limit_price=Decimal("2.80")),
+    ) == company_decision(
+        SetQuoteLadder(
+            product=ProductId.BOTTLED_MILK,
+            side=MarketSide.SELL,
+            levels=(
+                QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("2.50")),
+                QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("2.65")),
+                QuoteLevel(quantity=Decimal("4"), limit_price=Decimal("2.80")),
+            ),
         ),
+        review_after_minutes=30,
     )
 
 
@@ -458,9 +472,12 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
     agent = BaselineCompanyAgent()
     observation = _observation("retailer_a")
 
-    assert await agent.act(_turn("retailer_price", observation)) == SetRetailPrice(
-        product=ProductId.BOTTLED_MILK,
-        unit_price=Decimal("3.50"),
+    assert await agent.act(_turn("retailer_price", observation)) == company_decision(
+        SetRetailPrice(
+            product=ProductId.BOTTLED_MILK,
+            unit_price=Decimal("3.50"),
+        ),
+        review_after_minutes=1,
     )
 
     priced = observation.model_copy(update={"retail_price": Decimal("3.50")})
@@ -483,14 +500,17 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
             wake_reason=WakeReason.PRICE_ALERT,
             pending_deliveries=(delivery,),
         )
-    ) == SetQuoteLadder(
-        product=ProductId.BOTTLED_MILK,
-        side=MarketSide.BUY,
-        levels=(
-            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2.80")),
-            QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2.65")),
-            QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("2.50")),
+    ) == company_decision(
+        SetQuoteLadder(
+            product=ProductId.BOTTLED_MILK,
+            side=MarketSide.BUY,
+            levels=(
+                QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2.80")),
+                QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2.65")),
+                QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("2.50")),
+            ),
         ),
+        review_after_minutes=30,
     )
 
 
@@ -522,13 +542,13 @@ async def test_baseline_does_not_duplicate_a_resting_order() -> None:
     assert (
         await agent.act(
             _turn(
-                "processor_wait",
+                "processor_idle",
                 observation,
                 wake_reason=WakeReason.PRICE_ALERT,
                 open_orders=orders,
             )
         )
-        == Wait()
+        == company_decision()
     )
 
 
@@ -538,14 +558,14 @@ async def test_llm_agent_delegates_complete_request_budget_to_provider_adapter(
 ) -> None:
     agent, gateway, repository = _llm_agent(
         "prompt_limit",
-        Wait(),
+        company_decision(),
         memory_token_budget=100,
     )
     turn = _turn("prompt_limit", first_observation)
 
-    assert await agent.act(turn) == Wait()
+    assert await agent.act(turn) == company_decision()
 
-    assert len(gateway.command_requests) == 1
+    assert len(gateway.decision_requests) == 1
     invocation = repository.list_invocations("prompt_limit")[0]
     assert invocation.outcome is InvocationOutcome.SUCCESS
     assert invocation.domain_turn_id == turn.turn_id
@@ -556,26 +576,26 @@ async def test_llm_agent_audits_and_remembers_one_complete_turn(
     first_observation: CompanyObservation,
 ) -> None:
     run_id = "complete_cycle"
-    command = Produce(product="raw_milk", quantity="12")
-    agent, gateway, repository = _llm_agent(run_id, command)
+    decision = company_decision(Produce(product="raw_milk", quantity="12"))
+    agent, gateway, repository = _llm_agent(run_id, decision)
     turn = _turn(run_id, first_observation)
 
-    assert await agent.act(turn) == command
+    assert await agent.act(turn) == decision
 
-    envelope = CommandEnvelope(
+    envelope = DecisionEnvelope(
         turn_id=turn.turn_id,
-        command_id=f"{turn.turn_id}.command",
+        decision_id=f"{turn.turn_id}.decision",
         company_id=turn.company_id,
         issued_at=turn.sim_time,
         state_version=turn.state_version,
-        command=command,
+        decision=decision,
     )
-    outcome = CommandOutcome(
+    outcome = DecisionOutcome(
         turn_id=turn.turn_id,
-        command_id=envelope.command_id,
+        decision_id=envelope.decision_id,
         company_id=turn.company_id,
         occurred_at=turn.sim_time,
-        status=CommandStatus.ACCEPTED,
+        status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=1,
         apply_sequence=1,
@@ -590,15 +610,15 @@ async def test_llm_agent_audits_and_remembers_one_complete_turn(
     )
     agent.remember(record)
 
-    assert len(gateway.command_requests) == 1
+    assert len(gateway.decision_requests) == 1
     checkpoint = agent.checkpoint()
     assert checkpoint.revision == 1
     assert len(checkpoint.exchanges) == 1
     assert checkpoint.exchanges[0] == MemoryExchange.from_record(record)
     invocation = repository.list_invocations(run_id)[0]
     assert invocation.outcome is InvocationOutcome.SUCCESS
-    assert invocation.command == command
-    assert invocation.command_outcome == outcome
+    assert invocation.decision == decision
+    assert invocation.decision_outcome == outcome
     assert invocation.apply_sequence == 1
 
 
@@ -610,12 +630,12 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
     repository = InMemoryRunStore()
     first, _, _ = _llm_agent(
         run_id,
-        Wait(),
+        company_decision(),
         repository=repository,
     )
     second, _, _ = _llm_agent(
         run_id,
-        Wait(),
+        company_decision(),
         repository=repository,
     )
     turn = _turn(run_id, first_observation)
@@ -638,7 +658,7 @@ async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
     for company in scenario.companies:
         agent, _, _ = _llm_agent(
             run_id,
-            Wait(),
+            company_decision(),
             company_id=company.company_id,
             repository=repository,
         )
@@ -659,7 +679,7 @@ async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
     )
     assert len(invocations) == len(execution.turns)
     assert all(invocation.outcome is InvocationOutcome.SUCCESS for invocation in invocations)
-    assert all(invocation.command_outcome is not None for invocation in invocations)
+    assert all(invocation.decision_outcome is not None for invocation in invocations)
     assert len({invocation.prompt_hash for invocation in invocations}) == len(invocations)
     assert {company_id: agent.checkpoint().revision for company_id, agent in agents.items()} == {
         company.company_id: sum(

@@ -50,7 +50,7 @@ export type ProtocolIssueKind =
   | "invalid_response"
   | "missing_tool_call"
   | "multiple_tool_calls"
-  | "unauthorized_command";
+  | "unauthorized_decision_tool";
 
 export interface ProtocolIssueCountView {
   readonly kind: ProtocolIssueKind;
@@ -149,7 +149,7 @@ export interface RunDiagnosticsView {
   readonly benchmarkEligible: boolean | null;
   readonly protocolInvalidTurns: number;
   readonly economicRejections: number;
-  readonly waitPlanRejections: number;
+  readonly attentionRejections: number;
   readonly tradeCount: number;
   readonly lastTradeDay: number | null;
   readonly zeroTradeDayStreak: number;
@@ -184,7 +184,7 @@ export interface TimelineDaySummaryView {
   readonly turnCount: number;
   readonly acceptedCount: number;
   readonly rejectedCount: number;
-  readonly waitCount: number;
+  readonly idleCount: number;
   readonly systemStepCount: number;
   readonly eventCount: number;
   readonly tradeQuantity: DecimalText;
@@ -258,7 +258,7 @@ export type EconomicEffectView =
     }
 ;
 
-export type TimelineCommandView =
+export type EconomicActionView =
   | {
       readonly kind: "produce";
       readonly product: string;
@@ -280,14 +280,25 @@ export type TimelineCommandView =
       readonly kind: "set_retail_price";
       readonly product: string;
       readonly unitPrice: DecimalText;
-    }
-  | {
-      readonly kind: "wait";
-      readonly reviewAfterMinutes: number | null;
-      readonly alerts: readonly QuoteAlertView[];
     };
 
-export type CommandStateChangeView =
+export interface AttentionPlanView {
+  readonly reviewAfterMinutes: number | null;
+  readonly alerts: readonly QuoteAlertView[];
+}
+
+export type TimelineDecisionView =
+  | {
+      readonly kind: "action";
+      readonly action: EconomicActionView;
+      readonly attention: AttentionPlanView;
+    }
+  | {
+      readonly kind: "idle";
+      readonly attention: AttentionPlanView;
+    };
+
+export type DecisionStateChangeView =
   | {
       readonly changeType: "order_placed";
       readonly orderId: string;
@@ -515,7 +526,7 @@ export interface TracePreviewView {
   readonly appliedToCommittedTurn: boolean;
 }
 
-export type CommandDispositionSource =
+export type DecisionDispositionSource =
   | "economic_engine"
   | "runtime_attention"
   | "runtime_protocol";
@@ -533,16 +544,17 @@ export interface TurnTimelineItemView {
   readonly wakeSignals: readonly WakeSignalView[];
   readonly observation: ObservationFactsView;
   readonly observationDelta: ObservationDeltaView;
-  readonly command: TimelineCommandView;
+  readonly decision: TimelineDecisionView;
   readonly accepted: boolean;
-  readonly dispositionSource: CommandDispositionSource;
+  readonly dispositionSource: DecisionDispositionSource;
   readonly reason: string | null;
   readonly resultingStateVersion: number;
   readonly quoteLadderResult: QuoteLadderResultView | null;
   readonly outcomeJobId: string | null;
   readonly effects: readonly EconomicEffectView[];
-  readonly stateChanges: readonly CommandStateChangeView[];
+  readonly stateChanges: readonly DecisionStateChangeView[];
   readonly nextAvailableMinute: number | null;
+  readonly reviewMinute: number | null;
   readonly sourceRunId: string | null;
   readonly sourceTurnId: string | null;
   readonly traces: readonly TracePreviewView[];

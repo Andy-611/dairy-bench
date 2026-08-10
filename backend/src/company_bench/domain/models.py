@@ -177,9 +177,7 @@ class CapacityFunction(StrictModel):
             raise ValueError("capacity factor range must contain 1")
         if self.minimum_factor > self.maximum_factor:
             raise ValueError("minimum capacity factor must not exceed maximum")
-        minimum_capacity = EconomicPrecision.round(
-            self.normal_capacity * self.minimum_factor
-        )
+        minimum_capacity = EconomicPrecision.round(self.normal_capacity * self.minimum_factor)
         if minimum_capacity <= ZERO:
             raise ValueError("minimum realized capacity must survive quantity precision")
         return self
@@ -270,10 +268,7 @@ class CostFunction(StrictModel):
         daily_base_unit_cost: Decimal,
     ) -> Money:
         total = daily_base_unit_cost * quantity + (
-            self.curvature
-            * daily_base_unit_cost
-            * quantity**2
-            / (Decimal("2") * daily_capacity)
+            self.curvature * daily_base_unit_cost * quantity**2 / (Decimal("2") * daily_capacity)
         )
         return EconomicPrecision.round(total)
 
@@ -389,7 +384,7 @@ class RuntimeSpec(StrictModel):
     operation_duration_minutes: int = Field(default=30, ge=1)
     delivery_duration_minutes: int = Field(default=30, ge=1)
     decision_interval_minutes: int = Field(default=1, ge=1)
-    max_wait_minutes: int = Field(default=120, ge=1)
+    max_review_minutes: int = Field(default=120, ge=1)
     max_turns_per_company_day: int = Field(default=25, ge=1)
     compaction_trigger_tokens: int = Field(default=12_288, ge=512)
 
@@ -470,10 +465,12 @@ class ScenarioSpec(StrictModel):
         inventory: tuple[InventoryLot, ...],
     ) -> Decimal:
         """Value inventory using immutable benchmark references."""
-        return EconomicPrecision.round(sum(
-            (lot.quantity * self.product(lot.product).reference_value for lot in inventory),
-            start=ZERO,
-        ))
+        return EconomicPrecision.round(
+            sum(
+                (lot.quantity * self.product(lot.product).reference_value for lot in inventory),
+                start=ZERO,
+            )
+        )
 
 
 class InventoryLot(StrictModel):
@@ -784,14 +781,14 @@ class ScoreCard(StrictModel):
 
 
 class ProtocolIssueKind(StrEnum):
-    """Stable categories for model-command protocol violations."""
+    """Stable categories for model-decision protocol violations."""
 
     CONTEXT_TOO_LARGE = "context_too_large"
     INVALID_ARGUMENTS = "invalid_arguments"
     INVALID_RESPONSE = "invalid_response"
     MISSING_TOOL_CALL = "missing_tool_call"
     MULTIPLE_TOOL_CALLS = "multiple_tool_calls"
-    UNAUTHORIZED_COMMAND = "unauthorized_command"
+    UNAUTHORIZED_DECISION_TOOL = "unauthorized_decision_tool"
 
 
 class ProtocolIssueCount(StrictModel):
@@ -832,8 +829,7 @@ class ProtocolReport(StrictModel):
             total_turn_count=total_turn_count,
             invalid_turn_count=len(issues),
             issues=tuple(
-                ProtocolIssueCount(kind=kind, count=count)
-                for kind, count in counts.items()
+                ProtocolIssueCount(kind=kind, count=count) for kind, count in counts.items()
             ),
         )
 

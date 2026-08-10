@@ -9,26 +9,34 @@ auditable decision cycle:
 ```text
 Wake
   -> AgentTurn(authoritative private observation)
-  -> exactly one CompanyCommand
-  -> EconomyEngine validation and CommandOutcome
+  -> exactly one CompanyDecision
+  -> EconomyEngine validation and DecisionOutcome
   -> immutable TurnRecord
 ```
 
 An agent does not submit a daily plan and never supplies its own identity,
-timestamp, state version, command ID, or turn ID. `EpisodeRuntime` binds those
-fields in `CommandEnvelope`.
+timestamp, state version, decision ID, or turn ID. `EpisodeRuntime` binds those
+fields in `DecisionEnvelope`.
 
-## Structured command format
+## Structured decision format
 
-The model must choose exactly one role-authorized command:
+`CompanyDecision` is a discriminated union:
 
-| Command | Purpose |
+- `ActionDecision(action, attention)` applies one authorized economic action and
+  installs its next attention plan atomically.
+- `IdleDecision(attention)` leaves economic state unchanged and installs its
+  next attention plan.
+
+The model must call exactly one role-authorized decision tool. Every tool input
+includes an `attention` object:
+
+| Decision tool | Economic effect |
 |---|---|
-| `produce(product, quantity)` | Start one farm production job |
-| `transform(input_product, output_product, input_quantity)` | Start one processor conversion job |
-| `set_quote_ladder(product, side, levels)` | Atomically set up to three target price-quantity levels |
-| `set_retail_price(product, unit_price)` | Set a retailer's consumer price |
-| `wait(review_after_minutes?)` | Yield for a bounded duration or until another relevant event |
+| `produce(product, quantity, attention)` | Start one farm production job |
+| `transform(input_product, output_product, input_quantity, attention)` | Start one processor conversion job |
+| `set_quote_ladder(product, side, levels, attention)` | Atomically set up to three target price-quantity levels |
+| `set_retail_price(product, unit_price, attention)` | Set a retailer's consumer price |
+| `idle(attention)` | Make no economic change |
 
 Farms may produce and trade raw milk. Processors may transform and trade raw or
 bottled milk. Retailers may trade bottled milk and set its consumer price.
@@ -36,11 +44,11 @@ bottled milk. Retailers may trade bottled milk and set its consumer price.
 Each `set_quote_ladder` level contains `quantity` and `limit_price`. A ladder has
 at most three levels with distinct prices. Every economic quantity and price
 must be an exact multiple of `0.0001` (at most four decimal places), and every
-level quantity must be positive. The engine rejects the whole command rather
+level quantity must be positive. The engine rejects the whole decision rather
 than rounding it. An empty `levels` tuple withdraws all
 of the company's quotes for that product and side.
 
-The command describes a target state, not a sequence of exchange operations.
+The quote-ladder action describes a target state, not a sequence of exchange operations.
 The Agent must supply Bid targets from highest to lowest price and Ask targets
 from lowest to highest; an out-of-order ladder is rejected. The market then
 reconciles the ordered levels deterministically:
@@ -55,10 +63,10 @@ Every replaced or newly placed level is an independent order with a new identity
 and priority. Because levels do not carry a model-supplied identity, a price
 change and a cancel-plus-place intention are not distinguishable; both lose old
 priority and the deterministic pairing above defines the audit result. One
-`set_quote_ladder` call performs the complete reconciliation and consumes one
+`set_quote_ladder` decision performs the complete reconciliation and consumes one
 Agent turn.
 
-An accepted `CommandOutcome.quote_ladder_result` reports every target level's
+An accepted `DecisionOutcome.quote_ladder_result` reports every target level's
 `keep`, `replace`, or `place` action, resulting order ID and priority, immediate
 post-match remaining quantity, plus separately cancelled order IDs. Fill events
 and scheduled deliveries remain in the outcome's normal event fields.
@@ -75,7 +83,7 @@ or extracts the exact ceiling from an explicit parameter rejection, then writes
 the result to a versioned local catalog. The complete serialized request,
 including tool schemas, is also checked against the configured input budget.
 Every model family is validated against the same discriminated Pydantic
-`CompanyCommand` union. A protocol-invalid completion receives one immediate
+`CompanyDecision` union. A protocol-invalid completion receives one immediate
 corrective retry. If that also fails, the turn becomes an audited protocol
 rejection, the economy remains unchanged, and the episode continues as
 diagnostic-only.
@@ -100,7 +108,7 @@ diagnostic-only.
   daily operation state;
 - private cumulative cash-flow and executable unit-economics estimates derived
   only from the company's own ledger and currently visible market prices;
-- company-visible domain events and the previous command outcome.
+- company-visible domain events and the previous decision outcome.
 
 The provider input also carries a typed `decision_constraints` projection. It
 always serializes the business-window and timing limits and, for productive
@@ -146,45 +154,49 @@ released.
 Every fill pays the seller immediately and creates one automatic delivery to
 the buyer 30 virtual minutes later. Until arrival, those lots are visible as
 inbound but cannot be transformed, sold, or reserved again. This is deliberately
-not a logistics workflow: there is no dispatch command, routing, carrier,
+not a logistics workflow: there is no dispatch action, routing, carrier,
 capacity, delay, failure, or escrow state.
 
 `produce` and `transform` also complete after exactly 30 virtual minutes. One
 company may have only one active physical operation, but that job does not block
-market, wait, or retail-price commands. Starting a job consumes its cash and,
+market, idle, or retail-price decisions. Starting a job consumes its cash and,
 for transformation, input inventory; output becomes available only at completion.
 
-The business window is `[09:00, 19:00)`. Commands have no 30-minute economic
+The business window is `[09:00, 19:00)`. Economic actions have no 30-minute economic
 cooldown; the runtime permits at most one decision per company per virtual
 minute and 25 turns per company per day. At 19:00, due operation and delivery
 completions run first, then markets close, then consumer sales run. Previously
 committed completions may drain until 19:29; day close occurs at 19:30.
 
-`wait` is an attention plan rather than a polling action. It may declare up to
-three anonymous quote conditions over visible `best_bid` or `best_ask` values;
-conditions use fixed OR semantics. It may also provide an absolute same-day
-fallback no more than 120 minutes away. Without one, the runtime schedules the
-same 120-minute fallback when it remains before 19:00. Alerts are one-shot and
-are evaluated only after all commands for a minute have committed; a match wakes
-the company on the following minute. Duplicate, hidden, or already-true alerts,
-and invalid fallback times, reject the whole command without changing the
-economy. Own trades, operation completions, and delivery completions also wake
-the affected company. Generic book mutations are not broadcast, and resting
-orders have no separate review timer. Reaching the daily cap writes an explicit
-state-neutral audit step and suppresses further Agent calls for that day. Each
-later Wake is still journaled with its typed causal signals.
+Every decision carries an `AttentionPlan`. It may declare up to three anonymous
+quote conditions over visible `best_bid` or `best_ask` values; conditions use
+fixed OR semantics. It may also provide a same-day relative fallback no more
+than 120 minutes away. Without one, the runtime schedules the same 120-minute
+fallback when it remains before 19:00. Alerts are one-shot and are evaluated
+only after all decisions for a minute have committed; a match wakes the company
+on the following minute. Duplicate, hidden, or already-true alerts, and invalid
+fallback times, reject the whole decision without changing the economy.
+
+An accepted action or idle decision never schedules a routine next-minute turn.
+The affected company wakes for its own trade, operation completion, delivery
+completion, matched price alert, fallback review, or the next market open. Only
+a rejected decision receives the bounded correction retry. Generic book
+mutations are not broadcast, and resting orders have no separate polling timer.
+Reaching the daily cap writes an explicit state-neutral audit step and suppresses
+further Agent calls for that day. Each later Wake is still journaled with its
+typed causal signals.
 
 ## Deterministic concurrency
 
 All agents woken in the same virtual minute observe the same base state version
 and their provider calls run concurrently. Completion speed does not establish
-economic priority. Before applying commands, the runtime sorts companies by:
+economic priority. Before applying decisions, the runtime sorts companies by:
 
 ```text
 SHA256(seed | absolute_minute | company_id)
 ```
 
-It then commits commands serially and persists the global `apply_sequence`.
+It then commits decisions serially and persists the global `apply_sequence`.
 Provider latency, retries, and token use remain invocation-audit metrics only.
 This makes a run replayable and comparable without pretending network latency is
 a business decision.
@@ -196,12 +208,12 @@ The provider request combines:
 
 1. current authoritative `AgentTurn` facts;
 2. explicit `decision_constraints` derived from that turn;
-3. recent compact decision records containing time, wake, command, disposition,
+3. recent compact decision records containing time, wake, decision, disposition,
    and rejection category; and
 4. a deterministic long-horizon summary of older decision records.
 
 Compaction is token-budget driven, not a fixed seven-day window. It never splits
-a command from its outcome and requires no extra model call. The default
+a decision from its outcome and requires no extra model call. The default
 compaction trigger is 12,288 estimated tokens. The NewAPI adapter independently
 checks the complete serialized request, including current facts and tool schemas,
 against its 128,000-token input budget. If authoritative current facts cannot
@@ -213,7 +225,7 @@ observations and outcomes are never duplicated into provider memory; complete
 
 ## Journal, checkpoint, and replay
 
-The turn journal records the exact observation, runtime-bound command, outcome,
+The turn journal records the exact observation, runtime-bound decision, outcome,
 `apply_sequence`, observation hash, causal references, and any protocol error.
 System steps record job completion, delivery, market close, consumer sales, and
 day close alongside their economic effects.
@@ -226,7 +238,7 @@ fingerprints.
 
 Recovery resumes only from that boundary and rejects provider, model, prompt,
 scenario, or configuration drift. Completed Run Replay creates no provider gateway: it
-verifies every observation hash, reproduces each recorded command or protocol
+verifies every observation hash, reproduces each recorded decision or protocol
 rejection, compares every outcome and system step, and finally requires equal
 events, snapshots, score, and quality metadata.
 
@@ -278,7 +290,7 @@ a terminal model-compatibility failure.
 
 | Condition | Result |
 |---|---|
-| Invalid model command | One immediate repair; if still invalid, protocol rejection, unchanged economy, diagnostic episode continues |
+| Invalid model decision | One immediate repair; if still invalid, protocol rejection, unchanged economy, diagnostic episode continues |
 | Output budget exhausted before any function call | Run fails with an audited compatibility error |
 | Role, collateral, ownership, capacity, or time rule fails | Typed engine rejection; run continues |
 | Authentication or permanent provider configuration failure | Run fails; no misleading score is emitted |
@@ -314,18 +326,18 @@ operation, including diagnostic-only sources.
 A V4 adapter implements:
 
 ```python
-class CommandGateway(Protocol):
-    async def generate_command(
+class DecisionGateway(Protocol):
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult: ...
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult: ...
 
     async def close(self) -> None: ...
 ```
 
 `AgentFactory` creates one NewAPI gateway per company while the application
 shares one transport across all gateways and runs. The adapter validates
-output into an authorized `CompanyCommand`, maps content failures to
+output into an authorized `CompanyDecision`, maps content failures to
 `ModelOutputError`, compatibility failures to `ModelCompatibilityError`, and
 permanent credential/configuration failures to `ModelConfigurationError`.
 Transient transport, timeout, rate-limit, and server failures map to

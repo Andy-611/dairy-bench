@@ -2707,14 +2707,14 @@ footer {
   text-transform: uppercase;
 }
 
-.command-outcome-detail {
+.decision-outcome-detail {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }
 
-.command-outcome-detail > div {
+.decision-outcome-detail > div {
   display: grid;
   gap: 5px;
   padding: 12px;
@@ -2722,18 +2722,18 @@ footer {
   background: #f7faf8;
 }
 
-.command-outcome-detail span {
+.decision-outcome-detail span {
   color: var(--muted);
   font-size: 9px;
   font-weight: 800;
   text-transform: uppercase;
 }
 
-.command-outcome-detail strong {
+.decision-outcome-detail strong {
   font-size: 12px;
 }
 
-.command-outcome-detail p {
+.decision-outcome-detail p {
   margin: 0;
   color: var(--muted);
   font-size: 10px;
@@ -2980,7 +2980,7 @@ footer {
 
   .delta-grid,
   .inventory-deltas,
-  .command-outcome-detail,
+  .decision-outcome-detail,
   .market-detail-grid,
   .market-detail-grid.compact {
     grid-template-columns: 1fr;

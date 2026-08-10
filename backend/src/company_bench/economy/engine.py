@@ -59,9 +59,9 @@ from company_bench.economy.market import (
 )
 from company_bench.economy.operations import OperatingEconomics
 from company_bench.runtime.models import (
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
     DeliveryExpiryBucket,
     IncomingDeliveryView,
     InventoryExpiryBucket,
@@ -79,7 +79,6 @@ from company_bench.runtime.models import (
     SimTime,
     SystemEventKind,
     Transform,
-    Wait,
 )
 
 __all__ = [
@@ -253,8 +252,7 @@ class EconomyState(StrictModel):
                 self.seed,
             ).open_day(self.day, self.base_state.operation_states)
             reset_operations = tuple(
-                state.model_copy(update={"used_capacity": ZERO})
-                for state in self.operation_states
+                state.model_copy(update={"used_capacity": ZERO}) for state in self.operation_states
             )
             if reset_operations != expected_operations:
                 raise ValueError("economy operation states do not match seed-derived conditions")
@@ -342,8 +340,8 @@ class EconomyState(StrictModel):
         )
 
 
-class _CommandRejected(ValueError):
-    """Expected command rejection that never commits transaction-local state."""
+class _DecisionRejected(ValueError):
+    """Expected decision rejection that never commits transaction-local state."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,8 +394,8 @@ class _MarketSession:
 
 
 @dataclass(frozen=True, slots=True)
-class _CommandEffect:
-    """One successfully applied command and its immediate audit output."""
+class _DecisionEffect:
+    """One successfully applied decision and its immediate audit output."""
 
     economy: EconomyState
     quote_ladder_result: QuoteLadderResult | None = None
@@ -634,38 +632,38 @@ class EconomyEngine:
     def apply_batch(
         self,
         economy: EconomyState,
-        envelopes: tuple[CommandEnvelope, ...],
+        envelopes: tuple[DecisionEnvelope, ...],
         *,
         first_apply_sequence: int,
         apply_sequences: tuple[int, ...] | None = None,
-    ) -> tuple[EconomyState, tuple[CommandOutcome, ...]]:
-        """Apply one deterministic same-minute command batch serially."""
+    ) -> tuple[EconomyState, tuple[DecisionOutcome, ...]]:
+        """Apply one deterministic same-minute decision batch serially."""
         if first_apply_sequence < 1:
             raise ValueError("first_apply_sequence must be positive")
         companies = [envelope.company_id for envelope in envelopes]
         if len(companies) != len(set(companies)):
-            raise ValueError("a company may submit at most one command per batch")
+            raise ValueError("a company may submit at most one decision per batch")
         if any(envelope.state_version != economy.state_version for envelope in envelopes):
-            raise ValueError("every batch command must target the shared state version")
+            raise ValueError("every batch decision must target the shared state version")
         issued_minutes = {envelope.issued_at.absolute_minute for envelope in envelopes}
         if len(issued_minutes) > 1:
-            raise ValueError("one command batch must share a virtual minute")
+            raise ValueError("one decision batch must share a virtual minute")
         sequences = (
             tuple(range(first_apply_sequence, first_apply_sequence + len(envelopes)))
             if apply_sequences is None
             else apply_sequences
         )
         if len(sequences) != len(envelopes):
-            raise ValueError("apply_sequences must align with submitted commands")
+            raise ValueError("apply_sequences must align with submitted decisions")
         if tuple(sorted(set(sequences))) != sequences:
             raise ValueError("apply_sequences must be unique and increasing")
         if sequences and sequences[0] < first_apply_sequence:
             raise ValueError("apply_sequences cannot precede first_apply_sequence")
 
         current = economy
-        outcomes: list[CommandOutcome] = []
+        outcomes: list[DecisionOutcome] = []
         for envelope, sequence in zip(envelopes, sequences, strict=True):
-            current, outcome = self._apply_command(current, envelope, sequence)
+            current, outcome = self._apply_decision(current, envelope, sequence)
             outcomes.append(outcome)
         return current, tuple(outcomes)
 
@@ -888,17 +886,17 @@ class EconomyEngine:
             ),
         )
 
-    def _apply_command(
+    def _apply_decision(
         self,
         economy: EconomyState,
-        envelope: CommandEnvelope,
+        envelope: DecisionEnvelope,
         apply_sequence: int,
-    ) -> tuple[EconomyState, CommandOutcome]:
-        """Apply one command transaction or return an unchanged rejection."""
+    ) -> tuple[EconomyState, DecisionOutcome]:
+        """Apply one decision transaction or return an unchanged rejection."""
         try:
-            self._validate_command_time(economy, envelope)
+            self._validate_decision_time(economy, envelope)
             effect = self._dispatch(economy, envelope, apply_sequence)
-        except (_CommandRejected, MarketError) as error:
+        except (_DecisionRejected, MarketError) as error:
             return economy, self._outcome(
                 economy,
                 envelope,
@@ -928,41 +926,45 @@ class EconomyEngine:
     def _dispatch(
         self,
         economy: EconomyState,
-        envelope: CommandEnvelope,
+        envelope: DecisionEnvelope,
         apply_sequence: int,
-    ) -> _CommandEffect:
-        command = envelope.command
-        if isinstance(command, Produce):
-            return self._produce(economy, envelope)
-        if isinstance(command, Transform):
-            return self._transform(economy, envelope)
-        if isinstance(command, SetQuoteLadder):
-            return self._set_quote_ladder(economy, envelope)
-        if isinstance(command, SetRetailPrice):
-            return self._set_retail_price(economy, envelope)
-        if isinstance(command, Wait):
-            return self._wait(economy, envelope)
-        raise TypeError(f"unsupported command: {type(command).__name__}")
+    ) -> _DecisionEffect:
+        action = envelope.action
+        if action is None:
+            return _DecisionEffect(economy=economy)
+        if isinstance(action, Produce):
+            return self._produce(economy, envelope, action)
+        if isinstance(action, Transform):
+            return self._transform(economy, envelope, action)
+        if isinstance(action, SetQuoteLadder):
+            return self._set_quote_ladder(economy, envelope, action)
+        if isinstance(action, SetRetailPrice):
+            return self._set_retail_price(economy, envelope, action)
+        raise TypeError(f"unsupported action: {type(action).__name__}")
 
-    def _produce(self, economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
-        command = envelope.command
+    def _produce(
+        self,
+        economy: EconomyState,
+        envelope: DecisionEnvelope,
+        action: Produce,
+    ) -> _DecisionEffect:
         company = economy.scenario.company(envelope.company_id)
         operation = company.operation
-        if not isinstance(command, Produce) or not isinstance(operation, FarmOperation):
-            raise _CommandRejected("produce is only available to farms")
-        if command.product is not operation.output_product:
-            raise _CommandRejected("farm cannot produce the requested product")
+        if not isinstance(operation, FarmOperation):
+            raise _DecisionRejected("produce is only available to farms")
+        if action.product is not operation.output_product:
+            raise _DecisionRejected("farm cannot produce the requested product")
         self._require_idle(economy, company.company_id)
         operation_state, cost = _price_operation(
             economy,
             company.company_id,
-            command.quantity,
+            action.quantity,
             operation.cost,
             "production",
         )
         session = _MarketSession.from_economy(economy)
         if cost > session.assets.cash(company.company_id):
-            raise _CommandRejected(
+            raise _DecisionRejected(
                 f"insufficient cash: required {cost}, "
                 f"available {session.assets.cash(company.company_id)}"
             )
@@ -975,9 +977,9 @@ class EconomyEngine:
             completes_at=envelope.issued_at.plus(
                 economy.scenario.runtime.operation_duration_minutes
             ),
-            product=command.product,
-            quantity=command.quantity,
-            unit_cost=EconomicPrecision.round(cost / command.quantity),
+            product=action.product,
+            quantity=action.quantity,
+            unit_cost=EconomicPrecision.round(cost / action.quantity),
             cash_cost=cost,
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
@@ -991,55 +993,56 @@ class EconomyEngine:
             }
         )
         completion = _operation_completion(job)
-        return _CommandEffect(
+        return _DecisionEffect(
             economy=updated,
             job_id=job.job_id,
             completions=(completion,),
         )
 
-    def _transform(self, economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
-        command = envelope.command
+    def _transform(
+        self,
+        economy: EconomyState,
+        envelope: DecisionEnvelope,
+        action: Transform,
+    ) -> _DecisionEffect:
         company = economy.scenario.company(envelope.company_id)
         operation = company.operation
-        if not isinstance(command, Transform) or not isinstance(
-            operation,
-            ProcessorOperation,
-        ):
-            raise _CommandRejected("transform is only available to processors")
+        if not isinstance(operation, ProcessorOperation):
+            raise _DecisionRejected("transform is only available to processors")
         if (
-            command.input_product is not operation.input_product
-            or command.output_product is not operation.output_product
+            action.input_product is not operation.input_product
+            or action.output_product is not operation.output_product
         ):
-            raise _CommandRejected("processor cannot perform the requested transformation")
+            raise _DecisionRejected("processor cannot perform the requested transformation")
         self._require_idle(economy, company.company_id)
         operation_state, cost = _price_operation(
             economy,
             company.company_id,
-            command.input_quantity,
+            action.input_quantity,
             operation.cost,
             "transformation",
         )
         output_quantity = EconomicPrecision.floor_quantity(
-            command.input_quantity * operation.yield_rate
+            action.input_quantity * operation.yield_rate
         )
         if output_quantity <= ZERO:
-            raise _CommandRejected("transformation output rounds to zero")
+            raise _DecisionRejected("transformation output rounds to zero")
         session = _MarketSession.from_economy(economy)
-        available_input = session.assets.quantity(company.company_id, command.input_product)
-        if command.input_quantity > available_input:
-            raise _CommandRejected(
-                f"insufficient inventory: requested {command.input_quantity}, "
+        available_input = session.assets.quantity(company.company_id, action.input_product)
+        if action.input_quantity > available_input:
+            raise _DecisionRejected(
+                f"insufficient inventory: requested {action.input_quantity}, "
                 f"available {available_input}"
             )
         if cost > session.assets.cash(company.company_id):
-            raise _CommandRejected(
+            raise _DecisionRejected(
                 f"insufficient cash: required {cost}, "
                 f"available {session.assets.cash(company.company_id)}"
             )
         session.assets.reserve_inventory(
             company.company_id,
-            command.input_product,
-            command.input_quantity,
+            action.input_product,
+            action.input_quantity,
         )
         session.assets.debit_cash(company.company_id, cost)
         sequence = economy.next_job_sequence
@@ -1050,13 +1053,11 @@ class EconomyEngine:
             completes_at=envelope.issued_at.plus(
                 economy.scenario.runtime.operation_duration_minutes
             ),
-            input_product=command.input_product,
-            output_product=command.output_product,
-            input_quantity=command.input_quantity,
+            input_product=action.input_product,
+            output_product=action.output_product,
+            input_quantity=action.input_quantity,
             output_quantity=output_quantity,
-            processing_cost_per_input=EconomicPrecision.round(
-                cost / command.input_quantity
-            ),
+            processing_cost_per_input=EconomicPrecision.round(cost / action.input_quantity),
             cash_cost=cost,
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
@@ -1069,7 +1070,7 @@ class EconomyEngine:
                 "next_job_sequence": sequence + 1,
             }
         )
-        return _CommandEffect(
+        return _DecisionEffect(
             economy=updated,
             job_id=job.job_id,
             completions=(_operation_completion(job),),
@@ -1078,19 +1079,17 @@ class EconomyEngine:
     def _set_quote_ladder(
         self,
         economy: EconomyState,
-        envelope: CommandEnvelope,
-    ) -> _CommandEffect:
-        command = envelope.command
-        if not isinstance(command, SetQuoteLadder):
-            raise TypeError("quote ladder handler requires SetQuoteLadder")
+        envelope: DecisionEnvelope,
+        action: SetQuoteLadder,
+    ) -> _DecisionEffect:
         company = economy.scenario.company(envelope.company_id)
-        if not _order_is_authorized(company, command.side, command.product):
-            raise _CommandRejected("order side or product is not authorized for this company")
+        if not _order_is_authorized(company, action.side, action.product):
+            raise _DecisionRejected("order side or product is not authorized for this company")
         session = _MarketSession.from_economy(economy)
         sequence = economy.next_order_sequence
-        execution = session.market(command.product).set_quote_ladder(
+        execution = session.market(action.product).set_quote_ladder(
             owner_id=company.company_id,
-            ladder=command,
+            ladder=action,
             placed_at=envelope.issued_at,
             order_identity_factory=lambda offset: OrderIdentity(
                 order_id=f"d{economy.day}.o{sequence + offset - 1}.{company.company_id}",
@@ -1113,29 +1112,26 @@ class EconomyEngine:
     @staticmethod
     def _set_retail_price(
         economy: EconomyState,
-        envelope: CommandEnvelope,
-    ) -> _CommandEffect:
-        command = envelope.command
+        envelope: DecisionEnvelope,
+        action: SetRetailPrice,
+    ) -> _DecisionEffect:
         company = economy.scenario.company(envelope.company_id)
         operation = company.operation
-        if not isinstance(command, SetRetailPrice) or not isinstance(
-            operation,
-            RetailerOperation,
-        ):
-            raise _CommandRejected("set_retail_price is only available to retailers")
-        if command.product is not operation.input_product:
-            raise _CommandRejected("retailer cannot price the requested product")
+        if not isinstance(operation, RetailerOperation):
+            raise _DecisionRejected("set_retail_price is only available to retailers")
+        if action.product is not operation.input_product:
+            raise _DecisionRejected("retailer cannot price the requested product")
         prices = tuple(
             price
             for price in economy.retail_prices
-            if (price.company_id, price.product) != (company.company_id, command.product)
+            if (price.company_id, price.product) != (company.company_id, action.product)
         )
         price = RetailPriceState(
             company_id=company.company_id,
-            product=command.product,
-            unit_price=command.unit_price,
+            product=action.product,
+            unit_price=action.unit_price,
         )
-        return _CommandEffect(
+        return _DecisionEffect(
             economy=economy.model_copy(
                 update={
                     "state_version": economy.state_version + 1,
@@ -1143,12 +1139,6 @@ class EconomyEngine:
                 }
             )
         )
-
-    @staticmethod
-    def _wait(economy: EconomyState, envelope: CommandEnvelope) -> _CommandEffect:
-        if not isinstance(envelope.command, Wait):
-            raise TypeError("wait handler requires Wait")
-        return _CommandEffect(economy=economy)
 
     def _commit_quote_ladder(
         self,
@@ -1158,12 +1148,12 @@ class EconomyEngine:
         result: QuoteLadderResult,
         fills: tuple[TradeFill, ...],
         next_order_sequence: int,
-    ) -> _CommandEffect:
+    ) -> _DecisionEffect:
         changed = bool(result.cancelled_order_ids) or any(
             level.action is not QuoteLevelAction.KEEP for level in result.levels
         )
         if not changed:
-            return _CommandEffect(economy=economy, quote_ladder_result=result)
+            return _DecisionEffect(economy=economy, quote_ladder_result=result)
         trade_effects = self._trade_effects(economy, fills, at)
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
@@ -1174,7 +1164,7 @@ class EconomyEngine:
                 "next_trade_sequence": trade_effects.next_trade_sequence,
             }
         )
-        return _CommandEffect(
+        return _DecisionEffect(
             economy=updated,
             quote_ladder_result=result,
             events=trade_effects.events,
@@ -1238,13 +1228,13 @@ class EconomyEngine:
     def _trade_id_factory(
         economy: EconomyState,
     ) -> Callable[[int], Identifier]:
-        """Return a deterministic per-command trade identity factory."""
+        """Return a deterministic per-decision trade identity factory."""
         return lambda offset: f"d{economy.day}.trade{economy.next_trade_sequence + offset - 1}"
 
     def _outcome(
         self,
         economy: EconomyState,
-        envelope: CommandEnvelope,
+        envelope: DecisionEnvelope,
         apply_sequence: int,
         *,
         accepted: bool,
@@ -1253,16 +1243,14 @@ class EconomyEngine:
         job_id: Identifier | None = None,
         events: tuple[DomainEvent, ...] = (),
         completions: tuple[ScheduledCompletion, ...] = (),
-    ) -> CommandOutcome:
-        next_available = envelope.issued_at.plus(
-            economy.scenario.runtime.decision_interval_minutes
-        )
-        return CommandOutcome(
+    ) -> DecisionOutcome:
+        next_available = envelope.issued_at.plus(economy.scenario.runtime.decision_interval_minutes)
+        return DecisionOutcome(
             turn_id=envelope.turn_id,
-            command_id=envelope.command_id,
+            decision_id=envelope.decision_id,
             company_id=envelope.company_id,
             occurred_at=envelope.issued_at,
-            status=CommandStatus.ACCEPTED if accepted else CommandStatus.REJECTED,
+            status=DecisionStatus.ACCEPTED if accepted else DecisionStatus.REJECTED,
             accepted=accepted,
             rejection_category=None if accepted else RejectionCategory.ECONOMIC,
             reason=reason,
@@ -1276,12 +1264,12 @@ class EconomyEngine:
         )
 
     @staticmethod
-    def _validate_command_time(economy: EconomyState, envelope: CommandEnvelope) -> None:
+    def _validate_decision_time(economy: EconomyState, envelope: DecisionEnvelope) -> None:
         runtime = economy.scenario.runtime
         if envelope.issued_at.day != economy.day - 1:
-            raise _CommandRejected("command targets a different business day")
+            raise _DecisionRejected("decision targets a different business day")
         if not runtime.open_minute <= envelope.issued_at.minute_of_day < runtime.close_minute:
-            raise _CommandRejected("command is outside business hours")
+            raise _DecisionRejected("decision is outside business hours")
 
     @staticmethod
     def _validate_system_time(economy: EconomyState, at: SimTime) -> None:
@@ -1301,7 +1289,7 @@ class EconomyEngine:
     @staticmethod
     def _require_idle(economy: EconomyState, company_id: CompanyId) -> None:
         if any(job.company_id == company_id for job in economy.jobs):
-            raise _CommandRejected("company operation resource is busy")
+            raise _DecisionRejected("company operation resource is busy")
 
     def _observation(
         self,
@@ -1467,9 +1455,7 @@ def _operation_output_value(economy: EconomyState, company_id: CompanyId) -> Mon
     else:
         product = job.output_product
         quantity = job.output_quantity
-    return EconomicPrecision.round(
-        quantity * economy.scenario.product(product).reference_value
-    )
+    return EconomicPrecision.round(quantity * economy.scenario.product(product).reference_value)
 
 
 def _persisted_lots(economy: EconomyState) -> Iterable[InventoryLot]:
@@ -1529,8 +1515,7 @@ def _replace_operation_state(
     replacement: DailyOperationState,
 ) -> tuple[DailyOperationState, ...]:
     return tuple(
-        replacement if state.company_id == replacement.company_id else state
-        for state in states
+        replacement if state.company_id == replacement.company_id else state for state in states
     )
 
 
@@ -1543,7 +1528,7 @@ def _price_operation(
 ) -> tuple[DailyOperationState, Money]:
     state = _operation_state(economy.operation_states, company_id)
     if quantity > state.remaining_capacity:
-        raise _CommandRejected(
+        raise _DecisionRejected(
             f"insufficient {label} capacity: requested {quantity}, "
             f"available {state.remaining_capacity}"
         )
@@ -1558,7 +1543,7 @@ def _price_operation(
             raise ValueError(f"{label} cost rounds to zero")
         return state.consume(quantity), cost
     except ValueError as error:
-        raise _CommandRejected(str(error)) from error
+        raise _DecisionRejected(str(error)) from error
 
 
 def _operation_completion(job: OperationJob) -> ScheduledCompletion:

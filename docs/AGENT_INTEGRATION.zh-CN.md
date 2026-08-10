@@ -8,36 +8,42 @@ Dairy Bench 运行九个独立企业 Agent：三家牧场、三家加工厂和�
 ```text
 唤醒
   -> AgentTurn（权威的企业私有观察）
-  -> 恰好一条 CompanyCommand
-  -> EconomyEngine 校验并返回 CommandOutcome
+  -> 恰好一条 CompanyDecision
+  -> EconomyEngine 校验并返回 DecisionOutcome
   -> 不可变 TurnRecord
 ```
 
-Agent 不提交整日计划，也不能自行提供身份、时间、状态版本、命令 ID 或 Turn ID；这些
-字段由 `EpisodeRuntime` 写入 `CommandEnvelope`。
+Agent 不提交整日计划，也不能自行提供身份、时间、状态版本、决策 ID 或 Turn ID；这些
+字段由 `EpisodeRuntime` 写入 `DecisionEnvelope`。
 
-## 结构化命令格式
+## 结构化决策格式
 
-模型必须选择一条且仅一条符合企业角色的命令：
+`CompanyDecision` 是带判别字段的联合类型：
 
-| 命令 | 含义 |
+- `ActionDecision(action, attention)`：执行一条经济动作并原子安装下一份注意力计划；
+- `IdleDecision(attention)`：不改变经济状态，只安装下一份注意力计划。
+
+模型必须调用一个且仅一个符合企业角色的决策工具；每个工具输入都必须包含
+`attention`：
+
+| 决策工具 | 经济效果 |
 |---|---|
-| `produce(product, quantity)` | 启动一项牧场生产作业 |
-| `transform(input_product, output_product, input_quantity)` | 启动一项加工转换作业 |
-| `set_quote_ladder(product, side, levels)` | 原子设置最多三档目标价格与数量 |
-| `set_retail_price(product, unit_price)` | 设置零售消费者价格 |
-| `wait(review_after_minutes?)` | 等待一段受限时长或下一个相关事件 |
+| `produce(product, quantity, attention)` | 启动一项牧场生产作业 |
+| `transform(input_product, output_product, input_quantity, attention)` | 启动一项加工转换作业 |
+| `set_quote_ladder(product, side, levels, attention)` | 原子设置最多三档目标价格与数量 |
+| `set_retail_price(product, unit_price, attention)` | 设置零售消费者价格 |
+| `idle(attention)` | 不改变经济状态 |
 
 牧场可以生产和交易原奶；加工厂可以转换并交易原奶或盒装奶；零售商可以交易盒装奶
 并设置消费者价格。
 
 `set_quote_ladder` 的每档都包含 `quantity` 和 `limit_price`。一个阶梯最多三档且价格
 不得重复；所有数量和价格都必须是 `0.0001` 的整数倍（最多四位小数），并且每档
-数量必须为正数。引擎会整条拒绝非法命令而不是四舍五入。`levels` 为空表示撤掉该
+数量必须为正数。引擎会整条拒绝非法决策而不是四舍五入。`levels` 为空表示撤掉该
 企业在对应产品和方向上的
 全部报价。
 
-该命令描述目标状态，而不是一串交易所操作。Agent 必须按价格从高到低提交买方目标，
+阶梯动作描述目标状态，而不是一串交易所操作。Agent 必须按价格从高到低提交买方目标，
 按价格从低到高提交卖方目标；顺序错误的阶梯会被拒绝。市场再确定性对账：
 
 1. 价格和数量都完全相同的档位保持不变，保留订单身份和优先级；
@@ -50,7 +56,7 @@ Agent 不提交整日计划，也不能自行提供身份、时间、状态版�
 优先级，并由上述确定性配对形成审计结果。一次 `set_quote_ladder` 即完成整组对账，
 只消耗一个 Agent Turn。
 
-成功后的 `CommandOutcome.quote_ladder_result` 会报告每个目标档位的 `keep`、`replace`
+成功后的 `DecisionOutcome.quote_ladder_result` 会报告每个目标档位的 `keep`、`replace`
 或 `place` 动作、结果订单 ID 与优先级、立即撮合后的剩余数量，以及单独 Cancel 的订单
 ID；成交事件和计划到货仍使用 Outcome 原有的事件字段。
 
@@ -61,7 +67,7 @@ Adapter 优先设置 `tool_choice="required"`；若 Provider 明确拒绝这个�
 输出上限，不进行阶梯式预算增长。模型第一次提交 Run 前，`ModelCapabilityCatalog` 会
 用一条短请求验证文档候选值，或从明确的参数拒绝中提取准确上限，并写入本地版本化目录；
 包含工具 schema 的完整序列化输入还会在发送前检查输入预算。无论模型属于哪个家族，
-输出都按同一个带判别字段的 Pydantic `CompanyCommand` 联合类型校验。协议无效的响应会
+输出都按同一个带判别字段的 Pydantic `CompanyDecision` 联合类型校验。协议无效的响应会
 立即获得一次纠正重试；若仍无效，该 Turn 被记为协议拒绝、经济状态不变，Episode 继续
 完成但只能用于诊断。
 
@@ -79,7 +85,7 @@ Adapter 优先设置 `tool_choice="required"`；若 Provider 明确拒绝这个�
 - 已保证的待到货商品、数量、准确到货时间及数量守恒的到期日分桶；
 - 当前生产或加工任务，以及权威的当日作业状态；
 - 仅由本企业账本和当前可执行市场价格派生的累计现金流与单位经济性；
-- 企业可见领域事件和上一条命令结果。
+- 企业可见领域事件和上一条决策结果。
 
 Provider 输入还包含强类型 `decision_constraints` 投影。它始终显式序列化营业时间与
 运行时限；对于生产企业，还会显式给出当日已用和剩余作业产能。这些值均由
@@ -118,34 +124,37 @@ Agent 看不到公开订单簿中其他企业的身份，也看不到其他企�
 命令、路线、承运商、运力、延迟、失败或托管状态。
 
 `produce` 和 `transform` 同样在恰好 30 个虚拟分钟后完成。每家公司同时最多有一项
-物理作业，但该作业不会阻塞市场、等待或零售价命令。启动作业时即消耗现金；加工还会
+物理作业，但该作业不会阻塞市场、空闲或零售价决策。启动作业时即消耗现金；加工还会
 消耗输入库存，产出只在完成时变为可用。
 
-营业窗口为 `[09:00, 19:00)`。命令没有 30 分钟经济冷却；Runtime 限制每家公司每个
+营业窗口为 `[09:00, 19:00)`。经济动作没有 30 分钟经济冷却；Runtime 限制每家公司每个
 虚拟分钟最多决策一次，并设置每日每家公司 25 Turn 的硬上限。19:00 先处理到期作业
 和到货，再关市，最后执行消费者购买。此前已承诺的任务最晚可在 19:29 完成，19:30
 日结。
 
-`wait` 是注意力计划，不是轮询动作。它最多可声明三个针对 Agent 可见匿名
+每条决策都携带 `AttentionPlan`。它最多可声明三个针对 Agent 可见匿名
 `best_bid` / `best_ask` 的价格条件，多个条件固定为 OR；也可给出最多 120 分钟后的
 相对复查间隔 `review_after_minutes`，且不能跨出当日营业窗口。省略时，只要仍早于
-19:00，Runtime 就安排 120 分钟后的默认复查。Alert 为一次性，只在同一分钟全部命令
+19:00，Runtime 就安排 120 分钟后的默认复查。Alert 为一次性，只在同一分钟全部决策
 提交后判断，命中则于下一分钟唤醒。重复、不可见、提交时已经为真的条件，以及非法
-时间，会使整条命令被拒绝且不改变经济状态。
-自有成交、作业完成和到货也会唤醒受影响企业；普通订单簿变化不再广播，挂单没有额外
-复查定时器。达到每日上限时，系统写入明确且不改变状态的审计步骤，并停止当日后续
-Agent 调用；此后的每个 Wake 仍会连同强类型因果信号写入 Journal。
+时间，会使整条决策被拒绝且不改变经济状态。
+
+成功的动作或空闲决策不会自动安排下一分钟 Turn。企业只会因自有成交、作业完成、到货、
+价格 Alert、兜底复查或次日开盘而被唤醒；只有被拒绝的决策会获得受限的修正唤醒。
+普通订单簿变化不广播，挂单也没有独立轮询定时器。达到每日上限时，系统写入明确且
+不改变状态的审计步骤，并停止当日后续 Agent 调用；此后的每个 Wake 仍会连同强类型
+因果信号写入 Journal。
 
 ## 确定性并发
 
 同一分钟被唤醒的所有 Agent 都观察同一个基础状态版本，Provider 请求并发执行，但
-完成速度不决定经济优先级。应用命令前，Runtime 按以下键对企业排序：
+完成速度不决定经济优先级。应用决策前，Runtime 按以下键对企业排序：
 
 ```text
 SHA256(seed | absolute_minute | company_id)
 ```
 
-随后命令串行提交，全局 `apply_sequence` 被持久化。Provider 延迟、重试和 token
+随后决策串行提交，全局 `apply_sequence` 被持久化。Provider 延迟、重试和 token
 使用量只属于调用审计指标。这使运行可以复现并公平比较，而不会把网络延迟误当作经营
 能力。
 
@@ -156,10 +165,10 @@ Provider 请求由四层上下文构成：
 
 1. 当前权威 `AgentTurn` 事实；
 2. 由该 Turn 派生的显式 `decision_constraints`；
-3. 只保留时间、唤醒原因、命令、处置结果和拒绝类别的近期紧凑决策记录；
+3. 只保留时间、唤醒原因、决策、处置结果和拒绝类别的近期紧凑决策记录；
 4. 更早决策记录的确定性长期摘要。
 
-记忆按 token 预算压缩，而不是固定保留最近七天。压缩不会拆开命令和结果，也不产生
+记忆按 token 预算压缩，而不是固定保留最近七天。压缩不会拆开决策和结果，也不产生
 额外模型调用。默认在约 12,288 个估算 token 时开始压缩。NewAPI Adapter 会独立检查
 包含当前事实与工具 schema 的完整序列化请求，默认输入预算为 128,000 token。如果仅
 当前权威事实就无法装入，该 Turn 会明确记为协议拒绝，而不会隐藏业务事实。
@@ -169,7 +178,7 @@ Provider 请求由四层上下文构成：
 
 ## Journal、Checkpoint 与 Replay
 
-Turn Journal 记录精确观察、Runtime 绑定的命令、结果、`apply_sequence`、观察哈希、
+Turn Journal 记录精确观察、Runtime 绑定的决策、结果、`apply_sequence`、观察哈希、
 因果引用以及协议错误。System Step 记录作业完成、到货、关市、消费者购买和日结及其
 经济影响。
 
@@ -178,7 +187,7 @@ Turn Journal 记录精确观察、Runtime 绑定的命令、结果、`apply_sequ
 Scheduler、企业可用时间、事件、快照、记忆、游标和固定策略指纹。
 
 恢复只能从该原子边界继续，并拒绝 Provider、模型、Prompt、场景或配置漂移。精确
-Replay 不创建 Provider Gateway：它校验每次观察哈希，重现记录的命令或协议拒绝，
+Replay 不创建 Provider Gateway：它校验每次观察哈希，重现记录的决策或协议拒绝，
 比较每个结果与 System Step，并最终要求事件、快照、得分和质量元数据完全相同。
 
 ## 通过 NewAPI 运行模型 Agent
@@ -219,7 +228,7 @@ Windows 用户的 DPAPI 加密格式保存在 `.dairy-bench/credentials`，同�
 
 | 情况 | 结果 |
 |---|---|
-| 模型命令无效 | 立即纠正一次；仍无效则协议拒绝、经济状态不变，诊断 Episode 继续 |
+| 模型决策无效 | 立即纠正一次；仍无效则协议拒绝、经济状态不变，诊断 Episode 继续 |
 | 输出预算耗尽仍未调用函数 | 记录兼容性错误并结束运行 |
 | 角色、担保、所有权、产能或时间规则失败 | 强类型引擎拒绝；运行继续 |
 | 认证或永久 Provider 配置故障 | 整个运行失败，不产生误导性分数 |
@@ -253,18 +262,18 @@ Replay，但明确排除在 Benchmark 对比之外。
 V4 Adapter 实现：
 
 ```python
-class CommandGateway(Protocol):
-    async def generate_command(
+class DecisionGateway(Protocol):
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult: ...
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult: ...
 
     async def close(self) -> None: ...
 ```
 
 `AgentFactory` 为每家公司创建独立 NewAPI Gateway，应用在所有 Gateway 和 Run 之间
 共享一个 Transport。Adapter 把输出校验为已授权的
-`CompanyCommand`，将内容错误映射为 `ModelOutputError`，将兼容性错误映射为
+`CompanyDecision`，将内容错误映射为 `ModelOutputError`，将兼容性错误映射为
 `ModelCompatibilityError`，将认证等永久配置故障映射为 `ModelConfigurationError`，
 并将 DNS、连接、超时、限流或 5xx 等临时故障映射为 `ModelInfrastructureError`。
 它不能访问 `EconomyEngine` 或其他公司的状态。支持新模型时应把模型接入 NewAPI，

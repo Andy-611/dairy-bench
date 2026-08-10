@@ -10,7 +10,7 @@ from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
 from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus
 from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
-from company_bench.runtime.models import AgentTurn, CompanyCommand, SystemStepRecord, TurnRecord
+from company_bench.runtime.models import AgentTurn, CompanyDecision, SystemStepRecord, TurnRecord
 from company_bench.storage.store import InMemoryRunStore
 from company_bench.timeline.projector import RunTimelineProjector
 
@@ -38,7 +38,7 @@ class _PausingAgent:
         self._delegate = BaselineCompanyAgent()
         self._remaining = passthrough_calls
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
         """Delegate until the configured pause point."""
         if self._remaining == 0:
             self.blocked.set()

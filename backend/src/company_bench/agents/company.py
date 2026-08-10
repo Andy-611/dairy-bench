@@ -9,9 +9,9 @@ from typing import Final, Protocol, runtime_checkable
 from uuid import uuid4
 
 from company_bench.agents.contracts import (
-    CommandGateway,
-    CommandModelRequest,
-    CommandName,
+    DecisionGateway,
+    DecisionModelRequest,
+    DecisionToolName,
     ModelCallError,
     ModelCompatibilityError,
     ModelConfigurationError,
@@ -49,8 +49,12 @@ from company_bench.runs.models import (
     TokenUsage,
 )
 from company_bench.runtime.models import (
+    ActionDecision,
     AgentTurn,
-    CompanyCommand,
+    AttentionPlan,
+    CompanyDecision,
+    EconomicCommand,
+    IdleDecision,
     MarketSide,
     Produce,
     QuoteLevel,
@@ -58,20 +62,19 @@ from company_bench.runtime.models import (
     SetRetailPrice,
     Transform,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 
-COMMAND_PROMPT_VERSION: Final = "dairy-company-v3.7"
+DECISION_PROMPT_VERSION: Final = "dairy-company-v3.8"
 
 
 class CompanyAgent(Protocol):
-    """Return exactly one atomic command for a runtime-owned turn."""
+    """Return exactly one atomic decision for a runtime-owned turn."""
 
     metadata: PolicyMetadata
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
-        """Choose one command without changing economic state."""
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        """Choose one decision without changing economic state."""
         ...
 
 
@@ -89,7 +92,7 @@ class ReplayDriftError(RuntimeError):
 
 @runtime_checkable
 class TurnMemory(Protocol):
-    """Optional Agent-owned sink for complete command/outcome cycles."""
+    """Optional Agent-owned sink for complete decision/outcome cycles."""
 
     def remember(self, record: TurnRecord) -> None:
         """Retain one completed turn for the next model call."""
@@ -122,7 +125,7 @@ class AgentDecisionConstraints(StrictModel):
     operation_duration_minutes: int
     delivery_duration_minutes: int
     decision_interval_minutes: int
-    max_wait_minutes: int
+    max_review_minutes: int
     used_operation_capacity: Quantity | None
     remaining_operation_capacity: Quantity | None
 
@@ -137,13 +140,13 @@ class AgentDecisionConstraints(StrictModel):
             operation_duration_minutes=runtime.operation_duration_minutes,
             delivery_duration_minutes=runtime.delivery_duration_minutes,
             decision_interval_minutes=runtime.decision_interval_minutes,
-            max_wait_minutes=runtime.max_wait_minutes,
+            max_review_minutes=runtime.max_review_minutes,
             used_operation_capacity=None if operation is None else operation.used_capacity,
             remaining_operation_capacity=turn.remaining_operation_capacity,
         )
 
 
-class AgentCommandInput(StrictModel):
+class AgentDecisionInput(StrictModel):
     """Current facts, explicit limits, and one company's private memory."""
 
     memory: AgentMemoryView
@@ -155,7 +158,7 @@ class AgentCommandInput(StrictModel):
         cls,
         memory: AgentCheckpoint,
         turn: AgentTurn,
-    ) -> AgentCommandInput:
+    ) -> AgentDecisionInput:
         """Build the provider projection from one authoritative turn."""
         return cls(
             memory=memory.provider_view(),
@@ -174,7 +177,7 @@ class LlmCompanyAgent:
         *,
         run_id: str,
         company_id: CompanyId,
-        gateway: CommandGateway,
+        gateway: DecisionGateway,
         audit_sink: PolicyAuditSink,
         metadata: PolicyMetadata,
         checkpoint: AgentCheckpoint | None = None,
@@ -196,29 +199,29 @@ class LlmCompanyAgent:
         )
         self._pending_invocations: dict[str, PolicyInvocation] = {}
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
-        """Generate and audit exactly one role-authorized command."""
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        """Generate and audit exactly one role-authorized decision."""
         if turn.company_id != self._company_id:
             raise ValueError("an Agent cannot control another company")
-        allowed_commands = _allowed_commands(turn)
-        instructions = _command_instructions(allowed_commands)
-        request = CommandModelRequest(
+        allowed_tools = _allowed_tools(turn)
+        instructions = _decision_instructions(allowed_tools)
+        request = DecisionModelRequest(
             invocation_id=f"inv_{uuid4().hex}",
             run_id=self._run_id,
             turn=turn,
             instructions=instructions,
-            input_text=AgentCommandInput.from_turn(
+            input_text=AgentDecisionInput.from_turn(
                 self._memory.checkpoint(),
                 turn,
             ).model_dump_json(
                 exclude_defaults=True,
                 exclude_none=True,
             ),
-            allowed_commands=allowed_commands,
+            allowed_tools=allowed_tools,
         )
         started_at = datetime.now(UTC)
         try:
-            result = await self._gateway.generate_command(request)
+            result = await self._gateway.generate_decision(request)
         except (ModelCompatibilityError, ModelConfigurationError) as error:
             self._record_failure(
                 request,
@@ -268,7 +271,7 @@ class LlmCompanyAgent:
             **self._invocation_fields(request, started_at),
             finished_at=datetime.now(UTC),
             outcome=InvocationOutcome.SUCCESS,
-            command=result.command,
+            decision=result.decision,
             response_id=result.response_id,
             request_id=result.request_id,
             usage=result.usage,
@@ -278,7 +281,7 @@ class LlmCompanyAgent:
         )
         self._pending_invocations[turn.turn_id] = invocation
         self._audit_sink.record_invocation(invocation)
-        return result.command
+        return result.decision
 
     def remember(self, record: TurnRecord) -> None:
         """Store the complete cycle and attach its outcome to provider audit."""
@@ -290,12 +293,12 @@ class LlmCompanyAgent:
             completed = invocation.model_copy(
                 update={
                     "apply_sequence": record.outcome.apply_sequence,
-                    "command": (
-                        invocation.command
-                        if invocation.command is not None
-                        else record.envelope.command
+                    "decision": (
+                        invocation.decision
+                        if invocation.decision is not None
+                        else record.envelope.decision
                     ),
-                    "command_outcome": record.outcome,
+                    "decision_outcome": record.outcome,
                 }
             )
             self._audit_sink.record_invocation(
@@ -308,7 +311,7 @@ class LlmCompanyAgent:
 
     def _record_failure(
         self,
-        request: CommandModelRequest,
+        request: DecisionModelRequest,
         started_at: datetime,
         outcome: InvocationOutcome,
         error: Exception,
@@ -332,7 +335,7 @@ class LlmCompanyAgent:
 
     def _invocation_fields(
         self,
-        request: CommandModelRequest,
+        request: DecisionModelRequest,
         started_at: datetime,
     ) -> dict[str, object]:
         turn = request.turn
@@ -344,7 +347,7 @@ class LlmCompanyAgent:
             "observation": turn.observation,
             "provider": self.metadata.provider or "unknown",
             "model": self.metadata.model or "unknown",
-            "prompt_version": self.metadata.prompt_version or COMMAND_PROMPT_VERSION,
+            "prompt_version": self.metadata.prompt_version or DECISION_PROMPT_VERSION,
             "prompt_hash": hashlib.sha256(
                 f"{request.instructions}\0{request.input_text}".encode()
             ).hexdigest(),
@@ -363,39 +366,40 @@ class BaselineCompanyAgent:
         kind=PolicyKind.BASELINE,
     )
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
-        """Choose a feasible atomic command from fresh current facts."""
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        """Choose a feasible action and its next attention plan."""
         operation = turn.observation.operation
         if isinstance(operation, FarmOperation):
-            return self._farm_command(turn)
-        if isinstance(operation, ProcessorOperation):
-            return self._processor_command(turn)
-        if isinstance(operation, RetailerOperation):
-            return self._retailer_command(turn)
-        raise TypeError(f"unsupported operation: {type(operation).__name__}")
+            action = self._farm_action(turn)
+        elif isinstance(operation, ProcessorOperation):
+            action = self._processor_action(turn)
+        elif isinstance(operation, RetailerOperation):
+            action = self._retailer_action(turn)
+        else:
+            raise TypeError(f"unsupported operation: {type(operation).__name__}")
+        return _baseline_decision(turn, action)
 
     @staticmethod
-    def _farm_command(turn: AgentTurn) -> CompanyCommand:
+    def _farm_action(turn: AgentTurn) -> EconomicCommand | None:
         operation = turn.observation.operation
         assert isinstance(operation, FarmOperation)
         if WakeReason.DAY_OPEN in turn.wake_reasons:
             capacity = _remaining_capacity(turn)
             if capacity <= 0:
-                return Wait()
+                return None
             return Produce(
                 product=operation.output_product,
                 quantity=min(capacity, Decimal("50")),
             )
-        command = _sell_ladder(
+        return _sell_ladder(
             turn,
             operation.output_product,
             Decimal("50"),
             (Decimal("1.20"), Decimal("1.40"), Decimal("1.60")),
         )
-        return command or Wait()
 
     @staticmethod
-    def _processor_command(turn: AgentTurn) -> CompanyCommand:
+    def _processor_action(turn: AgentTurn) -> EconomicCommand | None:
         operation = turn.observation.operation
         assert isinstance(operation, ProcessorOperation)
         capacity = _remaining_capacity(turn)
@@ -433,10 +437,10 @@ class BaselineCompanyAgent:
             order_quantity,
             (Decimal("1.60"), Decimal("1.50"), Decimal("1.40")),
         )
-        return buy_command or Wait()
+        return buy_command
 
     @staticmethod
-    def _retailer_command(turn: AgentTurn) -> CompanyCommand:
+    def _retailer_action(turn: AgentTurn) -> EconomicCommand | None:
         operation = turn.observation.operation
         assert isinstance(operation, RetailerOperation)
         if turn.observation.retail_price is None:
@@ -452,17 +456,16 @@ class BaselineCompanyAgent:
                 - _pending_quantity(turn, operation.input_product),
             )
         )
-        command = _buy_ladder(
+        return _buy_ladder(
             turn,
             operation.input_product,
             order_quantity,
             (Decimal("2.80"), Decimal("2.65"), Decimal("2.50")),
         )
-        return command or Wait()
 
 
 class ReplayCompanyAgent:
-    """Replay one company's command stream with observation-drift checks."""
+    """Replay one company's decision stream with observation-drift checks."""
 
     metadata: PolicyMetadata
 
@@ -489,11 +492,11 @@ class ReplayCompanyAgent:
             )
         )
         if not 0 <= completed_turns <= len(self._records):
-            raise ValueError("completed_turns exceeds the source command stream")
+            raise ValueError("completed_turns exceeds the source decision stream")
         self._index = completed_turns
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
-        """Return the next source command only when current facts match."""
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        """Return the next source decision only when current facts match."""
         if turn.company_id != self._company_id:
             raise ReplayDriftError("a replay Agent cannot control another company")
         if self._index >= len(self._records):
@@ -509,18 +512,18 @@ class ReplayCompanyAgent:
             if source.protocol_issue_kind is None:
                 raise ReplayDriftError("source protocol error is missing its typed category")
             raise ReplayedProtocolError(source.protocol_issue_kind, source.protocol_error)
-        return source.envelope.command
+        return source.envelope.decision
 
     def remember(self, record: TurnRecord) -> None:
-        """Verify that replay reproduced the source command outcome exactly."""
+        """Verify that replay reproduced the source decision outcome exactly."""
         if record.turn.company_id != self._company_id or self._index == 0:
             raise ReplayDriftError("replay outcome arrived without a matching source turn")
         source = self._records[self._index - 1]
         same_outcome = source.outcome.model_dump_json(
-            exclude={"turn_id", "command_id"}
-        ) == record.outcome.model_dump_json(exclude={"turn_id", "command_id"})
+            exclude={"turn_id", "decision_id"}
+        ) == record.outcome.model_dump_json(exclude={"turn_id", "decision_id"})
         if (
-            record.envelope.command != source.envelope.command
+            record.envelope.decision != source.envelope.decision
             or record.protocol_issue_kind != source.protocol_issue_kind
             or record.protocol_error != source.protocol_error
             or not same_outcome
@@ -544,7 +547,7 @@ def observation_hash(turn: AgentTurn) -> str:
             "wake_signals": True,
             "previous_outcome": {
                 "turn_id",
-                "command_id",
+                "decision_id",
                 "company_id",
                 "apply_sequence",
             },
@@ -553,32 +556,32 @@ def observation_hash(turn: AgentTurn) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _allowed_commands(turn: AgentTurn) -> tuple[CommandName, ...]:
-    """Expose only commands authorized for the observed company role."""
+def _allowed_tools(turn: AgentTurn) -> tuple[DecisionToolName, ...]:
+    """Expose only decision tools authorized for the observed company role."""
     operation = turn.observation.operation
     if isinstance(operation, FarmOperation):
-        return ("produce", "set_quote_ladder", "wait")
+        return ("produce", "set_quote_ladder", "idle")
     if isinstance(operation, ProcessorOperation):
-        return ("transform", "set_quote_ladder", "wait")
+        return ("transform", "set_quote_ladder", "idle")
     if isinstance(operation, RetailerOperation):
         return (
             "set_quote_ladder",
             "set_retail_price",
-            "wait",
+            "idle",
         )
     raise TypeError(f"unsupported operation: {type(operation).__name__}")
 
 
-def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
-    """Build the stable provider-neutral V4 command prompt."""
-    commands = ", ".join(allowed)
+def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
+    """Build the stable provider-neutral company decision prompt."""
+    tools = ", ".join(allowed)
     return (
         "You are the sole Agent for one dairy company in a continuous spot market. "
         "Your sole objective is to maximize your own company's profit. "
         "Orders lock real cash or FEFO inventory, crossing quotes trade immediately at "
         "the resting price. Purchases arrive after decision_constraints."
         "delivery_duration_minutes; production and transformation finish after "
-        "decision_constraints.operation_duration_minutes while market commands remain "
+        "decision_constraints.operation_duration_minutes while market actions remain "
         "available. Order books list every anonymous price level with aggregate quantity "
         "and order_count. queue_ahead_quantity is the same-price quantity ahead of your "
         "order. "
@@ -592,28 +595,45 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "observation.operation.cost.curvature supplies curvature; "
         "for a new quantity q, cash cost is C(u+q)-C(u), where "
         "C(x)=c*x+curvature*c*x^2/(2*K). Use only supplied facts and "
-        "submit exactly one atomic command; never invent identity, time, or state version. "
+        "submit exactly one atomic decision; never invent identity, time, or state version. "
         "Every submitted economic quantity and price must use at most four decimal "
         f"places (an exact multiple of {ECONOMIC_QUANTUM}); every production, "
         "transformation, and quote-level quantity must also be at least "
-        f"{ECONOMIC_QUANTUM}. Invalid precision rejects the entire command without "
+        f"{ECONOMIC_QUANTUM}. Invalid precision rejects the entire action without "
         "rounding; never submit a dust quantity. set_quote_ladder declares "
         "the complete target state for one product and side: use zero to three unique "
         "levels ordered best-to-worst (buy prices descending, sell prices ascending), "
         "and use [] to cancel that ladder. The complete update is atomic. Exact unchanged "
         "price-quantity levels keep their order identity and priority; every changed level "
         "loses its old priority. Total asks require real inventory and total bids require "
-        "real cash collateral. Use wait when no action is justified: set "
-        "review_after_minutes to null to "
+        "real cash collateral. Every tool input must include attention, which controls the "
+        "next review after this decision. Set review_after_minutes to null to "
         "use the runtime's bounded fallback review when it remains before market close, or "
-        "select a positive delay no greater than decision_constraints.max_wait_minutes; "
+        "select a positive delay no greater than decision_constraints.max_review_minutes; "
         "the resulting review must remain before market close. Set alerts to [] when no price "
         "condition is needed; otherwise provide up to three OR price alerts over the "
         "best visible quote: bids[0].unit_price for best_bid or asks[0].unit_price for "
         "best_ask. Every alert must still be false when armed. "
         "Background monitoring consumes no turn, but every model call counts against the "
-        "daily turn budget supplied in the turn. Do not poll for ordinary quote changes. "
-        f"Authorized commands: {commands}."
+        "daily turn budget supplied in the turn. Use idle when no economic action is "
+        "justified. Do not poll for ordinary quote changes. "
+        f"Authorized decision tools: {tools}."
+    )
+
+
+def _baseline_decision(
+    turn: AgentTurn,
+    action: EconomicCommand | None,
+) -> CompanyDecision:
+    """Pair one baseline action with a bounded, non-polling review plan."""
+    if action is None:
+        return IdleDecision(attention=AttentionPlan())
+    desired_delay = 1 if isinstance(action, SetRetailPrice) else 30
+    remaining = turn.observation.runtime.close_minute - turn.sim_time.minute_of_day - 1
+    review_after = min(desired_delay, remaining) if remaining > 0 else None
+    return ActionDecision(
+        action=action,
+        attention=AttentionPlan(review_after_minutes=review_after),
     )
 
 

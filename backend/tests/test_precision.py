@@ -7,12 +7,12 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from company_bench.domain.models import Money, ProductId
 from company_bench.domain.precision import ECONOMIC_QUANTUM, EconomicPrecision
 from company_bench.runtime.models import (
+    AttentionPlan,
     Produce,
     QuoteAlert,
     QuoteLevel,
     SetRetailPrice,
     Transform,
-    Wait,
 )
 
 
@@ -52,7 +52,7 @@ def test_derived_values_use_the_two_explicit_rounding_directions() -> None:
             product=ProductId.BOTTLED_MILK,
             unit_price=Decimal("1.00001"),
         ),
-        lambda: Wait(
+        lambda: AttentionPlan(
             alerts=(
                 QuoteAlert(
                     product=ProductId.RAW_MILK,
@@ -78,7 +78,7 @@ def test_every_agent_decimal_input_rejects_excess_precision(
         (Transform, 1),
         (QuoteLevel, 2),
         (SetRetailPrice, 1),
-        (Wait, 1),
+        (AttentionPlan, 1),
     ),
 )
 def test_agent_command_schemas_publish_the_economic_quantum(

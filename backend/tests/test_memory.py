@@ -18,12 +18,13 @@ from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.economy.engine import EconomyEngine
 from company_bench.runtime.models import (
     AgentTurn,
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
+    AttentionPlan,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
+    IdleDecision,
     SimTime,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 
@@ -45,7 +46,7 @@ def test_memory_exchange_keeps_only_decision_relevant_runtime_facts(
     payload = exchange.model_dump()
 
     assert exchange.turn_id == "turn_farm_a_1"
-    assert exchange.command == Wait()
+    assert exchange.decision == IdleDecision(attention=AttentionPlan())
     assert "turn" not in payload
     assert "observation" not in payload
 
@@ -60,7 +61,7 @@ def test_memory_rejects_cross_company_and_cross_run_state(
         memory.remember(_exchange(observations["processor_a"], 2))
 
     checkpoint = memory.checkpoint()
-    assert checkpoint.schema_version == 6
+    assert checkpoint.schema_version == 7
     with pytest.raises(ValueError, match="another company"):
         ConversationMemory.restore(RUN_ID, "farm_b", checkpoint)
     with pytest.raises(ValueError, match="another run"):
@@ -202,7 +203,7 @@ def _exchange(
     company_id = observation.company_id
     sim_time = SimTime(absolute_minute=540 + index * 30)
     turn_id = f"turn_{company_id}_{index}"
-    command_id = f"command_{company_id}_{index}"
+    decision_id = f"decision_{company_id}_{index}"
     turn = AgentTurn(
         turn_id=turn_id,
         company_id=company_id,
@@ -210,25 +211,25 @@ def _exchange(
         state_version=index - 1,
         turn_number_today=index,
         turn_limit_today=observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.CONTINUE,),
+        wake_reasons=(WakeReason.REVIEW_DUE,),
         observation=observation,
         available_cash=observation.cash,
         marked_surplus=Decimal(),
     )
-    envelope = CommandEnvelope(
+    envelope = DecisionEnvelope(
         turn_id=turn_id,
-        command_id=command_id,
+        decision_id=decision_id,
         company_id=company_id,
         issued_at=sim_time,
         state_version=index - 1,
-        command=Wait(),
+        decision=IdleDecision(attention=AttentionPlan()),
     )
-    outcome = CommandOutcome(
+    outcome = DecisionOutcome(
         turn_id=turn_id,
-        command_id=command_id,
+        decision_id=decision_id,
         company_id=company_id,
         occurred_at=sim_time,
-        status=CommandStatus.ACCEPTED,
+        status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=index,
         apply_sequence=index,

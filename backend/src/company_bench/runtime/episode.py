@@ -50,7 +50,7 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.attention import (
     AgentAttention,
-    ArmedWait,
+    ArmedAttention,
     AttentionMatch,
     AttentionRejected,
 )
@@ -58,10 +58,12 @@ from company_bench.runtime.economics import PrivateEconomicsProjector
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
-    CompanyCommand,
+    AttentionPlan,
+    CompanyDecision,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
+    IdleDecision,
     JournalEntryKind,
     JournalEntryReference,
     RejectionCategory,
@@ -70,14 +72,13 @@ from company_bench.runtime.models import (
     SystemStepRecord,
     TurnRecord,
     TurnReplayOrigin,
-    Wait,
     WakeReason,
     WakeSignal,
     system_step_id,
 )
 from company_bench.runtime.scheduler import ScheduledEvent, Scheduler
 
-_COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
+_DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 type DayCallback = Callable[[int], Awaitable[None]]
 type TurnCallback = Callable[[TurnRecord], Awaitable[None]]
 
@@ -108,26 +109,26 @@ class _Cursor:
     next_turn_sequence: int = 1
     last_visible_event_sequence: int = 0
     available_at: SimTime | None = None
-    active_wait: ArmedWait | None = None
+    active_attention: ArmedAttention | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _PendingTurn:
     turn: AgentTurn
-    command: CompanyCommand
+    decision: CompanyDecision
     protocol_issue_kind: ProtocolIssueKind | None = None
     protocol_error: str | None = None
-    command_error: str | None = None
-    attention_plan: ArmedWait | None = None
+    decision_error: str | None = None
+    attention_plan: ArmedAttention | None = None
 
     @property
     def preflight_accepted(self) -> bool:
-        """Return whether the engine may receive this command."""
-        return self.protocol_error is None and self.command_error is None
+        """Return whether the engine may receive this decision."""
+        return self.protocol_error is None and self.decision_error is None
 
 
 class EpisodeRuntime:
-    """Run one V4 episode with deterministic scheduling and atomic commands."""
+    """Run one V4 episode with deterministic scheduling and atomic decisions."""
 
     def __init__(
         self,
@@ -392,7 +393,7 @@ class EpisodeRuntime:
             for event in eligible:
                 if event.company_id is not None:
                     scheduler.cancel_company_wakes(event.company_id)
-                    cursors[event.company_id].active_wait = None
+                    cursors[event.company_id].active_attention = None
             pending = await self._query_bucket(
                 run_id,
                 economy,
@@ -408,13 +409,13 @@ class EpisodeRuntime:
                 for item in self._application_order(pending, seed, scheduler.now)
             )
             envelopes = tuple(
-                CommandEnvelope(
+                DecisionEnvelope(
                     turn_id=item.turn.turn_id,
-                    command_id=f"{item.turn.turn_id}.command",
+                    decision_id=f"{item.turn.turn_id}.decision",
                     company_id=item.turn.company_id,
                     issued_at=item.turn.sim_time,
                     state_version=item.turn.state_version,
-                    command=item.command,
+                    decision=item.decision,
                 )
                 for item in ordered
             )
@@ -484,7 +485,7 @@ class EpisodeRuntime:
                     agent.remember(record)
                 if on_turn_completed is not None:
                     await on_turn_completed(record)
-                self._schedule_continuation(
+                self._schedule_rejection_retry(
                     scheduler,
                     record,
                     turn_counts[(economy.day, company_id)],
@@ -506,7 +507,7 @@ class EpisodeRuntime:
                     or audit_key in turn_limit_audits
                 ):
                     continue
-                cursors[company_id].active_wait = None
+                cursors[company_id].active_attention = None
                 step = self._turn_limit_step(
                     run_id,
                     economy,
@@ -544,9 +545,7 @@ class EpisodeRuntime:
             if isinstance(agent, EpisodeCompletionGuard):
                 agent.ensure_episode_complete()
         protocol_issues = tuple(
-            record.protocol_issue_kind
-            for record in turns
-            if record.protocol_issue_kind is not None
+            record.protocol_issue_kind for record in turns if record.protocol_issue_kind is not None
         )
         protocol = ProtocolReport.from_issues(len(turns), protocol_issues)
         events = tuple(record.event for record in event_records)
@@ -611,7 +610,7 @@ class EpisodeRuntime:
         wake_events: tuple[ScheduledEvent, ...],
         cursors: Mapping[str, _Cursor],
     ) -> tuple[ScheduledEvent, ...]:
-        """Move external wakes to the end of a company's active command."""
+        """Move external wakes to the end of a company's active action."""
         ready: list[ScheduledEvent] = []
         for event in wake_events:
             company_id = event.company_id
@@ -650,8 +649,8 @@ class EpisodeRuntime:
 
     @staticmethod
     def _available_after(record: TurnRecord) -> SimTime | None:
-        """Return the cooldown boundary; waiting itself does not occupy a company."""
-        if isinstance(record.envelope.command, Wait) and record.outcome.accepted:
+        """Return the cooldown boundary; idling does not occupy a company."""
+        if isinstance(record.envelope.decision, IdleDecision) and record.outcome.accepted:
             return None
         return record.outcome.next_available_at
 
@@ -797,7 +796,7 @@ class EpisodeRuntime:
         agents: Mapping[str, CompanyAgent],
         event_records: list[EventRecord],
         cursors: dict[str, _Cursor],
-        previous_outcomes: dict[str, CommandOutcome],
+        previous_outcomes: dict[str, DecisionOutcome],
         turn_counts: Mapping[tuple[int, str], int],
     ) -> tuple[_PendingTurn, ...]:
         turns = tuple(
@@ -831,7 +830,7 @@ class EpisodeRuntime:
         wake_event: ScheduledEvent,
         event_records: list[EventRecord],
         cursor: _Cursor,
-        previous_outcome: CommandOutcome | None,
+        previous_outcome: DecisionOutcome | None,
         turn_number_today: int,
     ) -> AgentTurn:
         company_id = wake_event.company_id
@@ -902,13 +901,13 @@ class EpisodeRuntime:
         agent: CompanyAgent,
     ) -> _PendingTurn:
         try:
-            command = await asyncio.wait_for(
+            decision = await asyncio.wait_for(
                 agent.act(turn),
                 timeout=self._agent_timeout_seconds,
             )
             return _PendingTurn(
                 turn=turn,
-                command=_COMMAND_ADAPTER.validate_python(command),
+                decision=_DECISION_ADAPTER.validate_python(decision),
             )
         except (PolicyInfrastructureError, PolicyTerminalError, ReplayDriftError):
             raise
@@ -919,7 +918,7 @@ class EpisodeRuntime:
         except ReplayedProtocolError as error:
             return _PendingTurn(
                 turn=turn,
-                command=Wait(),
+                decision=IdleDecision(attention=AttentionPlan()),
                 protocol_issue_kind=error.issue_kind,
                 protocol_error=str(error),
             )
@@ -927,7 +926,7 @@ class EpisodeRuntime:
             reason = f"{type(error).__name__}: {str(error).strip()}"[:450]
             return _PendingTurn(
                 turn=turn,
-                command=Wait(),
+                decision=IdleDecision(attention=AttentionPlan()),
                 protocol_issue_kind=(
                     error.issue_kind
                     if isinstance(error, ModelOutputError)
@@ -941,20 +940,20 @@ class EpisodeRuntime:
             ) from error
 
     def _prepare_attention(self, item: _PendingTurn) -> _PendingTurn:
-        """Preflight Wait semantics without exposing them to the economy module."""
-        if item.protocol_error is not None or not isinstance(item.command, Wait):
+        """Preflight attention semantics before applying the economic decision."""
+        if item.protocol_error is not None:
             return item
         try:
-            plan = self._attention.arm(item.command, item.turn)
+            plan = self._attention.arm(item.decision.attention, item.turn)
         except AttentionRejected as error:
             return _PendingTurn(
                 turn=item.turn,
-                command=item.command,
-                command_error=str(error),
+                decision=item.decision,
+                decision_error=str(error),
             )
         return _PendingTurn(
             turn=item.turn,
-            command=item.command,
+            decision=item.decision,
             attention_plan=plan,
         )
 
@@ -976,42 +975,38 @@ class EpisodeRuntime:
     @staticmethod
     def _merge_outcomes(
         pending: tuple[_PendingTurn, ...],
-        envelopes: tuple[CommandEnvelope, ...],
-        accepted_outcomes: tuple[CommandOutcome, ...],
+        envelopes: tuple[DecisionEnvelope, ...],
+        accepted_outcomes: tuple[DecisionOutcome, ...],
         first_apply_sequence: int,
-    ) -> tuple[CommandOutcome, ...]:
+    ) -> tuple[DecisionOutcome, ...]:
         successful = iter(accepted_outcomes)
-        outcomes: list[CommandOutcome] = []
+        outcomes: list[DecisionOutcome] = []
         state_version = pending[0].turn.state_version if pending else 0
         for offset, (item, envelope) in enumerate(zip(pending, envelopes, strict=True)):
             if item.preflight_accepted:
                 outcome = next(successful)
-                if item.attention_plan is not None and outcome.accepted:
-                    outcome = outcome.model_copy(
-                        update={"next_available_at": item.attention_plan.review_at}
-                    )
                 outcomes.append(outcome)
                 state_version = outcome.resulting_state_version
                 continue
             reason = (
                 f"{PROTOCOL_ERROR_PREFIX}{item.protocol_error}"
                 if item.protocol_error is not None
-                else item.command_error
+                else item.decision_error
             )
             if reason is None:
                 raise RuntimeError("rejected preflight is missing a reason")
             outcomes.append(
-                CommandOutcome(
+                DecisionOutcome(
                     turn_id=envelope.turn_id,
-                    command_id=envelope.command_id,
+                    decision_id=envelope.decision_id,
                     company_id=envelope.company_id,
                     occurred_at=envelope.issued_at,
-                    status=CommandStatus.REJECTED,
+                    status=DecisionStatus.REJECTED,
                     accepted=False,
                     rejection_category=(
                         RejectionCategory.PROTOCOL
                         if item.protocol_error is not None
-                        else RejectionCategory.WAIT_PLAN
+                        else RejectionCategory.ATTENTION
                     ),
                     reason=reason,
                     resulting_state_version=state_version,
@@ -1023,16 +1018,16 @@ class EpisodeRuntime:
             )
         return tuple(outcomes)
 
-    def _schedule_continuation(
+    def _schedule_rejection_retry(
         self,
         scheduler: Scheduler,
         record: TurnRecord,
         turns_today: int,
     ) -> None:
-        if turns_today >= self.scenario.runtime.max_turns_per_company_day:
-            return
-        command = record.envelope.command
-        if isinstance(command, Wait) and record.outcome.accepted:
+        if (
+            record.outcome.accepted
+            or turns_today >= self.scenario.runtime.max_turns_per_company_day
+        ):
             return
         available = record.outcome.next_available_at
         if (
@@ -1043,7 +1038,7 @@ class EpisodeRuntime:
             scheduler.schedule_wake(
                 record.turn.company_id,
                 available,
-                (WakeReason.CONTINUE if record.outcome.accepted else WakeReason.COMMAND_REJECTED),
+                WakeReason.DECISION_REJECTED,
                 source=JournalEntryReference(
                     entry_id=record.turn.turn_id,
                     entry_type=JournalEntryKind.TURN,
@@ -1077,7 +1072,7 @@ class EpisodeRuntime:
     @staticmethod
     def _schedule_completions(
         scheduler: Scheduler,
-        outcomes: tuple[CommandOutcome, ...],
+        outcomes: tuple[DecisionOutcome, ...],
     ) -> None:
         """Persist every accepted asynchronous economic commitment."""
         for outcome in outcomes:
@@ -1095,24 +1090,23 @@ class EpisodeRuntime:
         scheduler: Scheduler,
         cursor: _Cursor,
         record: TurnRecord,
-        plan: ArmedWait | None,
+        plan: ArmedAttention | None,
         turns_today: int,
     ) -> None:
-        """Persist an accepted Wait and schedule only its fallback review."""
-        command = record.envelope.command
-        if not isinstance(command, Wait) or not record.outcome.accepted:
+        """Persist accepted attention and schedule only its fallback review."""
+        if not record.outcome.accepted:
             return
         if plan is None:
-            raise RuntimeError("accepted wait is missing its attention plan")
+            raise RuntimeError("accepted decision is missing its attention plan")
         if turns_today >= self.scenario.runtime.max_turns_per_company_day:
             return
-        cursor.active_wait = plan
+        cursor.active_attention = plan
         if plan.review_at is None:
             return
         scheduler.schedule_wake(
             record.turn.company_id,
             plan.review_at,
-            WakeReason.WAIT_EXPIRED,
+            WakeReason.REVIEW_DUE,
             source=self._turn_reference(record.turn.turn_id),
         )
 
@@ -1154,7 +1148,7 @@ class EpisodeRuntime:
         """Evaluate every plan once against the committed minute-end books."""
         wake_at = scheduler.now.plus(self.scenario.runtime.decision_interval_minutes)
         for company_id, cursor in sorted(cursors.items()):
-            plan = cursor.active_wait
+            plan = cursor.active_attention
             if plan is None:
                 continue
             match = self._attention.evaluate(
@@ -1167,9 +1161,9 @@ class EpisodeRuntime:
                 scheduler.cancel_wake(
                     company_id,
                     plan.review_at,
-                    WakeReason.WAIT_EXPIRED,
+                    WakeReason.REVIEW_DUE,
                 )
-            cursor.active_wait = None
+            cursor.active_attention = None
             if not self._can_wake_on_day(wake_at, scheduler.now.day):
                 continue
             scheduler.schedule_wake(
@@ -1226,7 +1220,7 @@ class EpisodeRuntime:
             if counts.get(key, 0) < limit:
                 eligible.append(wake)
                 continue
-            cursors[company_id].active_wait = None
+            cursors[company_id].active_attention = None
             if key not in audited:
                 steps.append(
                     self._turn_limit_step(
@@ -1326,7 +1320,7 @@ class EpisodeRuntime:
         if not any(event.kind is SystemEventKind.MARKET_CLOSE for event in events):
             return
         for cursor in cursors.values():
-            cursor.active_wait = None
+            cursor.active_attention = None
 
     @staticmethod
     def _restore_cursor(
@@ -1339,7 +1333,7 @@ class EpisodeRuntime:
                 next_turn_sequence=cursor.next_turn_sequence,
                 last_visible_event_sequence=cursor.last_visible_event_sequence,
                 available_at=cursor.available_at,
-                active_wait=cursor.active_wait,
+                active_attention=cursor.active_attention,
             )
             if cursor is not None
             else _Cursor()
@@ -1348,8 +1342,8 @@ class EpisodeRuntime:
     @staticmethod
     def _previous_outcomes(
         turns: list[TurnRecord],
-    ) -> dict[str, CommandOutcome]:
-        outcomes: dict[str, CommandOutcome] = {}
+    ) -> dict[str, DecisionOutcome]:
+        outcomes: dict[str, DecisionOutcome] = {}
         for record in sorted(turns, key=lambda item: item.outcome.apply_sequence):
             outcomes[record.turn.company_id] = record.outcome
         return outcomes
@@ -1402,7 +1396,7 @@ class EpisodeRuntime:
                     next_turn_sequence=cursor.next_turn_sequence,
                     last_visible_event_sequence=cursor.last_visible_event_sequence,
                     available_at=cursor.available_at,
-                    active_wait=cursor.active_wait,
+                    active_attention=cursor.active_attention,
                 )
                 for company_id, cursor in sorted(cursors.items())
             ),

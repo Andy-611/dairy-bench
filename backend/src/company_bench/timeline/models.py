@@ -26,8 +26,8 @@ from company_bench.domain.models import (
 from company_bench.domain.precision import EconomicDecimal
 from company_bench.runs.models import InvocationOutcome, RunStatus, TokenUsage
 from company_bench.runtime.models import (
-    CommandOutcome,
-    CompanyCommand,
+    CompanyDecision,
+    DecisionOutcome,
     IncomingDeliveryView,
     InventoryExpiryBucket,
     MarketSide,
@@ -39,7 +39,6 @@ from company_bench.runtime.models import (
     SystemStepRecord,
     TurnRecord,
     TurnReplayOrigin,
-    Wait,
     WakeSignal,
 )
 
@@ -51,7 +50,7 @@ class RunDiagnostics(StrictModel):
     benchmark_eligible: bool | None = None
     protocol_invalid_turns: int = Field(ge=0)
     economic_rejections: int = Field(ge=0)
-    wait_plan_rejections: int = Field(ge=0)
+    attention_rejections: int = Field(ge=0)
     trade_count: int = Field(ge=0)
     last_trade_day: int | None = Field(default=None, ge=1)
     zero_trade_day_streak: int = Field(ge=0)
@@ -97,7 +96,7 @@ class DayTimelineSummary(StrictModel):
     turn_count: int = Field(ge=0)
     accepted_count: int = Field(ge=0)
     rejected_count: int = Field(ge=0)
-    wait_count: int = Field(ge=0)
+    idle_count: int = Field(ge=0)
     system_step_count: int = Field(ge=0)
     event_count: int = Field(ge=0)
     trade_quantity: Quantity
@@ -197,14 +196,14 @@ class RetailPriceChanged(StrictModel):
     after: PositiveMoney
 
 
-type CommandStateChange = Annotated[
+type DecisionStateChange = Annotated[
     OrderPlacedChange | OrderCancelledChange | OrderReplacedChange | RetailPriceChanged,
     Field(discriminator="change_type"),
 ]
 
 
-class CommandDispositionSource(StrEnum):
-    """Authority that accepted or rejected a company command."""
+class DecisionDispositionSource(StrEnum):
+    """Authority that accepted or rejected a company decision."""
 
     ECONOMIC_ENGINE = "economic_engine"
     RUNTIME_ATTENTION = "runtime_attention"
@@ -228,12 +227,13 @@ class TurnTimelineItem(StrictModel):
     wake_signals: tuple[WakeSignal, ...]
     observation: ObservationFacts
     observation_delta: ObservationDelta
-    command: CompanyCommand
-    outcome: CommandOutcome
-    disposition_source: CommandDispositionSource
+    decision: CompanyDecision
+    outcome: DecisionOutcome
+    disposition_source: DecisionDispositionSource
     effects: tuple[DomainEvent, ...]
-    state_changes: tuple[CommandStateChange, ...] = ()
+    state_changes: tuple[DecisionStateChange, ...] = ()
     next_available_at: SimTime | None = None
+    review_at: SimTime | None = None
     replay_origin: TurnReplayOrigin | None = None
     traces: tuple[AgentTracePreview, ...] = ()
     protocol_error: str | None = None
@@ -244,16 +244,14 @@ class TurnTimelineItem(StrictModel):
     def validate_disposition_source(self) -> Self:
         """Keep the displayed authority aligned with the persisted outcome."""
         source = self.disposition_source
-        if self.outcome.accepted and source is not CommandDispositionSource.ECONOMIC_ENGINE:
-            raise ValueError("accepted commands must be attributed to the economic engine")
+        if self.outcome.accepted and source is not DecisionDispositionSource.ECONOMIC_ENGINE:
+            raise ValueError("accepted decisions must be attributed to the economic engine")
         if (self.protocol_error is not None) != (
-            source is CommandDispositionSource.RUNTIME_PROTOCOL
+            source is DecisionDispositionSource.RUNTIME_PROTOCOL
         ):
             raise ValueError("runtime protocol attribution must match protocol_error")
-        if source is CommandDispositionSource.RUNTIME_ATTENTION and (
-            self.outcome.accepted or not isinstance(self.command, Wait)
-        ):
-            raise ValueError("runtime attention may only reject Wait commands")
+        if source is DecisionDispositionSource.RUNTIME_ATTENTION and self.outcome.accepted:
+            raise ValueError("runtime attention may only reject decisions")
         return self
 
 
@@ -359,9 +357,7 @@ class MarketMatchLeg(StrictModel):
         if self.quantity > self.maker_order.remaining_quantity:
             raise ValueError("match quantity cannot exceed the maker order")
         if (
-            self.quantity
-            + self.maker_remaining_quantity
-            + self.maker_withdrawn_quantity
+            self.quantity + self.maker_remaining_quantity + self.maker_withdrawn_quantity
             != self.maker_order.remaining_quantity
         ):
             raise ValueError("maker quantity must equal matched plus remaining plus withdrawn")
@@ -389,9 +385,7 @@ class _AppliedMarketOrder(StrictModel):
             matched + self.remaining_quantity + self.withdrawn_quantity
             != incoming.remaining_quantity
         ):
-            raise ValueError(
-                "submitted quantity must equal matched plus remaining plus withdrawn"
-            )
+            raise ValueError("submitted quantity must equal matched plus remaining plus withdrawn")
         trade_ids = [match.trade_id for match in self.matches]
         if len(trade_ids) != len(set(trade_ids)):
             raise ValueError("matching trace trade ids must be unique")

@@ -25,15 +25,15 @@ from pydantic import (
 )
 
 from company_bench.agents.contracts import (
-    CommandGateway,
-    CommandModelRequest,
-    CommandModelResult,
-    CommandName,
+    DecisionGateway,
+    DecisionModelRequest,
+    DecisionModelResult,
+    DecisionToolName,
     ModelCompatibilityError,
     ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
-    command_model,
+    decision_tool_model,
 )
 from company_bench.agents.providers.capabilities import ModelCapabilityError
 from company_bench.diagnostics import bounded_error
@@ -44,14 +44,14 @@ from company_bench.runs.models import (
     ProviderAttemptOutcome,
     TokenUsage,
 )
-from company_bench.runtime.models import CompanyCommand
+from company_bench.runtime.models import CompanyDecision
 from company_bench.settings import MAX_PARALLELISM, require_parallelism
 
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 
 DEFAULT_NEWAPI_BASE_URL = "https://newapi.deepwisdom.ai/v1"
-_COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
+_DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 _DEFAULT_MAX_INPUT_TOKENS = 128_000
 _DISCOVERY_MAX_OUTPUT_TOKENS = 2_147_483_647
@@ -256,7 +256,7 @@ class _ChatRequest(StrictModel):
     def repair(self, violation: str) -> Self:
         """Append one bounded correction without replaying hidden model text."""
         correction = (
-            "Your previous response violated the command protocol: "
+            "Your previous response violated the decision protocol: "
             f"{violation[:240]}. Return exactly one function call from the supplied tools, "
             "with one valid JSON argument object and no additional tool calls."
         )
@@ -276,7 +276,7 @@ class _CapabilityProbeRequest(StrictModel):
 
 
 class NewApiRequestFeatures(StrictModel):
-    """Negotiated optional hints for the benchmark command protocol."""
+    """Negotiated optional hints for the benchmark decision protocol."""
 
     tool_choice_supported: bool = True
 
@@ -397,8 +397,8 @@ class NewApiCapabilityProbe:
         ) from failure
 
 
-class NewApiModelGateway(CommandGateway):
-    """Generate typed company commands through NewAPI's common chat interface."""
+class NewApiModelGateway(DecisionGateway):
+    """Generate typed company decisions through NewAPI's common chat interface."""
 
     provider = "newapi"
 
@@ -412,11 +412,11 @@ class NewApiModelGateway(CommandGateway):
         self._transport = transport or NewApiTransport(config)
         self._features = NewApiRequestFeatures()
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
-        """Return exactly one role-authorized atomic company command."""
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        """Return exactly one role-authorized atomic company decision."""
         payload = _chat_request(self.config, request)
         history: tuple[ProviderAttempt, ...] = ()
         for protocol_attempt in range(_PROTOCOL_ATTEMPTS):
@@ -439,9 +439,9 @@ class NewApiModelGateway(CommandGateway):
 
             completion = result.completion
             try:
-                command = _decode_command(
+                decision = _decode_decision(
                     completion,
-                    request.allowed_commands,
+                    request.allowed_tools,
                     self.config.max_output_tokens,
                 )
             except _ProtocolViolation as violation:
@@ -450,9 +450,7 @@ class NewApiModelGateway(CommandGateway):
                 if violation.repairable and protocol_attempt + 1 < _PROTOCOL_ATTEMPTS:
                     payload = payload.repair(str(violation))
                     continue
-                error_class = (
-                    ModelOutputError if violation.repairable else ModelCompatibilityError
-                )
+                error_class = ModelOutputError if violation.repairable else ModelCompatibilityError
                 error = error_class(
                     f"invalid NewAPI tool call: {violation}",
                     issue_kind=violation.kind,
@@ -463,8 +461,8 @@ class NewApiModelGateway(CommandGateway):
 
             history = (*history, *result.attempt_history)
             usage = _attempt_usage(history)
-            return CommandModelResult(
-                command=command,
+            return DecisionModelResult(
+                decision=decision,
                 provider=self.provider,
                 model=completion.model or self.config.model,
                 response_id=completion.id,
@@ -569,23 +567,23 @@ class NewApiModelGateway(CommandGateway):
 
 def _chat_request(
     config: NewApiModelConfig,
-    request: CommandModelRequest,
+    request: DecisionModelRequest,
 ) -> _ChatRequest:
-    """Build one provider request from the provider-neutral command contract."""
+    """Build one provider request from the provider-neutral decision contract."""
     return _ChatRequest(
         model=config.model,
         messages=(
             _Message(role="system", content=request.instructions),
             _Message(role="user", content=request.input_text),
         ),
-        tools=tuple(_command_tool(name) for name in request.allowed_commands),
+        tools=tuple(_decision_tool(name) for name in request.allowed_tools),
         max_tokens=config.max_output_tokens,
     )
 
 
-def _command_tool(name: CommandName) -> _Tool:
-    """Build one Chat Completions function from the canonical command model."""
-    model = command_model(name)
+def _decision_tool(name: DecisionToolName) -> _Tool:
+    """Build one Chat Completions function from the canonical decision input."""
+    model = decision_tool_model(name)
     schema = model.model_json_schema()
     properties = schema.get("properties")
     if isinstance(properties, dict):
@@ -672,25 +670,33 @@ def _single_tool_call(
         ) from error
 
 
-def _decode_command(
+def _decode_decision(
     completion: _ChatCompletion,
-    allowed_commands: tuple[CommandName, ...],
+    allowed_tools: tuple[DecisionToolName, ...],
     max_output_tokens: int,
-) -> CompanyCommand:
-    """Decode and validate one provider call against the authorized command set."""
+) -> CompanyDecision:
+    """Decode one provider tool call into the canonical company decision."""
     name, arguments = _single_tool_call(completion, max_output_tokens)
-    if name not in allowed_commands:
+    if name not in allowed_tools:
         raise _ProtocolViolation(
-            ProtocolIssueKind.UNAUTHORIZED_COMMAND,
-            f"unknown or unauthorized command: {name}",
+            ProtocolIssueKind.UNAUTHORIZED_DECISION_TOOL,
+            f"unknown or unauthorized decision tool: {name}",
         )
     if "kind" in arguments:
         raise _ProtocolViolation(
             ProtocolIssueKind.INVALID_ARGUMENTS,
-            "tool input must not supply a command kind",
+            "tool input must not supply a decision kind",
         )
     try:
-        return _COMMAND_ADAPTER.validate_python({"kind": name, **arguments})
+        submitted = decision_tool_model(name).model_validate({"kind": name, **arguments})
+        payload = submitted.model_dump()
+        attention = payload.pop("attention")
+        decision = (
+            {"kind": "idle", "attention": attention}
+            if name == "idle"
+            else {"kind": "action", "action": payload, "attention": attention}
+        )
+        return _DECISION_ADAPTER.validate_python(decision)
     except ValidationError as error:
         raise _ProtocolViolation(
             ProtocolIssueKind.INVALID_ARGUMENTS,
@@ -719,8 +725,7 @@ def _truncated_without_tool_call(
         return False
     choice = completion.choices[0]
     return not choice.message.tool_calls and (
-        choice.finish_reason == "length"
-        or completion.usage.completion_tokens >= max_output_tokens
+        choice.finish_reason == "length" or completion.usage.completion_tokens >= max_output_tokens
     )
 
 

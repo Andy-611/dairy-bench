@@ -7,8 +7,13 @@ Dairy Bench 是一个事件驱动的多 Agent 易腐乳制品供应链 Benchmark
 同一条强类型边界：
 
 ```text
-唤醒 -> AgentTurn -> 一条 CompanyCommand -> EconomyEngine -> Journal -> 下次唤醒
+唤醒 -> AgentTurn -> 一条 CompanyDecision -> EconomyEngine -> Journal -> 下次唤醒
 ```
+
+`CompanyDecision` 分为携带经济动作的 `ActionDecision` 与不改变经济状态的
+`IdleDecision`；两者都必须携带 `AttentionPlan`。成功决策不会自动在下一分钟再次调用
+模型，企业只会因自身成交、作业或到货完成、价格提醒、兜底复查或次日开盘而被唤醒；
+只有被拒绝的决策会获得一次受限的修正唤醒。
 
 只有 `EconomyEngine` 可以修改现金、库存、订单、作业、交付或成交结果；模型文本不能
 直接促成经济结算。

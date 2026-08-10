@@ -10,50 +10,77 @@ from company_bench.domain.models import Identifier, ProtocolIssueKind, StrictMod
 from company_bench.runs.models import ProviderAttempt, ProviderCallAudit, TokenUsage
 from company_bench.runtime.models import (
     AgentTurn,
-    CompanyCommand,
+    AttentionPlan,
+    CompanyDecision,
+    IdleDecision,
     Produce,
     SetQuoteLadder,
     SetRetailPrice,
     Transform,
-    Wait,
 )
 
-type CommandName = Literal[
+type DecisionToolName = Literal[
     "produce",
     "transform",
     "set_quote_ladder",
     "set_retail_price",
-    "wait",
+    "idle",
 ]
-_COMMAND_MODELS: dict[CommandName, type[BaseModel]] = {
-    "produce": Produce,
-    "transform": Transform,
-    "set_quote_ladder": SetQuoteLadder,
-    "set_retail_price": SetRetailPrice,
-    "wait": Wait,
+
+
+class ProduceDecisionInput(Produce):
+    """Produce, then arm the supplied attention plan."""
+
+    attention: AttentionPlan
+
+
+class TransformDecisionInput(Transform):
+    """Transform inventory, then arm the supplied attention plan."""
+
+    attention: AttentionPlan
+
+
+class QuoteDecisionInput(SetQuoteLadder):
+    """Set a quote ladder, then arm the supplied attention plan."""
+
+    attention: AttentionPlan
+
+
+class RetailPriceDecisionInput(SetRetailPrice):
+    """Set a retail price, then arm the supplied attention plan."""
+
+    attention: AttentionPlan
+
+
+_DECISION_TOOL_MODELS: dict[DecisionToolName, type[BaseModel]] = {
+    "produce": ProduceDecisionInput,
+    "transform": TransformDecisionInput,
+    "set_quote_ladder": QuoteDecisionInput,
+    "set_retail_price": RetailPriceDecisionInput,
+    "idle": IdleDecision,
 }
 
 
-def command_model(name: CommandName) -> type[BaseModel]:
-    """Return the canonical Pydantic model for one command tool."""
-    return _COMMAND_MODELS[name]
+def decision_tool_model(name: DecisionToolName) -> type[BaseModel]:
+    """Return the canonical Pydantic model for one decision tool."""
+    return _DECISION_TOOL_MODELS[name]
 
 
-class CommandModelRequest(StrictModel):
-    """Complete provider-neutral request for one atomic company command."""
+class DecisionModelRequest(StrictModel):
+    """Complete provider-neutral request for one atomic company decision."""
 
     invocation_id: Identifier
     run_id: Identifier
     turn: AgentTurn
     instructions: str
     input_text: str
-    allowed_commands: tuple[CommandName, ...] = Field(min_length=1)
+    allowed_tools: tuple[DecisionToolName, ...] = Field(min_length=1)
 
 
-class CommandModelResult(ProviderCallAudit):
-    """Validated atomic command plus provider observability metadata."""
+class DecisionModelResult(ProviderCallAudit):
+    """Validated decision plus provider observability metadata."""
 
-    command: CompanyCommand
+    decision: CompanyDecision
     provider: str
     model: str
     response_id: str | None = None
@@ -85,7 +112,7 @@ class ModelCallError(RuntimeError):
 
 
 class ModelOutputError(ModelCallError):
-    """The Agent returned no schema-valid command."""
+    """The Agent returned no schema-valid decision."""
 
     def __init__(
         self,
@@ -99,7 +126,7 @@ class ModelOutputError(ModelCallError):
 
 
 class ModelCompatibilityError(ModelOutputError):
-    """The selected model cannot satisfy the required command protocol."""
+    """The selected model cannot satisfy the required decision protocol."""
 
 
 class ModelConfigurationError(ModelCallError):
@@ -115,7 +142,7 @@ class PolicyTerminalError(RuntimeError):
 
 
 class PolicyCompatibilityError(PolicyTerminalError):
-    """The selected policy cannot satisfy the benchmark command protocol."""
+    """The selected policy cannot satisfy the benchmark decision protocol."""
 
 
 class PolicyConfigurationError(PolicyTerminalError):
@@ -130,14 +157,14 @@ class PolicyInfrastructureError(RuntimeError):
     """A transient provider failure that interrupts a recoverable run."""
 
 
-class CommandGateway(Protocol):
-    """External model seam for one native or adapted atomic command."""
+class DecisionGateway(Protocol):
+    """External model seam for one atomic company decision."""
 
-    async def generate_command(
+    async def generate_decision(
         self,
-        request: CommandModelRequest,
-    ) -> CommandModelResult:
-        """Return exactly one validated command."""
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        """Return exactly one validated decision."""
         ...
 
     async def close(self) -> None:

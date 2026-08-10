@@ -10,8 +10,8 @@ import pytest
 from pydantic import SecretStr
 
 from company_bench.agents.contracts import (
-    CommandModelRequest,
-    CommandModelResult,
+    DecisionModelRequest,
+    DecisionModelResult,
     ModelCompatibilityError,
     ModelConfigurationError,
     ModelInfrastructureError,
@@ -30,7 +30,9 @@ from company_bench.agents.providers.newapi import (
 from company_bench.domain.models import CompanyObservation, ProductId, ProtocolIssueKind
 from company_bench.runs.models import ProviderAttemptOutcome
 from company_bench.runtime.models import (
+    ActionDecision,
     AgentTurn,
+    AttentionPlan,
     MarketSide,
     QuoteLevel,
     SetQuoteLadder,
@@ -87,16 +89,16 @@ def _turn(observation: CompanyObservation) -> AgentTurn:
     )
 
 
-def _command_request(observation: CompanyObservation) -> CommandModelRequest:
-    """Build one atomic command request."""
+def _decision_request(observation: CompanyObservation) -> DecisionModelRequest:
+    """Build one atomic decision request."""
     turn = _turn(observation)
-    return CommandModelRequest.model_construct(
+    return DecisionModelRequest.model_construct(
         invocation_id="newapi_test.farm_a.t1.provider",
         run_id="newapi_test",
         turn=turn,
         instructions="Call exactly one authorized tool.",
         input_text=turn.model_dump_json(),
-        allowed_commands=("produce", "set_quote_ladder", "wait"),
+        allowed_tools=("produce", "set_quote_ladder", "idle"),
     )
 
 
@@ -172,6 +174,8 @@ def _completion_response(
 
 def _tool_call(name: str, arguments: object) -> dict[str, object]:
     """Build one OpenAI-compatible function call."""
+    if isinstance(arguments, dict) and "attention" not in arguments:
+        arguments = {**arguments, "attention": {}}
     return {
         "id": f"call_{name}",
         "type": "function",
@@ -231,9 +235,10 @@ def test_config_loads_every_model_family_and_hides_secret(
     other_key = loaded.model_copy(update={"api_key": SecretStr("second-secret")})
     assert loaded.fingerprint == other_key.fingerprint
     assert "first-secret" not in loaded.fingerprint
-    assert selected.fingerprint != selected.model_copy(
-        update={"max_output_tokens": 32_768}
-    ).fingerprint
+    assert (
+        selected.fingerprint
+        != selected.model_copy(update={"max_output_tokens": 32_768}).fingerprint
+    )
 
 
 @pytest.mark.parametrize(
@@ -291,7 +296,7 @@ def test_capability_probe_rejects_unknown_limit_when_gateway_silently_accepts_ce
         asyncio.run(_probe_limit(handler, None))
 
 
-def test_gateway_sends_common_tools_and_parses_command() -> None:
+def test_gateway_sends_common_tools_and_parses_decision() -> None:
     observation = _observation()
     requests: list[dict[str, object]] = []
 
@@ -317,17 +322,20 @@ def test_gateway_sends_common_tools_and_parses_command() -> None:
         )
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     result = asyncio.run(_with_gateway(handler, operation))
 
-    assert result.command == SetQuoteLadder(
-        product=ProductId.RAW_MILK,
-        side=MarketSide.SELL,
-        levels=(
-            QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("1.2")),
-            QuoteLevel(quantity=Decimal("3"), limit_price=Decimal("1.4")),
+    assert result.decision == ActionDecision(
+        action=SetQuoteLadder(
+            product=ProductId.RAW_MILK,
+            side=MarketSide.SELL,
+            levels=(
+                QuoteLevel(quantity=Decimal("8"), limit_price=Decimal("1.2")),
+                QuoteLevel(quantity=Decimal("3"), limit_price=Decimal("1.4")),
+            ),
         ),
+        attention=AttentionPlan(),
     )
     assert result.provider == "newapi"
     assert result.response_id == "chatcmpl_newapi"
@@ -354,7 +362,7 @@ def test_gateway_sends_common_tools_and_parses_command() -> None:
     assert {tool["function"]["name"] for tool in tools} == {
         "produce",
         "set_quote_ladder",
-        "wait",
+        "idle",
     }
     ladder = next(tool for tool in tools if tool["function"]["name"] == "set_quote_ladder")
     assert ladder["type"] == "function"
@@ -373,7 +381,7 @@ def test_missing_required_tool_call_gets_one_audited_protocol_repair() -> None:
         return _completion_response(request, [])
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelOutputError, match="required function call") as raised:
         asyncio.run(_with_gateway(handler, operation))
@@ -384,25 +392,25 @@ def test_missing_required_tool_call_gets_one_audited_protocol_repair() -> None:
     assert len(requests[1]["messages"]) == 3
 
 
-def test_multiple_tool_calls_repair_to_one_command_and_charge_both_responses() -> None:
+def test_multiple_tool_calls_repair_to_one_decision_and_charge_both_responses() -> None:
     observation = _observation()
     requests: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
         calls = (
-            [_tool_call("wait", {}), _tool_call("produce", {"product": "raw_milk", "quantity": 1})]
+            [_tool_call("idle", {}), _tool_call("produce", {"product": "raw_milk", "quantity": 1})]
             if len(requests) == 1
-            else [_tool_call("wait", {})]
+            else [_tool_call("idle", {})]
         )
         return _completion_response(request, calls)
 
-    async def operation(gateway: NewApiModelGateway) -> CommandModelResult:
-        return await gateway.generate_command(_command_request(observation))
+    async def operation(gateway: NewApiModelGateway) -> DecisionModelResult:
+        return await gateway.generate_decision(_decision_request(observation))
 
     result = asyncio.run(_with_gateway(handler, operation))
 
-    assert result.command.kind == "wait"
+    assert result.decision.kind == "idle"
     assert result.attempts == 2
     assert result.usage.total_tokens == 28
     assert tuple(attempt.outcome for attempt in result.attempt_history) == (
@@ -419,10 +427,10 @@ def test_complete_request_budget_counts_messages_and_tool_schemas() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        return _completion_response(request, [_tool_call("wait", {})])
+        return _completion_response(request, [_tool_call("idle", {})])
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelOutputError, match="complete NewAPI request estimate") as raised:
         asyncio.run(_with_gateway(handler, operation, max_input_tokens=1))
@@ -435,7 +443,7 @@ def test_complete_request_budget_counts_messages_and_tool_schemas() -> None:
 
 def test_repair_budget_failure_preserves_the_first_physical_attempt() -> None:
     observation = _observation()
-    request = _command_request(observation)
+    request = _decision_request(observation)
     config = _config()
     payload = newapi_module._chat_request(config, request)
     initial_budget = (len(payload.model_dump_json(exclude_none=True).encode()) + 1) // 2
@@ -447,7 +455,7 @@ def test_repair_budget_failure_preserves_the_first_physical_attempt() -> None:
         return _completion_response(http_request, [])
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(request)
+        return await gateway.generate_decision(request)
 
     with pytest.raises(ModelOutputError, match="complete NewAPI request estimate") as raised:
         asyncio.run(_with_gateway(handler, operation, max_input_tokens=initial_budget))
@@ -478,13 +486,13 @@ def test_gateway_negotiates_and_remembers_omitted_tool_choice() -> None:
                 "invalid_request_error",
                 "RuntimeError: Thinking mode does not support this tool_choice",
             )
-        return _completion_response(request, [_tool_call("wait", {})])
+        return _completion_response(request, [_tool_call("idle", {})])
 
     async def operation(gateway: NewApiModelGateway) -> tuple[object, object]:
-        command_request = _command_request(observation)
+        decision_request = _decision_request(observation)
         return (
-            await gateway.generate_command(command_request),
-            await gateway.generate_command(command_request),
+            await gateway.generate_decision(decision_request),
+            await gateway.generate_decision(decision_request),
         )
 
     first, second = asyncio.run(_with_gateway(handler, operation, max_attempts=2))
@@ -513,7 +521,7 @@ def test_gateway_still_requires_a_tool_call_after_compatibility_fallback() -> No
         return _completion_response(request, [])
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelOutputError, match="required function call") as raised:
         asyncio.run(_with_gateway(handler, operation, max_attempts=2))
@@ -534,7 +542,7 @@ def test_gateway_reports_an_exhausted_fixed_output_budget() -> None:
         )
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelCompatibilityError, match="128000-token response budget") as raised:
         asyncio.run(_with_gateway(handler, operation))
@@ -545,7 +553,7 @@ def test_gateway_reports_an_exhausted_fixed_output_budget() -> None:
 @pytest.mark.parametrize(
     "calls",
     [
-        [_tool_call("wait", {}), _tool_call("produce", {"product": "raw_milk", "quantity": 1})],
+        [_tool_call("idle", {}), _tool_call("produce", {"product": "raw_milk", "quantity": 1})],
         [
             _tool_call(
                 "transform",
@@ -559,18 +567,18 @@ def test_gateway_reports_an_exhausted_fixed_output_budget() -> None:
         [_tool_call("produce", {"product": "raw_milk", "quantity": -1})],
         [_tool_call("produce", {"product": "raw_milk", "quantity": 1.00001})],
         [_tool_call("produce", {"kind": "produce", "product": "raw_milk", "quantity": 1})],
-        [_tool_call("wait", "not-json")],
+        [_tool_call("idle", "not-json")],
     ],
     ids=("multiple", "unauthorized", "invalid", "overprecision", "kind", "malformed"),
 )
-def test_gateway_rejects_invalid_command_output(calls: list[dict[str, object]]) -> None:
+def test_gateway_rejects_invalid_decision_output(calls: list[dict[str, object]]) -> None:
     observation = _observation()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return _completion_response(request, calls)
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelOutputError, match="invalid NewAPI tool call") as raised:
         asyncio.run(_with_gateway(handler, operation))
@@ -588,7 +596,7 @@ def test_gateway_fails_fast_for_an_incompatible_endpoint() -> None:
         return _error_response(request, 400, "invalid_request_error", "tools unsupported")
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelCompatibilityError, match="tools unsupported"):
         asyncio.run(_with_gateway(handler, operation, max_attempts=3))
@@ -605,7 +613,7 @@ def test_gateway_does_not_retry_authentication_failure() -> None:
         return _error_response(request, 401, "authentication_error")
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelConfigurationError, match="NewAPI HTTP 401"):
         asyncio.run(_with_gateway(handler, operation, max_attempts=3))
@@ -628,10 +636,10 @@ def test_gateway_retries_temporary_or_wrapped_failures(
         calls += 1
         if calls == 1:
             return _error_response(request, status_code, error_type)
-        return _completion_response(request, [_tool_call("wait", {})])
+        return _completion_response(request, [_tool_call("idle", {})])
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     result = asyncio.run(_with_gateway(handler, operation, max_attempts=2))
     assert result.attempts == 2
@@ -645,7 +653,7 @@ def test_gateway_classifies_exhausted_wrapped_failure_as_infrastructure() -> Non
         return _error_response(request, 400, "bad_response_status_code")
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelInfrastructureError, match="NewAPI HTTP 400") as raised:
         asyncio.run(_with_gateway(handler, operation, max_attempts=2))
@@ -662,7 +670,7 @@ def test_gateway_retries_timeout_then_fails() -> None:
         raise httpx.ReadTimeout("test timeout", request=request)
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelInfrastructureError, match="test timeout") as raised:
         asyncio.run(_with_gateway(handler, operation, max_attempts=2))
@@ -677,7 +685,7 @@ def test_gateway_redacts_key_echoed_by_provider() -> None:
         return _error_response(request, 401, "authentication_error", "echoed test-key")
 
     async def operation(gateway: NewApiModelGateway) -> object:
-        return await gateway.generate_command(_command_request(observation))
+        return await gateway.generate_decision(_decision_request(observation))
 
     with pytest.raises(ModelConfigurationError) as raised:
         asyncio.run(_with_gateway(handler, operation))
@@ -734,13 +742,11 @@ class _BlockingHttpTransport(httpx.AsyncBaseTransport):
 async def test_shared_transport_starts_100_requests_and_queues_the_101st() -> None:
     config = _config()
     blocker = _BlockingHttpTransport(saturation=100)
-    request = _command_request(_observation())
+    request = _decision_request(_observation())
     async with httpx.AsyncClient(transport=blocker) as client:
         transport = NewApiTransport(config, max_concurrent_requests=100, client=client)
         gateway = NewApiModelGateway(config, transport)
-        tasks = tuple(
-            asyncio.create_task(gateway.generate_command(request)) for _ in range(101)
-        )
+        tasks = tuple(asyncio.create_task(gateway.generate_decision(request)) for _ in range(101))
         try:
             async with asyncio.timeout(2):
                 await blocker.saturated.wait()
@@ -786,20 +792,20 @@ async def test_retry_backoff_releases_the_shared_request_slot(
     monkeypatch.setattr(newapi_module, "_retry_delay_seconds", lambda _: 1.0)
     config = _config(max_attempts=2)
     provider = _RetryOrderTransport()
-    request = _command_request(_observation())
+    request = _decision_request(_observation())
     first_request = request.model_copy(update={"instructions": "first"})
     second_request = request.model_copy(update={"instructions": "second"})
     async with httpx.AsyncClient(transport=provider) as client:
         transport = NewApiTransport(config, max_concurrent_requests=1, client=client)
         first = asyncio.create_task(
-            NewApiModelGateway(config, transport).generate_command(first_request)
+            NewApiModelGateway(config, transport).generate_decision(first_request)
         )
-        second: asyncio.Task[CommandModelResult] | None = None
+        second: asyncio.Task[DecisionModelResult] | None = None
         try:
             async with asyncio.timeout(2):
                 await provider.first_attempt_finished.wait()
             second = asyncio.create_task(
-                NewApiModelGateway(config, transport).generate_command(second_request)
+                NewApiModelGateway(config, transport).generate_decision(second_request)
             )
             async with asyncio.timeout(0.5):
                 await provider.second_gateway_entered.wait()

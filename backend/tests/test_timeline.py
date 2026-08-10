@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 
 from company_bench.agents.company import (
-    COMMAND_PROMPT_VERSION,
+    DECISION_PROMPT_VERSION,
     BaselineCompanyAgent,
     CompanyAgent,
     LlmCompanyAgent,
     ReplayCompanyAgent,
 )
-from company_bench.agents.contracts import CommandModelRequest, CommandModelResult
+from company_bench.agents.contracts import DecisionModelRequest, DecisionModelResult
 from company_bench.domain.models import PolicyKind, PolicyMetadata, ProductId, TradeExecutedEvent
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
@@ -26,28 +26,28 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import (
+    ActionDecision,
     AgentTurn,
-    CompanyCommand,
+    CompanyDecision,
     MarketSide,
     Produce,
     QuoteLevel,
     SetQuoteLadder,
     SystemStepRecord,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 from company_bench.storage.store import InMemoryRunStore, SQLiteRunStore
 from company_bench.timeline.market import MarketProjectionError, MarketTimelineProjector
 from company_bench.timeline.models import (
-    CommandDispositionSource,
+    DecisionDispositionSource,
     MarketOrderCancelled,
     MarketOrderPlaced,
     MarketOrderPreserved,
     MarketOrderReplaced,
 )
 from company_bench.timeline.projector import RunTimelineProjector
-from tests.support.fakes import FixedCommandAgent
+from tests.support.fakes import FixedDecisionAgent, company_decision
 
 
 def _complete(
@@ -61,10 +61,10 @@ def _complete(
     repository.complete_job(
         result,
         RunJob(
-                run_id=result.run_id,
-                mode=mode,
-                model="test-model" if mode is PolicyKind.MODEL else None,
-                status=RunStatus.COMPLETED,
+            run_id=result.run_id,
+            mode=mode,
+            model="test-model" if mode is PolicyKind.MODEL else None,
+            status=RunStatus.COMPLETED,
             seed=result.seed,
             source_run_id=source_run_id,
             scenario_id=result.scenario.scenario_id,
@@ -97,13 +97,16 @@ def _ladder(
 class _AuditedUnauthorizedGateway:
     """Return one role-invalid ladder with nonzero provider audit metadata."""
 
-    async def generate_command(self, _: CommandModelRequest) -> CommandModelResult:
-        """Return a schema-valid command that the economy must reject."""
-        return CommandModelResult(
-            command=_ladder(
-                MarketSide.BUY,
-                ProductId.RAW_MILK,
-                ("10", "1.40"),
+    async def generate_decision(self, _: DecisionModelRequest) -> DecisionModelResult:
+        """Return a schema-valid decision that the economy must reject."""
+        return DecisionModelResult(
+            decision=company_decision(
+                _ladder(
+                    MarketSide.BUY,
+                    ProductId.RAW_MILK,
+                    ("10", "1.40"),
+                ),
+                review_after_minutes=30,
             ),
             provider="scripted",
             model="rejection-model",
@@ -123,51 +126,69 @@ class _MarketTimelineAgent:
 
     metadata = PolicyMetadata(name="market-timeline", kind=PolicyKind.BASELINE)
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
-        """Return one deterministic command from the current virtual minute."""
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        """Return one deterministic decision from the current virtual minute."""
         minute = turn.sim_time.minute_of_day
         open_minute = turn.observation.runtime.open_minute
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-            return _ladder(
-                MarketSide.BUY,
-                ProductId.RAW_MILK,
-                ("40", "1.66"),
+            return company_decision(
+                _ladder(
+                    MarketSide.BUY,
+                    ProductId.RAW_MILK,
+                    ("40", "1.66"),
+                ),
+                review_after_minutes=30,
             )
         if turn.company_id != "farm_a":
-            return Wait()
+            return company_decision()
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            return Produce(
-                product=ProductId.RAW_MILK,
-                quantity=Decimal("60"),
+            return company_decision(
+                Produce(
+                    product=ProductId.RAW_MILK,
+                    quantity=Decimal("60"),
+                ),
+                review_after_minutes=30,
             )
         if minute == open_minute + 30:
-            return _ladder(
-                MarketSide.SELL,
-                ProductId.RAW_MILK,
-                ("50", "1.65"),
-                ("10", "1.80"),
+            return company_decision(
+                _ladder(
+                    MarketSide.SELL,
+                    ProductId.RAW_MILK,
+                    ("50", "1.65"),
+                    ("10", "1.80"),
+                ),
+                review_after_minutes=30,
             )
         if minute == open_minute + 31 and turn.open_orders:
-            return _ladder(
-                MarketSide.SELL,
-                ProductId.RAW_MILK,
-                ("10", "1.65"),
-                ("10", "1.75"),
+            return company_decision(
+                _ladder(
+                    MarketSide.SELL,
+                    ProductId.RAW_MILK,
+                    ("10", "1.65"),
+                    ("10", "1.75"),
+                ),
+                review_after_minutes=1,
             )
         if minute == open_minute + 32 and turn.open_orders:
-            return _ladder(MarketSide.SELL, ProductId.RAW_MILK)
-        return Wait()
+            return company_decision(
+                _ladder(MarketSide.SELL, ProductId.RAW_MILK),
+                review_after_minutes=30,
+            )
+        return company_decision()
 
 
 class _TwoBidMarketTimelineAgent(_MarketTimelineAgent):
     """Add a second same-price processor bid for priority-corruption tests."""
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
         if turn.company_id.startswith("processor_") and WakeReason.DAY_OPEN in turn.wake_reasons:
-            return _ladder(
-                MarketSide.BUY,
-                ProductId.RAW_MILK,
-                ("40", "1.66"),
+            return company_decision(
+                _ladder(
+                    MarketSide.BUY,
+                    ProductId.RAW_MILK,
+                    ("40", "1.66"),
+                ),
+                review_after_minutes=30,
             )
         return await super().act(turn)
 
@@ -177,28 +198,37 @@ class _ThreeFillMarketTimelineAgent:
 
     metadata = PolicyMetadata(name="three-fill-timeline", kind=PolicyKind.BASELINE)
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-            return _ladder(
-                MarketSide.BUY,
-                ProductId.RAW_MILK,
-                ("10", "1.70"),
-                ("10", "1.60"),
-                ("10", "1.50"),
+            return company_decision(
+                _ladder(
+                    MarketSide.BUY,
+                    ProductId.RAW_MILK,
+                    ("10", "1.70"),
+                    ("10", "1.60"),
+                    ("10", "1.50"),
+                ),
+                review_after_minutes=30,
             )
         if turn.company_id != "farm_a":
-            return Wait()
+            return company_decision()
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            return Produce(product=ProductId.RAW_MILK, quantity=Decimal("30"))
-        if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
-            return _ladder(
-                MarketSide.SELL,
-                ProductId.RAW_MILK,
-                ("10", "1.40"),
-                ("10", "1.45"),
-                ("10", "1.50"),
+            return company_decision(
+                Produce(product=ProductId.RAW_MILK, quantity=Decimal("30")),
+                review_after_minutes=30,
             )
-        return Wait()
+        if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
+            return company_decision(
+                _ladder(
+                    MarketSide.SELL,
+                    ProductId.RAW_MILK,
+                    ("10", "1.40"),
+                    ("10", "1.45"),
+                    ("10", "1.50"),
+                ),
+                review_after_minutes=30,
+            )
+        return company_decision()
 
 
 @pytest.mark.asyncio
@@ -222,8 +252,7 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
     assert diagnostics.benchmark_eligible
     assert diagnostics.protocol_invalid_turns == 0
     assert diagnostics.trade_count == sum(
-        isinstance(record.event, TradeExecutedEvent)
-        for record in execution.episode.events
+        isinstance(record.event, TradeExecutedEvent) for record in execution.episode.events
     )
     assert diagnostics.consumer_demand == execution.episode.snapshots[0].consumer_demand
     assert diagnostics.consumer_sales == execution.episode.snapshots[0].consumer_sales
@@ -244,7 +273,7 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
         for turn in moment.turns
     )
     assert all(
-        turn.disposition_source is CommandDispositionSource.ECONOMIC_ENGINE
+        turn.disposition_source is DecisionDispositionSource.ECONOMIC_ENGINE
         for moment in page.moments
         for turn in moment.turns
         if turn.outcome.accepted
@@ -283,10 +312,10 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
         }
     )
     agents = {
-        company.company_id: FixedCommandAgent(
-            (Wait(review_after_minutes=scenario.runtime.max_wait_minutes + 1),)
+        company.company_id: FixedDecisionAgent(
+            (company_decision(review_after_minutes=scenario.runtime.max_review_minutes + 1),)
             if company.company_id == "farm_a"
-            else (Wait(),)
+            else (company_decision(),)
         )
         for company in scenario.companies
     }
@@ -305,7 +334,7 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
     )
 
     assert not farm_turn.outcome.accepted
-    assert farm_turn.disposition_source is CommandDispositionSource.RUNTIME_ATTENTION
+    assert farm_turn.disposition_source is DecisionDispositionSource.RUNTIME_ATTENTION
 
 
 @pytest.mark.asyncio
@@ -635,8 +664,8 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
                 sim_minute=source_turn.turn.sim_time.absolute_minute,
                 state_version=source_turn.turn.state_version,
                 apply_sequence=(source_turn.outcome.apply_sequence if applied else None),
-                command=source_turn.envelope.command,
-                command_outcome=source_turn.outcome if applied else None,
+                decision=source_turn.envelope.decision,
+                decision_outcome=source_turn.outcome if applied else None,
                 usage=TokenUsage(input_tokens=index, total_tokens=index),
             )
         )
@@ -750,7 +779,8 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
     repository = InMemoryRunStore()
     run_id = "failed_ladder_history"
     agents: dict[str, CompanyAgent] = {
-        company.company_id: FixedCommandAgent((Wait(),)) for company in scenario.companies
+        company.company_id: FixedDecisionAgent((company_decision(),))
+        for company in scenario.companies
     }
     agents["farm_a"] = LlmCompanyAgent(
         run_id=run_id,
@@ -762,7 +792,7 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
             kind=PolicyKind.MODEL,
             provider="scripted",
             model="rejection-model",
-            prompt_version=COMMAND_PROMPT_VERSION,
+            prompt_version=DECISION_PROMPT_VERSION,
         ),
     )
 
@@ -777,10 +807,10 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
     assert checkpoint is not None
     repository.save_job(
         RunJob(
-                run_id=run_id,
-                mode=PolicyKind.MODEL,
-                model="rejection-model",
-                status=RunStatus.FAILED,
+            run_id=run_id,
+            mode=PolicyKind.MODEL,
+            model="rejection-model",
+            status=RunStatus.FAILED,
             seed=17,
             scenario_id=scenario.scenario_id,
             total_days=scenario.days,
@@ -797,18 +827,21 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
     )
     invocation = repository.list_invocations(run_id)[0]
 
-    assert isinstance(turn.command, SetQuoteLadder)
-    assert turn.command == _ladder(
-        MarketSide.BUY,
-        ProductId.RAW_MILK,
-        ("10", "1.40"),
+    assert isinstance(turn.decision, ActionDecision)
+    assert turn.decision == company_decision(
+        _ladder(
+            MarketSide.BUY,
+            ProductId.RAW_MILK,
+            ("10", "1.40"),
+        ),
+        review_after_minutes=30,
     )
     assert not turn.outcome.accepted
-    assert turn.disposition_source is CommandDispositionSource.ECONOMIC_ENGINE
+    assert turn.disposition_source is DecisionDispositionSource.ECONOMIC_ENGINE
     assert "not authorized" in turn.outcome.reason
     assert turn.protocol_error is None
-    assert invocation.command == turn.command
-    assert invocation.command_outcome == turn.outcome
+    assert invocation.decision == turn.decision
+    assert invocation.decision_outcome == turn.outcome
     assert invocation.response_id == "response_rejected"
     assert invocation.request_id == "request_rejected"
     assert invocation.usage.total_tokens == 5

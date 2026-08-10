@@ -22,8 +22,8 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 11
-_PAYLOAD_SCHEMA_VERSION = 5
+_DATABASE_SCHEMA_VERSION = 12
+_PAYLOAD_SCHEMA_VERSION = 6
 _AUTO_RESUME_STATUSES = (
     RunStatus.QUEUED,
     RunStatus.RUNNING,
@@ -158,11 +158,7 @@ class InMemoryRunStore:
     def list_auto_resume_jobs(self) -> tuple[RunJob, ...]:
         """Return automatic startup jobs from oldest to newest."""
         with self._lock:
-            jobs = (
-                job
-                for job in self._jobs.values()
-                if job.status in _AUTO_RESUME_STATUSES
-            )
+            jobs = (job for job in self._jobs.values() if job.status in _AUTO_RESUME_STATUSES)
             return tuple(sorted(jobs, key=lambda job: job.submitted_at))
 
     def record_invocation(self, invocation: PolicyInvocation) -> None:
@@ -471,9 +467,7 @@ class SQLiteRunStore:
                 """,
                 (run_id,),
             ).fetchall()
-        return tuple(
-            TurnRecord.model_validate_json(_current_payload(row)) for row in rows
-        )
+        return tuple(TurnRecord.model_validate_json(_current_payload(row)) for row in rows)
 
     def record_system_step(self, record: SystemStepRecord) -> None:
         """Append one immutable system step, accepting exact retries only."""
@@ -492,9 +486,7 @@ class SQLiteRunStore:
                 """,
                 (run_id,),
             ).fetchall()
-        return tuple(
-            SystemStepRecord.model_validate_json(_current_payload(row)) for row in rows
-        )
+        return tuple(SystemStepRecord.model_validate_json(_current_payload(row)) for row in rows)
 
     def save_checkpoint(self, checkpoint: RunCheckpoint) -> None:
         """Atomically replace the canonical versioned checkpoint payload."""

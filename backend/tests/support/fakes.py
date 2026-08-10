@@ -5,8 +5,8 @@ from collections.abc import Callable, Iterable
 from pydantic import TypeAdapter
 
 from company_bench.agents.contracts import (
-    CommandModelRequest,
-    CommandModelResult,
+    DecisionModelRequest,
+    DecisionModelResult,
     ModelOutputError,
 )
 from company_bench.agents.providers.capabilities import (
@@ -14,9 +14,16 @@ from company_bench.agents.providers.capabilities import (
     verified_capabilities,
 )
 from company_bench.domain.models import PolicyKind, PolicyMetadata
-from company_bench.runtime.models import AgentTurn, CompanyCommand
+from company_bench.runtime.models import (
+    ActionDecision,
+    AgentTurn,
+    AttentionPlan,
+    CompanyDecision,
+    EconomicCommand,
+    IdleDecision,
+)
 
-_COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
+_DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 
 
 def model_capability_catalog(limits: dict[str, int]) -> ModelCapabilityCatalog:
@@ -24,40 +31,58 @@ def model_capability_catalog(limits: dict[str, int]) -> ModelCapabilityCatalog:
     return ModelCapabilityCatalog(None, None, seeds=verified_capabilities(limits))
 
 
-class FixedCommandAgent:
-    """Return commands from one deterministic iterable."""
+class FixedDecisionAgent:
+    """Return decisions from one deterministic iterable."""
 
-    metadata = PolicyMetadata(name="fixed-command", kind=PolicyKind.BASELINE)
+    metadata = PolicyMetadata(name="fixed-decision", kind=PolicyKind.BASELINE)
 
-    def __init__(self, commands: Iterable[CompanyCommand]) -> None:
-        self._commands = iter(commands)
+    def __init__(self, decisions: Iterable[CompanyDecision]) -> None:
+        self._decisions = iter(decisions)
 
-    async def act(self, _: AgentTurn) -> CompanyCommand:
+    async def act(self, _: AgentTurn) -> CompanyDecision:
         try:
-            return next(self._commands)
+            return next(self._decisions)
         except StopIteration as error:
-            raise ValueError("fixed Agent command stream is exhausted") from error
+            raise ValueError("fixed Agent decision stream is exhausted") from error
 
 
-class ScriptedModelGateway:
-    """Adapt a deterministic command factory to the provider Gateway Interface."""
+class ScriptedDecisionGateway:
+    """Adapt a deterministic decision factory to the provider Gateway Interface."""
 
     provider = "scripted"
 
-    def __init__(self, command_factory: Callable[[CommandModelRequest], CompanyCommand]) -> None:
-        self._command_factory = command_factory
-        self.command_requests: list[CommandModelRequest] = []
+    def __init__(
+        self,
+        decision_factory: Callable[[DecisionModelRequest], CompanyDecision],
+    ) -> None:
+        self._decision_factory = decision_factory
+        self.decision_requests: list[DecisionModelRequest] = []
 
-    async def generate_command(self, request: CommandModelRequest) -> CommandModelResult:
-        self.command_requests.append(request)
-        command = _COMMAND_ADAPTER.validate_python(self._command_factory(request))
-        if command.kind not in request.allowed_commands:
-            raise ModelOutputError(f"command {command.kind} is not allowed")
-        return CommandModelResult(
-            command=command,
+    async def generate_decision(self, request: DecisionModelRequest) -> DecisionModelResult:
+        self.decision_requests.append(request)
+        decision = _DECISION_ADAPTER.validate_python(self._decision_factory(request))
+        tool = decision.action.kind if isinstance(decision, ActionDecision) else decision.kind
+        if tool not in request.allowed_tools:
+            raise ModelOutputError(f"decision tool {tool} is not allowed")
+        return DecisionModelResult(
+            decision=decision,
             provider=self.provider,
             model="scripted-current",
         )
 
     async def close(self) -> None:
         """Release no resources."""
+
+
+def company_decision(
+    action: EconomicCommand | None = None,
+    *,
+    review_after_minutes: int | None = None,
+) -> CompanyDecision:
+    """Build one typed test decision with an empty alert set."""
+    attention = AttentionPlan(review_after_minutes=review_after_minutes)
+    return (
+        IdleDecision(attention=attention)
+        if action is None
+        else ActionDecision(action=action, attention=attention)
+    )

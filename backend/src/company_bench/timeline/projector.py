@@ -28,7 +28,9 @@ from company_bench.runs.models import (
     RunStatus,
     TokenUsage,
 )
+from company_bench.runtime.attention import AgentAttention
 from company_bench.runtime.models import (
+    IdleDecision,
     Produce,
     QuoteLevelAction,
     RejectionCategory,
@@ -40,15 +42,14 @@ from company_bench.runtime.models import (
     Transform,
     TurnRecord,
     TurnReplayOrigin,
-    Wait,
     WakeSignal,
 )
 from company_bench.timeline.market import MarketTimelineProjector
 from company_bench.timeline.models import (
     AgentTraceDetail,
     AgentTracePreview,
-    CommandDispositionSource,
     DayTimelineSummary,
+    DecisionDispositionSource,
     InventoryQuantityChange,
     ObservationDelta,
     ObservationFacts,
@@ -367,16 +368,17 @@ class RunTimelineProjector:
                 visible_event_count=len(record.turn.visible_events),
             ),
             observation_delta=self._observation_delta(record, previous),
-            command=record.envelope.command,
+            decision=record.envelope.decision,
             outcome=record.outcome,
             disposition_source=_disposition_source(record),
             effects=record.outcome.events,
             state_changes=_state_changes(record),
             next_available_at=record.outcome.next_available_at,
+            review_at=_review_at(record),
             replay_origin=origin,
             traces=tuple(preview for _, preview in self._trace_pairs(data, record)),
             protocol_error=record.protocol_error,
-            title=_command_title(record),
+            title=_decision_title(record),
             summary=_turn_summary(record),
         )
 
@@ -584,11 +586,11 @@ def _sum_usage(invocations: Iterable[PolicyInvocation]) -> TokenUsage:
 def _require_replay_pair(current: TurnRecord, source: TurnRecord) -> None:
     """Fail closed unless one replay Turn exactly reproduces its source."""
     same_outcome = current.outcome.model_dump(
-        exclude={"turn_id", "command_id"}
-    ) == source.outcome.model_dump(exclude={"turn_id", "command_id"})
+        exclude={"turn_id", "decision_id"}
+    ) == source.outcome.model_dump(exclude={"turn_id", "decision_id"})
     if (
         current.observation_hash != source.observation_hash
-        or current.envelope.command != source.envelope.command
+        or current.envelope.decision != source.envelope.decision
         or current.protocol_error != source.protocol_error
         or not same_outcome
     ):
@@ -600,13 +602,13 @@ def _is_applied_invocation(
     record: TurnRecord,
 ) -> bool:
     """Identify the physical call explicitly linked to the committed outcome."""
-    linked = invocation.command_outcome
+    linked = invocation.decision_outcome
     return (
         linked is not None
-        and invocation.command == record.envelope.command
+        and invocation.decision == record.envelope.decision
         and linked.apply_sequence == record.outcome.apply_sequence
-        and linked.model_dump(exclude={"turn_id", "command_id"})
-        == record.outcome.model_dump(exclude={"turn_id", "command_id"})
+        and linked.model_dump(exclude={"turn_id", "decision_id"})
+        == record.outcome.model_dump(exclude={"turn_id", "decision_id"})
     )
 
 
@@ -624,7 +626,7 @@ def _day_summary(
         turn_count=len(day_turns),
         accepted_count=sum(item.outcome.accepted for item in day_turns),
         rejected_count=sum(not item.outcome.accepted for item in day_turns),
-        wait_count=sum(isinstance(item.envelope.command, Wait) for item in day_turns),
+        idle_count=sum(isinstance(item.envelope.decision, IdleDecision) for item in day_turns),
         system_step_count=len(day_steps),
         event_count=len(day_events),
         trade_quantity=sum(
@@ -651,24 +653,19 @@ def _run_diagnostics(
 ) -> RunDiagnostics:
     """Derive protocol and market-health facts from authoritative journals."""
     trade_days = tuple(
-        record.event.day
-        for record in event_records
-        if isinstance(record.event, TradeExecutedEvent)
+        record.event.day for record in event_records if isinstance(record.event, TradeExecutedEvent)
     )
     completed_days = len(snapshots)
     demand = sum((snapshot.consumer_demand for snapshot in snapshots), Decimal())
     sales = sum((snapshot.consumer_sales for snapshot in snapshots), Decimal())
     fill_rate = EconomicPrecision.round(sales / demand) if demand else Decimal()
-    initial_cash = {
-        company.company_id: company.initial_cash for company in scenario.companies
-    }
+    initial_cash = {company.company_id: company.initial_cash for company in scenario.companies}
     latest_value = (
         {company.company_id: company.net_worth for company in snapshots[-1].companies}
         if snapshots
         else {
             record.turn.company_id: EconomicPrecision.round(
-                record.turn.marked_surplus
-                + initial_cash[record.turn.company_id]
+                record.turn.marked_surplus + initial_cash[record.turn.company_id]
             )
             for record in turns
         }
@@ -681,21 +678,17 @@ def _run_diagnostics(
     )
     return RunDiagnostics(
         completed_days=completed_days,
-        benchmark_eligible=(
-            result.quality.benchmark_eligible if result is not None else None
-        ),
+        benchmark_eligible=(result.quality.benchmark_eligible if result is not None else None),
         protocol_invalid_turns=(
             result.quality.protocol.invalid_turn_count
             if result is not None
             else sum(record.protocol_error is not None for record in turns)
         ),
         economic_rejections=sum(
-            record.outcome.rejection_category is RejectionCategory.ECONOMIC
-            for record in turns
+            record.outcome.rejection_category is RejectionCategory.ECONOMIC for record in turns
         ),
-        wait_plan_rejections=sum(
-            record.outcome.rejection_category is RejectionCategory.WAIT_PLAN
-            for record in turns
+        attention_rejections=sum(
+            record.outcome.rejection_category is RejectionCategory.ATTENTION for record in turns
         ),
         trade_count=len(trade_days),
         last_trade_day=max(trade_days, default=None),
@@ -724,31 +717,36 @@ def _affected_companies(records: tuple[EventRecord, ...]) -> tuple[CompanyId, ..
     return tuple(dict.fromkeys(companies))
 
 
-def _command_title(record: TurnRecord) -> str:
-    command = record.envelope.command
-    if isinstance(command, Produce):
-        return f"Produce {command.product.value.replace('_', ' ')}"
-    if isinstance(command, Transform):
+def _decision_title(record: TurnRecord) -> str:
+    action = record.envelope.action
+    if isinstance(action, Produce):
+        return f"Produce {action.product.value.replace('_', ' ')}"
+    if isinstance(action, Transform):
         return (
-            f"Transform {command.input_product.value.replace('_', ' ')} "
-            f"into {command.output_product.value.replace('_', ' ')}"
+            f"Transform {action.input_product.value.replace('_', ' ')} "
+            f"into {action.output_product.value.replace('_', ' ')}"
         )
-    if isinstance(command, SetQuoteLadder):
-        return (
-            f"Set {command.side.value} quote ladder for {command.product.value.replace('_', ' ')}"
-        )
-    if isinstance(command, SetRetailPrice):
-        return f"Set retail price for {command.product.value.replace('_', ' ')}"
-    return "Wait"
+    if isinstance(action, SetQuoteLadder):
+        return f"Set {action.side.value} quote ladder for {action.product.value.replace('_', ' ')}"
+    if isinstance(action, SetRetailPrice):
+        return f"Set retail price for {action.product.value.replace('_', ' ')}"
+    return "Idle"
 
 
-def _disposition_source(record: TurnRecord) -> CommandDispositionSource:
-    """Identify the module that produced the persisted command disposition."""
+def _review_at(record: TurnRecord) -> SimTime | None:
+    """Rebuild the installed fallback review for an accepted decision."""
+    if not record.outcome.accepted:
+        return None
+    return AgentAttention().arm(record.envelope.decision.attention, record.turn).review_at
+
+
+def _disposition_source(record: TurnRecord) -> DecisionDispositionSource:
+    """Identify the module that produced the persisted decision disposition."""
     if record.outcome.rejection_category is RejectionCategory.PROTOCOL:
-        return CommandDispositionSource.RUNTIME_PROTOCOL
-    if record.outcome.rejection_category is RejectionCategory.WAIT_PLAN:
-        return CommandDispositionSource.RUNTIME_ATTENTION
-    return CommandDispositionSource.ECONOMIC_ENGINE
+        return DecisionDispositionSource.RUNTIME_PROTOCOL
+    if record.outcome.rejection_category is RejectionCategory.ATTENTION:
+        return DecisionDispositionSource.RUNTIME_ATTENTION
+    return DecisionDispositionSource.ECONOMIC_ENGINE
 
 
 def _turn_summary(record: TurnRecord) -> str:
@@ -772,11 +770,11 @@ def _state_changes(
     OrderPlacedChange | OrderCancelledChange | OrderReplacedChange | RetailPriceChanged,
     ...,
 ]:
-    """Project accepted non-event mutations from the committed command."""
+    """Project accepted non-event mutations from the committed action."""
     if not record.outcome.accepted:
         return ()
-    command = record.envelope.command
-    if isinstance(command, SetQuoteLadder):
+    action = record.envelope.action
+    if isinstance(action, SetQuoteLadder):
         result = record.outcome.quote_ladder_result
         if result is None:
             return ()
@@ -786,8 +784,8 @@ def _state_changes(
                 changes.append(
                     OrderPlacedChange(
                         order_id=level.order_id,
-                        side=command.side,
-                        product=command.product,
+                        side=action.side,
+                        product=action.product,
                         quantity=level.level.quantity,
                         limit_price=level.level.limit_price,
                     )
@@ -805,12 +803,12 @@ def _state_changes(
             OrderCancelledChange(order_id=order_id) for order_id in result.cancelled_order_ids
         )
         return tuple(changes)
-    if isinstance(command, SetRetailPrice):
+    if isinstance(action, SetRetailPrice):
         return (
             RetailPriceChanged(
-                product=command.product,
+                product=action.product,
                 before=record.turn.observation.retail_price,
-                after=command.unit_price,
+                after=action.unit_price,
             ),
         )
     return ()

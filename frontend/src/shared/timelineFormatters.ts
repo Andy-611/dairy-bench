@@ -1,36 +1,39 @@
-import { companyLabel, humanizeIdentifier, productLabel } from "./labels";
-import { formatExactDecimal } from "./format";
 import type {
-  CommandStateChangeView,
+  AttentionPlanView,
+  DecisionStateChangeView,
+  EconomicActionView,
   EconomicEffectView,
   QuoteAlertView,
-  TimelineCommandView,
+  TimelineDecisionView,
   TurnTimelineItemView,
 } from "./api/types";
+import { formatExactDecimal } from "./format";
+import { companyLabel, humanizeIdentifier, productLabel } from "./labels";
 
 export const ACCEPTED_BY_ENGINE_LABEL = "Accepted by Engine";
-export const COMMAND_PROCESSING_ORDER_LABEL = "Command Processing Order";
+export const DECISION_PROCESSING_ORDER_LABEL = "Decision Processing Order";
 export const ORDER_BOOK_PRIORITY_LABEL = "Order-book Priority";
 
-const COMMAND_LABELS: Readonly<Record<TimelineCommandView["kind"], string>> = {
+export type DecisionKind = EconomicActionView["kind"] | "idle";
+
+const DECISION_LABELS: Readonly<Record<DecisionKind, string>> = {
+  idle: "Idle",
   produce: "Produce",
   set_quote_ladder: "Set quote ladder",
   set_retail_price: "Set retail price",
   transform: "Transform",
-  wait: "Wait",
 };
 
 const WAKE_LABELS: Readonly<Record<string, string>> = {
-  command_rejected: "Previous command was rejected",
-  continue: "Decision interval elapsed",
   day_open: "Market day opened",
+  decision_rejected: "Previous decision was rejected",
   delivery_completed: "Delivery arrived",
   external_event: "Relevant external event",
   operation_completed: "Operation completed",
   price_alert: "Watched price reached",
+  review_due: "Fallback review became due",
   trade_executed: "Own order executed",
   turn_limit_reached: "Daily turn limit reached",
-  wait_expired: "Fallback review became due",
 };
 
 const SYSTEM_LABELS: Readonly<Record<string, string>> = {
@@ -43,8 +46,12 @@ const SYSTEM_LABELS: Readonly<Record<string, string>> = {
   turn_limit_reached: "Daily turn limit reached",
 };
 
-export function commandLabel(kind: TimelineCommandView["kind"]): string {
-  return COMMAND_LABELS[kind];
+export function decisionKind(decision: TimelineDecisionView): DecisionKind {
+  return decision.kind === "idle" ? "idle" : decision.action.kind;
+}
+
+export function decisionLabel(kind: DecisionKind): string {
+  return DECISION_LABELS[kind];
 }
 
 export function wakeLabel(reason: string): string {
@@ -56,14 +63,14 @@ export function systemLabel(kind: string): string {
 }
 
 export function decisionContextSummary(turn: TurnTimelineItemView): string {
-  return `Decision based on economic state v${turn.stateVersion} · ${commandProcessingOrderSummary(turn.applySequence)}`;
+  return `Decision based on economic state v${turn.stateVersion} · ${decisionProcessingOrderSummary(turn.applySequence)}`;
 }
 
-export function commandProcessingOrderSummary(sequence: number): string {
-  return `${COMMAND_PROCESSING_ORDER_LABEL} #${sequence}`;
+export function decisionProcessingOrderSummary(sequence: number): string {
+  return `${DECISION_PROCESSING_ORDER_LABEL} #${sequence}`;
 }
 
-export function commandDispositionLabel(turn: TurnTimelineItemView): string {
+export function decisionDispositionLabel(turn: TurnTimelineItemView): string {
   if (turn.accepted) {
     return ACCEPTED_BY_ENGINE_LABEL;
   }
@@ -72,25 +79,26 @@ export function commandDispositionLabel(turn: TurnTimelineItemView): string {
     : "Rejected by Runtime";
 }
 
-export function commandProcessingResult(turn: TurnTimelineItemView): string {
+export function decisionProcessingResult(turn: TurnTimelineItemView): string {
   if (!turn.accepted) {
     const disposition = rejectedDisposition(turn.dispositionSource);
     return turn.reason === null ? disposition : `${disposition} · ${turn.reason}`;
   }
-  return `Accepted by economic engine · ${acceptedCommandResult(turn)}`;
+  return `Accepted by economic engine · ${acceptedDecisionResult(turn)}`;
 }
 
 export function nextDecisionTiming(turn: TurnTimelineItemView): string {
-  if (turn.nextAvailableMinute === null) {
-    return "No same-day follow-up scheduled";
+  const alerts = turn.decision.attention.alerts;
+  const review = turn.reviewMinute;
+  if (review === null) {
+    return alerts.length > 0
+      ? "On a matching price alert or the next market day"
+      : "At the next market day";
   }
-  const time = clockTime(turn.nextAvailableMinute);
-  if (turn.accepted && turn.command.kind === "wait") {
-    return turn.command.alerts.length > 0
-      ? `Price alert, or fallback review at ${time}`
-      : `Fallback review at ${time}`;
-  }
-  return `Routine follow-up at ${time}`;
+  const at = clockTime(review);
+  return alerts.length > 0
+    ? `On a matching price alert, or fallback review at ${at}`
+    : `Fallback review at ${at}`;
 }
 
 export function economicStateTransitionSummary(
@@ -105,23 +113,28 @@ export function economicStateTransitionSummary(
     : `v${before} → v${after}`;
 }
 
-export function commandSummary(command: TimelineCommandView): string {
-  switch (command.kind) {
+export function decisionSummary(decision: TimelineDecisionView): string {
+  return decision.kind === "idle" ? "Idle" : actionSummary(decision.action);
+}
+
+export function actionSummary(action: EconomicActionView): string {
+  switch (action.kind) {
     case "produce":
-      return `Produce ${formatExactDecimal(command.quantity)} ${productLabel(command.product)}`;
+      return `Produce ${formatExactDecimal(action.quantity)} ${productLabel(action.product)}`;
     case "transform":
-      return `Transform ${formatExactDecimal(command.inputQuantity)} ${productLabel(command.inputProduct)} into ${productLabel(command.outputProduct)}`;
+      return `Transform ${formatExactDecimal(action.inputQuantity)} ${productLabel(action.inputProduct)} into ${productLabel(action.outputProduct)}`;
     case "set_quote_ladder":
-      return quoteLadderSummary(command);
+      return quoteLadderSummary(action);
     case "set_retail_price":
-      return `Set ${productLabel(command.product)} retail price to ${formatExactDecimal(command.unitPrice)}`;
-    case "wait":
-      return waitSummary(command);
+      return `Set ${productLabel(action.product)} retail price to ${formatExactDecimal(action.unitPrice)}`;
   }
 }
 
-function acceptedCommandResult(turn: TurnTimelineItemView): string {
-  switch (turn.command.kind) {
+function acceptedDecisionResult(turn: TurnTimelineItemView): string {
+  if (turn.decision.kind === "idle") {
+    return "Economic state unchanged; attention plan armed";
+  }
+  switch (turn.decision.action.kind) {
     case "produce":
       return identifiedResult("Production job started", turn.outcomeJobId);
     case "transform":
@@ -130,19 +143,17 @@ function acceptedCommandResult(turn: TurnTimelineItemView): string {
       return quoteLadderResultSummary(turn);
     case "set_retail_price":
       return "Retail price updated";
-    case "wait":
-      return "Attention plan armed";
   }
 }
 
 function quoteLadderSummary(
-  command: Extract<TimelineCommandView, { readonly kind: "set_quote_ladder" }>,
+  action: Extract<EconomicActionView, { readonly kind: "set_quote_ladder" }>,
 ): string {
-  const scope = `${command.side} ${productLabel(command.product)} quote ladder`;
-  if (command.levels.length === 0) {
+  const scope = `${action.side} ${productLabel(action.product)} quote ladder`;
+  if (action.levels.length === 0) {
     return `Clear ${scope}`;
   }
-  const levels = command.levels
+  const levels = action.levels
     .map(
       (level) =>
         `${formatExactDecimal(level.quantity)} @ ${formatExactDecimal(level.limitPrice)}`,
@@ -156,11 +167,7 @@ function quoteLadderResultSummary(turn: TurnTimelineItemView): string {
   if (result === null) {
     return "Quote ladder reconciled";
   }
-  const labels = {
-    keep: "kept",
-    place: "placed",
-    replace: "replaced",
-  } as const;
+  const labels = { keep: "kept", place: "placed", replace: "replaced" } as const;
   const actions = (["keep", "place", "replace"] as const)
     .map((action) => ({
       action,
@@ -199,22 +206,18 @@ export function quoteAlertSummary(alert: QuoteAlertView): string {
   return `${productLabel(alert.product)} ${quote} ${operator} ${formatExactDecimal(alert.price)}`;
 }
 
-export function waitFallbackSummary(
-  command: Extract<TimelineCommandView, { readonly kind: "wait" }>,
-): string {
-  return command.reviewAfterMinutes === null
+export function attentionFallbackSummary(attention: AttentionPlanView): string {
+  return attention.reviewAfterMinutes === null
     ? "use the runtime's bounded fallback review"
-    : `review after ${command.reviewAfterMinutes} minutes`;
+    : `review after ${attention.reviewAfterMinutes} minutes`;
 }
 
-function waitSummary(
-  command: Extract<TimelineCommandView, { readonly kind: "wait" }>,
-): string {
-  const fallback = waitFallbackSummary(command);
-  if (command.alerts.length === 0) {
-    return `Wait · ${fallback}`;
+export function attentionSummary(attention: AttentionPlanView): string {
+  const fallback = attentionFallbackSummary(attention);
+  if (attention.alerts.length === 0) {
+    return fallback;
   }
-  return `Watch ${command.alerts.map(quoteAlertSummary).join(" or ")} · fallback ${fallback}`;
+  return `watch ${attention.alerts.map(quoteAlertSummary).join(" or ")} · fallback ${fallback}`;
 }
 
 export function effectSummary(effect: EconomicEffectView): string {
@@ -234,7 +237,7 @@ export function effectSummary(effect: EconomicEffectView): string {
   }
 }
 
-export function stateChangeSummary(change: CommandStateChangeView): string {
+export function stateChangeSummary(change: DecisionStateChangeView): string {
   switch (change.changeType) {
     case "order_placed":
       return `${capitalize(change.side)} order ${shortId(change.orderId)} · ${formatExactDecimal(change.quantity)} ${productLabel(change.product)} at ${formatExactDecimal(change.limitPrice)}`;
@@ -247,7 +250,7 @@ export function stateChangeSummary(change: CommandStateChangeView): string {
   }
 }
 
-export function stateChangeKey(change: CommandStateChangeView): string {
+export function stateChangeKey(change: DecisionStateChangeView): string {
   return change.changeType === "retail_price_changed"
     ? `${change.changeType}-${change.product}`
     : `${change.changeType}-${change.orderId}`;

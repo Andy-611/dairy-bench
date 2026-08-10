@@ -17,7 +17,7 @@ The active scenario is `flow.dairy.base.s9.v5`:
 
 ```text
 CompanyAgent
-    | one typed command
+    | one typed CompanyDecision
     v
 EpisodeRuntime ---- Scheduler
     | deterministic batch order
@@ -32,7 +32,7 @@ RunStore ---- Journal + Checkpoint + SQLite
 
 Responsibilities are deliberately narrow:
 
-- `CompanyAgent` chooses one authorized `CompanyCommand`; it cannot mutate state.
+- `CompanyAgent` chooses one authorized `CompanyDecision`; it cannot mutate state.
 - `EpisodeRuntime` owns virtual time, wakes, concurrent inference, seed-derived
   application order, journal sequencing, and checkpoint boundaries.
 - `EconomyEngine` owns business authorization, operations, deliveries, consumer
@@ -50,7 +50,7 @@ confined to a short transaction-local market session and frozen back into
 
 ## Daily event order
 
-The command window is `[09:00, 19:00)`:
+The decision window is `[09:00, 19:00)`:
 
 | Time | Ordered behavior |
 |---|---|
@@ -72,7 +72,7 @@ sale, but it is fully delivered before the 19:30 snapshot. No new company
 decision is accepted at or after 19:00.
 
 `RuntimeSpec` validates that the day-close boundary is late enough for the
-longest operation or delivery started in the last command minute.
+longest operation or delivery started in the last decision minute.
 
 ## Continuous spot market
 
@@ -166,13 +166,13 @@ Starting either job:
 - exposes no output until that completion creates a new expiring inventory lot.
 
 Each company has at most one active physical operation. The resource lock does
-not block quote-ladder updates, retail pricing, or wait. Daily used capacity is
+not block quote-ladder updates, retail pricing, or idle decisions. Daily used capacity is
 tracked independently from the active job, so completing a job does not restore
 that day's capacity.
 
 ## Decisions and deterministic concurrency
 
-Commands have zero modeled duration except for their physical consequences.
+Economic actions have zero modeled duration except for their physical consequences.
 The runtime prevents zero-time loops with a one-decision-per-company-per-minute
 throttle and a hard cap of 25 Agent turns per company per day. The current turn
 number and limit are part of every `AgentTurn`; reaching the limit produces one
@@ -181,14 +181,14 @@ suppressed without a model call but remains auditable as an
 `AGENT_WAKE_SUPPRESSED` step with its typed signals.
 
 Agents woken in the same minute observe the same base `state_version`. Inference
-runs concurrently, but commands apply in a full deterministic permutation:
+runs concurrently, but decisions apply in a full deterministic permutation:
 
 ```text
 sort_key = SHA256(seed | absolute_minute | company_id)
 ```
 
-The resulting global `apply_sequence` is journaled as command-processing order.
-When that command is applied, each new or replaced ladder level receives its own
+The resulting global `apply_sequence` is journaled as decision-processing order.
+When that decision is applied, each new or replaced ladder level receives its own
 persisted order priority sequence in best-to-worst target order; unchanged
 levels retain theirs. Real response latency, retries, and provider load are
 audited but never feed matching.
@@ -205,20 +205,22 @@ model and atomically persists confirmed limits; gateways receive only fully
 resolved model configurations. These bounds do not change the
 same-minute inference and deterministic serial-application rule inside a run.
 
-Sparse decisions are governed by the in-process `AgentAttention` module. An
-accepted `wait` may arm up to three Agent-visible `best_bid`/`best_ask` threshold
-alerts, combined with OR semantics, plus an optional relative review delay. An
-explicit `review_after_minutes` must be at most 120 minutes and remain within the
-same business day. Omitting it schedules a 120-minute review when that still
-falls before market close; otherwise there is no same-day review. Duplicate,
-hidden, or already-true alerts reject the entire command without changing
-economic state.
+Sparse decisions are governed by the in-process `AgentAttention` module. Every
+`ActionDecision` and `IdleDecision` carries an `AttentionPlan` with up to three
+Agent-visible `best_bid`/`best_ask` threshold alerts, combined with OR semantics,
+plus an optional relative review delay. An explicit `review_after_minutes` must
+be at most 120 minutes and remain within the same business day. Omitting it
+schedules a 120-minute review when that still falls before market close;
+otherwise there is no same-day review. Duplicate, hidden, or already-true alerts
+reject the entire decision without changing economic state.
 
 Alerts are one-shot. They observe only the final committed order books after all
-seed-ordered commands for a minute have applied, then wake the company on the
-following minute. Own trades, operation completion, and delivery completion are
-important wakes; generic order-book mutations are not broadcast and resting
-orders do not receive an independent polling timer.
+seed-ordered decisions for a minute have applied, then wake the company on the
+following minute. An accepted decision never creates a routine next-minute wake.
+Own trades, operation completion, delivery completion, a matched alert, fallback
+review, and the next market open are the normal wakes. Only a rejected decision
+gets the bounded correction retry. Generic order-book mutations are not
+broadcast and resting orders do not receive an independent polling timer.
 
 ## Agent projection and information boundary
 
@@ -251,13 +253,13 @@ covers spot inventory only; pending deliveries retain their own expiry buckets,
 and work in process enters an expiry bucket only when completed.
 
 Other companies' identities, holdings, orders, memories, and traces stay hidden.
-Natural-language reasoning is non-binding; only the validated structured command
+Natural-language reasoning is non-binding; only the validated structured decision
 can change the economy.
 
 ## Memory, durability, and replay
 
 Every company has its own token-budgeted `ConversationMemory`. Recent compact
-decision records keep only time, wake, command, disposition, and rejection
+decision records keep only time, wake, decision, disposition, and rejection
 category; older records compact into a deterministic summary. Full observations
 and outcomes remain in the journal instead of being duplicated into every model
 request. Memory has no seven-day cutoff and never replaces current authoritative
@@ -267,12 +269,12 @@ The immutable journal records company turns and ordered system steps. A
 `RunCheckpoint` captures all state needed to resume exactly, including books and
 collateral, jobs, deliveries, scheduler state, armed attention plans,
 per-company memory, sequence counters, events, and snapshots. Each armed plan is
-validated against its source Wait turn and exact fallback wake. Journal additions
+validated against its source decision and exact fallback wake. Journal additions
 and checkpoint replacement commit in one database transaction at a stable
 virtual-time boundary.
 
 Replay uses the same runtime and engine without model calls. Observation hashes,
-commands or protocol rejections, outcomes, `apply_sequence`, system effects,
+decisions or protocol rejections, outcomes, `apply_sequence`, system effects,
 events, snapshots, final score, and episode quality must match exactly.
 
 ## Episode evaluation
@@ -305,19 +307,19 @@ technically failed, or replay-divergent episode still produces no final result.
 ## Core invariants
 
 1. Only `EconomyEngine` changes economic state.
-2. One company submits at most one command in a same-minute batch.
+2. One company submits at most one decision in a same-minute batch.
 3. Every resting order is fully backed by uniquely held cash or inventory.
 4. One company has at most three distinct active price levels per product and
-   side; one ladder command commits all of its changes or none of them.
+   side; one ladder action commits all of its changes or none of them.
 5. Every live order quantity is positive and aligned to the `0.0001` market
-   tick; raw journal commands remain audit evidence, not executable state.
+   tick; raw journal decisions remain audit evidence, not executable state.
 6. Every active order has an independent persisted priority sequence; one
-   command's `apply_sequence` is not reused as three order priorities.
+   decision's `apply_sequence` is not reused as three order priorities.
 7. Available, reserved, and pending inventory lots have globally unique IDs.
 8. One company has at most one active operation; one trade has one pending
    delivery until completion.
 9. Product markets share session state and always open or close together.
-10. No company command is accepted outside `[09:00, 19:00)`.
+10. No company decision is accepted outside `[09:00, 19:00)`.
 11. Books, jobs, and deliveries are empty before the 19:30 day snapshot.
 12. Provider completion order never changes economic application order.
 13. Journal plus checkpoint, not prompts or UI projections, is the replay

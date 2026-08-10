@@ -22,16 +22,15 @@ from company_bench.domain.models import (
     StrictModel,
 )
 from company_bench.economy.engine import EconomyState
-from company_bench.runtime.attention import AgentAttention, ArmedWait, AttentionRejected
+from company_bench.runtime.attention import AgentAttention, ArmedAttention, AttentionRejected
 from company_bench.runtime.models import (
-    CommandOutcome,
-    CompanyCommand,
+    CompanyDecision,
+    DecisionOutcome,
     JournalEntryKind,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 from company_bench.runtime.scheduler import SchedulerCheckpoint
@@ -170,13 +169,13 @@ class CompanyRuntimeCursor(StrictModel):
     next_turn_sequence: int = Field(ge=1)
     last_visible_event_sequence: int = Field(default=0, ge=0)
     available_at: SimTime | None = None
-    active_wait: ArmedWait | None = None
+    active_attention: ArmedAttention | None = None
 
 
 class RunCheckpoint(StrictModel):
     """Current mutable state needed to resume one V4 episode."""
 
-    schema_version: Literal[8] = 8
+    schema_version: Literal[9] = 9
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -199,9 +198,7 @@ class RunCheckpoint(StrictModel):
         company_ids = [checkpoint.company_id for checkpoint in self.agent_states]
         _require_unique(company_ids, "agent checkpoint company_ids")
         expected_memory_ids = [
-            policy.company_id
-            for policy in self.policies
-            if policy.kind is PolicyKind.MODEL
+            policy.company_id for policy in self.policies if policy.kind is PolicyKind.MODEL
         ]
         if company_ids != expected_memory_ids:
             raise ValueError(
@@ -416,28 +413,29 @@ class PolicyInvocation(ProviderCallAudit):
     sim_minute: int | None = Field(default=None, ge=0)
     state_version: int | None = Field(default=None, ge=0)
     apply_sequence: int | None = Field(default=None, ge=1)
-    command: CompanyCommand | None = None
-    command_outcome: CommandOutcome | None = None
+    decision: CompanyDecision | None = None
+    decision_outcome: DecisionOutcome | None = None
     error_kind: str | None = None
     error_message: str | None = Field(default=None, max_length=500)
     response_id: str | None = None
     request_id: str | None = None
+
     @model_validator(mode="after")
     def validate_event_turn(self) -> PolicyInvocation:
         """Keep optional event-driven audit fields complete and consistent."""
         if self.domain_turn_id is not None and (
             self.sim_minute is None
             or self.state_version is None
-            or (self.outcome is InvocationOutcome.SUCCESS and self.command is None)
+            or (self.outcome is InvocationOutcome.SUCCESS and self.decision is None)
         ):
-            raise ValueError("event-driven invocation requires time, state, and command")
-        if self.command_outcome is not None:
-            if self.domain_turn_id != self.command_outcome.turn_id:
-                raise ValueError("command outcome must match domain_turn_id")
-            if self.command is None:
-                raise ValueError("command outcome requires a command")
-            if self.apply_sequence != self.command_outcome.apply_sequence:
-                raise ValueError("command outcome must match apply_sequence")
+            raise ValueError("event-driven invocation requires time, state, and decision")
+        if self.decision_outcome is not None:
+            if self.domain_turn_id != self.decision_outcome.turn_id:
+                raise ValueError("decision outcome must match domain_turn_id")
+            if self.decision is None:
+                raise ValueError("decision outcome requires a decision")
+            if self.apply_sequence != self.decision_outcome.apply_sequence:
+                raise ValueError("decision outcome must match apply_sequence")
         return self
 
 
@@ -501,7 +499,7 @@ def _validate_attention_commitments(
     checkpoint: RunCheckpoint,
     turns: tuple[TurnRecord, ...],
 ) -> None:
-    """Pair each armed Wait with its source Turn and fallback wake."""
+    """Pair each armed attention plan with its source Turn and fallback wake."""
     attention = AgentAttention()
     turns_by_id = {record.turn.turn_id: record for record in turns}
     latest_by_company: dict[CompanyId, TurnRecord] = {}
@@ -510,7 +508,7 @@ def _validate_attention_commitments(
 
     expected: list[tuple[CompanyId, int, Identifier]] = []
     for cursor in checkpoint.cursors:
-        plan = cursor.active_wait
+        plan = cursor.active_attention
         if plan is None:
             continue
         source = turns_by_id.get(plan.source_turn_id)
@@ -518,17 +516,16 @@ def _validate_attention_commitments(
             source is None
             or source.turn.company_id != cursor.company_id
             or latest_by_company.get(cursor.company_id) != source
-            or not isinstance(source.envelope.command, Wait)
             or not source.outcome.accepted
             or source.turn.turn_number_today >= source.turn.turn_limit_today
         ):
-            raise ValueError("active wait must reference the company's latest accepted Wait")
+            raise ValueError("active attention must reference the latest accepted decision")
         try:
-            derived = attention.arm(source.envelope.command, source.turn)
+            derived = attention.arm(source.envelope.decision.attention, source.turn)
         except AttentionRejected as error:
-            raise ValueError("active wait source no longer forms a valid plan") from error
-        if derived != plan or plan.review_at != source.outcome.next_available_at:
-            raise ValueError("active wait must match its source Turn and outcome")
+            raise ValueError("attention source no longer forms a valid plan") from error
+        if derived != plan:
+            raise ValueError("active attention must match its source Turn")
         if plan.review_at is not None:
             expected.append(
                 (cursor.company_id, plan.review_at.absolute_minute, plan.source_turn_id)
@@ -539,14 +536,14 @@ def _validate_attention_commitments(
         if event.kind is not SystemEventKind.COMPANY_WAKE or event.company_id is None:
             continue
         for signal in event.wake_signals:
-            if signal.reason is not WakeReason.WAIT_EXPIRED:
+            if signal.reason is not WakeReason.REVIEW_DUE:
                 continue
             if signal.source is None or signal.source.entry_type is not JournalEntryKind.TURN:
-                raise ValueError("wait-expiry wakes require a source Turn")
+                raise ValueError("review wakes require a source Turn")
             actual.append((event.company_id, event.at.absolute_minute, signal.source.entry_id))
-    _require_unique(actual, "wait-expiry commitments")
+    _require_unique(actual, "review commitments")
     if set(actual) != set(expected):
-        raise ValueError("armed waits and wait-expiry wakes must match")
+        raise ValueError("armed attention and review wakes must match")
 
 
 def _require_unique(values: Iterable[Hashable], label: str) -> None:

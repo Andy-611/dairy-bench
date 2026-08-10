@@ -23,10 +23,12 @@ from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.economy.engine import EconomyEngine, EconomyState, PendingDelivery
 from company_bench.economy.operations import OperatingEconomics
 from company_bench.runtime.models import (
-    CommandEnvelope,
-    CommandOutcome,
-    CompanyCommand,
+    ActionDecision,
+    AttentionPlan,
+    DecisionEnvelope,
+    DecisionOutcome,
     DeliveryExpiryBucket,
+    EconomicCommand,
     MarketSide,
     Produce,
     QuoteLevel,
@@ -67,19 +69,19 @@ def _at(hour: int, minute: int = 0, *, day: int = 0) -> SimTime:
 def _envelope(
     economy: EconomyState,
     company_id: str,
-    command: CompanyCommand,
+    command: EconomicCommand,
     at: SimTime,
     sequence: int,
-) -> CommandEnvelope:
+) -> DecisionEnvelope:
     """Bind a command to the current shared state version."""
     identity = f"{company_id}.{at.absolute_minute}.{sequence}"
-    return CommandEnvelope(
+    return DecisionEnvelope(
         turn_id=f"turn.{identity}",
-        command_id=f"command.{identity}",
+        decision_id=f"decision.{identity}",
         company_id=company_id,
         issued_at=at,
         state_version=economy.state_version,
-        command=command,
+        decision=ActionDecision(action=command, attention=AttentionPlan()),
     )
 
 
@@ -87,10 +89,10 @@ def _apply(
     engine: EconomyEngine,
     economy: EconomyState,
     company_id: str,
-    command: CompanyCommand,
+    command: EconomicCommand,
     at: SimTime,
     sequence: int,
-) -> tuple[EconomyState, CommandOutcome]:
+) -> tuple[EconomyState, DecisionOutcome]:
     """Apply one command and unwrap its sole outcome."""
     updated, outcomes = engine.apply_batch(
         economy,
@@ -162,7 +164,7 @@ def _ladder(
     )
 
 
-def _order_id(outcome: CommandOutcome) -> str:
+def _order_id(outcome: DecisionOutcome) -> str:
     """Return the sole target order identity from a one-level ladder result."""
     result = outcome.quote_ladder_result
     assert result is not None and len(result.levels) == 1
@@ -247,7 +249,7 @@ def _run_operation(
     engine: EconomyEngine,
     economy: EconomyState,
     company_id: str,
-    command: CompanyCommand,
+    command: EconomicCommand,
     start: SimTime,
     sequence: int,
 ) -> tuple[EconomyState, Decimal]:
@@ -331,7 +333,7 @@ def test_engine_rejects_invalid_seed(seed: int) -> None:
     ],
 )
 def test_operation_commands_reject_dust_quantities(
-    command_factory: Callable[[], CompanyCommand],
+    command_factory: Callable[[], EconomicCommand],
 ) -> None:
     with pytest.raises(ValidationError, match=r"exact multiple of 0\.0001"):
         command_factory()
@@ -468,10 +470,8 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     assert started.accepted and started.job_id is not None
     job = economy.jobs[0]
     expected_surplus = (
-        (Decimal("100") - capacity)
-        * economy.scenario.product(ProductId.RAW_MILK).reference_value
-        + job.output_quantity
-        * economy.scenario.product(ProductId.BOTTLED_MILK).reference_value
+        (Decimal("100") - capacity) * economy.scenario.product(ProductId.RAW_MILK).reference_value
+        + job.output_quantity * economy.scenario.product(ProductId.BOTTLED_MILK).reference_value
         - job.cash_cost
     )
     assert started.scheduled_completions[0].at == _at(9, 30)
@@ -501,9 +501,7 @@ def test_transformation_consumes_input_then_completes_with_yield_and_daily_limit
     assert isinstance(event, MilkProcessedEvent)
     assert event.actual_input == capacity
     assert event.output_quantity == capacity * Decimal("0.8")
-    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == (
-        capacity * Decimal("0.8")
-    )
+    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == (capacity * Decimal("0.8"))
     assert engine.marked_surplus(economy, "processor_a") == expected_surplus
     expiry_by_product = {
         bucket.product: bucket.available_quantity
@@ -570,9 +568,7 @@ def test_transformation_floors_output_and_rejects_zero_cost_atomically(
         started.job_id,
         started.scheduled_completions[0].at,
     )
-    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == Decimal(
-        "0.0001"
-    )
+    assert _quantity(economy, "processor_a", ProductId.BOTTLED_MILK) == Decimal("0.0001")
 
 
 @pytest.mark.parametrize(
@@ -586,7 +582,7 @@ def test_later_equal_batches_cost_more_without_split_order_discount(
     engine: EconomyEngine,
     economy: EconomyState,
     company_id: str,
-    command: CompanyCommand,
+    command: EconomicCommand,
     with_input_inventory: bool,
 ) -> None:
     if with_input_inventory:
@@ -721,7 +717,7 @@ def test_orders_require_authorization_and_full_cash_or_inventory_collateral(
     economy: EconomyState,
 ) -> None:
     original = economy
-    rejected_commands: tuple[tuple[str, CompanyCommand, str], ...] = (
+    rejected_commands: tuple[tuple[str, EconomicCommand, str], ...] = (
         (
             "farm_a",
             _order(MarketSide.BUY, ProductId.RAW_MILK, "1", "1"),
@@ -1184,9 +1180,7 @@ def test_consumer_sale_that_rounds_to_zero_is_not_executed(
     assert sale.sold_quantity == Decimal("0.0000")
     assert sale.revenue == Decimal("0.0000")
     assert _company(economy, "retailer_a").cash == starting_cash
-    assert _quantity(economy, "retailer_a", ProductId.BOTTLED_MILK) == Decimal(
-        "0.0001"
-    )
+    assert _quantity(economy, "retailer_a", ProductId.BOTTLED_MILK) == Decimal("0.0001")
 
 
 def test_marked_surplus_recognizes_expiry_only_at_day_close(

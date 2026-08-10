@@ -30,7 +30,9 @@ from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
-    CompanyCommand,
+    AttentionPlan,
+    CompanyDecision,
+    IdleDecision,
     MarketSide,
     Produce,
     QuoteAlert,
@@ -41,16 +43,16 @@ from company_bench.runtime.models import (
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 from company_bench.storage.store import InMemoryRunStore
+from tests.support.fakes import company_decision
 
 _OPEN = 9 * 60
 _MARKET_CLOSE = 19 * 60
 _DAY_CLOSE = 19 * 60 + 30
 _QUANTITY = Decimal("10")
-type _Decision = Callable[[AgentTurn], CompanyCommand]
+type _Decision = Callable[[AgentTurn], CompanyDecision]
 
 
 @dataclass(slots=True)
@@ -63,8 +65,8 @@ class _ScriptedAgent:
         kind=PolicyKind.BASELINE,
     )
 
-    async def act(self, turn: AgentTurn) -> CompanyCommand:
-        """Return one scripted command after an optional real-time delay."""
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        """Return one scripted decision after an optional real-time delay."""
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
         return self.decide(turn)
@@ -105,10 +107,10 @@ class _InterruptOnAttention:
         system_steps: tuple[SystemStepRecord, ...],
         checkpoint: RunCheckpoint,
     ) -> None:
-        """Stop after an armed Wait and its fallback wake are durable."""
+        """Stop after an armed attention plan and its fallback wake are durable."""
         self.repository.save_progress(turns, system_steps, checkpoint)
         if not self.interrupted and any(
-            cursor.active_wait is not None for cursor in checkpoint.cursors
+            cursor.active_attention is not None for cursor in checkpoint.cursors
         ):
             self.interrupted = True
             raise RuntimeError("interrupted after durable attention plan")
@@ -159,8 +161,8 @@ def _agents(
     }
 
 
-def _wait(_: AgentTurn) -> CompanyCommand:
-    return Wait()
+def _idle(_: AgentTurn) -> CompanyDecision:
+    return company_decision()
 
 
 def _quote(
@@ -177,29 +179,38 @@ def _quote(
     )
 
 
-def _supply_command(turn: AgentTurn) -> CompanyCommand:
+def _supply_decision(turn: AgentTurn) -> CompanyDecision:
     if turn.company_id == "farm_a":
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            return Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY)
+            return company_decision(
+                Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY),
+                review_after_minutes=30,
+            )
         if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
-            return _quote(
-                MarketSide.SELL,
-                ProductId.RAW_MILK,
-                _QUANTITY,
-                Decimal("1.50"),
+            return company_decision(
+                _quote(
+                    MarketSide.SELL,
+                    ProductId.RAW_MILK,
+                    _QUANTITY,
+                    Decimal("1.50"),
+                ),
+                review_after_minutes=30,
             )
     if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-        return _quote(
-            MarketSide.BUY,
-            ProductId.RAW_MILK,
-            _QUANTITY,
-            Decimal("2.00"),
+        return company_decision(
+            _quote(
+                MarketSide.BUY,
+                ProductId.RAW_MILK,
+                _QUANTITY,
+                Decimal("2.00"),
+            ),
+            review_after_minutes=30,
         )
-    return Wait()
+    return company_decision()
 
 
 def _supply_agents(scenario: ScenarioSpec) -> dict[str, CompanyAgent]:
-    return _agents(scenario, _supply_command)
+    return _agents(scenario, _supply_decision)
 
 
 def _timed_retail_agents(
@@ -208,43 +219,53 @@ def _timed_retail_agents(
 ) -> dict[str, CompanyAgent]:
     trade_at = SimTime(absolute_minute=trade_minute)
 
-    def wait_toward(turn: AgentTurn) -> Wait:
-        return Wait(
+    def idle_toward(turn: AgentTurn) -> CompanyDecision:
+        return company_decision(
             review_after_minutes=min(
                 trade_at.absolute_minute - turn.sim_time.absolute_minute,
-                turn.observation.runtime.max_wait_minutes,
+                turn.observation.runtime.max_review_minutes,
             ),
         )
 
-    def decide(turn: AgentTurn) -> CompanyCommand:
+    def decide(turn: AgentTurn) -> CompanyDecision:
         if turn.company_id == "farm_a":
             if WakeReason.DAY_OPEN in turn.wake_reasons:
-                return Produce(product=ProductId.BOTTLED_MILK, quantity=_QUANTITY)
+                return company_decision(
+                    Produce(product=ProductId.BOTTLED_MILK, quantity=_QUANTITY),
+                    review_after_minutes=30,
+                )
             if turn.sim_time == trade_at:
-                return _quote(
-                    MarketSide.SELL,
-                    ProductId.BOTTLED_MILK,
-                    _QUANTITY,
-                    Decimal("2.50"),
+                return company_decision(
+                    _quote(
+                        MarketSide.SELL,
+                        ProductId.BOTTLED_MILK,
+                        _QUANTITY,
+                        Decimal("2.50"),
+                    )
                 )
             if turn.sim_time.absolute_minute < trade_at.absolute_minute:
-                return wait_toward(turn)
+                return idle_toward(turn)
         elif turn.company_id == "retailer_a":
             if WakeReason.DAY_OPEN in turn.wake_reasons:
-                return SetRetailPrice(
-                    product=ProductId.BOTTLED_MILK,
-                    unit_price=Decimal("3.50"),
+                return company_decision(
+                    SetRetailPrice(
+                        product=ProductId.BOTTLED_MILK,
+                        unit_price=Decimal("3.50"),
+                    ),
+                    review_after_minutes=1,
                 )
             if turn.sim_time == trade_at:
-                return _quote(
-                    MarketSide.BUY,
-                    ProductId.BOTTLED_MILK,
-                    _QUANTITY,
-                    Decimal("3.00"),
+                return company_decision(
+                    _quote(
+                        MarketSide.BUY,
+                        ProductId.BOTTLED_MILK,
+                        _QUANTITY,
+                        Decimal("3.00"),
+                    )
                 )
             if turn.sim_time.absolute_minute < trade_at.absolute_minute:
-                return wait_toward(turn)
-        return Wait()
+                return idle_toward(turn)
+        return company_decision()
 
     return _agents(scenario, decide)
 
@@ -289,7 +310,7 @@ async def test_runtime_orders_open_market_close_consumer_sales_and_day_close() -
     repository = InMemoryRunStore()
 
     await EpisodeRuntime(scenario).run(
-        _agents(scenario, _wait),
+        _agents(scenario, _idle),
         7,
         run_id="clock_order",
         store=repository,
@@ -318,8 +339,11 @@ async def test_turn_limit_journals_each_suppressed_wake_with_its_cause() -> None
     scenario = _scenario(max_turns=1, company_ids=("farm_a",))
     repository = InMemoryRunStore()
 
-    def produce_once(turn: AgentTurn) -> CompanyCommand:
-        return Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY)
+    def produce_once(turn: AgentTurn) -> CompanyDecision:
+        return company_decision(
+            Produce(product=ProductId.RAW_MILK, quantity=_QUANTITY),
+            review_after_minutes=30,
+        )
 
     execution = await EpisodeRuntime(scenario).run(
         _agents(scenario, produce_once),
@@ -349,12 +373,12 @@ async def test_real_response_order_does_not_change_seed_hash_application_order()
     runtime = EpisodeRuntime(scenario)
 
     forward = await runtime.run(
-        _agents(scenario, _wait, forward_delays),
+        _agents(scenario, _idle, forward_delays),
         17,
         run_id="response_order",
     )
     reverse = await runtime.run(
-        _agents(scenario, _wait, reverse_delays),
+        _agents(scenario, _idle, reverse_delays),
         17,
         run_id="response_order",
     )
@@ -379,8 +403,8 @@ async def test_a_different_seed_can_change_same_minute_application_order() -> No
     )
     runtime = EpisodeRuntime(scenario)
 
-    first = await runtime.run(_agents(scenario, _wait), first_seed, run_id="seed_one")
-    second = await runtime.run(_agents(scenario, _wait), second_seed, run_id="seed_two")
+    first = await runtime.run(_agents(scenario, _idle), first_seed, run_id="seed_one")
+    second = await runtime.run(_agents(scenario, _idle), second_seed, run_id="seed_two")
 
     assert tuple(company_id for company_id, _ in _apply_projection(first)) == first_order
     assert _apply_projection(first) != _apply_projection(second)
@@ -439,18 +463,21 @@ async def test_operation_and_delivery_completions_wake_the_owning_companies() ->
 
 
 @pytest.mark.asyncio
-async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -> None:
+async def test_resting_order_does_not_broadcast_and_action_review_is_bounded() -> None:
     scenario = _scenario(max_turns=4)
 
-    def place_one_bid(turn: AgentTurn) -> CompanyCommand:
+    def place_one_bid(turn: AgentTurn) -> CompanyDecision:
         if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
-            return _quote(
-                MarketSide.BUY,
-                ProductId.RAW_MILK,
-                _QUANTITY,
-                Decimal("2.00"),
+            return company_decision(
+                _quote(
+                    MarketSide.BUY,
+                    ProductId.RAW_MILK,
+                    _QUANTITY,
+                    Decimal("2.00"),
+                ),
+                review_after_minutes=scenario.runtime.max_review_minutes,
             )
-        return Wait()
+        return company_decision()
 
     execution = await EpisodeRuntime(scenario).run(
         _agents(scenario, place_one_bid),
@@ -464,13 +491,12 @@ async def test_resting_order_does_not_broadcast_and_wait_reviews_are_bounded() -
         record
         for record in execution.turns
         if record.turn.company_id == "processor_a"
-        and WakeReason.WAIT_EXPIRED in record.turn.wake_reasons
+        and WakeReason.REVIEW_DUE in record.turn.wake_reasons
     )
 
-    assert tuple(record.turn.company_id for record in at_next_minute) == ("processor_a",)
-    assert at_next_minute[0].turn.wake_reasons == (WakeReason.CONTINUE,)
+    assert at_next_minute == ()
     assert processor_review.turn.sim_time.minute_of_day == (
-        _OPEN + 1 + scenario.runtime.max_wait_minutes
+        _OPEN + scenario.runtime.max_review_minutes
     )
     assert tuple(order.product for order in processor_review.turn.open_orders) == (
         ProductId.RAW_MILK,
@@ -488,17 +514,20 @@ async def test_price_alert_observes_the_committed_minute_and_wakes_once() -> Non
         price=Decimal("1.50"),
     )
 
-    def decide(turn: AgentTurn) -> CompanyCommand:
+    def decide(turn: AgentTurn) -> CompanyDecision:
         if WakeReason.DAY_OPEN in turn.wake_reasons:
             if turn.company_id == "farm_a":
-                return Wait(alerts=(alert,))
-            return _quote(
-                MarketSide.BUY,
-                ProductId.RAW_MILK,
-                _QUANTITY,
-                Decimal("1.50"),
+                return IdleDecision(attention=AttentionPlan(alerts=(alert,)))
+            return company_decision(
+                _quote(
+                    MarketSide.BUY,
+                    ProductId.RAW_MILK,
+                    _QUANTITY,
+                    Decimal("1.50"),
+                ),
+                review_after_minutes=30,
             )
-        return Wait()
+        return company_decision()
 
     execution = await EpisodeRuntime(scenario).run(
         _agents(scenario, decide),
@@ -531,8 +560,8 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
     scenario = _scenario(max_turns=3)
     turns: list[TurnRecord] = []
 
-    def broken(_: AgentTurn) -> CompanyCommand:
-        raise ModelOutputError("invalid command")
+    def broken(_: AgentTurn) -> CompanyDecision:
+        raise ModelOutputError("invalid decision")
 
     async def remember(record: TurnRecord) -> None:
         turns.append(record)
@@ -556,7 +585,7 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
             _OPEN + 2,
         )
         assert all(
-            record.protocol_error == "ModelOutputError: invalid command" for record in records
+            record.protocol_error == "ModelOutputError: invalid decision" for record in records
         )
         assert all(
             record.outcome.reason == f"{PROTOCOL_ERROR_PREFIX}{record.protocol_error}"
@@ -564,7 +593,7 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
         )
         assert all(right.turn.previous_outcome == left.outcome for left, right in pairwise(records))
         assert all(
-            WakeReason.COMMAND_REJECTED in record.turn.wake_reasons for record in records[1:]
+            WakeReason.DECISION_REJECTED in record.turn.wake_reasons for record in records[1:]
         )
     assert len({(record.turn.company_id, record.turn.sim_time) for record in turns}) == len(turns)
 
@@ -573,12 +602,12 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
 async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> None:
     scenario = _scenario(max_turns=2, company_ids=("farm_a",))
 
-    def decide(turn: AgentTurn) -> CompanyCommand:
+    def decide(turn: AgentTurn) -> CompanyDecision:
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            return Wait(
-                review_after_minutes=turn.observation.runtime.max_wait_minutes + 1
+            return company_decision(
+                review_after_minutes=turn.observation.runtime.max_review_minutes + 1
             )
-        return Wait()
+        return company_decision()
 
     execution = await EpisodeRuntime(scenario).run(
         _agents(scenario, decide),
@@ -588,10 +617,10 @@ async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> 
     first, correction = execution.turns
 
     assert not first.outcome.accepted
-    assert first.outcome.reason == "wait review delay cannot exceed 120 minutes"
+    assert first.outcome.reason == "attention review delay cannot exceed 120 minutes"
     assert first.outcome.resulting_state_version == first.turn.state_version
     assert correction.turn.sim_time == first.turn.sim_time.plus(1)
-    assert correction.turn.wake_reasons == (WakeReason.COMMAND_REJECTED,)
+    assert correction.turn.wake_reasons == (WakeReason.DECISION_REJECTED,)
     assert correction.turn.previous_outcome == first.outcome
 
 
@@ -745,14 +774,14 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
     scenario = _scenario(max_turns=3)
     run_id = "resume_attention"
     runtime = EpisodeRuntime(scenario)
-    agents = _agents(scenario, _wait)
+    agents = _agents(scenario, _idle)
     expected = await runtime.run(agents, 39, run_id=run_id)
     repository = InMemoryRunStore()
     store = _InterruptOnAttention(repository)
 
     with pytest.raises(RuntimeError, match="durable attention plan"):
         await runtime.run(
-            _agents(scenario, _wait),
+            _agents(scenario, _idle),
             39,
             run_id=run_id,
             store=store,
@@ -760,40 +789,30 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
     recovery = repository.load_recovery(run_id)
     assert recovery is not None
     checkpoint = recovery.checkpoint
-    assert all(cursor.active_wait is not None for cursor in checkpoint.cursors)
-    wait_expiries = tuple(
+    assert all(cursor.active_attention is not None for cursor in checkpoint.cursors)
+    review_wakes = tuple(
         event
         for event in checkpoint.scheduler.pending_events
         if event.kind is SystemEventKind.COMPANY_WAKE
-        and WakeReason.WAIT_EXPIRED in event.wake_reasons
+        and WakeReason.REVIEW_DUE in event.wake_reasons
     )
-    assert len(wait_expiries) == len(scenario.companies)
+    assert len(review_wakes) == len(scenario.companies)
 
     target_cursor = checkpoint.cursors[0]
-    target_plan = target_cursor.active_wait
+    target_plan = target_cursor.active_attention
     assert target_plan is not None
-    invalid_review = target_plan.armed_at.plus(scenario.runtime.max_wait_minutes + 1)
+    invalid_review = target_plan.armed_at.plus(scenario.runtime.max_review_minutes + 1)
     invalid_plan = target_plan.model_copy(update={"review_at": invalid_review})
     invalid_cursors = tuple(
-        cursor.model_copy(update={"active_wait": invalid_plan})
+        cursor.model_copy(update={"active_attention": invalid_plan})
         if cursor.company_id == target_cursor.company_id
         else cursor
         for cursor in checkpoint.cursors
     )
-    invalid_turns = tuple(
-        record.model_copy(
-            update={
-                "outcome": record.outcome.model_copy(update={"next_available_at": invalid_review})
-            }
-        )
-        if record.turn.turn_id == target_plan.source_turn_id
-        else record
-        for record in recovery.turns
-    )
     invalid_events = tuple(
         event.model_copy(update={"at": invalid_review})
         if event.company_id == target_cursor.company_id
-        and WakeReason.WAIT_EXPIRED in event.wake_reasons
+        and WakeReason.REVIEW_DUE in event.wake_reasons
         else event
         for event in checkpoint.scheduler.pending_events
     )
@@ -803,15 +822,15 @@ async def test_checkpoint_restores_attention_plan_and_fallback_wake_exactly() ->
             "scheduler": checkpoint.scheduler.model_copy(update={"pending_events": invalid_events}),
         }
     )
-    with pytest.raises(ValidationError, match="active wait must match"):
+    with pytest.raises(ValidationError, match="active attention must match"):
         RunRecovery(
             checkpoint=invalid_checkpoint,
-            turns=invalid_turns,
+            turns=recovery.turns,
             system_steps=recovery.system_steps,
         )
 
     resumed = await runtime.run(
-        _agents(scenario, _wait),
+        _agents(scenario, _idle),
         39,
         run_id=run_id,
         store=repository,
@@ -843,8 +862,8 @@ async def test_turn_journal_replay_is_economically_deterministic() -> None:
         replay_source=source.episode,
     )
 
-    assert tuple(record.envelope.command for record in replay.turns) == tuple(
-        record.envelope.command for record in source.turns
+    assert tuple(record.envelope.decision for record in replay.turns) == tuple(
+        record.envelope.decision for record in source.turns
     )
     assert replay.episode.events == source.episode.events
     assert replay.episode.snapshots == source.episode.snapshots

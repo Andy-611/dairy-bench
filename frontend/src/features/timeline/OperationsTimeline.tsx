@@ -11,19 +11,20 @@ import { isAbortError, requestErrorMessage } from "../../shared/requestErrors";
 import {
   ACCEPTED_BY_ENGINE_LABEL,
   clockTime,
-  commandDispositionLabel,
-  commandLabel,
-  commandProcessingResult,
-  commandSummary,
+  decisionDispositionLabel,
+  decisionKind,
+  decisionLabel,
+  decisionProcessingResult,
+  decisionSummary,
   decisionContextSummary,
   nextDecisionTiming,
   plural,
   systemLabel,
   wakeLabel,
+  type DecisionKind,
 } from "../../shared/timelineFormatters";
 import type {
   SystemTimelineItemView,
-  TimelineCommandView,
   TimelineContextView,
   TimelineDayView,
   TimelineDetailView,
@@ -62,14 +63,14 @@ interface CompanyOption {
 }
 
 interface TimelineFilters {
-  readonly command: TimelineCommandView["kind"] | typeof ALL;
+  readonly decision: DecisionKind | typeof ALL;
   readonly company: string;
   readonly status: StatusFilter;
 }
 
 const ALL = "all";
 const INITIAL_FILTERS: TimelineFilters = {
-  command: ALL,
+  decision: ALL,
   company: ALL,
   status: "all",
 };
@@ -146,10 +147,10 @@ export function OperationsTimeline({
     [timeline],
   );
 
-  const commandKinds = useMemo<readonly TimelineCommandView["kind"][]>(
+  const decisionKinds = useMemo<readonly DecisionKind[]>(
     () =>
       [...new Set(timeline?.moments.flatMap((moment) =>
-        moment.turns.map((turn) => turn.command.kind),
+        moment.turns.map((turn) => decisionKind(turn.decision)),
       )) ?? []].sort(),
     [timeline],
   );
@@ -176,7 +177,7 @@ export function OperationsTimeline({
             summaries={timeline.daySummaries}
           />
           <TimelineFilterBar
-            commandKinds={commandKinds}
+            decisionKinds={decisionKinds}
             companies={companies}
             filters={filters}
             onChange={setFilters}
@@ -334,10 +335,10 @@ function RunDiagnosticsPanel({ context }: { readonly context: TimelineContextVie
           <dd>{formatExactDecimal(diagnostics.expiredQuantity)}</dd>
         </div>
         <div>
-          <dt>Rejected commands</dt>
+          <dt>Rejected decisions</dt>
           <dd>
             {formatValue(diagnostics.economicRejections)} economic ·{" "}
-            {formatValue(diagnostics.waitPlanRejections)} wait-plan
+            {formatValue(diagnostics.attentionRejections)} attention
           </dd>
         </div>
         <div>
@@ -411,12 +412,12 @@ function DayNavigator({
 }
 
 function TimelineFilterBar({
-  commandKinds,
+  decisionKinds,
   companies,
   filters,
   onChange,
 }: {
-  readonly commandKinds: readonly TimelineCommandView["kind"][];
+  readonly decisionKinds: readonly DecisionKind[];
   readonly companies: readonly CompanyOption[];
   readonly filters: TimelineFilters;
   readonly onChange: (filters: TimelineFilters) => void;
@@ -452,24 +453,24 @@ function TimelineFilterBar({
         >
           <option value="all">All Results</option>
           <option value="accepted">{ACCEPTED_BY_ENGINE_LABEL}</option>
-          <option value="rejected">Rejected Commands</option>
+          <option value="rejected">Rejected Decisions</option>
         </select>
       </label>
       <label>
-        <span>Command</span>
+        <span>Decision</span>
         <select
           onChange={(event) =>
             onChange({
               ...filters,
-              command: event.target.value as TimelineFilters["command"],
+              decision: event.target.value as TimelineFilters["decision"],
             })
           }
-          value={filters.command}
+          value={filters.decision}
         >
-          <option value={ALL}>All commands</option>
-          {commandKinds.map((kind) => (
+          <option value={ALL}>All decisions</option>
+          {decisionKinds.map((kind) => (
             <option key={kind} value={kind}>
-              {commandLabel(kind)}
+              {decisionLabel(kind)}
             </option>
           ))}
         </select>
@@ -578,7 +579,7 @@ function TurnCard({
           <small>{decisionContextSummary(turn)}</small>
         </span>
         <span className={`decision-status ${turn.accepted ? "accepted" : "rejected"}`}>
-          {commandDispositionLabel(turn)}
+          {decisionDispositionLabel(turn)}
         </span>
       </header>
       <ol className="decision-chain">
@@ -589,13 +590,13 @@ function TurnCard({
             .join(" · ")}
         />
         <DecisionStage
-          label="Company Command"
-          value={commandSummary(turn.command)}
+          label="Company Decision"
+          value={decisionSummary(turn.decision)}
         />
         <DecisionStage
-          label="Command Processing Result"
+          label="Decision Processing Result"
           tone={turn.accepted ? "positive" : "negative"}
-          value={commandProcessingResult(turn)}
+          value={decisionProcessingResult(turn)}
         />
         <DecisionStage
           label="Next Decision Timing"
@@ -646,7 +647,8 @@ function filterMoments(
     const turns = moment.turns.filter((turn) => {
       return (
         (filters.company === ALL || turn.companyId === filters.company) &&
-        (filters.command === ALL || turn.command.kind === filters.command) &&
+        (filters.decision === ALL ||
+          decisionKind(turn.decision) === filters.decision) &&
         (filters.status === "all" ||
           (filters.status === "accepted" && turn.accepted) ||
           (filters.status === "rejected" && !turn.accepted))

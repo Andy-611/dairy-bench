@@ -8,10 +8,10 @@ import {
   isZeroDecimal,
 } from "../../shared/format";
 import {
-  COMMAND_PROCESSING_ORDER_LABEL,
+  DECISION_PROCESSING_ORDER_LABEL,
   ORDER_BOOK_PRIORITY_LABEL,
   clockTime,
-  commandProcessingOrderSummary,
+  decisionProcessingOrderSummary,
   plural,
 } from "../../shared/timelineFormatters";
 import type {
@@ -108,7 +108,7 @@ function OrderFlow({
       <header>
         <span>QUOTE LADDER FLOW</span>
         <strong>
-          Atomic reconciliation actions produced by quote-ladder commands
+          Atomic reconciliation actions produced by quote-ladder decisions
         </strong>
       </header>
       {items.length === 0 ? (
@@ -133,7 +133,7 @@ function OrderFlow({
                 >
                   <span
                     className="market-flow-sequence"
-                    title={commandProcessingOrderSummary(flow.applySequence)}
+                    title={decisionProcessingOrderSummary(flow.applySequence)}
                   >
                     Ladder #{flow.applySequence}
                   </span>
@@ -180,9 +180,9 @@ function TradeTape({
             <li key={trade.tradeId} title={`Trade ${trade.tradeId}`}>
               <span
                 className="trade-sequence"
-                title={commandProcessingOrderSummary(trade.applySequence)}
+                title={decisionProcessingOrderSummary(trade.applySequence)}
               >
-                Command #{trade.applySequence}
+                Decision #{trade.applySequence}
               </span>
               <span className="trade-contract">
                 <strong>{productLabel(trade.product)}</strong>
@@ -408,7 +408,7 @@ function OrderFlowDetail({
         >
           <dl className="market-detail-grid">
             <MarketMeta
-              label={COMMAND_PROCESSING_ORDER_LABEL}
+              label={DECISION_PROCESSING_ORDER_LABEL}
               value={`#${flow.applySequence}`}
             />
             <MarketMeta label="Action" value={flow.action.toUpperCase()} />
@@ -493,7 +493,7 @@ function OrderFlowDetail({
                 </ol>
               )}
             </MarketDrawerSection>
-            <MarketDrawerSection label="3" title="Immediate command result">
+            <MarketDrawerSection label="3" title="Immediate decision result">
               <dl className="market-detail-grid compact">
                 <MarketMeta
                   label="Submitted"

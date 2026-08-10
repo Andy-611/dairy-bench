@@ -7,13 +7,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from company_bench.agents.company import (
-    COMMAND_PROMPT_VERSION,
+    DECISION_PROMPT_VERSION,
     BaselineCompanyAgent,
     CompanyAgent,
     LlmCompanyAgent,
     ReplayCompanyAgent,
 )
-from company_bench.agents.contracts import CommandGateway
+from company_bench.agents.contracts import DecisionGateway
 from company_bench.agents.memory import AgentCheckpoint
 from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
 from company_bench.agents.providers.newapi import (
@@ -25,7 +25,7 @@ from company_bench.domain.models import PolicyKind, PolicyMetadata, ScenarioSpec
 from company_bench.runs.models import PolicyAuditSink, PolicyProfileView
 from company_bench.runtime.models import TurnRecord
 
-type NewApiGatewayFactory = Callable[[NewApiModelConfig], CommandGateway]
+type NewApiGatewayFactory = Callable[[NewApiModelConfig], DecisionGateway]
 
 _MODEL_UNAVAILABLE = (
     "Model Agents are unavailable: run `start.cmd --configure-newapi`, then restart `start.cmd`"
@@ -41,7 +41,7 @@ class AgentBundle:
     """Company actors and their independently owned model gateways."""
 
     agents: Mapping[str, CompanyAgent]
-    _gateways: tuple[CommandGateway, ...] = ()
+    _gateways: tuple[DecisionGateway, ...] = ()
 
     async def close(self) -> None:
         """Release every company gateway and surface the first failure."""
@@ -139,7 +139,7 @@ class AgentFactory:
         metadata = _model_metadata(config)
         checkpoint_by_company = {checkpoint.company_id: checkpoint for checkpoint in checkpoints}
         agents: dict[str, CompanyAgent] = {}
-        gateways: list[CommandGateway] = []
+        gateways: list[DecisionGateway] = []
         for company in self._scenario.companies:
             gateway = self._gateway_factory(config)
             gateways.append(gateway)
@@ -211,7 +211,7 @@ def _model_metadata(config: NewApiModelConfig) -> PolicyMetadata:
         kind=PolicyKind.MODEL,
         provider="newapi",
         model=config.model,
-        prompt_version=COMMAND_PROMPT_VERSION,
+        prompt_version=DECISION_PROMPT_VERSION,
         config_fingerprint=config.fingerprint,
     )
 

@@ -1,4 +1,4 @@
-"""Strongly typed commands and runtime records for event-driven episodes."""
+"""Strongly typed decisions and runtime records for event-driven episodes."""
 
 from __future__ import annotations
 
@@ -28,12 +28,16 @@ from company_bench.domain.precision import EconomicDecimal
 
 __all__ = [
     "PROTOCOL_ERROR_PREFIX",
+    "ActionDecision",
     "AgentTurn",
-    "CommandEnvelope",
-    "CommandOutcome",
-    "CommandStatus",
-    "CompanyCommand",
+    "AttentionPlan",
+    "CompanyDecision",
+    "DecisionEnvelope",
+    "DecisionOutcome",
+    "DecisionStatus",
     "DeliveryExpiryBucket",
+    "EconomicCommand",
+    "IdleDecision",
     "IncomingDeliveryView",
     "InventoryExpiryBucket",
     "JournalEntryKind",
@@ -63,7 +67,6 @@ __all__ = [
     "Transform",
     "TurnRecord",
     "TurnReplayOrigin",
-    "Wait",
     "WakeReason",
     "WakeSignal",
     "system_step_id",
@@ -120,11 +123,10 @@ class WakeReason(StrEnum):
     """Why a company is receiving a new Agent turn."""
 
     DAY_OPEN = "day_open"
-    CONTINUE = "continue"
-    WAIT_EXPIRED = "wait_expired"
+    REVIEW_DUE = "review_due"
     PRICE_ALERT = "price_alert"
     TRADE_EXECUTED = "trade_executed"
-    COMMAND_REJECTED = "command_rejected"
+    DECISION_REJECTED = "decision_rejected"
     OPERATION_COMPLETED = "operation_completed"
     DELIVERY_COMPLETED = "delivery_completed"
     EXTERNAL_EVENT = "external_event"
@@ -269,44 +271,69 @@ class QuoteAlert(StrictModel):
     price: PositiveMoney
 
 
-class Wait(StrictModel):
-    """Yield for a bounded duration or until a visible quote alert fires."""
+class AttentionPlan(StrictModel):
+    """Declare when a company should next receive an Agent turn."""
 
-    kind: Literal["wait"] = "wait"
     review_after_minutes: int | None = Field(default=None, ge=1)
     alerts: tuple[QuoteAlert, ...] = Field(default=(), max_length=3)
 
 
-type CompanyCommand = Annotated[
-    Produce | Transform | SetQuoteLadder | SetRetailPrice | Wait,
+type EconomicCommand = Annotated[
+    Produce | Transform | SetQuoteLadder | SetRetailPrice,
     Field(discriminator="kind"),
 ]
 
 
-class CommandEnvelope(StrictModel):
-    """Bind an untrusted command to runtime-owned identity and time."""
+class ActionDecision(StrictModel):
+    """Apply one economic command and arm its next attention plan atomically."""
+
+    kind: Literal["action"] = "action"
+    action: EconomicCommand
+    attention: AttentionPlan
+
+
+class IdleDecision(StrictModel):
+    """Leave economic state unchanged while arming the next attention plan."""
+
+    kind: Literal["idle"] = "idle"
+    attention: AttentionPlan
+
+
+type CompanyDecision = Annotated[
+    ActionDecision | IdleDecision,
+    Field(discriminator="kind"),
+]
+
+
+class DecisionEnvelope(StrictModel):
+    """Bind an untrusted decision to runtime-owned identity and time."""
 
     turn_id: Identifier
-    command_id: Identifier
+    decision_id: Identifier
     company_id: CompanyId
     issued_at: SimTime
     state_version: int = Field(ge=0)
-    command: CompanyCommand
+    decision: CompanyDecision
+
+    @property
+    def action(self) -> EconomicCommand | None:
+        """Return the economic command, if this is an action decision."""
+        return self.decision.action if isinstance(self.decision, ActionDecision) else None
 
 
-class CommandStatus(StrEnum):
-    """Immediate disposition of a submitted company command."""
+class DecisionStatus(StrEnum):
+    """Immediate disposition of a submitted company decision."""
 
     ACCEPTED = "accepted"
     REJECTED = "rejected"
 
 
 class RejectionCategory(StrEnum):
-    """Authority responsible for rejecting one submitted command."""
+    """Authority responsible for rejecting one submitted decision."""
 
     ECONOMIC = "economic"
     PROTOCOL = "protocol"
-    WAIT_PLAN = "wait_plan"
+    ATTENTION = "attention"
 
 
 class QuoteLevelAction(StrEnum):
@@ -376,24 +403,24 @@ class ScheduledCompletion(StrictModel):
 
     @model_validator(mode="after")
     def validate_kind(self) -> Self:
-        """Only asynchronous completions may be scheduled by commands."""
+        """Only asynchronous completions may be scheduled by decisions."""
         allowed = {
             SystemEventKind.OPERATION_COMPLETED,
             SystemEventKind.DELIVERY_COMPLETED,
         }
         if self.kind not in allowed:
-            raise ValueError("command schedules must be operation or delivery completions")
+            raise ValueError("decision schedules must be operation or delivery completions")
         return self
 
 
-class CommandOutcome(StrictModel):
-    """Auditable immediate result of applying one command."""
+class DecisionOutcome(StrictModel):
+    """Auditable immediate result of applying one company decision."""
 
     turn_id: Identifier
-    command_id: Identifier
+    decision_id: Identifier
     company_id: CompanyId
     occurred_at: SimTime
-    status: CommandStatus
+    status: DecisionStatus
     accepted: bool
     rejection_category: RejectionCategory | None = None
     reason: str | None = Field(default=None, min_length=1, max_length=500)
@@ -408,12 +435,12 @@ class CommandOutcome(StrictModel):
     @model_validator(mode="after")
     def validate_outcome(self) -> Self:
         """Keep status, time, and rejection details internally consistent."""
-        if self.accepted != (self.status is CommandStatus.ACCEPTED):
+        if self.accepted != (self.status is DecisionStatus.ACCEPTED):
             raise ValueError("accepted must agree with status")
-        if self.status is CommandStatus.REJECTED and self.reason is None:
-            raise ValueError("rejected commands require a reason")
+        if self.status is DecisionStatus.REJECTED and self.reason is None:
+            raise ValueError("rejected decisions require a reason")
         if self.accepted != (self.rejection_category is None):
-            raise ValueError("rejection_category is required only for rejected commands")
+            raise ValueError("rejection_category is required only for rejected decisions")
         if (
             self.next_available_at is not None
             and self.next_available_at.absolute_minute < self.occurred_at.absolute_minute
@@ -579,7 +606,7 @@ class AgentTurn(StrictModel):
     active_operation: OperationJobView | None = None
     private_economics: PrivateEconomicsView = PrivateEconomicsView()
     visible_events: tuple[DomainEvent, ...] = ()
-    previous_outcome: CommandOutcome | None = None
+    previous_outcome: DecisionOutcome | None = None
 
     @property
     def remaining_operation_capacity(self) -> Quantity | None:
@@ -691,12 +718,12 @@ def system_step_id(run_id: Identifier, scheduled_event_id: Identifier) -> Identi
 
 
 class TurnRecord(StrictModel):
-    """One complete Agent turn with its bound command and outcome."""
+    """One complete Agent turn with its bound decision and outcome."""
 
     run_id: Identifier
     turn: AgentTurn
-    envelope: CommandEnvelope
-    outcome: CommandOutcome
+    envelope: DecisionEnvelope
+    outcome: DecisionOutcome
     observation_hash: Identifier
     protocol_issue_kind: ProtocolIssueKind | None = None
     protocol_error: str | None = Field(default=None, min_length=1, max_length=450)
@@ -709,28 +736,28 @@ class TurnRecord(StrictModel):
         if self.envelope.turn_id != self.turn.turn_id:
             raise ValueError("envelope turn_id must match the turn")
         if self.envelope.company_id != self.turn.company_id:
-            raise ValueError("command company_id must match the turn")
+            raise ValueError("decision company_id must match the turn")
         if self.envelope.issued_at != self.turn.sim_time:
-            raise ValueError("command issued_at must match the turn time")
+            raise ValueError("decision issued_at must match the turn time")
         if self.envelope.state_version != self.turn.state_version:
-            raise ValueError("command state_version must match the turn")
+            raise ValueError("decision state_version must match the turn")
         if self.outcome.turn_id != self.turn.turn_id:
             raise ValueError("outcome turn_id must match the turn")
         if self.outcome.company_id != self.turn.company_id:
             raise ValueError("outcome company_id must match the turn")
-        if self.outcome.command_id != self.envelope.command_id:
-            raise ValueError("outcome command_id must match the command")
+        if self.outcome.decision_id != self.envelope.decision_id:
+            raise ValueError("outcome decision_id must match the decision")
         if self.outcome.resulting_state_version < self.envelope.state_version:
             raise ValueError("outcome cannot move the state version backwards")
         if self.outcome.occurred_at.absolute_minute < self.envelope.issued_at.absolute_minute:
-            raise ValueError("outcome cannot precede the command")
-        command = self.envelope.command
+            raise ValueError("outcome cannot precede the decision")
+        action = self.envelope.action
         result = self.outcome.quote_ladder_result
-        expects_ladder_result = self.outcome.accepted and isinstance(command, SetQuoteLadder)
+        expects_ladder_result = self.outcome.accepted and isinstance(action, SetQuoteLadder)
         if (result is not None) != expects_ladder_result:
             raise ValueError("only an accepted quote ladder requires a ladder result")
-        if result is not None and tuple(level.level for level in result.levels) != command.levels:
-            raise ValueError("quote ladder result levels must match the command target")
+        if result is not None and tuple(level.level for level in result.levels) != action.levels:
+            raise ValueError("quote ladder result levels must match the action target")
         if (
             self.turn.previous_outcome is not None
             and self.outcome.apply_sequence <= self.turn.previous_outcome.apply_sequence
@@ -743,8 +770,8 @@ class TurnRecord(StrictModel):
                 raise ValueError("a protocol error cannot produce an accepted outcome")
             if self.outcome.rejection_category is not RejectionCategory.PROTOCOL:
                 raise ValueError("protocol errors require a protocol rejection category")
-            if not isinstance(self.envelope.command, Wait):
-                raise ValueError("protocol errors must normalize to a wait command")
+            if not isinstance(self.envelope.decision, IdleDecision):
+                raise ValueError("protocol errors must normalize to an idle decision")
             if self.outcome.reason != f"{PROTOCOL_ERROR_PREFIX}{self.protocol_error}":
                 raise ValueError("protocol error must match the outcome reason")
         return self

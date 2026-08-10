@@ -8,7 +8,7 @@ The default scenario is `flow.dairy.base.s9.v5`. One episode lasts 30 simulated
 days, and every decision follows one typed boundary:
 
 ```text
-Wake -> AgentTurn -> one CompanyCommand -> EconomyEngine -> Journal -> next Wake
+Wake -> AgentTurn -> one CompanyDecision -> EconomyEngine -> Journal -> next Wake
 ```
 
 Only `EconomyEngine` may mutate cash, inventory, orders, jobs, deliveries, or
@@ -27,7 +27,7 @@ Dairy Bench exposes exactly three modes:
   model and rejects observation or outcome drift.
 
 There is no direct model-provider path. All model-backed runs go through the
-single NewAPI adapter and validate into the same Pydantic command union.
+single NewAPI adapter and validate into the same Pydantic decision union.
 
 ## V4 behavior
 
@@ -35,7 +35,12 @@ single NewAPI adapter and validate into the same Pydantic command union.
 - Atomic target ladders with up to three price levels and price-time priority.
 - FEFO inventory reservation and a shared `0.0001` economic quantum.
 - Concurrent same-minute model inference followed by deterministic persisted
-  command application order.
+  decision application order.
+- Every `ActionDecision` and `IdleDecision` carries an `AttentionPlan`. Accepted
+  decisions do not create an automatic next-minute turn; companies wake for
+  their own trades, operation or delivery completion, price alerts, bounded
+  review, or the next market open. Only rejected decisions receive a bounded
+  correction retry.
 - Thirty-minute production, transformation, and delivery events.
 - Private per-company memory, immutable journals, atomic checkpoints, recovery,
   and deterministic completed-run replay.
@@ -94,8 +99,9 @@ The launcher opens `http://127.0.0.1:5173`. Use `start.cmd --check` to inspect
 local prerequisites and NewAPI configuration without starting services.
 
 The model selector is populated from the NewAPI catalog. Because `/v1/models`
-does not prove command-tool compatibility, Dairy Bench still requires exactly
-one authorized function call. The adapter prefers `tool_choice="required"` and
+does not prove decision-tool compatibility, Dairy Bench still requires exactly
+one authorized function call whose input includes an attention plan. The adapter
+prefers `tool_choice="required"` and
 omits that hint only when the provider explicitly rejects it, as some thinking
 models do. It always disables parallel tool calls and gives an invalid completion
 one structured repair attempt. Before the first run of a model is queued, a short

@@ -14,9 +14,10 @@ import {
 } from "../../shared/format";
 import { isAbortError, requestErrorMessage } from "../../shared/requestErrors";
 import {
-  COMMAND_PROCESSING_ORDER_LABEL,
+  DECISION_PROCESSING_ORDER_LABEL,
+  attentionFallbackSummary,
   clockTime,
-  commandSummary,
+  decisionSummary,
   economicStateTransitionSummary,
   effectSummary,
   plural,
@@ -25,11 +26,11 @@ import {
   stateChangeKey,
   stateChangeSummary,
   systemLabel,
-  waitFallbackSummary,
   wakeLabel,
 } from "../../shared/timelineFormatters";
 import type {
-  CommandStateChangeView,
+  AttentionPlanView,
+  DecisionStateChangeView,
   EconomicEffectView,
   JsonValue,
   SystemTimelineItemView,
@@ -124,7 +125,7 @@ function TurnDetail({
           value={`Economic state v${turn.stateVersion}`}
         />
         <Meta
-          label={COMMAND_PROCESSING_ORDER_LABEL}
+          label={DECISION_PROCESSING_ORDER_LABEL}
           value={`#${turn.applySequence}`}
         />
         <Meta
@@ -171,11 +172,11 @@ function TurnDetail({
         <ObservationDelta turn={turn} />
       </DrawerSection>
 
-      <DrawerSection number="3" title="Command and engine outcome">
-        <div className="command-outcome-detail">
+      <DrawerSection number="3" title="Decision and engine outcome">
+        <div className="decision-outcome-detail">
           <div>
-            <span>Atomic command</span>
-            <strong>{commandSummary(turn.command)}</strong>
+            <span>Company decision</span>
+            <strong>{decisionSummary(turn.decision)}</strong>
           </div>
           <div>
             <span>Engine result</span>
@@ -189,20 +190,18 @@ function TurnDetail({
         </div>
         {turn.effects.length > 0 && <EffectList effects={turn.effects} />}
         <StateChangeList changes={turn.stateChanges} />
-        {turn.command.kind === "wait" && (
-          <WaitPlan
-            accepted={turn.accepted}
-            command={turn.command}
-            nextAvailableMinute={turn.nextAvailableMinute}
-          />
-        )}
+        <AttentionPlan
+          accepted={turn.accepted}
+          attention={turn.decision.attention}
+          reviewMinute={turn.reviewMinute}
+        />
         {turn.effects.length === 0 && turn.stateChanges.length === 0 && (
           <p className="inline-empty">No immediate economic change.</p>
         )}
         <p className="next-action">
           {turn.nextAvailableMinute === null
-            ? "No continuation was scheduled."
-            : `The company became available again at ${clockTime(turn.nextAvailableMinute)}.`}
+            ? "No economic action cooldown is active."
+            : `Economic action cooldown ended at ${clockTime(turn.nextAvailableMinute)}; it did not itself schedule a new turn.`}
         </p>
       </DrawerSection>
 
@@ -218,21 +217,21 @@ function TurnDetail({
   );
 }
 
-function WaitPlan({
+function AttentionPlan({
   accepted,
-  command,
-  nextAvailableMinute,
+  attention,
+  reviewMinute,
 }: {
   readonly accepted: boolean;
-  readonly command: Extract<TurnTimelineItemView["command"], { kind: "wait" }>;
-  readonly nextAvailableMinute: number | null;
+  readonly attention: AttentionPlanView;
+  readonly reviewMinute: number | null;
 }) {
   return (
     <div className="observed-facts">
       <h4>{accepted ? "Attention plan" : "Requested attention plan"}</h4>
-      {command.alerts.length > 0 ? (
+      {attention.alerts.length > 0 ? (
         <ul className="effect-list">
-          {command.alerts.map((alert, index) => (
+          {attention.alerts.map((alert, index) => (
             <li key={`${alert.product}-${alert.quote}-${alert.operator}-${index}`}>
               <span>Price alert</span>
               <strong>
@@ -245,14 +244,14 @@ function WaitPlan({
         <p>No price alert was armed.</p>
       )}
       <p>
-        Requested fallback: {waitFallbackSummary(command)}.
+        Requested fallback: {attentionFallbackSummary(attention)}.
       </p>
       {!accepted ? (
-        <p>The attention plan was not armed because the command was rejected.</p>
-      ) : nextAvailableMinute === null ? (
+        <p>The attention plan was not armed because the decision was rejected.</p>
+      ) : reviewMinute === null ? (
         <p>No same-day fallback wake was scheduled.</p>
       ) : (
-        <p>Effective fallback: {clockTime(nextAvailableMinute)}.</p>
+        <p>Effective fallback: {clockTime(reviewMinute)}.</p>
       )}
     </div>
   );
@@ -567,7 +566,7 @@ function TraceProvenance({
                   {trace.preview.isSourceTrace ? "Source trace" : "Current-run trace"}
                   {" · "}
                   {trace.preview.appliedToCommittedTurn
-                    ? "Committed command"
+                    ? "Committed decision"
                     : "Uncommitted physical attempt"}
                 </span>
               </div>
@@ -635,7 +634,7 @@ function EffectList({
 function StateChangeList({
   changes,
 }: {
-  readonly changes: readonly CommandStateChangeView[];
+  readonly changes: readonly DecisionStateChangeView[];
 }) {
   if (changes.length === 0) {
     return null;

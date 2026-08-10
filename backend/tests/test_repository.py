@@ -32,12 +32,13 @@ from company_bench.runs.models import (
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import (
     AgentTurn,
-    CommandEnvelope,
-    CommandOutcome,
-    CommandStatus,
+    AttentionPlan,
+    DecisionEnvelope,
+    DecisionOutcome,
+    DecisionStatus,
+    IdleDecision,
     SimTime,
     TurnRecord,
-    Wait,
     WakeReason,
 )
 from company_bench.runtime.scheduler import SchedulerCheckpoint
@@ -50,9 +51,7 @@ from company_bench.storage.store import (
 
 def run_episode(seed: int = 42) -> EpisodeResult:
     """Create one real V4 episode through the public runtime interface."""
-    agents = {
-        company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_SCENARIO.companies
-    }
+    agents = {company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_SCENARIO.companies}
     execution = asyncio.run(
         EpisodeRuntime(DAIRY_S9_SCENARIO).run(
             agents,
@@ -84,9 +83,7 @@ def test_repository_rejects_completion_quality_drift() -> None:
             (ProtocolIssueKind.MISSING_TOOL_CALL,),
         ),
     )
-    completed_job = _completed_job_for(result).model_copy(
-        update={"quality": invalid_quality}
-    )
+    completed_job = _completed_job_for(result).model_copy(update={"quality": invalid_quality})
 
     with pytest.raises(ValueError, match="same quality"):
         repository.complete_job(result, completed_job)
@@ -228,10 +225,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
-        assert connection.execute(
-            "SELECT schema_version FROM run_turns"
-        ).fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 6
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
             "result_json",
@@ -247,8 +242,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
-def test_sqlite_repository_rejects_non_v11_databases(
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13])
+def test_sqlite_repository_rejects_non_v12_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -277,7 +272,7 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
-    assert checkpoint.schema_version == 8
+    assert checkpoint.schema_version == 9
 
     with SQLiteRunStore(database) as repository:
         repository.save_progress((first,), (), checkpoint)
@@ -307,11 +302,11 @@ def test_sqlite_repository_rejects_stale_journal_payload_schema(
     with SQLiteRunStore(database) as repository:
         repository.record_turn(record)
     with sqlite3.connect(database) as connection:
-        connection.execute("UPDATE run_turns SET schema_version = 4")
+        connection.execute("UPDATE run_turns SET schema_version = 5")
 
     with (
         SQLiteRunStore(database) as repository,
-        pytest.raises(RuntimeError, match="journal payload schema version: 4"),
+        pytest.raises(RuntimeError, match="journal payload schema version: 5"),
     ):
         repository.list_turns(record.run_id)
 
@@ -544,10 +539,10 @@ def _turn_for(
     *,
     sequence: int = 1,
 ) -> TurnRecord:
-    """Build one complete wait turn with deterministic runtime identities."""
+    """Build one complete idle decision with deterministic runtime identities."""
     at = SimTime.at(day=0, hour=9, minute=(sequence - 1) * 10)
     turn_id = f"{run_id}.turn.{sequence}"
-    command_id = f"{run_id}.command.{sequence}"
+    decision_id = f"{run_id}.decision.{sequence}"
     turn = AgentTurn(
         turn_id=turn_id,
         company_id=observation.company_id,
@@ -555,29 +550,28 @@ def _turn_for(
         state_version=sequence - 1,
         turn_number_today=sequence,
         turn_limit_today=observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.DAY_OPEN if sequence == 1 else WakeReason.CONTINUE,),
+        wake_reasons=(WakeReason.DAY_OPEN if sequence == 1 else WakeReason.REVIEW_DUE,),
         observation=observation,
         available_cash=observation.cash,
         marked_surplus=Decimal(),
     )
-    envelope = CommandEnvelope(
+    envelope = DecisionEnvelope(
         turn_id=turn_id,
-        command_id=command_id,
+        decision_id=decision_id,
         company_id=observation.company_id,
         issued_at=at,
         state_version=sequence - 1,
-        command=Wait(review_after_minutes=10),
+        decision=IdleDecision(attention=AttentionPlan(review_after_minutes=10)),
     )
-    outcome = CommandOutcome(
+    outcome = DecisionOutcome(
         turn_id=turn_id,
-        command_id=command_id,
+        decision_id=decision_id,
         company_id=observation.company_id,
         occurred_at=at,
-        status=CommandStatus.ACCEPTED,
+        status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=sequence,
         apply_sequence=sequence,
-        next_available_at=at.plus(10),
     )
     return TurnRecord(
         run_id=run_id,
@@ -681,7 +675,7 @@ def _invocation_for_turn(
     record: TurnRecord,
     observation: CompanyObservation,
 ) -> PolicyInvocation:
-    """Build one completed command audit tied to its applied turn."""
+    """Build one completed decision audit tied to its applied turn."""
     now = datetime.now(UTC)
     return PolicyInvocation(
         invocation_id=f"{record.turn.turn_id}.invocation",
@@ -700,6 +694,6 @@ def _invocation_for_turn(
         sim_minute=record.turn.sim_time.absolute_minute,
         state_version=record.turn.state_version,
         apply_sequence=record.outcome.apply_sequence,
-        command=record.envelope.command,
-        command_outcome=record.outcome,
+        decision=record.envelope.decision,
+        decision_outcome=record.outcome,
     )
