@@ -11,7 +11,7 @@ from company_bench.agents.company import (
     LlmCompanyAgent,
     observation_hash,
 )
-from company_bench.agents.contracts import ModelOutputError
+from company_bench.agents.memory import MemoryExchange
 from company_bench.domain.models import (
     CompanyObservation,
     InventoryPosition,
@@ -57,7 +57,6 @@ def _llm_agent(
     company_id: str = "farm_a",
     repository: InMemoryRunStore | None = None,
     memory_token_budget: int = 12_288,
-    max_prompt_tokens: int = 16_384,
 ) -> tuple[LlmCompanyAgent, ScriptedModelGateway, InMemoryRunStore]:
     """Create one isolated scripted V4 Agent and its audit repository."""
     audit_repository = repository if repository is not None else InMemoryRunStore()
@@ -75,7 +74,6 @@ def _llm_agent(
             prompt_version=COMMAND_PROMPT_VERSION,
         ),
         memory_token_budget=memory_token_budget,
-        max_prompt_tokens=max_prompt_tokens,
     )
     return agent, gateway, audit_repository
 
@@ -535,23 +533,21 @@ async def test_baseline_does_not_duplicate_a_resting_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_agent_rejects_an_oversized_prompt_before_calling_provider(
+async def test_llm_agent_delegates_complete_request_budget_to_provider_adapter(
     first_observation: CompanyObservation,
 ) -> None:
     agent, gateway, repository = _llm_agent(
         "prompt_limit",
         Wait(),
         memory_token_budget=100,
-        max_prompt_tokens=200,
     )
     turn = _turn("prompt_limit", first_observation)
 
-    with pytest.raises(ModelOutputError, match="prompt-token limit"):
-        await agent.act(turn)
+    assert await agent.act(turn) == Wait()
 
-    assert gateway.command_requests == []
+    assert len(gateway.command_requests) == 1
     invocation = repository.list_invocations("prompt_limit")[0]
-    assert invocation.outcome is InvocationOutcome.AGENT_ERROR
+    assert invocation.outcome is InvocationOutcome.SUCCESS
     assert invocation.domain_turn_id == turn.turn_id
 
 
@@ -598,7 +594,7 @@ async def test_llm_agent_audits_and_remembers_one_complete_turn(
     checkpoint = agent.checkpoint()
     assert checkpoint.revision == 1
     assert len(checkpoint.exchanges) == 1
-    assert checkpoint.exchanges[0].model_dump() == record.model_dump()
+    assert checkpoint.exchanges[0] == MemoryExchange.from_record(record)
     invocation = repository.list_invocations(run_id)[0]
     assert invocation.outcome is InvocationOutcome.SUCCESS
     assert invocation.command == command

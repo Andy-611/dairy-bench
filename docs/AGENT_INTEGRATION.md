@@ -28,7 +28,7 @@ The model must choose exactly one role-authorized command:
 | `transform(input_product, output_product, input_quantity)` | Start one processor conversion job |
 | `set_quote_ladder(product, side, levels)` | Atomically set up to three target price-quantity levels |
 | `set_retail_price(product, unit_price)` | Set a retailer's consumer price |
-| `wait(until?)` | Yield until a deadline or another relevant event |
+| `wait(review_after_minutes?)` | Yield for a bounded duration or until another relevant event |
 
 Farms may produce and trade raw milk. Processors may transform and trade raw or
 bottled milk. Retailers may trade bottled milk and set its consumer price.
@@ -67,11 +67,18 @@ Every model-backed run uses NewAPI's common Chat Completions interface and
 requires exactly one authorized function call. The adapter prefers
 `tool_choice="required"`; if a provider explicitly rejects that optional hint,
 it retries without the field while retaining the complete tools schema and the
-same output checks. Every request fixes `max_tokens` at 131,072; there is no
-adaptive output-budget growth or environment override. Every model family is
-validated against the same discriminated Pydantic `CompanyCommand` union.
-Missing, multiple, unknown, unauthorized, or malformed calls cannot mutate the
-economy.
+same output checks. It always sends `parallel_tool_calls=false`. Every request
+uses the maximum output limit confirmed for that model and NewAPI route; there
+is no adaptive output-budget growth. Before the first run for a model is queued,
+`ModelCapabilityCatalog` validates a documented candidate with one short request
+or extracts the exact ceiling from an explicit parameter rejection, then writes
+the result to a versioned local catalog. The complete serialized request,
+including tool schemas, is also checked against the configured input budget.
+Every model family is validated against the same discriminated Pydantic
+`CompanyCommand` union. A protocol-invalid completion receives one immediate
+corrective retry. If that also fails, the turn becomes an audited protocol
+rejection, the economy remains unchanged, and the episode continues as
+diagnostic-only.
 
 ## What an agent observes
 
@@ -91,6 +98,8 @@ economy.
   quantity-preserving expiry buckets;
 - the active production or transformation job, if any, and the authoritative
   daily operation state;
+- private cumulative cash-flow and executable unit-economics estimates derived
+  only from the company's own ledger and currently visible market prices;
 - company-visible domain events and the previous command outcome.
 
 The provider input also carries a typed `decision_constraints` projection. It
@@ -187,17 +196,20 @@ The provider request combines:
 
 1. current authoritative `AgentTurn` facts;
 2. explicit `decision_constraints` derived from that turn;
-3. recent complete Turn/Command/Outcome exchanges; and
-4. a deterministic long-horizon summary of older complete exchanges.
+3. recent compact decision records containing time, wake, command, disposition,
+   and rejection category; and
+4. a deterministic long-horizon summary of older decision records.
 
 Compaction is token-budget driven, not a fixed seven-day window. It never splits
 a command from its outcome and requires no extra model call. The default
-compaction trigger is 12,288 estimated tokens; the full prompt has an independent
-16,384-token ceiling. If authoritative current facts cannot fit, the turn fails
-explicitly rather than hiding business state.
+compaction trigger is 12,288 estimated tokens. The NewAPI adapter independently
+checks the complete serialized request, including current facts and tool schemas,
+against its 128,000-token input budget. If authoritative current facts cannot
+fit, the turn is explicitly protocol-rejected rather than hiding business state.
 
-Memory helps the agent reason but is not the economic authority. Complete
-`TurnRecord` objects stay in the immutable journal even after prompt compaction.
+Memory helps the agent reason but is not the economic authority. Full
+observations and outcomes are never duplicated into provider memory; complete
+`TurnRecord` objects stay in the immutable journal.
 
 ## Journal, checkpoint, and replay
 
@@ -216,7 +228,7 @@ Recovery resumes only from that boundary and rejects provider, model, prompt,
 scenario, or configuration drift. Completed Run Replay creates no provider gateway: it
 verifies every observation hash, reproduces each recorded command or protocol
 rejection, compares every outcome and system step, and finally requires equal
-events, snapshots, and score.
+events, snapshots, score, and quality metadata.
 
 ## Running model agents through NewAPI
 
@@ -235,23 +247,39 @@ encrypted credential plus the non-secret model catalog under
 `.dairy-bench/credentials`. Normal startup decrypts the key only into the
 backend child process environment. The browser receives only the catalog; the
 selected model is persisted in `RunJob` and policy audit metadata. Re-run the
-configuration command to replace the key or refresh models, then restart an
-already-running backend.
+configuration command to replace the key or refresh models; this removes limits
+validated for the previous route. Then restart an already-running backend.
 
-Each company owns a separate `NewApiModelGateway` and HTTP client. Calls go to
-`/v1/chat/completions`; there is no provider-specific SDK or fallback route.
+The first submission for each model performs one pre-run capability calibration.
+Known model IDs start from an auditable documented candidate. Unknown IDs use a
+deliberately invalid discovery ceiling and are accepted only when NewAPI reports
+an exact lower output limit. A silent clamp or ambiguous context/input error is
+rejected rather than guessed. Confirmed records live in
+`.dairy-bench/credentials/newapi-model-capabilities.json`; subsequent submissions
+perform no calibration request. The selected limit participates in the policy
+configuration fingerprint but the calibration request itself is not a benchmark
+Agent invocation.
+
+Each company owns a separate `NewApiModelGateway`; every gateway shares the
+application-owned `NewApiTransport`, HTTP connection pool, and 100-request
+semaphore. Calls go to `/v1/chat/completions`; there is no provider-specific SDK
+or fallback route. Retry backoff occurs after the request permit is released.
 The model-list endpoint does not certify tool support. A gateway initially asks
 for a required tool call, remembers an explicit provider rejection of
-`tool_choice`, and omits only that field on the retry and later calls. A selected
-model that still returns no function call within the fixed 131,072-token budget
-fails the run as an audited compatibility error.
+`tool_choice`, and omits only that field on the retry and later calls. Every
+physical request is audited with latency, request IDs, outcome, and provider
+token usage. Missing, multiple, unknown, unauthorized, or malformed calls get
+one semantic repair request; exhausting that repair rejects only the turn and
+makes the completed episode ineligible for benchmark comparison. A response
+that exhausts its confirmed model-native output budget before choosing a tool is
+a terminal model-compatibility failure.
 
 ## Failure semantics
 
 | Condition | Result |
 |---|---|
-| Invalid model command | Protocol rejection; economy unchanged; correction may be attempted on the next virtual minute |
-| Selected model cannot return a required function call | Run fails immediately with an audited compatibility error |
+| Invalid model command | One immediate repair; if still invalid, protocol rejection, unchanged economy, diagnostic episode continues |
+| Output budget exhausted before any function call | Run fails with an audited compatibility error |
 | Role, collateral, ownership, capacity, or time rule fails | Typed engine rejection; run continues |
 | Authentication or permanent provider configuration failure | Run fails; no misleading score is emitted |
 | DNS, connection, timeout, 408, 409, 429, or retry-exhausted 5xx failure | Run is interrupted with its checkpoint preserved |
@@ -273,11 +301,13 @@ GET /api/runs/{run_id}/invocations
 `turns` is the authoritative business journal. `invocations` audits provider
 calls, latency, and tokens. `timeline` is a causal human-readable projection.
 The operations timeline remains readable from committed journal and checkpoint
-evidence even when a run has no final episode or score. **All Runs** includes
-every persisted lifecycle state. `stopped`, `interrupted`, and checkpointed
-`failed` jobs support explicit resume under the same run ID; only `interrupted`
-jobs auto-resume after backend restart. **Completed Run Replay** remains a
-separate completed-only verification operation.
+evidence even when a run has no final episode or score. Completed runs expose
+trade, rejection, demand, expiry, insolvency-risk, and protocol-quality
+diagnostics. **All Runs** includes every persisted lifecycle state. `stopped`
+and `interrupted` jobs support explicit resume under the same run ID; only
+`interrupted` jobs auto-resume after backend restart. A `failed` job is terminal.
+**Completed Run Replay** remains a separate completed-only verification
+operation, including diagnostic-only sources.
 
 ## Model adapter boundary
 
@@ -293,7 +323,8 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`AgentFactory` creates one NewAPI gateway per company. The adapter validates
+`AgentFactory` creates one NewAPI gateway per company while the application
+shares one transport across all gateways and runs. The adapter validates
 output into an authorized `CompanyCommand`, maps content failures to
 `ModelOutputError`, compatibility failures to `ModelCompatibilityError`, and
 permanent credential/configuration failures to `ModelConfigurationError`.

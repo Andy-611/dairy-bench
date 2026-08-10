@@ -15,12 +15,17 @@ from company_bench.agents.company import (
 )
 from company_bench.agents.contracts import CommandGateway
 from company_bench.agents.memory import AgentCheckpoint
-from company_bench.agents.providers.newapi import NewApiConfig, NewApiModelGateway
+from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
+from company_bench.agents.providers.newapi import (
+    NewApiConfig,
+    NewApiModelConfig,
+    NewApiModelGateway,
+)
 from company_bench.domain.models import PolicyKind, PolicyMetadata, ScenarioSpec
 from company_bench.runs.models import PolicyAuditSink, PolicyProfileView
 from company_bench.runtime.models import TurnRecord
 
-type NewApiGatewayFactory = Callable[[NewApiConfig], CommandGateway]
+type NewApiGatewayFactory = Callable[[NewApiModelConfig], CommandGateway]
 
 _MODEL_UNAVAILABLE = (
     "Model Agents are unavailable: run `start.cmd --configure-newapi`, then restart `start.cmd`"
@@ -52,11 +57,17 @@ class AgentFactory:
         audit_sink: PolicyAuditSink,
         *,
         newapi_config: NewApiConfig | None = None,
+        model_capabilities: ModelCapabilityCatalog | None = None,
         gateway_factory: NewApiGatewayFactory = NewApiModelGateway,
     ) -> None:
+        if (newapi_config is None) != (model_capabilities is None):
+            raise ValueError(
+                "NewAPI configuration and model capabilities must be provided together"
+            )
         self._scenario = scenario
         self._audit_sink = audit_sink
         self._newapi_config = newapi_config
+        self._model_capabilities = model_capabilities
         self._gateway_factory = gateway_factory
 
     @property
@@ -140,22 +151,32 @@ class AgentFactory:
                 metadata=metadata,
                 checkpoint=checkpoint_by_company.get(company.company_id),
                 memory_token_budget=self._scenario.runtime.compaction_trigger_tokens,
-                max_prompt_tokens=self._scenario.runtime.max_prompt_tokens,
             )
         return AgentBundle(agents, tuple(gateways))
 
-    def ensure_available(self, mode: PolicyKind, model: str | None = None) -> None:
-        """Reject an unavailable model profile before queueing a run."""
+    async def ensure_available(self, mode: PolicyKind, model: str | None = None) -> None:
+        """Calibrate and reject unavailable model profiles before queueing a run."""
         if mode is PolicyKind.MODEL:
-            self._model_config(model)
+            config, capabilities = self._newapi_dependencies()
+            await capabilities.ensure(config.require_model(model))
         elif model is not None:
             raise ValueError("model is only valid for Model Agents")
 
-    def _model_config(self, model: str | None) -> NewApiConfig:
+    def _model_config(self, model: str | None) -> NewApiModelConfig:
         """Resolve one allowed NewAPI model without exposing credentials."""
-        if self._newapi_config is None:
+        config, capabilities = self._newapi_dependencies()
+        selected = config.require_model(model)
+        capability = capabilities.require(selected)
+        return config.select_model(
+            selected,
+            max_output_tokens=capability.max_output_tokens,
+        )
+
+    def _newapi_dependencies(self) -> tuple[NewApiConfig, ModelCapabilityCatalog]:
+        """Return the complete configured NewAPI seam or one availability error."""
+        if self._newapi_config is None or self._model_capabilities is None:
             raise PolicyUnavailableError(_MODEL_UNAVAILABLE)
-        return self._newapi_config.select_model(model)
+        return self._newapi_config, self._model_capabilities
 
     def _replay_agents(
         self,
@@ -183,7 +204,7 @@ class AgentFactory:
         )
 
 
-def _model_metadata(config: NewApiConfig) -> PolicyMetadata:
+def _model_metadata(config: NewApiModelConfig) -> PolicyMetadata:
     """Build auditable metadata for one selected NewAPI model."""
     return PolicyMetadata(
         name="model-company-agent",

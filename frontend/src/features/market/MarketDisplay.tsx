@@ -170,7 +170,7 @@ function TradeTape({
     <section className="trade-tape">
       <header>
         <span>TRADE TAPE</span>
-        <strong>Trades during {clockTime(minute)}</strong>
+        <strong>Trades during {clockTime(minute)} · this minute only</strong>
       </header>
       {frame.trades.length === 0 ? (
         <p>No trades during this minute</p>

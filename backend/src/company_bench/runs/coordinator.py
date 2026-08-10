@@ -10,8 +10,9 @@ from company_bench.agents.contracts import PolicyInfrastructureError
 from company_bench.agents.factory import AgentFactory
 from company_bench.diagnostics import bounded_error
 from company_bench.domain.models import MAX_SEED, PolicyKind
-from company_bench.runs.models import PolicyProfileView, RunJob, RunStatus
+from company_bench.runs.models import PolicyProfileView, RunJob
 from company_bench.runtime.episode import EpisodeRuntime
+from company_bench.settings import MAX_PARALLELISM, require_parallelism
 from company_bench.storage.store import RunStore
 
 
@@ -24,16 +25,18 @@ class RunCoordinator:
         policy_factory: AgentFactory,
         runtime: EpisodeRuntime,
         *,
-        max_concurrent_runs: int = 1,
+        max_concurrent_runs: int = MAX_PARALLELISM,
     ) -> None:
-        if max_concurrent_runs <= 0:
-            raise ValueError("max_concurrent_runs must be positive")
+        max_concurrent_runs = require_parallelism(
+            max_concurrent_runs,
+            "max_concurrent_runs",
+        )
         if runtime.scenario != policy_factory.scenario:
             raise ValueError("execution and policy factory scenarios must match")
         self._repository = repository
         self._policy_factory = policy_factory
         self._runtime = runtime
-        self._semaphore = asyncio.Semaphore(max_concurrent_runs)
+        self._run_slots = asyncio.Semaphore(max_concurrent_runs)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop_requests: set[str] = set()
 
@@ -76,7 +79,7 @@ class RunCoordinator:
         if source_run_id is not None and not self._repository.list_turns(source_run_id):
             raise ValueError("replay source has no event-driven turn journal")
         run_id = f"run_{uuid4().hex}"
-        self._policy_factory.ensure_available(mode, model)
+        await self._policy_factory.ensure_available(mode, model)
         job = RunJob(
             run_id=run_id,
             mode=mode,
@@ -133,12 +136,6 @@ class RunCoordinator:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         current = self._repository.get_job(run_id) or job
-        if (
-            current.status is RunStatus.FAILED
-            and self._repository.get_checkpoint(run_id) is None
-        ):
-            raise ValueError("a failed run can only resume from a saved checkpoint")
-
         queued = current.queue_for_resume()
         self._repository.save_job(queued)
         self._schedule(queued)
@@ -167,13 +164,14 @@ class RunCoordinator:
         self._stop_requests.discard(run_id)
 
     async def _execute(self, initial_job: RunJob) -> None:
-        """Run one episode under the global model-call concurrency bound."""
+        """Run one isolated episode under the application-level run bound."""
         job = initial_job
         try:
-            async with self._semaphore:
+            async with self._run_slots:
                 scenario = self._runtime.scenario
                 if job.scenario_id != scenario.scenario_id or job.total_days != scenario.days:
                     raise ValueError("persisted job scenario does not match the active runtime")
+                await self._policy_factory.ensure_available(job.mode, job.model)
                 job = job.mark_running(datetime.now(UTC))
                 self._repository.save_job(job)
                 source = self._repository.get(job.source_run_id) if job.source_run_id else None
@@ -211,7 +209,7 @@ class RunCoordinator:
                     result = execution.episode
                 finally:
                     await agent_bundle.close()
-                job = job.mark_completed(datetime.now(UTC))
+                job = job.mark_completed(datetime.now(UTC), result.quality)
                 self._repository.complete_job(result, job)
         except asyncio.CancelledError:
             current = self._repository.get_job(job.run_id) or job

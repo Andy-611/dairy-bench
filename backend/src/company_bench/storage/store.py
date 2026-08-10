@@ -139,9 +139,13 @@ class InMemoryRunStore:
         """Return every completed run from newest submission to oldest."""
         with self._lock:
             sources = (
-                ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at)
+                ReplaySource(
+                    run_id=job.run_id,
+                    submitted_at=job.submitted_at,
+                    benchmark_eligible=job.quality.benchmark_eligible,
+                )
                 for job in self._jobs.values()
-                if job.status == RunStatus.COMPLETED
+                if job.status == RunStatus.COMPLETED and job.quality is not None
             )
             return tuple(
                 sorted(
@@ -398,14 +402,23 @@ class SQLiteRunStore:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT run_id, submitted_at
+                SELECT payload_json
                 FROM run_jobs
                 WHERE status = ?
                 ORDER BY submitted_at DESC, rowid DESC
                 """,
                 (RunStatus.COMPLETED.value,),
             ).fetchall()
-        return tuple(ReplaySource.model_validate(dict(row)) for row in rows)
+        jobs = tuple(RunJob.model_validate_json(row["payload_json"]) for row in rows)
+        return tuple(
+            ReplaySource(
+                run_id=job.run_id,
+                submitted_at=job.submitted_at,
+                benchmark_eligible=job.quality.benchmark_eligible,
+            )
+            for job in jobs
+            if job.quality is not None
+        )
 
     def list_auto_resume_jobs(self) -> tuple[RunJob, ...]:
         """Return automatic startup jobs from oldest to newest."""
@@ -866,6 +879,8 @@ def _validate_completion(
         or completed_job.seed != result.seed
     ):
         raise ValueError("result and completed job must describe the same episode")
+    if completed_job.quality != result.quality:
+        raise ValueError("result and completed job must have the same quality")
 
 
 def _turn_order(record: TurnRecord) -> tuple[int, int, str]:

@@ -382,7 +382,7 @@ def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
 
 
 def test_wait_can_target_time_but_cannot_spoof_runtime_fields() -> None:
-    command = Wait(until=SimTime(absolute_minute=1_140))
+    command = Wait(review_after_minutes=60)
     envelope = CommandEnvelope(
         turn_id="turn_wait_1",
         command_id="wait_1",
@@ -392,7 +392,7 @@ def test_wait_can_target_time_but_cannot_spoof_runtime_fields() -> None:
         command=command,
     )
 
-    assert envelope.command.until == SimTime(absolute_minute=1_140)
+    assert envelope.command.review_after_minutes == 60
     with pytest.raises(ValidationError):
         Wait.model_validate(
             {

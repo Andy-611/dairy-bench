@@ -14,6 +14,7 @@ from company_bench.domain.models import (
     CompanyId,
     CompanyObservation,
     DaySnapshot,
+    EpisodeQuality,
     EventRecord,
     Identifier,
     PolicyDescriptor,
@@ -54,7 +55,7 @@ class RunStatus(StrEnum):
     @property
     def resumable(self) -> bool:
         """Return whether the same run may be explicitly continued."""
-        return self in {self.FAILED, self.INTERRUPTED, self.STOPPED}
+        return self in {self.INTERRUPTED, self.STOPPED}
 
 
 class RunJob(StrictModel):
@@ -74,6 +75,7 @@ class RunJob(StrictModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error_message: str | None = Field(default=None, max_length=500)
+    quality: EpisodeQuality | None = None
 
     @model_validator(mode="after")
     def validate_progress(self) -> RunJob:
@@ -84,6 +86,8 @@ class RunJob(StrictModel):
             raise ValueError("Model Agent jobs require a model")
         if self.mode is not PolicyKind.MODEL and self.model is not None:
             raise ValueError("model is only valid for Model Agent jobs")
+        if (self.status is RunStatus.COMPLETED) != (self.quality is not None):
+            raise ValueError("only completed runs require quality metadata")
         return self
 
     def mark_running(self, started_at: datetime) -> Self:
@@ -99,13 +103,14 @@ class RunJob(StrictModel):
         """Record one newly completed simulation day."""
         return self._advance(current_day=day)
 
-    def mark_completed(self, finished_at: datetime) -> Self:
+    def mark_completed(self, finished_at: datetime, quality: EpisodeQuality) -> Self:
         """Finish the full horizon without an error."""
         return self._advance(
             status=RunStatus.COMPLETED,
             current_day=self.total_days,
             finished_at=finished_at,
             error_message=None,
+            quality=quality,
         )
 
     def mark_interrupted(self, finished_at: datetime, reason: str) -> Self:
@@ -155,6 +160,7 @@ class ReplaySource(StrictModel):
 
     run_id: Identifier
     submitted_at: datetime
+    benchmark_eligible: bool
 
 
 class CompanyRuntimeCursor(StrictModel):
@@ -319,8 +325,79 @@ class TokenUsage(StrictModel):
     reasoning_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
 
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        """Add physical provider usage without losing cached-token detail."""
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
 
-class PolicyInvocation(StrictModel):
+
+class ProviderAttemptOutcome(StrEnum):
+    """Physical outcome of one request sent to a model provider."""
+
+    HTTP_ERROR = "http_error"
+    PROTOCOL_ERROR = "protocol_error"
+    SUCCESS = "success"
+    TRANSPORT_ERROR = "transport_error"
+
+
+class ProviderAttempt(StrictModel):
+    """Auditable metadata for one physical provider request."""
+
+    sequence: int = Field(ge=1)
+    outcome: ProviderAttemptOutcome
+    request_id: str | None = None
+    response_id: str | None = None
+    usage: TokenUsage = TokenUsage()
+    latency_ms: int = Field(default=0, ge=0)
+    error_kind: str | None = None
+    error_message: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> Self:
+        """Pair errors with failed attempts and keep successes clean."""
+        if (self.error_kind is None) != (self.error_message is None):
+            raise ValueError("provider attempt error fields must be paired")
+        failed = self.outcome is not ProviderAttemptOutcome.SUCCESS
+        if failed != (self.error_kind is not None):
+            raise ValueError("only failed provider attempts require an error")
+        return self
+
+
+class ProviderCallAudit(StrictModel):
+    """Shared aggregate over every physical request in one provider call."""
+
+    usage: TokenUsage = TokenUsage()
+    attempts: int = Field(default=1, ge=0)
+    attempt_history: tuple[ProviderAttempt, ...] = ()
+    latency_ms: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_attempts(self) -> Self:
+        """Keep aggregate counters equal to the physical request history."""
+        if not self.attempt_history:
+            return self
+        sequences = tuple(attempt.sequence for attempt in self.attempt_history)
+        if sequences != tuple(range(1, len(sequences) + 1)):
+            raise ValueError("provider attempts must have contiguous sequences")
+        if self.attempts != len(self.attempt_history):
+            raise ValueError("attempt count must match attempt_history")
+        usage = sum(
+            (attempt.usage for attempt in self.attempt_history),
+            start=TokenUsage(),
+        )
+        if self.usage != usage:
+            raise ValueError("provider usage must equal physical attempt usage")
+        if self.latency_ms != sum(attempt.latency_ms for attempt in self.attempt_history):
+            raise ValueError("provider latency must equal physical attempt latency")
+        return self
+
+
+class PolicyInvocation(ProviderCallAudit):
     """Auditable provider call for one V4 atomic company turn."""
 
     invocation_id: Identifier
@@ -345,10 +422,6 @@ class PolicyInvocation(StrictModel):
     error_message: str | None = Field(default=None, max_length=500)
     response_id: str | None = None
     request_id: str | None = None
-    usage: TokenUsage = TokenUsage()
-    attempts: int = Field(default=1, ge=1)
-    latency_ms: int = Field(default=0, ge=0)
-
     @model_validator(mode="after")
     def validate_event_turn(self) -> PolicyInvocation:
         """Keep optional event-driven audit fields complete and consistent."""

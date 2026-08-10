@@ -26,7 +26,7 @@ Agent 不提交整日计划，也不能自行提供身份、时间、状态版�
 | `transform(input_product, output_product, input_quantity)` | 启动一项加工转换作业 |
 | `set_quote_ladder(product, side, levels)` | 原子设置最多三档目标价格与数量 |
 | `set_retail_price(product, unit_price)` | 设置零售消费者价格 |
-| `wait(until?)` | 等待指定时刻或下一个相关事件 |
+| `wait(review_after_minutes?)` | 等待一段受限时长或下一个相关事件 |
 
 牧场可以生产和交易原奶；加工厂可以转换并交易原奶或盒装奶；零售商可以交易盒装奶
 并设置消费者价格。
@@ -56,10 +56,14 @@ ID；成交事件和计划到货仍使用 Outcome 原有的事件字段。
 
 所有模型运行统一使用 NewAPI 的 Chat Completions 接口，并要求恰好一个已授权函数调用。
 Adapter 优先设置 `tool_choice="required"`；若 Provider 明确拒绝这个可选提示，则只省略
-该字段重试，同时保留完整 tools schema 和同样的输出校验。所有请求的 `max_tokens`
-固定为 131,072，不进行阶梯式预算增长，也不提供环境变量覆盖。无论模型属于哪个家族，
-输出都按同一个带判别字段的 Pydantic `CompanyCommand` 联合类型校验。缺失、多条、
-未知、未授权或参数错误的调用都不能改变经济状态。
+该字段重试，同时保留完整 tools schema 和同样的输出校验；所有请求都显式发送
+`parallel_tool_calls=false`。每个请求直接使用该模型在当前 NewAPI 路由上确认过的最大
+输出上限，不进行阶梯式预算增长。模型第一次提交 Run 前，`ModelCapabilityCatalog` 会
+用一条短请求验证文档候选值，或从明确的参数拒绝中提取准确上限，并写入本地版本化目录；
+包含工具 schema 的完整序列化输入还会在发送前检查输入预算。无论模型属于哪个家族，
+输出都按同一个带判别字段的 Pydantic `CompanyCommand` 联合类型校验。协议无效的响应会
+立即获得一次纠正重试；若仍无效，该 Turn 被记为协议拒绝、经济状态不变，Episode 继续
+完成但只能用于诊断。
 
 ## Agent 可以看到什么
 
@@ -74,6 +78,7 @@ Adapter 优先设置 `tool_choice="required"`；若 Provider 明确拒绝这个�
   最近成交价和当日成交量；`bids[0]` 与 `asks[0]` 分别是最优买价和最优卖价；
 - 已保证的待到货商品、数量、准确到货时间及数量守恒的到期日分桶；
 - 当前生产或加工任务，以及权威的当日作业状态；
+- 仅由本企业账本和当前可执行市场价格派生的累计现金流与单位经济性；
 - 企业可见领域事件和上一条命令结果。
 
 Provider 输入还包含强类型 `decision_constraints` 投影。它始终显式序列化营业时间与
@@ -123,9 +128,10 @@ Agent 看不到公开订单簿中其他企业的身份，也看不到其他企�
 
 `wait` 是注意力计划，不是轮询动作。它最多可声明三个针对 Agent 可见匿名
 `best_bid` / `best_ask` 的价格条件，多个条件固定为 OR；也可给出最多 120 分钟后的
-当日绝对兜底时间。省略时间时，只要仍早于 19:00，Runtime 就安排 120 分钟后的默认
-复查。Alert 为一次性，只在同一分钟全部命令提交后判断，命中则于下一分钟唤醒。重复、
-不可见、提交时已经为真的条件，以及非法时间，会使整条命令被拒绝且不改变经济状态。
+相对复查间隔 `review_after_minutes`，且不能跨出当日营业窗口。省略时，只要仍早于
+19:00，Runtime 就安排 120 分钟后的默认复查。Alert 为一次性，只在同一分钟全部命令
+提交后判断，命中则于下一分钟唤醒。重复、不可见、提交时已经为真的条件，以及非法
+时间，会使整条命令被拒绝且不改变经济状态。
 自有成交、作业完成和到货也会唤醒受影响企业；普通订单簿变化不再广播，挂单没有额外
 复查定时器。达到每日上限时，系统写入明确且不改变状态的审计步骤，并停止当日后续
 Agent 调用；此后的每个 Wake 仍会连同强类型因果信号写入 Journal。
@@ -150,15 +156,16 @@ Provider 请求由四层上下文构成：
 
 1. 当前权威 `AgentTurn` 事实；
 2. 由该 Turn 派生的显式 `decision_constraints`；
-3. 最近的完整 Turn/Command/Outcome 循环；
-4. 更早完整循环的确定性长期摘要。
+3. 只保留时间、唤醒原因、命令、处置结果和拒绝类别的近期紧凑决策记录；
+4. 更早决策记录的确定性长期摘要。
 
 记忆按 token 预算压缩，而不是固定保留最近七天。压缩不会拆开命令和结果，也不产生
-额外模型调用。默认在约 12,288 个估算 token 时开始压缩，完整 Prompt 另有 16,384
-token 上限。如果仅当前权威事实就无法装入，请求会明确失败，而不会隐藏业务事实。
+额外模型调用。默认在约 12,288 个估算 token 时开始压缩。NewAPI Adapter 会独立检查
+包含当前事实与工具 schema 的完整序列化请求，默认输入预算为 128,000 token。如果仅
+当前权威事实就无法装入，该 Turn 会明确记为协议拒绝，而不会隐藏业务事实。
 
-记忆用于辅助 Agent 推理，但不是经济事实权威。即使 Prompt 已压缩，完整
-`TurnRecord` 仍永久保留在不可变 Journal 中。
+记忆用于辅助 Agent 推理，但不是经济事实权威。完整观察和结果不会重复塞入 Provider
+记忆；完整 `TurnRecord` 始终保留在不可变 Journal 中。
 
 ## Journal、Checkpoint 与 Replay
 
@@ -172,7 +179,7 @@ Scheduler、企业可用时间、事件、快照、记忆、游标和固定策�
 
 恢复只能从该原子边界继续，并拒绝 Provider、模型、Prompt、场景或配置漂移。精确
 Replay 不创建 Provider Gateway：它校验每次观察哈希，重现记录的命令或协议拒绝，
-比较每个结果与 System Step，并最终要求事件、快照和得分完全相同。
+比较每个结果与 System Step，并最终要求事件、快照、得分和质量元数据完全相同。
 
 ## 通过 NewAPI 运行模型 Agent
 
@@ -189,20 +196,31 @@ start.cmd
 Windows 用户的 DPAPI 加密格式保存在 `.dairy-bench/credentials`，同时保存不含密钥
 的模型目录。正常启动时，密钥只解密到后端子进程环境；浏览器只能收到模型目录。UI
 选中的模型会写入 `RunJob` 和 Policy 审计元数据，恢复运行仍使用同一模型。替换密钥
-或刷新模型列表时重新执行配置命令；若后端已运行，配置后需要重启。
+或刷新模型列表时重新执行配置命令；该操作会删除旧路由验证得到的上限。若后端已运行，
+配置后需要重启。
 
-每家公司拥有独立的 `NewApiModelGateway` 和 HTTP Client。调用统一进入
-`/v1/chat/completions`，不存在模型厂商专用 SDK 或回退路径。模型目录本身不能证明
+每个模型第一次提交时会执行一次 Run 之前的能力校准。已知模型 ID 从可审计的文档候选
+值开始；未知 ID 使用一个故意非法的发现上限，只有 NewAPI 明确返回更低的准确输出上限
+时才接受。静默截断、输入上限或含糊的上下文错误不会被猜测。确认结果保存在
+`.dairy-bench/credentials/newapi-model-capabilities.json`，后续提交不再校准；选定上限
+进入 Policy 配置指纹，但校准请求本身不属于 Benchmark Agent 调用。
+
+每家公司拥有独立的 `NewApiModelGateway`；所有 Gateway 共享应用级
+`NewApiTransport`、HTTP 连接池和上限为 100 的请求信号量。调用统一进入
+`/v1/chat/completions`，重试退避不会占用请求许可，也不存在模型厂商专用 SDK 或回退路径。模型目录本身不能证明
 工具调用兼容性。Gateway 首次要求必选工具调用；若 Provider 明确拒绝 `tool_choice`，
-它会记住该能力，并在重试和后续调用中只省略这个字段。若所选模型在固定的 131,072
-Token 预算内仍未返回函数调用，系统会先记录调用审计，再以明确的兼容性错误结束运行。
+它会记住该能力，并在重试和后续调用中只省略这个字段。每个真实 HTTP 请求都会记录
+延迟、请求 ID、结果和 Provider 返回的 Token 使用量。缺失、多条、未知、未授权或参数
+错误的调用会获得一次语义纠正；若仍失败，只拒绝该 Turn，并把最终 Episode 标为不可
+进入 Benchmark 对比。只有模型耗尽当前已确认的模型原生输出预算后仍未选择工具，才
+作为终止性的模型兼容性错误结束运行。
 
 ## 失败语义
 
 | 情况 | 结果 |
 |---|---|
-| 模型命令无效 | 协议拒绝；经济状态不变；可在下一虚拟分钟尝试修正 |
-| 所选模型无法返回必选函数调用 | 记录兼容性错误并立即结束运行 |
+| 模型命令无效 | 立即纠正一次；仍无效则协议拒绝、经济状态不变，诊断 Episode 继续 |
+| 输出预算耗尽仍未调用函数 | 记录兼容性错误并结束运行 |
 | 角色、担保、所有权、产能或时间规则失败 | 强类型引擎拒绝；运行继续 |
 | 认证或永久 Provider 配置故障 | 整个运行失败，不产生误导性分数 |
 | DNS、连接、超时、408、409、429 或重试耗尽的 5xx 故障 | 中断运行并保留 Checkpoint |
@@ -225,9 +243,10 @@ GET /api/runs/{run_id}/invocations
 `timeline` 是可读的因果投影。
 页面的 **All Runs** 包含所有已持久化状态，并可读取它们已提交的时间线；
 **Completed Run Replay** 下拉框只列出 completed Run，启动后才执行确定性验证。
-`stopped`、`interrupted` 和拥有 Checkpoint 的 `failed` Run 都支持沿用原 run ID 显式恢复；
-只有 `interrupted` 会在后端重启时自动恢复。未完成 Run 没有最终分数，也不会进入
-Completed Run Replay 来源。
+完成后的页面会展示成交、拒绝、需求、过期、资不抵债风险和协议质量诊断。
+`stopped` 与 `interrupted` Run 支持沿用原 run ID 显式恢复；只有 `interrupted` 会在
+后端重启时自动恢复，`failed` 是终止状态。协议无效但完成的 Run 仍有诊断分数并可
+Replay，但明确排除在 Benchmark 对比之外。
 
 ## 模型适配边界
 
@@ -243,7 +262,8 @@ class CommandGateway(Protocol):
     async def close(self) -> None: ...
 ```
 
-`AgentFactory` 为每家公司创建独立 NewAPI Gateway。Adapter 把输出校验为已授权的
+`AgentFactory` 为每家公司创建独立 NewAPI Gateway，应用在所有 Gateway 和 Run 之间
+共享一个 Transport。Adapter 把输出校验为已授权的
 `CompanyCommand`，将内容错误映射为 `ModelOutputError`，将兼容性错误映射为
 `ModelCompatibilityError`，将认证等永久配置故障映射为 `ModelConfigurationError`，
 并将 DNS、连接、超时、限流或 5xx 等临时故障映射为 `ModelInfrastructureError`。

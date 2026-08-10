@@ -1,5 +1,5 @@
 import type { RunJobView } from "../../shared/api/types";
-import { isResumableRun } from "../../shared/runStatus";
+import { isActiveRun, isResumableRun } from "../../shared/runStatus";
 
 interface AllRunsProps {
   readonly busy: boolean;
@@ -9,8 +9,10 @@ interface AllRunsProps {
   readonly onLoadMore: () => void;
   readonly onResume: (runId: string) => void;
   readonly onSelect: (runId: string) => void;
+  readonly onStop: (runId: string) => void;
   readonly resumingRunId: string | null;
   readonly selectedJob: RunJobView | null;
+  readonly stoppingRunId: string | null;
 }
 
 export function AllRuns({
@@ -21,10 +23,13 @@ export function AllRuns({
   onLoadMore,
   onResume,
   onSelect,
+  onStop,
   resumingRunId,
   selectedJob,
+  stoppingRunId,
 }: AllRunsProps) {
   const resumable = selectedJob && isResumableRun(selectedJob.status);
+  const active = selectedJob && isActiveRun(selectedJob.status);
 
   return (
     <>
@@ -32,7 +37,7 @@ export function AllRuns({
         <span>Run history</span>
         <span className="sr-only">Selected run</span>
         <select
-          disabled={loading && jobs.length === 0}
+          disabled={busy || (loading && jobs.length === 0)}
           onChange={(event) => onSelect(event.target.value)}
           value={selectedJob?.runId ?? ""}
         >
@@ -54,11 +59,17 @@ export function AllRuns({
           onClick={() => onResume(selectedJob.runId)}
           type="button"
         >
-          {resumingRunId === selectedJob.runId
-            ? "Resuming..."
-            : selectedJob.status === "failed"
-              ? "Retry from checkpoint"
-              : "Resume run"}
+          {resumingRunId === selectedJob.runId ? "Resuming..." : "Resume run"}
+        </button>
+      )}
+      {active && (
+        <button
+          className="history-action stop-history-button"
+          disabled={busy}
+          onClick={() => confirmStop(selectedJob.runId, onStop)}
+          type="button"
+        >
+          {stoppingRunId === selectedJob.runId ? "Stopping..." : "Stop run"}
         </button>
       )}
       {canLoadMore && (
@@ -75,6 +86,16 @@ export function AllRuns({
   );
 }
 
+function confirmStop(runId: string, onStop: (runId: string) => void): void {
+  if (
+    window.confirm(
+      "Stop this run? Recorded activity and its checkpoint will remain available for resume.",
+    )
+  ) {
+    onStop(runId);
+  }
+}
+
 function runLabel(job: RunJobView): string {
   const policy =
     job.mode === "model"
@@ -82,7 +103,11 @@ function runLabel(job: RunJobView): string {
       : job.mode === "replay"
         ? "completed replay"
         : "rule baseline";
-  return `${job.status.toUpperCase()} · ${shortRunId(job.runId)} · ${policy} · day ${job.currentDay}/${job.totalDays}`;
+  const status =
+    job.status === "completed" && job.quality?.benchmarkEligible === false
+      ? "COMPLETED · DIAGNOSTIC"
+      : job.status.toUpperCase();
+  return `${status} · ${shortRunId(job.runId)} · ${policy} · day ${job.currentDay}/${job.totalDays}`;
 }
 
 function shortRunId(runId: string): string {

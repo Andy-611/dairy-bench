@@ -21,9 +21,10 @@ from company_bench.domain.models import (
     ProductId,
     Quantity,
     StrictModel,
+    UnitInterval,
 )
 from company_bench.domain.precision import EconomicDecimal
-from company_bench.runs.models import InvocationOutcome, TokenUsage
+from company_bench.runs.models import InvocationOutcome, RunStatus, TokenUsage
 from company_bench.runtime.models import (
     CommandOutcome,
     CompanyCommand,
@@ -43,6 +44,24 @@ from company_bench.runtime.models import (
 )
 
 
+class RunDiagnostics(StrictModel):
+    """Run-wide protocol and economic health facts for diagnosis."""
+
+    completed_days: int = Field(ge=0)
+    benchmark_eligible: bool | None = None
+    protocol_invalid_turns: int = Field(ge=0)
+    economic_rejections: int = Field(ge=0)
+    wait_plan_rejections: int = Field(ge=0)
+    trade_count: int = Field(ge=0)
+    last_trade_day: int | None = Field(default=None, ge=1)
+    zero_trade_day_streak: int = Field(ge=0)
+    consumer_demand: Quantity
+    consumer_sales: Quantity
+    consumer_fill_rate: UnitInterval
+    expired_quantity: Quantity
+    near_insolvent_company_ids: tuple[CompanyId, ...] = ()
+
+
 class TimelineRunContext(StrictModel):
     """Run identity and trace provenance shown above the timeline."""
 
@@ -50,6 +69,7 @@ class TimelineRunContext(StrictModel):
     scenario_id: Identifier
     scenario_version: int = Field(ge=2)
     total_days: int = Field(ge=1)
+    status: RunStatus
     mode: str
     source_run_id: Identifier | None = None
     trace_run_id: Identifier
@@ -60,6 +80,7 @@ class TimelineRunContext(StrictModel):
     source_usage: TokenUsage
     checkpoint_at: SimTime | None = None
     checkpoint_state_version: int | None = Field(default=None, ge=0)
+    diagnostics: RunDiagnostics
 
     @model_validator(mode="after")
     def validate_checkpoint_reference(self) -> Self:

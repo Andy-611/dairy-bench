@@ -9,6 +9,7 @@ $runtimeHome = Get-DairyBenchRuntimeHome -BackendDirectory $backendDirectory
 $newApiStateDirectory = Join-Path $runtimeHome "credentials"
 $newApiCredentialPath = Join-Path $newApiStateDirectory "newapi-token.clixml"
 $newApiModelsPath = Join-Path $newApiStateDirectory "newapi-models.json"
+$newApiCapabilitiesPath = Join-Path $newApiStateDirectory "newapi-model-capabilities.json"
 $newApiSecureKey = Read-Host "NewAPI API key" -AsSecureString
 $newApiCredential = [PSCredential]::new("newapi", $newApiSecureKey)
 $newApiPlainKey = $newApiCredential.GetNetworkCredential().Password
@@ -33,6 +34,7 @@ try {
     }
 
     New-Item -ItemType Directory -Path $newApiStateDirectory -Force | Out-Null
+    Remove-Item -LiteralPath $newApiCapabilitiesPath -Force -ErrorAction SilentlyContinue
     $newApiCredential | Export-Clixml -LiteralPath $newApiCredentialPath -Force
     ConvertTo-Json -InputObject ([string[]]$newApiModels) |
         Set-Content -LiteralPath $newApiModelsPath -Encoding UTF8

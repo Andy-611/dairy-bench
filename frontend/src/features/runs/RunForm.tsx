@@ -14,7 +14,6 @@ export type RunControl =
   | { readonly state: "idle" }
   | { readonly state: "starting" }
   | { readonly state: "resuming"; readonly runId: string }
-  | { readonly state: "running"; readonly runId: string }
   | { readonly state: "stopping"; readonly runId: string };
 
 interface RunFormProps {
@@ -110,8 +109,10 @@ export function RunForm({
           onLoadMore={onLoadMoreRuns}
           onResume={onResume}
           onSelect={onRunSelect}
+          onStop={onStop}
           resumingRunId={control.state === "resuming" ? control.runId : null}
           selectedJob={selectedJob}
+          stoppingRunId={control.state === "stopping" ? control.runId : null}
         />
       ) : mode === "replay" ? (
         <label className="run-field replay-field">
@@ -180,14 +181,11 @@ export function RunForm({
       <span className="sr-only" id="seed-help">
         Use the same seed to reproduce the economic environment.
       </span>
-      {(mode !== "all-runs" ||
-        control.state === "running" ||
-        control.state === "stopping") && (
+      {mode !== "all-runs" && (
         <RunActionButton
           canStart={canStart}
           completedReplay={mode === "replay"}
           control={control}
-          onStop={onStop}
         />
       )}
       {mode === "all-runs" && (
@@ -215,28 +213,13 @@ interface RunActionButtonProps {
   readonly canStart: boolean;
   readonly completedReplay: boolean;
   readonly control: RunControl;
-  readonly onStop: (runId: string) => void;
 }
 
 function RunActionButton({
   canStart,
   completedReplay,
   control,
-  onStop,
 }: RunActionButtonProps) {
-  if (control.state === "running") {
-    return (
-      <button
-        className="run-button stop-run-button"
-        onClick={() => confirmStop(control.runId, onStop)}
-        type="button"
-      >
-        <span aria-hidden="true">■</span>
-        Stop run
-      </button>
-    );
-  }
-
   if (
     control.state === "starting" ||
     control.state === "resuming" ||
@@ -262,18 +245,9 @@ function RunActionButton({
   );
 }
 
-function confirmStop(runId: string, onStop: (runId: string) => void): void {
-  if (
-    window.confirm(
-      "Stop this run? Recorded activity and its checkpoint will remain available for resume.",
-    )
-  ) {
-    onStop(runId);
-  }
-}
-
 function replaySourceLabel(source: ReplaySourceView): string {
-  return `${shortRunId(source.runId)} · ${formatDateTime(source.submittedAt)}`;
+  const quality = source.benchmarkEligible ? "benchmark eligible" : "diagnostic only";
+  return `${shortRunId(source.runId)} · ${quality} · ${formatDateTime(source.submittedAt)}`;
 }
 
 function shortRunId(runId: string): string {

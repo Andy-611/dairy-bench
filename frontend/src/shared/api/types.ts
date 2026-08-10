@@ -44,6 +44,26 @@ export interface TokenUsageView {
   readonly totalTokens: number;
 }
 
+export type ProtocolIssueKind =
+  | "context_too_large"
+  | "invalid_arguments"
+  | "invalid_response"
+  | "missing_tool_call"
+  | "multiple_tool_calls"
+  | "unauthorized_command";
+
+export interface ProtocolIssueCountView {
+  readonly kind: ProtocolIssueKind;
+  readonly count: number;
+}
+
+export interface EpisodeQualityView {
+  readonly benchmarkEligible: boolean;
+  readonly totalTurnCount: number;
+  readonly invalidTurnCount: number;
+  readonly issues: readonly ProtocolIssueCountView[];
+}
+
 export interface AgentUsageSummaryView {
   readonly invocationCount: number;
   readonly successfulInvocations: number;
@@ -80,6 +100,7 @@ export interface EpisodeView {
   readonly seed: number;
   readonly days: number;
   readonly score: ScoreView;
+  readonly quality: EpisodeQualityView;
   readonly agentUsage: AgentUsageSummaryView | null;
   readonly companies: readonly CompanyResultView[];
   readonly snapshots: readonly DailySnapshotView[];
@@ -114,11 +135,29 @@ export interface RunJobView extends RunProgressView {
   readonly submittedAt: string;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
+  readonly quality: EpisodeQualityView | null;
 }
 
 export interface ReplaySourceView {
   readonly runId: string;
   readonly submittedAt: string;
+  readonly benchmarkEligible: boolean;
+}
+
+export interface RunDiagnosticsView {
+  readonly completedDays: number;
+  readonly benchmarkEligible: boolean | null;
+  readonly protocolInvalidTurns: number;
+  readonly economicRejections: number;
+  readonly waitPlanRejections: number;
+  readonly tradeCount: number;
+  readonly lastTradeDay: number | null;
+  readonly zeroTradeDayStreak: number;
+  readonly consumerDemand: DecimalText;
+  readonly consumerSales: DecimalText;
+  readonly consumerFillRate: DecimalText;
+  readonly expiredQuantity: DecimalText;
+  readonly nearInsolventCompanyIds: readonly string[];
 }
 
 export interface TimelineContextView {
@@ -126,6 +165,7 @@ export interface TimelineContextView {
   readonly scenarioId: string;
   readonly scenarioVersion: number;
   readonly totalDays: number;
+  readonly status: RunStatus;
   readonly mode: string;
   readonly isReplay: boolean;
   readonly sourceRunId: string | null;
@@ -136,6 +176,7 @@ export interface TimelineContextView {
   readonly sourceUsage: TokenUsageView;
   readonly checkpointMinute: number | null;
   readonly checkpointStateVersion: number | null;
+  readonly diagnostics: RunDiagnosticsView;
 }
 
 export interface TimelineDaySummaryView {
@@ -242,7 +283,7 @@ export type TimelineCommandView =
     }
   | {
       readonly kind: "wait";
-      readonly untilMinute: number | null;
+      readonly reviewAfterMinutes: number | null;
       readonly alerts: readonly QuoteAlertView[];
     };
 

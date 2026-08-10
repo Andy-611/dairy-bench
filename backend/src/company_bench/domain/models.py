@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -380,7 +381,7 @@ class ScoringSpec(StrictModel):
 
 
 class RuntimeSpec(StrictModel):
-    """Event-time and context budgets for one benchmark scenario."""
+    """Event-time and memory budgets for one benchmark scenario."""
 
     open_minute: int = Field(default=9 * 60, ge=0, lt=24 * 60)
     close_minute: int = Field(default=19 * 60, ge=0, lt=24 * 60)
@@ -390,12 +391,11 @@ class RuntimeSpec(StrictModel):
     decision_interval_minutes: int = Field(default=1, ge=1)
     max_wait_minutes: int = Field(default=120, ge=1)
     max_turns_per_company_day: int = Field(default=25, ge=1)
-    max_prompt_tokens: int = Field(default=16_384, ge=1_024)
     compaction_trigger_tokens: int = Field(default=12_288, ge=512)
 
     @model_validator(mode="after")
     def validate_schedule(self) -> Self:
-        """Require ordered market boundaries and a usable context budget."""
+        """Require ordered market boundaries."""
         boundaries = (self.open_minute, self.close_minute, self.day_close_minute)
         if boundaries != tuple(sorted(set(boundaries))):
             raise ValueError("runtime boundaries must be strictly increasing")
@@ -409,8 +409,6 @@ class RuntimeSpec(StrictModel):
         )
         if latest_completion >= self.day_close_minute:
             raise ValueError("day close must follow every possible completion")
-        if self.compaction_trigger_tokens >= self.max_prompt_tokens:
-            raise ValueError("compaction must start below the prompt-token limit")
         return self
 
 
@@ -785,6 +783,75 @@ class ScoreCard(StrictModel):
         return self
 
 
+class ProtocolIssueKind(StrEnum):
+    """Stable categories for model-command protocol violations."""
+
+    CONTEXT_TOO_LARGE = "context_too_large"
+    INVALID_ARGUMENTS = "invalid_arguments"
+    INVALID_RESPONSE = "invalid_response"
+    MISSING_TOOL_CALL = "missing_tool_call"
+    MULTIPLE_TOOL_CALLS = "multiple_tool_calls"
+    UNAUTHORIZED_COMMAND = "unauthorized_command"
+
+
+class ProtocolIssueCount(StrictModel):
+    """Count one protocol-violation category across an episode."""
+
+    kind: ProtocolIssueKind
+    count: int = Field(ge=1)
+
+
+class ProtocolReport(StrictModel):
+    """Episode-wide protocol quality independent of economic execution."""
+
+    total_turn_count: int = Field(ge=0)
+    invalid_turn_count: int = Field(ge=0)
+    issues: tuple[ProtocolIssueCount, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        """Keep issue categories unique and equal to the invalid-turn total."""
+        kinds = tuple(issue.kind for issue in self.issues)
+        if len(kinds) != len(set(kinds)):
+            raise ValueError("protocol issue categories must be unique")
+        if sum(issue.count for issue in self.issues) != self.invalid_turn_count:
+            raise ValueError("protocol issue counts must equal invalid_turn_count")
+        if self.invalid_turn_count > self.total_turn_count:
+            raise ValueError("invalid_turn_count cannot exceed total_turn_count")
+        return self
+
+    @classmethod
+    def from_issues(
+        cls,
+        total_turn_count: int,
+        issues: tuple[ProtocolIssueKind, ...],
+    ) -> ProtocolReport:
+        """Aggregate ordered issue categories without leaking provider messages."""
+        counts = Counter(issues)
+        return cls(
+            total_turn_count=total_turn_count,
+            invalid_turn_count=len(issues),
+            issues=tuple(
+                ProtocolIssueCount(kind=kind, count=count)
+                for kind, count in counts.items()
+            ),
+        )
+
+
+class EpisodeQuality(StrictModel):
+    """Eligibility metadata kept separate from the diagnostic economic score."""
+
+    benchmark_eligible: bool
+    protocol: ProtocolReport
+
+    @model_validator(mode="after")
+    def validate_eligibility(self) -> Self:
+        """Only a protocol-clean episode may enter benchmark comparisons."""
+        if self.benchmark_eligible != (self.protocol.invalid_turn_count == 0):
+            raise ValueError("benchmark eligibility must match protocol validity")
+        return self
+
+
 class PolicyMetadata(StrictModel):
     """Versioned configuration shared by equivalent company policies."""
 
@@ -815,6 +882,7 @@ class EpisodeResult(StrictModel):
     events: tuple[EventRecord, ...]
     snapshots: tuple[DaySnapshot, ...]
     score: ScoreCard
+    quality: EpisodeQuality
 
     @model_validator(mode="after")
     def validate_time_order(self) -> Self:

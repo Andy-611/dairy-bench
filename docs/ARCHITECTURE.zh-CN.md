@@ -163,9 +163,16 @@ sort_key = SHA256(seed | absolute_minute | company_id)
 或 Replace 档位按照目标价格从最优到最差获得独立、持久化的订单优先序号；未变化
 档位保留原序号。真实响应延迟、重试和 Provider 负载只用于审计，不参与撮合。
 
+Episode 并发属于独立的应用层职责。`RunCoordinator` 最多同时放行 100 个独立
+`RunJob`，其余保持排队。每个 Episode 独占 Scheduler、经济状态、Agent、Checkpoint
+和 Journal；模型 Gateway 仅共享应用级 `NewApiTransport`、HTTP 连接池和上限为 100
+的请求信号量。应用级 `ModelCapabilityCatalog` 会按模型合并并发的 Run 前输出上限校准，
+并原子持久化确认值；Gateway 只接收能力已经解析完整的模型配置。许可只覆盖 HTTP 请求，
+不覆盖重试退避，也不会改变单个 Run 内“同分钟并发推理、确定性串行应用”的规则。
+
 稀疏决策由进程内 `AgentAttention` 模块负责。成功的 `wait` 可以设置最多三个 Agent
-可见的 `best_bid` / `best_ask` 阈值 Alert，多个条件固定为 OR，并可指定一个绝对兜底
-复查时间。显式时间必须在当日后续营业时间内，且最多等待 120 分钟；省略时默认在
+可见的 `best_bid` / `best_ask` 阈值 Alert，多个条件固定为 OR，并可指定相对复查间隔
+`review_after_minutes`。显式间隔最多 120 分钟且不能跨出当日营业窗口；省略时默认在
 120 分钟后复查，但若已经跨过关市则当天不再安排复查。重复、不可见或提交时已经为真
 的 Alert 会使整条命令被拒绝，且不改变经济状态。
 
@@ -184,6 +191,7 @@ Alert 为一次性。系统只在同一分钟所有 seed 排序命令提交完�
   与卖单预留现货；
 - `pending_deliveries`，包含准确到达时间和数量守恒的到期日分桶；
 - `active_operation` 与权威的当日作业状态；
+- `private_economics`，仅由本企业现金流账本和当前可执行价格派生；
 - 当日 Turn 序号与硬上限。
 
 Provider Adapter 会额外生成一个强类型 `decision_constraints` 投影，其中显式包含
@@ -200,9 +208,10 @@ Provider Adapter 会额外生成一个强类型 `decision_constraints` 投影，
 
 ## 记忆、持久化与 Replay
 
-每家公司拥有自己的 token 预算 `ConversationMemory`。最近的完整
-Turn/Command/Outcome 循环保留原文，更早的完整循环压缩为确定性摘要。记忆没有七天
-截断，也永远不能替代当前权威事实。
+每家公司拥有自己的 token 预算 `ConversationMemory`。近期紧凑决策记录只保留时间、
+唤醒原因、命令、处置结果和拒绝类别，更早记录压缩为确定性摘要。完整观察与 Outcome
+留在 Journal 中，不再重复进入每次模型请求。记忆没有七天截断，也永远不能替代当前
+权威事实。
 
 不可变 Journal 记录企业 Turn 和有序 System Step。`RunCheckpoint` 保存精确恢复
 所需的全部状态，包括订单簿及冻结资产、作业、到货、Scheduler、已激活注意力计划、
@@ -211,7 +220,7 @@ Turn/Command/Outcome 循环保留原文，更早的完整循环压缩为确定�
 中提交。
 
 Replay 使用相同 Runtime 和引擎，但不调用模型。观察哈希、命令或协议拒绝、Outcome、
-`apply_sequence`、系统影响、事件、快照和最终得分都必须完全一致。
+`apply_sequence`、系统影响、事件、快照、最终得分和 Episode 质量都必须完全一致。
 
 ## Episode 评价标准
 
@@ -232,7 +241,9 @@ Score = 100 * E * sqrt(F * (1 - B))
 `s9-enterprise-v2` 在公式中保留完整中间精度，只在公开的 `CompanyScore` 与
 `ScoreCard` 边界把所有 Decimal 统一为四位小数。
 
-经济结果不再触发额外资格门槛。Episode 不完整、技术失败、协议无效或 Replay 漂移时不出分。
+经济结果不再触发额外资格门槛。完成的 Episode 始终产生诊断分数；协议无效的完成结果
+标记为 `benchmark_eligible=false`，不进入模型对比。Episode 不完整、技术失败或 Replay
+漂移时仍不产生最终结果。
 
 ## 核心不变量
 

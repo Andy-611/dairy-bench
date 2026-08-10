@@ -195,19 +195,6 @@ button:disabled {
   opacity: 0.72;
 }
 
-.stop-run-button {
-  background: var(--red);
-  box-shadow: 0 8px 18px rgb(191 75 66 / 20%);
-}
-
-.stop-run-button:hover:not(:disabled) {
-  background: #943a34;
-}
-
-.stop-run-button:focus-visible {
-  outline-color: rgb(191 75 66 / 28%);
-}
-
 .all-runs-field {
   flex: 1 1 440px;
 }
@@ -241,6 +228,17 @@ button:disabled {
 
 .resume-run-button:hover:not(:disabled) {
   color: var(--green-dark);
+}
+
+.stop-history-button {
+  color: #fff;
+  border-color: var(--red);
+  background: var(--red);
+}
+
+.stop-history-button:hover:not(:disabled) {
+  border-color: #943a34;
+  background: #943a34;
 }
 
 .hero {
@@ -1104,6 +1102,34 @@ tbody tr:hover {
   background: rgb(255 255 255 / 72%);
 }
 
+.quality-banner {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 18px;
+  color: #694b10;
+  border: 1px solid #ead59f;
+  border-radius: 14px;
+  background: #fff9e9;
+}
+
+.quality-banner > span {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  color: #fff;
+  border-radius: 50%;
+  background: #a87919;
+  font-weight: 800;
+  place-items: center;
+}
+
+.quality-banner p {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
 .progress-copy {
   display: grid;
   width: min(420px, 100%);
@@ -1421,6 +1447,58 @@ footer {
   color: #234f78;
   font-size: 0.92em;
   overflow-wrap: anywhere;
+}
+
+.run-diagnostics {
+  margin: 0 28px 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: #fff;
+}
+
+.run-diagnostics header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.run-diagnostics header span,
+.run-diagnostics dt {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.run-diagnostics dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.run-diagnostics dl > div {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: #f5f7f4;
+}
+
+.run-diagnostics dd {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.run-diagnostics > p {
+  margin: 12px 0 0;
+  color: #7b4a25;
+  font-size: 12px;
 }
 
 .day-navigator {
@@ -2819,6 +2897,14 @@ footer {
   .trace-provenance {
     align-items: flex-start;
     margin: 0 18px 16px;
+  }
+
+  .run-diagnostics {
+    margin: 0 18px 16px;
+  }
+
+  .run-diagnostics dl {
+    grid-template-columns: 1fr;
   }
 
   .day-navigator,

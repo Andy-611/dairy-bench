@@ -127,33 +127,32 @@ def test_default_review_does_not_cross_market_close(
     assert AgentAttention().arm(Wait(), turn).review_at is None
 
 
-@pytest.mark.parametrize(
-    ("until", "message"),
-    [
-        (SimTime.at(day=0, hour=9), "later than current time"),
-        (SimTime.at(day=1, hour=9), "current business day"),
-        (SimTime.at(day=0, hour=19), "inside business hours"),
-        (SimTime.at(day=0, hour=11, minute=1), "cannot exceed 120 minutes"),
-    ],
-)
-def test_explicit_review_must_obey_every_wait_constraint(
+def test_explicit_review_must_obey_wait_bound(
     first_observation: CompanyObservation,
-    until: SimTime,
-    message: str,
 ) -> None:
     turn = _turn(first_observation)
 
-    with pytest.raises(AttentionRejected, match=message):
-        AgentAttention().arm(Wait(until=until), turn)
+    with pytest.raises(AttentionRejected, match="cannot exceed 120 minutes"):
+        AgentAttention().arm(Wait(review_after_minutes=121), turn)
+
+
+def test_explicit_review_must_remain_inside_business_day(
+    first_observation: CompanyObservation,
+) -> None:
+    turn = _turn(first_observation, minute=17 * 60)
+
+    with pytest.raises(AttentionRejected, match="current business day"):
+        AgentAttention().arm(Wait(review_after_minutes=120), turn)
 
 
 def test_explicit_review_accepts_the_exact_maximum(
     first_observation: CompanyObservation,
 ) -> None:
     turn = _turn(first_observation)
-    until = SimTime.at(day=0, hour=11)
 
-    assert AgentAttention().arm(Wait(until=until), turn).review_at == until
+    assert AgentAttention().arm(Wait(review_after_minutes=120), turn).review_at == (
+        SimTime.at(day=0, hour=11)
+    )
 
 
 def test_arm_rejects_hidden_duplicate_and_already_true_alerts(

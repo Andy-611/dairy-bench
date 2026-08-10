@@ -12,6 +12,7 @@ from company_bench.domain.models import (
     CompanyEvent,
     CompanyId,
     ConsumerSaleEvent,
+    DaySnapshot,
     DomainEvent,
     EpisodeResult,
     EventRecord,
@@ -19,15 +20,18 @@ from company_bench.domain.models import (
     ScenarioSpec,
     TradeExecutedEvent,
 )
+from company_bench.domain.precision import EconomicPrecision
 from company_bench.runs.models import (
     PolicyInvocation,
     RunJob,
     RunRecovery,
+    RunStatus,
     TokenUsage,
 )
 from company_bench.runtime.models import (
     Produce,
     QuoteLevelAction,
+    RejectionCategory,
     SetQuoteLadder,
     SetRetailPrice,
     SimTime,
@@ -52,6 +56,7 @@ from company_bench.timeline.models import (
     OrderPlacedChange,
     OrderReplacedChange,
     RetailPriceChanged,
+    RunDiagnostics,
     SystemTimelineItem,
     TimelineDay,
     TimelineDetail,
@@ -258,11 +263,26 @@ class RunTimelineProjector:
             if result is not None
             else "unknown"
         )
+        snapshots = (
+            result.snapshots
+            if result is not None
+            else checkpoint.snapshots
+            if checkpoint is not None
+            else ()
+        )
+        event_records = (
+            result.events
+            if result is not None
+            else checkpoint.events
+            if checkpoint is not None
+            else ()
+        )
         context = TimelineRunContext(
             run_id=run_id,
             scenario_id=scenario.scenario_id,
             scenario_version=scenario.version,
             total_days=scenario.days,
+            status=job.status if job is not None else RunStatus.COMPLETED,
             mode=mode,
             source_run_id=source_run_id,
             trace_run_id=trace_run_id,
@@ -274,6 +294,13 @@ class RunTimelineProjector:
             checkpoint_at=checkpoint.scheduler.now if checkpoint is not None else None,
             checkpoint_state_version=(
                 checkpoint.economy.state_version if checkpoint is not None else None
+            ),
+            diagnostics=_run_diagnostics(
+                scenario,
+                result,
+                turns,
+                snapshots,
+                event_records,
             ),
         )
         return _TimelineData(
@@ -615,6 +642,77 @@ def _day_summary(
     )
 
 
+def _run_diagnostics(
+    scenario: ScenarioSpec,
+    result: EpisodeResult | None,
+    turns: tuple[TurnRecord, ...],
+    snapshots: tuple[DaySnapshot, ...],
+    event_records: tuple[EventRecord, ...],
+) -> RunDiagnostics:
+    """Derive protocol and market-health facts from authoritative journals."""
+    trade_days = tuple(
+        record.event.day
+        for record in event_records
+        if isinstance(record.event, TradeExecutedEvent)
+    )
+    completed_days = len(snapshots)
+    demand = sum((snapshot.consumer_demand for snapshot in snapshots), Decimal())
+    sales = sum((snapshot.consumer_sales for snapshot in snapshots), Decimal())
+    fill_rate = EconomicPrecision.round(sales / demand) if demand else Decimal()
+    initial_cash = {
+        company.company_id: company.initial_cash for company in scenario.companies
+    }
+    latest_value = (
+        {company.company_id: company.net_worth for company in snapshots[-1].companies}
+        if snapshots
+        else {
+            record.turn.company_id: EconomicPrecision.round(
+                record.turn.marked_surplus
+                + initial_cash[record.turn.company_id]
+            )
+            for record in turns
+        }
+    )
+    near_insolvent = tuple(
+        company.company_id
+        for company in scenario.companies
+        if latest_value.get(company.company_id, company.initial_cash)
+        <= EconomicPrecision.round(company.initial_cash * Decimal("0.01"))
+    )
+    return RunDiagnostics(
+        completed_days=completed_days,
+        benchmark_eligible=(
+            result.quality.benchmark_eligible if result is not None else None
+        ),
+        protocol_invalid_turns=(
+            result.quality.protocol.invalid_turn_count
+            if result is not None
+            else sum(record.protocol_error is not None for record in turns)
+        ),
+        economic_rejections=sum(
+            record.outcome.rejection_category is RejectionCategory.ECONOMIC
+            for record in turns
+        ),
+        wait_plan_rejections=sum(
+            record.outcome.rejection_category is RejectionCategory.WAIT_PLAN
+            for record in turns
+        ),
+        trade_count=len(trade_days),
+        last_trade_day=max(trade_days, default=None),
+        zero_trade_day_streak=(
+            max(0, completed_days - max(trade_days)) if trade_days else completed_days
+        ),
+        consumer_demand=demand,
+        consumer_sales=sales,
+        consumer_fill_rate=fill_rate,
+        expired_quantity=sum(
+            (snapshot.expired_quantity for snapshot in snapshots),
+            Decimal(),
+        ),
+        near_insolvent_company_ids=near_insolvent,
+    )
+
+
 def _affected_companies(records: tuple[EventRecord, ...]) -> tuple[CompanyId, ...]:
     companies: list[CompanyId] = []
     for record in records:
@@ -646,9 +744,9 @@ def _command_title(record: TurnRecord) -> str:
 
 def _disposition_source(record: TurnRecord) -> CommandDispositionSource:
     """Identify the module that produced the persisted command disposition."""
-    if record.protocol_error is not None:
+    if record.outcome.rejection_category is RejectionCategory.PROTOCOL:
         return CommandDispositionSource.RUNTIME_PROTOCOL
-    if not record.outcome.accepted and isinstance(record.envelope.command, Wait):
+    if record.outcome.rejection_category is RejectionCategory.WAIT_PLAN:
         return CommandDispositionSource.RUNTIME_ATTENTION
     return CommandDispositionSource.ECONOMIC_ENGINE
 

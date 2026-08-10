@@ -22,7 +22,12 @@ from company_bench.agents.contracts import (
     PolicyExecutionError,
     PolicyInfrastructureError,
 )
-from company_bench.agents.memory import AgentCheckpoint, ConversationMemory, MemoryExchange
+from company_bench.agents.memory import (
+    AgentCheckpoint,
+    AgentMemoryView,
+    ConversationMemory,
+    MemoryExchange,
+)
 from company_bench.diagnostics import bounded_error
 from company_bench.domain.models import (
     CompanyId,
@@ -31,6 +36,7 @@ from company_bench.domain.models import (
     PolicyMetadata,
     ProcessorOperation,
     ProductId,
+    ProtocolIssueKind,
     Quantity,
     RetailerOperation,
     StrictModel,
@@ -71,6 +77,10 @@ class CompanyAgent(Protocol):
 
 class ReplayedProtocolError(RuntimeError):
     """Reproduce one journaled Agent protocol failure without a provider call."""
+
+    def __init__(self, issue_kind: ProtocolIssueKind, message: str) -> None:
+        super().__init__(message)
+        self.issue_kind = issue_kind
 
 
 class ReplayDriftError(RuntimeError):
@@ -136,7 +146,7 @@ class AgentDecisionConstraints(StrictModel):
 class AgentCommandInput(StrictModel):
     """Current facts, explicit limits, and one company's private memory."""
 
-    memory: AgentCheckpoint
+    memory: AgentMemoryView
     turn: AgentTurn
     decision_constraints: AgentDecisionConstraints
 
@@ -148,7 +158,7 @@ class AgentCommandInput(StrictModel):
     ) -> AgentCommandInput:
         """Build the provider projection from one authoritative turn."""
         return cls(
-            memory=memory,
+            memory=memory.provider_view(),
             turn=turn,
             decision_constraints=AgentDecisionConstraints.from_turn(turn),
         )
@@ -169,16 +179,12 @@ class LlmCompanyAgent:
         metadata: PolicyMetadata,
         checkpoint: AgentCheckpoint | None = None,
         memory_token_budget: int = 12_288,
-        max_prompt_tokens: int = 16_384,
     ) -> None:
-        if memory_token_budget >= max_prompt_tokens:
-            raise ValueError("memory budget must leave room for fresh turn facts")
         self.metadata = metadata
         self._run_id = run_id
         self._company_id = company_id
         self._gateway = gateway
         self._audit_sink = audit_sink
-        self._max_prompt_tokens = max_prompt_tokens
         self._memory = (
             ConversationMemory.restore(run_id, company_id, checkpoint)
             if checkpoint is not None
@@ -212,11 +218,6 @@ class LlmCompanyAgent:
         )
         started_at = datetime.now(UTC)
         try:
-            if (
-                _estimated_tokens(request.instructions, request.input_text)
-                > self._max_prompt_tokens
-            ):
-                raise ModelOutputError("Agent context exceeds the configured prompt-token limit")
             result = await self._gateway.generate_command(request)
         except (ModelCompatibilityError, ModelConfigurationError) as error:
             self._record_failure(
@@ -236,12 +237,13 @@ class LlmCompanyAgent:
             )
             raise policy_error from error
         except ModelOutputError as error:
-            self._record_failure(
+            invocation = self._record_failure(
                 request,
                 started_at,
                 InvocationOutcome.AGENT_ERROR,
                 error,
             )
+            self._pending_invocations[turn.turn_id] = invocation
             raise
         except ModelInfrastructureError as error:
             self._record_failure(
@@ -271,6 +273,7 @@ class LlmCompanyAgent:
             request_id=result.request_id,
             usage=result.usage,
             attempts=result.attempts,
+            attempt_history=result.attempt_history,
             latency_ms=result.latency_ms,
         )
         self._pending_invocations[turn.turn_id] = invocation
@@ -284,13 +287,19 @@ class LlmCompanyAgent:
         self._memory.remember(MemoryExchange.from_record(record))
         invocation = self._pending_invocations.pop(record.turn.turn_id, None)
         if invocation is not None:
+            completed = invocation.model_copy(
+                update={
+                    "apply_sequence": record.outcome.apply_sequence,
+                    "command": (
+                        invocation.command
+                        if invocation.command is not None
+                        else record.envelope.command
+                    ),
+                    "command_outcome": record.outcome,
+                }
+            )
             self._audit_sink.record_invocation(
-                invocation.model_copy(
-                    update={
-                        "apply_sequence": record.outcome.apply_sequence,
-                        "command_outcome": record.outcome,
-                    }
-                )
+                PolicyInvocation.model_validate_json(completed.model_dump_json())
             )
 
     def checkpoint(self) -> AgentCheckpoint:
@@ -303,22 +312,23 @@ class LlmCompanyAgent:
         started_at: datetime,
         outcome: InvocationOutcome,
         error: Exception,
-    ) -> None:
+    ) -> PolicyInvocation:
         call_error = error if isinstance(error, ModelCallError) else None
-        self._audit_sink.record_invocation(
-            PolicyInvocation(
-                **self._invocation_fields(request, started_at),
-                finished_at=datetime.now(UTC),
-                outcome=outcome,
-                error_kind=type(error).__name__,
-                error_message=bounded_error(error),
-                response_id=call_error.response_id if call_error else None,
-                request_id=call_error.request_id if call_error else None,
-                usage=call_error.usage if call_error else TokenUsage(),
-                attempts=call_error.attempts if call_error else 1,
-                latency_ms=call_error.latency_ms if call_error else 0,
-            )
+        invocation = PolicyInvocation(
+            **self._invocation_fields(request, started_at),
+            finished_at=datetime.now(UTC),
+            outcome=outcome,
+            error_kind=type(error).__name__,
+            error_message=bounded_error(error),
+            response_id=call_error.response_id if call_error else None,
+            request_id=call_error.request_id if call_error else None,
+            usage=call_error.usage if call_error else TokenUsage(),
+            attempts=call_error.attempts if call_error else 0,
+            attempt_history=call_error.attempt_history if call_error else (),
+            latency_ms=call_error.latency_ms if call_error else 0,
         )
+        self._audit_sink.record_invocation(invocation)
+        return invocation
 
     def _invocation_fields(
         self,
@@ -496,7 +506,9 @@ class ReplayCompanyAgent:
             )
         self._index += 1
         if source.protocol_error is not None:
-            raise ReplayedProtocolError(source.protocol_error)
+            if source.protocol_issue_kind is None:
+                raise ReplayDriftError("source protocol error is missing its typed category")
+            raise ReplayedProtocolError(source.protocol_issue_kind, source.protocol_error)
         return source.envelope.command
 
     def remember(self, record: TurnRecord) -> None:
@@ -509,6 +521,7 @@ class ReplayCompanyAgent:
         ) == record.outcome.model_dump_json(exclude={"turn_id", "command_id"})
         if (
             record.envelope.command != source.envelope.command
+            or record.protocol_issue_kind != source.protocol_issue_kind
             or record.protocol_error != source.protocol_error
             or not same_outcome
         ):
@@ -590,10 +603,11 @@ def _command_instructions(allowed: tuple[CommandName, ...]) -> str:
         "and use [] to cancel that ladder. The complete update is atomic. Exact unchanged "
         "price-quantity levels keep their order identity and priority; every changed level "
         "loses its old priority. Total asks require real inventory and total bids require "
-        "real cash collateral. Use wait when no action is justified: set until to null to "
+        "real cash collateral. Use wait when no action is justified: set "
+        "review_after_minutes to null to "
         "use the runtime's bounded fallback review when it remains before market close, or "
-        "select an earlier deadline within decision_constraints.max_wait_minutes and "
-        "before decision_constraints.market_close_minute. Set alerts to [] when no price "
+        "select a positive delay no greater than decision_constraints.max_wait_minutes; "
+        "the resulting review must remain before market close. Set alerts to [] when no price "
         "condition is needed; otherwise provide up to three OR price alerts over the "
         "best visible quote: bids[0].unit_price for best_bid or asks[0].unit_price for "
         "best_ask. Every alert must still be false when armed. "
@@ -710,9 +724,3 @@ def _remaining_capacity(turn: AgentTurn) -> Decimal:
     if remaining is None:
         raise TypeError("productive baseline turn requires daily operation state")
     return remaining
-
-
-def _estimated_tokens(*parts: str) -> int:
-    """Bound provider input with the same deterministic four-character estimate."""
-    characters = sum(len(part) for part in parts)
-    return max(1, (characters + 3) // 4)

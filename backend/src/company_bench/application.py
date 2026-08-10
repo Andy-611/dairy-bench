@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from company_bench.agents.factory import AgentFactory
-from company_bench.agents.providers.newapi import NewApiConfig
+from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
+from company_bench.agents.providers.newapi import (
+    NewApiCapabilityProbe,
+    NewApiConfig,
+    NewApiModelGateway,
+    NewApiTransport,
+)
 from company_bench.domain.models import EpisodeResult, PolicyKind
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
@@ -15,7 +23,7 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import TurnRecord
-from company_bench.settings import RuntimePaths
+from company_bench.settings import MAX_PARALLELISM, ExecutionLimits, RuntimePaths
 from company_bench.storage.store import RunStore, SQLiteRunStore
 from company_bench.timeline.models import TimelineDay, TimelineDetail
 from company_bench.timeline.projector import RunTimelineProjector
@@ -29,16 +37,24 @@ class BenchmarkApplication:
         store: RunStore,
         agent_factory: AgentFactory,
         *,
+        max_concurrent_runs: int = MAX_PARALLELISM,
         owned_store: SQLiteRunStore | None = None,
+        owned_transport: NewApiTransport | None = None,
     ) -> None:
         runtime = EpisodeRuntime(
             agent_factory.scenario,
             agent_timeout_seconds=agent_factory.policy_timeout_seconds,
         )
         self._store = store
-        self._coordinator = RunCoordinator(store, agent_factory, runtime)
+        self._coordinator = RunCoordinator(
+            store,
+            agent_factory,
+            runtime,
+            max_concurrent_runs=max_concurrent_runs,
+        )
         self._timeline = RunTimelineProjector(store)
         self._owned_store = owned_store
+        self._owned_transport = owned_transport
 
     @classmethod
     def create(
@@ -48,20 +64,41 @@ class BenchmarkApplication:
     ) -> BenchmarkApplication:
         """Compose production Adapters while retaining explicit test seams."""
         paths = RuntimePaths.from_environment()
+        limits = ExecutionLimits.from_environment()
         owned_store = SQLiteRunStore(paths.database) if store is None else None
         active_store = owned_store or store
         if active_store is None:
             raise AssertionError("application composition requires a RunStore")
+        owned_transport: NewApiTransport | None = None
+        model_capabilities: ModelCapabilityCatalog | None = None
         if agent_factory is None:
+            newapi_config = NewApiConfig.from_environment()
+            if newapi_config is not None:
+                owned_transport = NewApiTransport(
+                    newapi_config,
+                    max_concurrent_requests=limits.max_concurrent_newapi_requests,
+                )
+                model_capabilities = ModelCapabilityCatalog.production(
+                    paths.model_capabilities,
+                    NewApiCapabilityProbe(newapi_config, owned_transport),
+                )
             agent_factory = AgentFactory(
                 scenario=DAIRY_S9_SCENARIO,
                 audit_sink=active_store,
-                newapi_config=NewApiConfig.from_environment(),
+                newapi_config=newapi_config,
+                model_capabilities=model_capabilities,
+                gateway_factory=(
+                    partial(NewApiModelGateway, transport=owned_transport)
+                    if owned_transport is not None
+                    else NewApiModelGateway
+                ),
             )
         return cls(
             active_store,
             agent_factory,
+            max_concurrent_runs=limits.max_concurrent_runs,
             owned_store=owned_store,
+            owned_transport=owned_transport,
         )
 
     async def start(self) -> None:
@@ -73,8 +110,12 @@ class BenchmarkApplication:
         try:
             await self._coordinator.close()
         finally:
-            if self._owned_store is not None:
-                self._owned_store.close()
+            try:
+                if self._owned_transport is not None:
+                    await self._owned_transport.close()
+            finally:
+                if self._owned_store is not None:
+                    self._owned_store.close()
 
     def profiles(self) -> tuple[PolicyProfileView, ...]:
         return self._coordinator.profiles()

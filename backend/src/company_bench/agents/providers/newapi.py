@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from time import monotonic
@@ -34,11 +35,17 @@ from company_bench.agents.contracts import (
     ModelOutputError,
     command_model,
 )
+from company_bench.agents.providers.capabilities import ModelCapabilityError
 from company_bench.diagnostics import bounded_error
-from company_bench.domain.models import StrictModel
+from company_bench.domain.models import ProtocolIssueKind, StrictModel
 from company_bench.domain.precision import require_numeric_economic_schema
-from company_bench.runs.models import TokenUsage
+from company_bench.runs.models import (
+    ProviderAttempt,
+    ProviderAttemptOutcome,
+    TokenUsage,
+)
 from company_bench.runtime.models import CompanyCommand
+from company_bench.settings import MAX_PARALLELISM, require_parallelism
 
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
@@ -46,9 +53,31 @@ type JsonObject = dict[str, JsonValue]
 DEFAULT_NEWAPI_BASE_URL = "https://newapi.deepwisdom.ai/v1"
 _COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
 _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
-_FIXED_MAX_OUTPUT_TOKENS = 128_000
+_DEFAULT_MAX_INPUT_TOKENS = 128_000
+_DISCOVERY_MAX_OUTPUT_TOKENS = 2_147_483_647
+_CAPABILITY_PROBE_TIMEOUT_SECONDS = 30.0
+_PROTOCOL_ATTEMPTS = 2
+_TOKEN_ESTIMATE_BYTES = 2
 _MAX_RETRY_DELAY_SECONDS = 2.0
 _PROXY_UPSTREAM_ERROR_TYPE = "bad_response_status_code"
+_EXCLUSIVE_OUTPUT_LIMIT = re.compile(
+    r"supported range is from \d[\d,]*\s*\(inclusive\)\s*to\s*"
+    r"(?P<limit>\d[\d,]*)\s*\(exclusive\)",
+    re.IGNORECASE,
+)
+_LESS_THAN_OUTPUT_LIMIT = re.compile(
+    r"(?:max[_ ]?tokens|max[_ ]?output[_ ]?tokens|maxOutputTokens)\s+"
+    r"must be less than\s+(?P<limit>\d[\d,]*)",
+    re.IGNORECASE,
+)
+_INCLUSIVE_OUTPUT_LIMITS = (
+    re.compile(r"supports? at most\s+(?P<limit>\d[\d,]*)", re.IGNORECASE),
+    re.compile(
+        r"max(?:imum)?(?:[_ ]output|[_ ]completion)?[_ ]tokens?[^\d]{0,32}"
+        r"(?:is|of|<=|less than or equal to)\s*(?P<limit>\d[\d,]*)",
+        re.IGNORECASE,
+    ),
+)
 
 
 class NewApiConfig(StrictModel):
@@ -60,6 +89,7 @@ class NewApiConfig(StrictModel):
     base_url: str = Field(default=DEFAULT_NEWAPI_BASE_URL, min_length=1)
     timeout_seconds: float = Field(default=300.0, gt=0, le=600)
     max_attempts: int = Field(default=3, ge=1, le=10)
+    max_input_tokens: int = Field(default=_DEFAULT_MAX_INPUT_TOKENS, ge=1)
 
     @field_validator("base_url")
     @classmethod
@@ -94,6 +124,12 @@ class NewApiConfig(StrictModel):
             models=models,
             timeout_seconds=float(os.getenv("DAIRY_BENCH_NEWAPI_TIMEOUT_SECONDS", "300")),
             max_attempts=int(os.getenv("DAIRY_BENCH_NEWAPI_MAX_ATTEMPTS", "3")),
+            max_input_tokens=int(
+                os.getenv(
+                    "DAIRY_BENCH_NEWAPI_MAX_INPUT_TOKENS",
+                    str(_DEFAULT_MAX_INPUT_TOKENS),
+                )
+            ),
         )
 
     @property
@@ -111,14 +147,35 @@ class NewApiConfig(StrictModel):
     def request_budget_seconds(self) -> float:
         """Return the maximum configured request and retry duration."""
         retry_delays = sum(_retry_delay_seconds(attempt) for attempt in range(1, self.max_attempts))
-        return self.timeout_seconds * self.max_attempts + retry_delays
+        transport_cycle = self.timeout_seconds * self.max_attempts + retry_delays
+        return transport_cycle * _PROTOCOL_ATTEMPTS
 
-    def select_model(self, model: str | None) -> NewApiConfig:
-        """Return one run-specific configuration after catalog validation."""
+    def select_model(
+        self,
+        model: str | None,
+        *,
+        max_output_tokens: int,
+    ) -> NewApiModelConfig:
+        """Return one fully resolved model configuration after catalog validation."""
+        selected = self.require_model(model)
+        return NewApiModelConfig(
+            **self.model_dump(exclude={"model"}),
+            model=selected,
+            max_output_tokens=max_output_tokens,
+        )
+
+    def require_model(self, model: str | None) -> str:
+        """Return one allowed model ID without resolving its capabilities."""
         selected = model or self.model
         if selected not in self.available_models:
             raise ValueError(f"NewAPI model is not configured: {selected}")
-        return self.model_copy(update={"model": selected})
+        return selected
+
+
+class NewApiModelConfig(NewApiConfig):
+    """Run-specific NewAPI configuration with a confirmed output limit."""
+
+    max_output_tokens: int = Field(gt=0)
 
 
 class _ExternalModel(BaseModel):
@@ -187,6 +244,7 @@ class _ChatRequest(StrictModel):
     messages: tuple[_Message, ...]
     tools: tuple[_Tool, ...]
     tool_choice: Literal["required"] | None = "required"
+    parallel_tool_calls: Literal[False] = False
     max_tokens: int
     n: Literal[1] = 1
     stream: Literal[False] = False
@@ -195,6 +253,41 @@ class _ChatRequest(StrictModel):
         """Omit an unsupported tool-choice hint while retaining all tools."""
         return self.model_copy(update={"tool_choice": None})
 
+    def repair(self, violation: str) -> Self:
+        """Append one bounded correction without replaying hidden model text."""
+        correction = (
+            "Your previous response violated the command protocol: "
+            f"{violation[:240]}. Return exactly one function call from the supplied tools, "
+            "with one valid JSON argument object and no additional tool calls."
+        )
+        return self.model_copy(
+            update={"messages": (*self.messages, _Message(role="user", content=correction))}
+        )
+
+
+class _CapabilityProbeRequest(StrictModel):
+    model: str
+    messages: tuple[_Message, ...] = (
+        _Message(role="user", content="Reply with exactly OK and nothing else."),
+    )
+    max_tokens: int = Field(gt=0)
+    n: Literal[1] = 1
+    stream: Literal[False] = False
+
+
+class NewApiRequestFeatures(StrictModel):
+    """Negotiated optional hints for the benchmark command protocol."""
+
+    tool_choice_supported: bool = True
+
+    def prepare(self, payload: _ChatRequest) -> _ChatRequest:
+        """Apply the negotiated optional hints to one request."""
+        return payload if self.tool_choice_supported else payload.without_tool_choice()
+
+    def without_tool_choice(self) -> NewApiRequestFeatures:
+        """Remember that this model rejects the optional forcing hint."""
+        return self.model_copy(update={"tool_choice_supported": False})
+
 
 @dataclass(frozen=True, slots=True)
 class _GatewayResponse:
@@ -202,9 +295,106 @@ class _GatewayResponse:
 
     response: httpx.Response
     completion: _ChatCompletion
-    usage: TokenUsage
-    attempts: int
-    latency_ms: int
+    attempt_history: tuple[ProviderAttempt, ...]
+
+
+class _ProtocolViolation(ValueError):
+    """Typed internal failure produced while decoding one model completion."""
+
+    def __init__(
+        self,
+        kind: ProtocolIssueKind,
+        message: str,
+        *,
+        repairable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.repairable = repairable
+
+
+class NewApiTransport:
+    """Share one bounded HTTP connection pool across every NewAPI gateway."""
+
+    def __init__(
+        self,
+        config: NewApiConfig,
+        *,
+        max_concurrent_requests: int = MAX_PARALLELISM,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        max_concurrent_requests = require_parallelism(
+            max_concurrent_requests,
+            "max_concurrent_requests",
+        )
+        self._api_key = config.api_key.get_secret_value()
+        self._base_url = config.base_url
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient(
+            timeout=config.timeout_seconds,
+            limits=httpx.Limits(
+                max_connections=max_concurrent_requests,
+                max_keepalive_connections=max_concurrent_requests,
+            ),
+        )
+        self._request_slots = asyncio.Semaphore(max_concurrent_requests)
+
+    async def post(
+        self,
+        payload: _ChatRequest | _CapabilityProbeRequest,
+    ) -> httpx.Response:
+        """Send one request while holding a permit only for network I/O."""
+        async with self._request_slots:
+            return await self._client.post(
+                f"{self._base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload.model_dump(mode="json", exclude_none=True),
+            )
+
+    async def close(self) -> None:
+        """Close only the application-owned HTTP client."""
+        if self._owns_client:
+            await self._client.aclose()
+
+
+class NewApiCapabilityProbe:
+    """Validate one documented limit or discover it from a bounded gateway rejection."""
+
+    def __init__(self, config: NewApiConfig, transport: NewApiTransport) -> None:
+        self._config = config
+        self._transport = transport
+
+    async def max_output_tokens(self, model_id: str, candidate: int | None) -> int:
+        """Return one limit confirmed against the active NewAPI route."""
+        requested = candidate or _DISCOVERY_MAX_OUTPUT_TOKENS
+        payload = _CapabilityProbeRequest(model=model_id, max_tokens=requested)
+        try:
+            async with asyncio.timeout(_CAPABILITY_PROBE_TIMEOUT_SECONDS):
+                response = await self._transport.post(payload)
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as error:
+            raise ModelCapabilityError(
+                f"NewAPI output-token calibration failed for '{model_id}': "
+                f"{bounded_error(error, 240, secrets=(self._config.api_key.get_secret_value(),))}"
+            ) from error
+
+        if response.is_success:
+            if candidate is None:
+                raise ModelCapabilityError(
+                    f"NewAPI accepted the discovery ceiling for '{model_id}' without "
+                    "reporting its exact output-token limit; add a manual capability record"
+                )
+            return candidate
+
+        discovered = _response_output_limit(response, requested)
+        if discovered is not None:
+            return discovered
+        failure = _response_error(response, self._config.api_key, 1, 0)
+        raise ModelCapabilityError(
+            f"NewAPI output-token calibration failed for '{model_id}': {failure}"
+        ) from failure
 
 
 class NewApiModelGateway(CommandGateway):
@@ -214,116 +404,171 @@ class NewApiModelGateway(CommandGateway):
 
     def __init__(
         self,
-        config: NewApiConfig,
-        client: httpx.AsyncClient | None = None,
+        config: NewApiModelConfig,
+        transport: NewApiTransport | None = None,
     ) -> None:
         self.config = config
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=config.timeout_seconds)
-        self._omit_tool_choice = False
+        self._owns_transport = transport is None
+        self._transport = transport or NewApiTransport(config)
+        self._features = NewApiRequestFeatures()
 
     async def generate_command(
         self,
         request: CommandModelRequest,
     ) -> CommandModelResult:
         """Return exactly one role-authorized atomic company command."""
-        result = await self._request(_chat_request(self.config, request))
-        completion = result.completion
-        try:
-            name, arguments = _single_tool_call(completion)
-            if name not in request.allowed_commands:
-                raise ValueError(f"unknown or unauthorized command: {name}")
-            if "kind" in arguments:
-                raise ValueError("tool input must not supply a command kind")
-            command = _COMMAND_ADAPTER.validate_python({"kind": name, **arguments})
-        except ModelCompatibilityError as error:
-            raise ModelCompatibilityError(
-                str(error),
-                request_id=_request_id(result.response),
+        payload = _chat_request(self.config, request)
+        history: tuple[ProviderAttempt, ...] = ()
+        for protocol_attempt in range(_PROTOCOL_ATTEMPTS):
+            try:
+                _require_input_budget(payload, self.config.max_input_tokens)
+            except ModelOutputError as error:
+                _audited_error(error, history)
+                raise
+            try:
+                result = await self._request(payload, sequence_offset=len(history))
+            except ModelCompatibilityError:
+                raise
+            except ModelOutputError as error:
+                history = (*history, *error.attempt_history)
+                if protocol_attempt + 1 < _PROTOCOL_ATTEMPTS:
+                    payload = payload.repair(str(error))
+                    continue
+                _audited_error(error, history)
+                raise
+
+            completion = result.completion
+            try:
+                command = _decode_command(
+                    completion,
+                    request.allowed_commands,
+                    self.config.max_output_tokens,
+                )
+            except _ProtocolViolation as violation:
+                failed_history = _mark_protocol_error(result.attempt_history, violation)
+                history = (*history, *failed_history)
+                if violation.repairable and protocol_attempt + 1 < _PROTOCOL_ATTEMPTS:
+                    payload = payload.repair(str(violation))
+                    continue
+                error_class = (
+                    ModelOutputError if violation.repairable else ModelCompatibilityError
+                )
+                error = error_class(
+                    f"invalid NewAPI tool call: {violation}",
+                    issue_kind=violation.kind,
+                    request_id=_request_id(result.response),
+                    response_id=completion.id,
+                )
+                raise _audited_error(error, history) from violation
+
+            history = (*history, *result.attempt_history)
+            usage = _attempt_usage(history)
+            return CommandModelResult(
+                command=command,
+                provider=self.provider,
+                model=completion.model or self.config.model,
                 response_id=completion.id,
-                usage=result.usage,
-                attempts=result.attempts,
-                latency_ms=result.latency_ms,
-            ) from error
-        except (json.JSONDecodeError, ValidationError, ValueError) as error:
-            raise _output_error(
-                "invalid NewAPI tool call",
-                error,
-                completion,
-                result,
-            ) from error
-        return CommandModelResult(
-            command=command,
-            provider=self.provider,
-            model=completion.model or self.config.model,
-            response_id=completion.id,
-            request_id=_request_id(result.response),
-            usage=result.usage,
-            attempts=result.attempts,
-            latency_ms=result.latency_ms,
-        )
+                request_id=_request_id(result.response),
+                usage=usage,
+                attempts=len(history),
+                attempt_history=history,
+                latency_ms=_attempt_latency(history),
+            )
+        raise AssertionError("bounded protocol repair loop did not terminate")
 
     async def close(self) -> None:
-        """Close only the HTTP client owned by this adapter."""
-        if self._owns_client:
-            await self._client.aclose()
+        """Close only a transport created privately by this gateway."""
+        if self._owns_transport:
+            await self._transport.close()
 
     async def _request(
         self,
         payload: _ChatRequest,
+        *,
+        sequence_offset: int,
     ) -> _GatewayResponse:
-        """Call NewAPI with bounded retries and return audit timing."""
-        started = monotonic()
-        api_key = self.config.api_key.get_secret_value()
-        if self._omit_tool_choice:
-            payload = payload.without_tool_choice()
+        """Call NewAPI with bounded transport retries and physical audit records."""
+        history: list[ProviderAttempt] = []
+        payload = self._features.prepare(payload)
         for attempt in range(1, self.config.max_attempts + 1):
+            started = monotonic()
+            sequence = sequence_offset + len(history) + 1
             try:
-                response = await self._client.post(
-                    f"{self.config.base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload.model_dump(mode="json", exclude_none=True),
-                )
+                response = await self._transport.post(payload)
             except (httpx.TimeoutException, httpx.TransportError) as error:
+                history.append(
+                    ProviderAttempt(
+                        sequence=sequence,
+                        outcome=ProviderAttemptOutcome.TRANSPORT_ERROR,
+                        latency_ms=_elapsed_ms(started),
+                        error_kind=type(error).__name__,
+                        error_message=bounded_error(
+                            error,
+                            300,
+                            secrets=(self.config.api_key.get_secret_value(),),
+                        ),
+                    )
+                )
                 if attempt == self.config.max_attempts:
-                    raise _transport_error(
-                        error,
-                        self.config.api_key,
-                        attempt,
-                        _elapsed_ms(started),
-                    ) from error
+                    failure = _transport_error(error, self.config.api_key, attempt, 0)
+                    raise _audited_error(failure, tuple(history)) from error
             else:
+                latency_ms = _elapsed_ms(started)
                 if response.is_success:
-                    latency_ms = _elapsed_ms(started)
-                    completion = _parse_completion(response, attempt, latency_ms)
+                    try:
+                        completion = _parse_completion(response, attempt, latency_ms)
+                    except ModelOutputError as error:
+                        history.append(
+                            ProviderAttempt(
+                                sequence=sequence,
+                                outcome=ProviderAttemptOutcome.PROTOCOL_ERROR,
+                                request_id=_request_id(response),
+                                latency_ms=latency_ms,
+                                error_kind=error.issue_kind.value,
+                                error_message=bounded_error(error, 300),
+                            )
+                        )
+                        _audited_error(error, tuple(history))
+                        raise
+                    history.append(
+                        ProviderAttempt(
+                            sequence=sequence,
+                            outcome=ProviderAttemptOutcome.SUCCESS,
+                            request_id=_request_id(response),
+                            response_id=completion.id,
+                            usage=_token_usage(completion.usage),
+                            latency_ms=latency_ms,
+                        )
+                    )
                     return _GatewayResponse(
                         response=response,
                         completion=completion,
-                        usage=_token_usage(completion.usage),
-                        attempts=attempt,
-                        latency_ms=latency_ms,
+                        attempt_history=tuple(history),
                     )
+                failure = _response_error(response, self.config.api_key, attempt, latency_ms)
+                history.append(
+                    ProviderAttempt(
+                        sequence=sequence,
+                        outcome=ProviderAttemptOutcome.HTTP_ERROR,
+                        request_id=_request_id(response),
+                        latency_ms=latency_ms,
+                        error_kind=type(failure).__name__,
+                        error_message=bounded_error(failure, 300),
+                    )
+                )
                 if payload.tool_choice and _rejects_tool_choice(response):
-                    self._omit_tool_choice = True
+                    self._features = self._features.without_tool_choice()
                     if attempt < self.config.max_attempts:
                         payload = payload.without_tool_choice()
                         continue
                 if not _retryable_response(response) or attempt == self.config.max_attempts:
-                    raise _response_error(
-                        response,
-                        self.config.api_key,
-                        attempt,
-                        _elapsed_ms(started),
-                    )
+                    raise _audited_error(failure, tuple(history))
             await asyncio.sleep(_retry_delay_seconds(attempt))
         raise AssertionError("bounded retry loop did not terminate")
 
 
 def _chat_request(
-    config: NewApiConfig,
+    config: NewApiModelConfig,
     request: CommandModelRequest,
 ) -> _ChatRequest:
     """Build one provider request from the provider-neutral command contract."""
@@ -334,7 +579,7 @@ def _chat_request(
             _Message(role="user", content=request.input_text),
         ),
         tools=tuple(_command_tool(name) for name in request.allowed_commands),
-        max_tokens=_FIXED_MAX_OUTPUT_TOKENS,
+        max_tokens=config.max_output_tokens,
     )
 
 
@@ -374,32 +619,83 @@ def _parse_completion(
         ) from error
 
 
-def _single_tool_call(completion: _ChatCompletion) -> tuple[str, JsonObject]:
-    """Return exactly one tool call or fail fast for an incompatible model."""
+def _single_tool_call(
+    completion: _ChatCompletion,
+    max_output_tokens: int,
+) -> tuple[str, JsonObject]:
+    """Return exactly one tool call or one typed protocol violation."""
     if len(completion.choices) != 1:
-        raise ValueError(f"expected one choice, received {len(completion.choices)}")
+        raise _ProtocolViolation(
+            ProtocolIssueKind.INVALID_RESPONSE,
+            f"expected one choice, received {len(completion.choices)}",
+        )
     calls = completion.choices[0].message.tool_calls
     if not calls:
+        truncated = _truncated_without_tool_call(completion, max_output_tokens)
         message = (
-            "selected NewAPI model exhausted the fixed 128000-token response budget "
+            f"selected NewAPI model exhausted its {max_output_tokens}-token response budget "
             "before returning a function call"
-            if _truncated_without_tool_call(completion)
+            if truncated
             else "selected NewAPI model did not return a required function call"
         )
-        raise ModelCompatibilityError(
+        raise _ProtocolViolation(
+            ProtocolIssueKind.MISSING_TOOL_CALL,
             message,
-            response_id=completion.id,
-            usage=_token_usage(completion.usage),
+            repairable=not truncated,
         )
     if len(calls) != 1:
-        raise ValueError(f"expected one function call, received {len(calls)}")
+        raise _ProtocolViolation(
+            ProtocolIssueKind.MULTIPLE_TOOL_CALLS,
+            f"expected one function call, received {len(calls)}",
+        )
     call = calls[0].function
-    arguments: object = (
-        json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments
-    )
+    try:
+        arguments: object = (
+            json.loads(call.arguments) if isinstance(call.arguments, str) else call.arguments
+        )
+    except json.JSONDecodeError as error:
+        raise _ProtocolViolation(
+            ProtocolIssueKind.INVALID_ARGUMENTS,
+            f"function arguments are not valid JSON: {error}",
+        ) from error
     if not isinstance(arguments, dict):
-        raise ValueError("function arguments must be a JSON object")
-    return call.name, _JSON_OBJECT_ADAPTER.validate_python(arguments)
+        raise _ProtocolViolation(
+            ProtocolIssueKind.INVALID_ARGUMENTS,
+            "function arguments must be a JSON object",
+        )
+    try:
+        return call.name, _JSON_OBJECT_ADAPTER.validate_python(arguments)
+    except ValidationError as error:
+        raise _ProtocolViolation(
+            ProtocolIssueKind.INVALID_ARGUMENTS,
+            str(error),
+        ) from error
+
+
+def _decode_command(
+    completion: _ChatCompletion,
+    allowed_commands: tuple[CommandName, ...],
+    max_output_tokens: int,
+) -> CompanyCommand:
+    """Decode and validate one provider call against the authorized command set."""
+    name, arguments = _single_tool_call(completion, max_output_tokens)
+    if name not in allowed_commands:
+        raise _ProtocolViolation(
+            ProtocolIssueKind.UNAUTHORIZED_COMMAND,
+            f"unknown or unauthorized command: {name}",
+        )
+    if "kind" in arguments:
+        raise _ProtocolViolation(
+            ProtocolIssueKind.INVALID_ARGUMENTS,
+            "tool input must not supply a command kind",
+        )
+    try:
+        return _COMMAND_ADAPTER.validate_python({"kind": name, **arguments})
+    except ValidationError as error:
+        raise _ProtocolViolation(
+            ProtocolIssueKind.INVALID_ARGUMENTS,
+            str(error),
+        ) from error
 
 
 def _token_usage(usage: _Usage) -> TokenUsage:
@@ -414,32 +710,69 @@ def _token_usage(usage: _Usage) -> TokenUsage:
     )
 
 
-def _truncated_without_tool_call(completion: _ChatCompletion) -> bool:
+def _truncated_without_tool_call(
+    completion: _ChatCompletion,
+    max_output_tokens: int,
+) -> bool:
     """Identify a model that spent its response budget before choosing a tool."""
     if len(completion.choices) != 1:
         return False
     choice = completion.choices[0]
     return not choice.message.tool_calls and (
         choice.finish_reason == "length"
-        or completion.usage.completion_tokens >= _FIXED_MAX_OUTPUT_TOKENS
+        or completion.usage.completion_tokens >= max_output_tokens
     )
 
 
-def _output_error(
-    label: str,
-    error: Exception,
-    completion: _ChatCompletion,
-    result: _GatewayResponse,
-) -> ModelOutputError:
-    """Attach provider observability to one invalid model response."""
-    return ModelOutputError(
-        f"{label}: {error}",
-        request_id=_request_id(result.response),
-        response_id=completion.id,
-        usage=result.usage,
-        attempts=result.attempts,
-        latency_ms=result.latency_ms,
+def _require_input_budget(payload: _ChatRequest, max_input_tokens: int) -> None:
+    """Bound the complete serialized request, including every tool schema."""
+    encoded = payload.model_dump_json(exclude_none=True).encode()
+    estimate = max(1, (len(encoded) + _TOKEN_ESTIMATE_BYTES - 1) // _TOKEN_ESTIMATE_BYTES)
+    if estimate > max_input_tokens:
+        raise ModelOutputError(
+            f"complete NewAPI request estimate {estimate} exceeds {max_input_tokens} tokens",
+            issue_kind=ProtocolIssueKind.CONTEXT_TOO_LARGE,
+            attempts=0,
+        )
+
+
+def _mark_protocol_error(
+    attempts: tuple[ProviderAttempt, ...],
+    violation: _ProtocolViolation,
+) -> tuple[ProviderAttempt, ...]:
+    """Reclassify the final HTTP success as a protocol-invalid completion."""
+    if not attempts or attempts[-1].outcome is not ProviderAttemptOutcome.SUCCESS:
+        raise ValueError("protocol validation requires one successful provider response")
+    failed = attempts[-1].model_copy(
+        update={
+            "outcome": ProviderAttemptOutcome.PROTOCOL_ERROR,
+            "error_kind": violation.kind.value,
+            "error_message": str(violation)[:300],
+        }
     )
+    return (*attempts[:-1], failed)
+
+
+def _attempt_usage(attempts: tuple[ProviderAttempt, ...]) -> TokenUsage:
+    """Sum provider-reported usage across every physical request."""
+    return sum((attempt.usage for attempt in attempts), start=TokenUsage())
+
+
+def _attempt_latency(attempts: tuple[ProviderAttempt, ...]) -> int:
+    """Sum physical request latency without counting local validation time."""
+    return sum(attempt.latency_ms for attempt in attempts)
+
+
+def _audited_error(
+    error: ModelOutputError | ModelConfigurationError | ModelInfrastructureError,
+    attempts: tuple[ProviderAttempt, ...],
+) -> ModelOutputError | ModelConfigurationError | ModelInfrastructureError:
+    """Attach cumulative immutable provider audit metadata to one failure."""
+    error.attempt_history = attempts
+    error.attempts = len(attempts) or error.attempts
+    error.usage = _attempt_usage(attempts)
+    error.latency_ms = _attempt_latency(attempts)
+    return error
 
 
 def _retryable_response(response: httpx.Response) -> bool:
@@ -490,6 +823,49 @@ def _provider_error_message(response: httpx.Response) -> str | None:
     detail = body.get("error")
     raw = detail.get("message") if isinstance(detail, Mapping) else body.get("message")
     return raw if isinstance(raw, str) else None
+
+
+def _response_output_limit(response: httpx.Response, requested: int) -> int | None:
+    """Extract one explicit output-token ceiling from a provider rejection."""
+    if response.status_code not in {400, 422}:
+        return None
+    message = _provider_error_message(response)
+    if message is None or not _names_output_token_parameter(message):
+        return None
+
+    exclusive = _EXCLUSIVE_OUTPUT_LIMIT.search(message) or _LESS_THAN_OUTPUT_LIMIT.search(message)
+    if exclusive is not None:
+        return _valid_discovered_limit(exclusive.group("limit"), requested, adjustment=-1)
+    for pattern in _INCLUSIVE_OUTPUT_LIMITS:
+        if match := pattern.search(message):
+            return _valid_discovered_limit(match.group("limit"), requested)
+    return None
+
+
+def _names_output_token_parameter(message: str) -> bool:
+    """Avoid mistaking context or input-token diagnostics for an output limit."""
+    normalized = message.casefold().replace("_", "").replace(" ", "")
+    return any(
+        name in normalized
+        for name in (
+            "maxtokens",
+            "maxoutputtokens",
+            "maxcompletiontokens",
+            "outputtokens",
+            "completiontokens",
+        )
+    )
+
+
+def _valid_discovered_limit(
+    raw_limit: str,
+    requested: int,
+    *,
+    adjustment: int = 0,
+) -> int | None:
+    """Accept only a positive ceiling stricter than the rejected request."""
+    limit = int(raw_limit.replace(",", "")) + adjustment
+    return limit if 0 < limit < requested else None
 
 
 def _response_error(

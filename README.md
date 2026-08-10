@@ -19,9 +19,10 @@ trade results. Model text never settles a transaction.
 Dairy Bench exposes exactly three modes:
 
 - **Rule baseline** — deterministic rules; no model call.
-- **Model agents via NewAPI** — one isolated Agent and NewAPI HTTP client per
-  company. The configured catalog may contain any model family that supports
-  function calls through NewAPI's common Chat Completions interface.
+- **Model agents via NewAPI** — one isolated Agent and gateway per company,
+  backed by one application-wide NewAPI HTTP transport. The configured catalog
+  may contain any model family that supports function calls through NewAPI's
+  common Chat Completions interface.
 - **Completed Run Replay** — reproduces a completed Turn Journal without calling a
   model and rejects observation or outcome drift.
 
@@ -80,7 +81,8 @@ start.cmd --configure-newapi
 The configuration command validates the key through `/v1/models`, stores a
 Windows-user-encrypted credential, and saves the complete non-secret model
 catalog under `.dairy-bench/credentials/`. Run it again whenever the key or
-catalog changes. If the backend is already open, restart it after configuration.
+catalog changes; doing so invalidates capabilities verified through the previous
+route. If the backend is already open, restart it after configuration.
 
 Start the application:
 
@@ -95,8 +97,13 @@ The model selector is populated from the NewAPI catalog. Because `/v1/models`
 does not prove command-tool compatibility, Dairy Bench still requires exactly
 one authorized function call. The adapter prefers `tool_choice="required"` and
 omits that hint only when the provider explicitly rejects it, as some thinking
-models do. Every request uses a fixed `max_tokens=131072` output budget. It never
-falls back to unstructured text or another provider.
+models do. It always disables parallel tool calls and gives an invalid completion
+one structured repair attempt. Before the first run of a model is queued, a short
+calibration request confirms its documented maximum output limit or extracts the
+exact limit from an explicit NewAPI rejection. The confirmed value is cached in a
+versioned local capability catalog and sent directly as `max_tokens`; there is no
+staircase growth. Complete serialized input is checked before transport. The
+adapter never falls back to unstructured text or another provider.
 
 The decrypted key exists only in the backend process environment. It never
 enters the browser, journal, or SQLite database.
@@ -106,16 +113,29 @@ enters the browser, journal, or SQLite database.
 The selected run and day live in `?run=...&day=...`, so refresh and browser
 navigation preserve the view. **All Runs** browses every persisted lifecycle
 state and its committed timeline. **Completed Run Replay** uses only a completed
-source run and inherits its seed. Stopped, interrupted, and checkpointed failed
-runs can resume under the same run ID; only interrupted work auto-resumes after
-a backend restart. Incomplete runs receive no final score and cannot become
-replay sources.
+source run and inherits its seed. Stopped and interrupted runs can resume under
+the same run ID; only interrupted work auto-resumes after a backend restart.
+Failed runs are terminal. A protocol-invalid episode still completes with a
+diagnostic score and replay source, but is explicitly excluded from benchmark
+comparison.
+
+Run submissions are independent: the backend executes up to 100 `RunJob`s at
+once and queues later jobs. All model runs share one HTTP connection pool and a
+100-request NewAPI semaphore; retry backoff happens after releasing its permit.
+The UI keeps every active job refreshed, so another model can be submitted while
+earlier runs continue. **All Runs** selects, stops, or resumes one job at a time.
+
+Both concurrency limits default to, and cannot exceed, 100. They can be lowered
+for a constrained gateway with `DAIRY_BENCH_MAX_CONCURRENT_RUNS` and
+`DAIRY_BENCH_MAX_CONCURRENT_NEWAPI_REQUESTS`.
 
 All mutable state stays under the Git-ignored `.dairy-bench/` directory:
 
 ```text
 .dairy-bench/
 |-- credentials/
+|   |-- newapi-model-capabilities.json
+|   `-- newapi-models.json
 `-- data/runs.sqlite3
 ```
 

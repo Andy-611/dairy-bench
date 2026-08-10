@@ -6,6 +6,7 @@ import {
 import type { ScoreView } from "../../shared/api/types";
 
 interface EvaluationStandardProps {
+  readonly benchmarkEligible: boolean;
   readonly score: ScoreView;
 }
 
@@ -55,7 +56,10 @@ const FORMULAS: readonly FormulaDefinition[] = [
   },
 ];
 
-export function EvaluationStandard({ score }: EvaluationStandardProps) {
+export function EvaluationStandard({
+  benchmarkEligible,
+  score,
+}: EvaluationStandardProps) {
   const metricGroups: readonly MetricGroupDefinition[] = [
     {
       title: "Efficiency inputs",
@@ -115,7 +119,9 @@ export function EvaluationStandard({ score }: EvaluationStandardProps) {
     <section aria-labelledby="evaluation-title" className="evaluation-panel panel">
       <header className="section-heading">
         <div>
-          <span className="eyebrow">BENCHMARK RESULT</span>
+          <span className="eyebrow">
+            {benchmarkEligible ? "BENCHMARK RESULT" : "DIAGNOSTIC RESULT"}
+          </span>
           <h2 id="evaluation-title">Evaluation standard</h2>
         </div>
         <p>
@@ -126,12 +132,16 @@ export function EvaluationStandard({ score }: EvaluationStandardProps) {
 
       <div className="evaluation-overview">
         <article className="final-score-card">
-          <span>FINAL SCORE</span>
+          <span>{benchmarkEligible ? "FINAL SCORE" : "DIAGNOSTIC SCORE"}</span>
           <div className="final-score-value">
             <strong>{formatExactDecimal(score.finalScore)}</strong>
             <small>/ 100</small>
           </div>
-          <p>The benchmark's primary model-ranking measure</p>
+          <p>
+            {benchmarkEligible
+              ? "The benchmark's primary model-ranking measure"
+              : "Excluded from model rankings because the command protocol was violated"}
+          </p>
         </article>
 
         <div className="evaluation-metrics">

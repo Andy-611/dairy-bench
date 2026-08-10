@@ -1,6 +1,5 @@
 import { companyLabel } from "../labels";
 import { isAbortError } from "../requestErrors";
-import { isActiveRun } from "../runStatus";
 import type {
   AgentUsageSummaryView,
   AgentTraceView,
@@ -11,13 +10,16 @@ import type {
   DailySnapshotView,
   DecimalText,
   EconomicEffectView,
+  EpisodeQualityView,
   EpisodeView,
   InvocationOutcome,
   JsonValue,
   MarketMatchLegView,
   PolicyMode,
   PolicyProfileView,
+  ProtocolIssueKind,
   ReplaySourceView,
+  RunDiagnosticsView,
   QuoteAlertView,
   RunJobView,
   RunRequest,
@@ -37,7 +39,6 @@ import type {
 } from "./types";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
-type ProgressListener = (progress: RunJobView) => void;
 
 interface InvocationUsageView {
   readonly model: string;
@@ -46,7 +47,6 @@ interface InvocationUsageView {
   readonly usage: TokenUsageView;
 }
 
-const POLL_INTERVAL_MS = 500;
 const DECIMAL_TEXT_PATTERN =
   /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
@@ -72,29 +72,25 @@ export class DairyBenchApi {
     );
   }
 
-  public async run(
+  public async submitRun(
     request: RunRequest,
-    onProgress: ProgressListener,
     signal?: AbortSignal,
   ): Promise<RunJobView> {
-    const progress = await this.postJob(
+    return this.postJob(
       "/api/runs",
       signal,
       runRequestPayload(request),
     );
-    return this.monitorJob(progress, onProgress, signal);
   }
 
   public async resumeRun(
     runId: string,
-    onProgress: ProgressListener,
     signal?: AbortSignal,
   ): Promise<RunJobView> {
-    const progress = await this.postJob(
+    return this.postJob(
       `/api/run-jobs/${encodeURIComponent(runId)}/resume`,
       signal,
     );
-    return this.monitorJob(progress, onProgress, signal);
   }
 
   public async runJobs(
@@ -135,31 +131,6 @@ export class DairyBenchApi {
       `/api/run-jobs/${encodeURIComponent(runId)}/stop`,
       signal,
     );
-  }
-
-  private async monitorJob(
-    initial: RunJobView,
-    onProgress: ProgressListener,
-    signal?: AbortSignal,
-  ): Promise<RunJobView> {
-    let progress = initial;
-    onProgress(progress);
-    while (isActiveRun(progress.status)) {
-      await delay(POLL_INTERVAL_MS, signal);
-      progress = parseRunJob(
-        await this.getJson(`/api/run-jobs/${progress.runId}`, signal),
-      );
-      onProgress(progress);
-    }
-
-    if (progress.status === "failed") {
-      throw new ApiError(
-        progress.errorMessage ?? "The run did not complete. Check the backend log.",
-        500,
-      );
-    }
-
-    return progress;
   }
 
   public async episode(
@@ -296,6 +267,10 @@ function parseRunJob(payload: unknown): RunJobView {
     startedAt: nullableDateTime(job.started_at, "started_at"),
     finishedAt: nullableDateTime(job.finished_at, "finished_at"),
     errorMessage: nullableText(job.error_message, "error_message"),
+    quality:
+      job.quality === null
+        ? null
+        : parseEpisodeQuality(job.quality, "quality"),
   };
 }
 
@@ -304,27 +279,11 @@ function parseReplaySource(payload: unknown): ReplaySourceView {
   return {
     runId: text(source.run_id, "run_id"),
     submittedAt: dateTime(source.submitted_at, "submitted_at"),
+    benchmarkEligible: boolean(
+      source.benchmark_eligible,
+      "benchmark_eligible",
+    ),
   };
-}
-
-function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    function abort(): void {
-      window.clearTimeout(timer);
-      reject(new DOMException("The request was cancelled.", "AbortError"));
-    }
-
-    const timer = window.setTimeout(() => {
-      signal?.removeEventListener("abort", abort);
-      resolve();
-    }, milliseconds);
-
-    if (signal?.aborted) {
-      abort();
-    } else {
-      signal?.addEventListener("abort", abort, { once: true });
-    }
-  });
 }
 
 function errorMessage(payload: unknown, status: number): string {
@@ -364,6 +323,7 @@ function parseEpisode(
     days: number(scenario.days, "scenario.days"),
     agentUsage: summarizeAgentUsage(invocations),
     score: parseScore(score),
+    quality: parseEpisodeQuality(episode.quality, "quality"),
     companies: companyScores.map((companyScore, index) =>
       parseCompany(
         companyScore,
@@ -373,6 +333,38 @@ function parseEpisode(
       ),
     ),
     snapshots: parseSnapshots(episode.snapshots),
+  };
+}
+
+function parseEpisodeQuality(
+  payload: unknown,
+  path: string,
+): EpisodeQualityView {
+  const quality = record(payload, path);
+  const protocol = record(quality.protocol, `${path}.protocol`);
+  return {
+    benchmarkEligible: boolean(
+      quality.benchmark_eligible,
+      `${path}.benchmark_eligible`,
+    ),
+    totalTurnCount: number(
+      protocol.total_turn_count,
+      `${path}.protocol.total_turn_count`,
+    ),
+    invalidTurnCount: number(
+      protocol.invalid_turn_count,
+      `${path}.protocol.invalid_turn_count`,
+    ),
+    issues: array(protocol.issues, `${path}.protocol.issues`).map(
+      (value, index) => {
+        const issuePath = `${path}.protocol.issues[${index}]`;
+        const issue = record(value, issuePath);
+        return {
+          kind: protocolIssueKind(issue.kind, `${issuePath}.kind`),
+          count: number(issue.count, `${issuePath}.count`),
+        };
+      },
+    ),
   };
 }
 
@@ -596,6 +588,7 @@ function parseTimelineContext(
       `${path}.scenario_version`,
     ),
     totalDays: number(context.total_days, `${path}.total_days`),
+    status: runStatus(context.status, `${path}.status`),
     mode: text(context.mode, `${path}.mode`),
     sourceRunId: nullableText(context.source_run_id, `${path}.source_run_id`),
     traceRunId: text(context.trace_run_id, `${path}.trace_run_id`),
@@ -623,6 +616,55 @@ function parseTimelineContext(
     checkpointStateVersion: nullableNumber(
       context.checkpoint_state_version,
       `${path}.checkpoint_state_version`,
+    ),
+    diagnostics: parseRunDiagnostics(context.diagnostics, `${path}.diagnostics`),
+  };
+}
+
+function parseRunDiagnostics(
+  payload: unknown,
+  path: string,
+): RunDiagnosticsView {
+  const diagnostics = record(payload, path);
+  return {
+    completedDays: number(diagnostics.completed_days, `${path}.completed_days`),
+    benchmarkEligible: nullableBoolean(
+      diagnostics.benchmark_eligible,
+      `${path}.benchmark_eligible`,
+    ),
+    protocolInvalidTurns: number(
+      diagnostics.protocol_invalid_turns,
+      `${path}.protocol_invalid_turns`,
+    ),
+    economicRejections: number(
+      diagnostics.economic_rejections,
+      `${path}.economic_rejections`,
+    ),
+    waitPlanRejections: number(
+      diagnostics.wait_plan_rejections,
+      `${path}.wait_plan_rejections`,
+    ),
+    tradeCount: number(diagnostics.trade_count, `${path}.trade_count`),
+    lastTradeDay: nullableNumber(diagnostics.last_trade_day, `${path}.last_trade_day`),
+    zeroTradeDayStreak: number(
+      diagnostics.zero_trade_day_streak,
+      `${path}.zero_trade_day_streak`,
+    ),
+    consumerDemand: decimalText(diagnostics.consumer_demand, `${path}.consumer_demand`),
+    consumerSales: decimalText(diagnostics.consumer_sales, `${path}.consumer_sales`),
+    consumerFillRate: decimalText(
+      diagnostics.consumer_fill_rate,
+      `${path}.consumer_fill_rate`,
+    ),
+    expiredQuantity: decimalText(
+      diagnostics.expired_quantity,
+      `${path}.expired_quantity`,
+    ),
+    nearInsolventCompanyIds: array(
+      diagnostics.near_insolvent_company_ids,
+      `${path}.near_insolvent_company_ids`,
+    ).map((value, index) =>
+      text(value, `${path}.near_insolvent_company_ids[${index}]`),
     ),
   };
 }
@@ -1403,10 +1445,10 @@ function parseTimelineCommand(
   if (kind === "wait") {
     return {
       kind,
-      untilMinute:
-        command.until === null
-          ? null
-          : simMinute(command.until, `${path}.until`),
+      reviewAfterMinutes: nullableNumber(
+        command.review_after_minutes,
+        `${path}.review_after_minutes`,
+      ),
       alerts: array(command.alerts, `${path}.alerts`).map((value, index) =>
         parseQuoteAlert(value, `${path}.alerts[${index}]`),
       ),
@@ -1699,6 +1741,24 @@ function invocationOutcome(value: unknown, path: string): InvocationOutcome {
     return value;
   }
   throw new Error(`Backend field ${path} is not a known invocation outcome.`);
+}
+
+function protocolIssueKind(value: unknown, path: string): ProtocolIssueKind {
+  if (
+    value === "context_too_large" ||
+    value === "invalid_arguments" ||
+    value === "invalid_response" ||
+    value === "missing_tool_call" ||
+    value === "multiple_tool_calls" ||
+    value === "unauthorized_command"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known protocol issue.`);
+}
+
+function nullableBoolean(value: unknown, path: string): boolean | null {
+  return value === null ? null : boolean(value, path);
 }
 
 function nullableText(value: unknown, path: string): string | null {

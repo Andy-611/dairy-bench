@@ -202,9 +202,9 @@ export function quoteAlertSummary(alert: QuoteAlertView): string {
 export function waitFallbackSummary(
   command: Extract<TimelineCommandView, { readonly kind: "wait" }>,
 ): string {
-  return command.untilMinute === null
+  return command.reviewAfterMinutes === null
     ? "use the runtime's bounded fallback review"
-    : `review at ${clockTime(command.untilMinute)}`;
+    : `review after ${command.reviewAfterMinutes} minutes`;
 }
 
 function waitSummary(

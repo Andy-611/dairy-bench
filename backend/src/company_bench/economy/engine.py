@@ -72,6 +72,7 @@ from company_bench.runtime.models import (
     Produce,
     QuoteLadderResult,
     QuoteLevelAction,
+    RejectionCategory,
     ScheduledCompletion,
     SetQuoteLadder,
     SetRetailPrice,
@@ -1253,11 +1254,8 @@ class EconomyEngine:
         events: tuple[DomainEvent, ...] = (),
         completions: tuple[ScheduledCompletion, ...] = (),
     ) -> CommandOutcome:
-        command = envelope.command
-        next_available = (
-            command.until
-            if accepted and isinstance(command, Wait)
-            else envelope.issued_at.plus(economy.scenario.runtime.decision_interval_minutes)
+        next_available = envelope.issued_at.plus(
+            economy.scenario.runtime.decision_interval_minutes
         )
         return CommandOutcome(
             turn_id=envelope.turn_id,
@@ -1266,6 +1264,7 @@ class EconomyEngine:
             occurred_at=envelope.issued_at,
             status=CommandStatus.ACCEPTED if accepted else CommandStatus.REJECTED,
             accepted=accepted,
+            rejection_category=None if accepted else RejectionCategory.ECONOMIC,
             reason=reason,
             resulting_state_version=economy.state_version,
             apply_sequence=apply_sequence,

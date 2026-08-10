@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { CompanyTable } from "../features/evaluation/CompanyTable";
 import { EvaluationStandard } from "../features/evaluation/EvaluationStandard";
 import { MetricChart } from "../features/evaluation/MetricChart";
+import { RunQualityBanner } from "../features/evaluation/RunQualityBanner";
 import { TokenSummary } from "../features/evaluation/TokenSummary";
 import {
   RunForm,
@@ -18,7 +19,6 @@ import type {
   RunRequest,
 } from "../shared/api/types";
 import { isAbortError, requestErrorMessage } from "../shared/requestErrors";
-import { isActiveRun } from "../shared/runStatus";
 import { EmptyState } from "../shared/ui/EmptyState";
 import { useRunWorkspace } from "./useRunWorkspace";
 
@@ -40,10 +40,7 @@ type RunTransition = Extract<
   { readonly state: "resuming" | "starting" | "stopping" }
 >;
 
-type RunStream = (
-  onProgress: (job: RunJobView) => void,
-  signal: AbortSignal,
-) => Promise<RunJobView>;
+type RunSubmission = (signal: AbortSignal) => Promise<RunJobView>;
 
 export function App() {
   const workspace = useRunWorkspace(api);
@@ -51,7 +48,6 @@ export function App() {
   const [profiles, setProfiles] = useState<readonly PolicyProfileView[]>([]);
   const [model, setModel] = useState("");
   const [seed, setSeed] = useState("42");
-  const [progress, setProgress] = useState<RunJobView | null>(null);
   const [runTransition, setRunTransition] = useState<RunTransition | null>(null);
   const [error, setError] = useState<AppError | null>(null);
   const [notice, setNotice] = useState<RunNotice | null>(null);
@@ -111,56 +107,34 @@ export function App() {
     workspace.selectedRunId,
   ]);
 
-  async function streamRun(
+  async function submitJob(
     transition: RunTransition,
     errorHeading: string,
-    operation: RunStream,
+    operation: RunSubmission,
   ): Promise<void> {
     const controller = new AbortController();
-    activeRequest.current?.abort();
     activeRequest.current = controller;
     setError(null);
     setNotice(null);
-    setProgress(null);
     setRunTransition(transition);
-    let selectedSubmittedRun = false;
-    let streamedRunId = "";
 
     try {
-      const result = await operation(
-        (job) => {
-          streamedRunId = job.runId;
-          setProgress(job);
-          setRunTransition((current) =>
-            current === transition ? null : current,
-          );
-          const selectLatestDay = !selectedSubmittedRun || !isActiveRun(job.status);
-          workspace.trackJob(job, selectLatestDay);
-          selectedSubmittedRun = true;
-        },
-        controller.signal,
-      );
-      const message = runNotice(result);
-      if (message) {
-        setNotice({ message, runId: result.runId });
-      }
+      const job = await operation(controller.signal);
+      workspace.trackJob(job, true);
     } catch (reason: unknown) {
       if (isAbortError(reason)) {
         return;
       }
-      setProgress(null);
       setError({
         heading: errorHeading,
         message: requestErrorMessage(reason, {
-          fallback:
-            "The run stopped before completion. Its persisted timeline remains available below.",
+          fallback: "The backend did not accept the run request.",
           network:
             "Could not reach the backend. Confirm FastAPI is running at 127.0.0.1:8000.",
         }),
       });
     } finally {
       setRunTransition((current) => (current === transition ? null : current));
-      workspace.releaseJobStream(streamedRunId);
       if (activeRequest.current === controller) {
         activeRequest.current = null;
       }
@@ -181,18 +155,18 @@ export function App() {
       setError({ heading: "The run could not be started", message: request });
       return;
     }
-    await streamRun(
+    await submitJob(
       { state: "starting" },
-      "The run could not be completed",
-      (onProgress, signal) => api.run(request, onProgress, signal),
+      "The run could not be started",
+      (signal) => api.submitRun(request, signal),
     );
   }
 
   async function resumeBenchmark(runId: string): Promise<void> {
-    await streamRun(
+    await submitJob(
       { state: "resuming", runId },
       "The run could not be resumed",
-      (onProgress, signal) => api.resumeRun(runId, onProgress, signal),
+      (signal) => api.resumeRun(runId, signal),
     );
   }
 
@@ -202,7 +176,6 @@ export function App() {
     setRunTransition({ state: "stopping", runId });
     try {
       const job = await api.stopRun(runId);
-      setProgress(job);
       workspace.trackJob(job, true);
       if (job.status === "stopped") {
         setNotice({ message: stopNotice(job), runId: job.runId });
@@ -245,12 +218,10 @@ export function App() {
   const episode =
     workspace.episode?.runId === selectedJob?.runId ? workspace.episode : null;
   const activeProgress =
-    progress && isActiveRun(progress.status) ? progress : workspace.activeJob;
-  const runControl: RunControl =
-    runTransition ??
-    (activeProgress
-      ? { state: "running", runId: activeProgress.runId }
-      : { state: "idle" });
+    workspace.activeJobs.find((job) => job.runId === selectedJob?.runId) ??
+    workspace.activeJobs[0] ??
+    null;
+  const runControl: RunControl = runTransition ?? { state: "idle" };
   const displayedNotice =
     (notice !== null && notice.runId === selectedJob?.runId
       ? notice.message
@@ -359,14 +330,28 @@ export function App() {
               <span>{displayedNotice}</span>
             </div>
           )}
-          {runControl.state !== "idle" && (
+          {runTransition && (
             <div className="loading-banner" role="status">
               <span className="spinner dark" />
               <div className="progress-copy">
-                <span>{progressText(runControl, activeProgress)}</span>
+                <span>{transitionText(runTransition)}</span>
+              </div>
+            </div>
+          )}
+          {activeProgress && (
+            <div className="loading-banner" role="status">
+              <span className="spinner dark" />
+              <div className="progress-copy">
+                <span>
+                  {activeRunText(
+                    workspace.activeJobs.length,
+                    activeProgress,
+                    activeProgress.runId === selectedJob?.runId,
+                  )}
+                </span>
                 <progress
-                  max={activeProgress?.totalDays ?? 30}
-                  value={activeProgress?.currentDay ?? 0}
+                  max={activeProgress.totalDays}
+                  value={activeProgress.currentDay}
                 />
               </div>
             </div>
@@ -394,7 +379,11 @@ export function App() {
             )}
             {episode && (
               <>
-                <EvaluationStandard score={episode.score} />
+                <RunQualityBanner quality={episode.quality} />
+                <EvaluationStandard
+                  benchmarkEligible={episode.quality.benchmarkEligible}
+                  score={episode.score}
+                />
                 {episode.agentUsage && (
                   <TokenSummary summary={episode.agentUsage} />
                 )}
@@ -451,10 +440,7 @@ function buildRunRequest(
   return { policyMode: mode, seed: parsedSeed };
 }
 
-function progressText(
-  control: RunControl,
-  progress: RunJobView | null,
-): string {
+function transitionText(control: RunTransition): string {
   if (control.state === "starting") {
     return "Starting run…";
   }
@@ -464,10 +450,19 @@ function progressText(
   if (control.state === "stopping") {
     return "Stopping run…";
   }
-  if (!progress || progress.status === "queued") {
-    return "Run queued. Preparing independent company agents…";
-  }
-  return `Running day ${progress.currentDay} of ${progress.totalDays}`;
+  return "Updating run…";
+}
+
+function activeRunText(
+  count: number,
+  job: RunJobView,
+  selected: boolean,
+): string {
+  const summary = `${count} active ${count === 1 ? "run" : "runs"}`;
+  const subject = selected ? "Selected run" : "Latest active run";
+  return job.status === "queued"
+    ? `${summary}. ${subject} is queued.`
+    : `${summary}. ${subject} is on day ${job.currentDay} of ${job.totalDays}.`;
 }
 
 function stopNotice(job: RunJobView): string {
@@ -479,13 +474,6 @@ function stopNotice(job: RunJobView): string {
 function interruptionNotice(job: RunJobView): string {
   const reason = job.errorMessage ? ` ${job.errorMessage}` : "";
   return `Run interrupted by a temporary infrastructure issue.${reason} Its timeline and checkpoint remain available for resume.`;
-}
-
-function runNotice(job: RunJobView): string | null {
-  if (job.status === "stopped") {
-    return stopNotice(job);
-  }
-  return job.status === "interrupted" ? interruptionNotice(job) : null;
 }
 
 function loadTimelineDay(

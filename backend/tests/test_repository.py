@@ -10,9 +10,12 @@ from company_bench.agents.company import BaselineCompanyAgent
 from company_bench.agents.memory import AgentCheckpoint
 from company_bench.domain.models import (
     CompanyObservation,
+    EpisodeQuality,
     EpisodeResult,
     PolicyDescriptor,
     PolicyKind,
+    ProtocolIssueKind,
+    ProtocolReport,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.economy.engine import EconomyEngine
@@ -69,6 +72,24 @@ def test_memory_repository_completed_episode_round_trip() -> None:
     assert result.score.efficiency_reference == Decimal("8316.0938")
     assert repository.get(result.run_id) == result
     assert repository.get("missing") is None
+
+
+def test_repository_rejects_completion_quality_drift() -> None:
+    repository = InMemoryRunStore()
+    result = run_episode()
+    invalid_quality = EpisodeQuality(
+        benchmark_eligible=False,
+        protocol=ProtocolReport.from_issues(
+            1,
+            (ProtocolIssueKind.MISSING_TOOL_CALL,),
+        ),
+    )
+    completed_job = _completed_job_for(result).model_copy(
+        update={"quality": invalid_quality}
+    )
+
+    with pytest.raises(ValueError, match="same quality"):
+        repository.complete_job(result, completed_job)
 
 
 def test_memory_repository_lists_every_job_status_newest_first() -> None:
@@ -188,6 +209,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
                 "current_day": 30,
                 "started_at": result.started_at,
                 "finished_at": result.finished_at,
+                "quality": result.quality,
             }
         )
         repository.complete_job(result, completed_job)
@@ -364,6 +386,7 @@ def _history_jobs() -> tuple[RunJob, ...]:
             scenario_id=DAIRY_S9_SCENARIO.scenario_id,
             total_days=DAIRY_S9_SCENARIO.days,
             submitted_at=submitted_at + timedelta(minutes=sequence),
+            quality=_clean_quality() if status is RunStatus.COMPLETED else None,
         )
         for sequence, status in enumerate(RunStatus)
     )
@@ -380,6 +403,7 @@ def _assert_replay_sources(repository: RunStore) -> tuple[ReplaySource, ...]:
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
         total_days=DAIRY_S9_SCENARIO.days,
         submitted_at=base_time,
+        quality=_clean_quality(),
     )
     newer = older.model_copy(
         update={
@@ -392,6 +416,7 @@ def _assert_replay_sources(repository: RunStore) -> tuple[ReplaySource, ...]:
         update={
             "run_id": "replay_failed",
             "status": RunStatus.FAILED,
+            "quality": None,
             "submitted_at": base_time + timedelta(minutes=2),
         }
     )
@@ -406,7 +431,12 @@ def _assert_replay_sources(repository: RunStore) -> tuple[ReplaySource, ...]:
         repository.save_job(job)
 
     expected = tuple(
-        ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at) for job in (newer, older)
+        ReplaySource(
+            run_id=job.run_id,
+            submitted_at=job.submitted_at,
+            benchmark_eligible=True,
+        )
+        for job in (newer, older)
     )
     assert repository.list_replay_sources() == expected
     return expected
@@ -536,7 +566,7 @@ def _turn_for(
         company_id=observation.company_id,
         issued_at=at,
         state_version=sequence - 1,
-        command=Wait(until=at.plus(10)),
+        command=Wait(review_after_minutes=10),
     )
     outcome = CommandOutcome(
         turn_id=turn_id,
@@ -626,7 +656,16 @@ def _completed_job_for(result: EpisodeResult) -> RunJob:
             "current_day": result.scenario.days,
             "started_at": result.started_at,
             "finished_at": result.finished_at,
+            "quality": result.quality,
         }
+    )
+
+
+def _clean_quality() -> EpisodeQuality:
+    """Build protocol-clean quality metadata for lifecycle-only tests."""
+    return EpisodeQuality(
+        benchmark_eligible=True,
+        protocol=ProtocolReport(total_turn_count=0, invalid_turn_count=0),
     )
 
 

@@ -5,7 +5,7 @@ import pytest
 
 from company_bench.agents.company import BaselineCompanyAgent, CompanyAgent
 from company_bench.agents.factory import AgentBundle, AgentFactory
-from company_bench.domain.models import PolicyKind
+from company_bench.domain.models import EpisodeQuality, PolicyKind, ProtocolReport
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
 from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus
@@ -234,6 +234,7 @@ async def test_stop_newly_queued_run_before_its_task_starts() -> None:
         repository,
         AgentFactory(runtime.scenario, repository),
         runtime,
+        max_concurrent_runs=1,
     )
     queued = await coordinator.submit(mode=PolicyKind.BASELINE, seed=2)
 
@@ -246,6 +247,28 @@ async def test_stop_newly_queued_run_before_its_task_starts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_default_limit_starts_100_runs_and_queues_the_101st() -> None:
+    repository = InMemoryRunStore()
+    runtime = _QueueingRuntime()
+    coordinator = RunCoordinator(
+        repository,
+        AgentFactory(runtime.scenario, repository),
+        runtime,
+    )
+    jobs = [await coordinator.submit(mode=PolicyKind.BASELINE, seed=seed) for seed in range(101)]
+
+    try:
+        async with asyncio.timeout(2):
+            while len(runtime.started_run_ids) < 100:
+                await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(runtime.started_run_ids) == 100
+        assert (repository.get_job(jobs[-1].run_id) or jobs[-1]).status is RunStatus.QUEUED
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_stop_queued_run_never_enters_the_runtime() -> None:
     repository = InMemoryRunStore()
     runtime = _QueueingRuntime()
@@ -253,6 +276,7 @@ async def test_stop_queued_run_never_enters_the_runtime() -> None:
         repository,
         AgentFactory(runtime.scenario, repository),
         runtime,
+        max_concurrent_runs=1,
     )
     active = await coordinator.submit(mode=PolicyKind.BASELINE, seed=1)
     async with asyncio.timeout(2):
@@ -292,6 +316,7 @@ async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
             submitted_at=source.episode.started_at,
             started_at=source.episode.started_at,
             finished_at=source.episode.finished_at,
+            quality=source.episode.quality,
         ),
     )
     for index, record in enumerate(source.turns):
@@ -414,7 +439,7 @@ async def test_start_resumes_a_checkpoint_to_completion() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
-    (RunStatus.FAILED, RunStatus.INTERRUPTED, RunStatus.STOPPED),
+    (RunStatus.INTERRUPTED, RunStatus.STOPPED),
 )
 async def test_explicit_resume_continues_the_same_checkpointed_run(
     status: RunStatus,
@@ -512,9 +537,19 @@ async def test_resume_rejects_irrecoverable_or_completed_runs() -> None:
         runtime=EpisodeRuntime(scenario),
     )
 
-    with pytest.raises(ValueError, match="saved checkpoint"):
+    with pytest.raises(ValueError, match="failed run cannot be resumed"):
         await coordinator.resume(base.run_id)
-    repository.save_job(base.model_copy(update={"status": RunStatus.COMPLETED}))
+    repository.save_job(
+        base.model_copy(
+            update={
+                "status": RunStatus.COMPLETED,
+                "quality": EpisodeQuality(
+                    benchmark_eligible=True,
+                    protocol=ProtocolReport(total_turn_count=0, invalid_turn_count=0),
+                ),
+            }
+        )
+    )
     with pytest.raises(ValueError, match="completed run cannot be resumed"):
         await coordinator.resume(base.run_id)
     with pytest.raises(LookupError, match="was not found"):

@@ -18,15 +18,32 @@ from company_bench.agents.contracts import (
     ModelOutputError,
 )
 from company_bench.agents.factory import AgentFactory
-from company_bench.agents.providers.newapi import NewApiConfig
-from company_bench.domain.models import CompanyObservation, PolicyKind, PolicyMetadata
+from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
+from company_bench.agents.providers.newapi import NewApiConfig, NewApiModelConfig
+from company_bench.domain.models import (
+    CompanyObservation,
+    PolicyKind,
+    PolicyMetadata,
+    ProtocolIssueKind,
+)
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
 from company_bench.runs.models import InvocationOutcome, RunJob, RunStatus, TokenUsage
 from company_bench.runtime.episode import EpisodeRuntime
-from company_bench.runtime.models import AgentTurn, SimTime, Wait, WakeReason
+from company_bench.runtime.models import (
+    PROTOCOL_ERROR_PREFIX,
+    AgentTurn,
+    CommandEnvelope,
+    CommandOutcome,
+    CommandStatus,
+    RejectionCategory,
+    SimTime,
+    TurnRecord,
+    Wait,
+    WakeReason,
+)
 from company_bench.storage.store import InMemoryRunStore
-from tests.support.fakes import ScriptedModelGateway
+from tests.support.fakes import ScriptedModelGateway, model_capability_catalog
 
 
 def _config() -> NewApiConfig:
@@ -36,6 +53,16 @@ def _config() -> NewApiConfig:
         model="gpt-test-default",
         models=("gpt-test-default", "gemini-test-selected"),
         max_attempts=1,
+    )
+
+
+def _capabilities() -> ModelCapabilityCatalog:
+    """Return confirmed limits for both injected test models."""
+    return model_capability_catalog(
+        {
+            "gpt-test-default": 128_000,
+            "gemini-test-selected": 65_536,
+        }
     )
 
 
@@ -57,10 +84,10 @@ class _RecordingGatewayFactory:
 
     def __init__(self, create: Callable[[], CommandGateway] = _TrackedScriptedGateway) -> None:
         self._create = create
-        self.configs: list[NewApiConfig] = []
+        self.configs: list[NewApiModelConfig] = []
         self.gateways: list[CommandGateway] = []
 
-    def __call__(self, config: NewApiConfig) -> CommandGateway:
+    def __call__(self, config: NewApiModelConfig) -> CommandGateway:
         """Create a fresh gateway for one company Agent."""
         gateway = self._create()
         self.configs.append(config)
@@ -75,6 +102,7 @@ def test_model_mode_owns_nine_independent_newapi_gateways() -> None:
         DAIRY_S9_SCENARIO,
         repository,
         newapi_config=_config(),
+        model_capabilities=_capabilities(),
         gateway_factory=gateway_factory,
     )
 
@@ -175,7 +203,7 @@ class _AuditedOutputErrorGateway:
         """Release no resources."""
 
 
-def test_output_failure_retains_provider_audit_coordinates(
+def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
     first_observation: CompanyObservation,
 ) -> None:
     repository = InMemoryRunStore()
@@ -218,6 +246,46 @@ def test_output_failure_retains_provider_audit_coordinates(
     assert invocation.sim_minute == turn.sim_time.absolute_minute
     assert invocation.prompt_version == COMMAND_PROMPT_VERSION
 
+    protocol_error = "ModelOutputError: invalid output"
+    command = Wait()
+    envelope = CommandEnvelope(
+        turn_id=turn.turn_id,
+        command_id="failed_command",
+        company_id=turn.company_id,
+        issued_at=turn.sim_time,
+        state_version=turn.state_version,
+        command=command,
+    )
+    outcome = CommandOutcome(
+        turn_id=turn.turn_id,
+        command_id=envelope.command_id,
+        company_id=turn.company_id,
+        occurred_at=turn.sim_time,
+        status=CommandStatus.REJECTED,
+        accepted=False,
+        rejection_category=RejectionCategory.PROTOCOL,
+        reason=f"{PROTOCOL_ERROR_PREFIX}{protocol_error}",
+        resulting_state_version=turn.state_version,
+        apply_sequence=1,
+        next_available_at=turn.sim_time.plus(1),
+    )
+    agent.remember(
+        TurnRecord(
+            run_id="failed_run",
+            turn=turn,
+            envelope=envelope,
+            outcome=outcome,
+            observation_hash="failed_observation",
+            protocol_issue_kind=ProtocolIssueKind.INVALID_RESPONSE,
+            protocol_error=protocol_error,
+        )
+    )
+
+    completed = repository.list_invocations("failed_run")[0]
+    assert completed.command == command
+    assert completed.command_outcome == outcome
+    assert completed.apply_sequence == outcome.apply_sequence
+
 
 async def _run_model_job_until(
     repository: InMemoryRunStore,
@@ -254,6 +322,7 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
         DAIRY_S9_SCENARIO,
         repository,
         newapi_config=_config(),
+        model_capabilities=_capabilities(),
         gateway_factory=gateway_factory,
     )
 
@@ -313,6 +382,7 @@ def test_permanent_model_failure_marks_job_failed_without_result(
         DAIRY_S9_SCENARIO,
         repository,
         newapi_config=_config(),
+        model_capabilities=_capabilities(),
         gateway_factory=gateway_factory,
     )
 

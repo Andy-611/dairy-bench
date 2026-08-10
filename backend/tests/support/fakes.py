@@ -9,10 +9,19 @@ from company_bench.agents.contracts import (
     CommandModelResult,
     ModelOutputError,
 )
+from company_bench.agents.providers.capabilities import (
+    ModelCapabilityCatalog,
+    verified_capabilities,
+)
 from company_bench.domain.models import PolicyKind, PolicyMetadata
 from company_bench.runtime.models import AgentTurn, CompanyCommand
 
 _COMMAND_ADAPTER = TypeAdapter(CompanyCommand)
+
+
+def model_capability_catalog(limits: dict[str, int]) -> ModelCapabilityCatalog:
+    """Return a no-I/O catalog of gateway-confirmed model limits."""
+    return ModelCapabilityCatalog(None, None, seeds=verified_capabilities(limits))
 
 
 class FixedCommandAgent:

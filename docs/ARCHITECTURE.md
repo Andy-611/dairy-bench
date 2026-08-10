@@ -193,13 +193,26 @@ persisted order priority sequence in best-to-worst target order; unchanged
 levels retain theirs. Real response latency, retries, and provider load are
 audited but never feed matching.
 
+Episode concurrency is a separate application concern. `RunCoordinator` admits
+up to 100 independent `RunJob`s into `EpisodeRuntime`; later jobs remain queued.
+Every episode owns its scheduler, economy state, agents, checkpoints, and
+journal, while immutable runtime services are shared. Model gateways share one
+application-owned `NewApiTransport`, whose connection pool and request semaphore
+allow at most 100 in-flight NewAPI calls across all runs. A permit covers only
+the HTTP request, never retry backoff. An application-owned
+`ModelCapabilityCatalog` single-flights pre-run output-limit calibration per
+model and atomically persists confirmed limits; gateways receive only fully
+resolved model configurations. These bounds do not change the
+same-minute inference and deterministic serial-application rule inside a run.
+
 Sparse decisions are governed by the in-process `AgentAttention` module. An
 accepted `wait` may arm up to three Agent-visible `best_bid`/`best_ask` threshold
-alerts, combined with OR semantics, plus an optional absolute fallback. An
-explicit fallback must be later on the same business day and at most 120 minutes
-away. Omitting it schedules a 120-minute review when that still falls before
-market close; otherwise there is no same-day review. Duplicate, hidden, or
-already-true alerts reject the entire command without changing economic state.
+alerts, combined with OR semantics, plus an optional relative review delay. An
+explicit `review_after_minutes` must be at most 120 minutes and remain within the
+same business day. Omitting it schedules a 120-minute review when that still
+falls before market close; otherwise there is no same-day review. Duplicate,
+hidden, or already-true alerts reject the entire command without changing
+economic state.
 
 Alerts are one-shot. They observe only the final committed order books after all
 seed-ordered commands for a minute have applied, then wake the company on the
@@ -221,6 +234,8 @@ Along with available assets and events, it contains:
 - `pending_deliveries` with exact arrival times and quantity-preserving expiry
   buckets;
 - `active_operation` and the authoritative daily operation state; and
+- `private_economics`, derived from only the company's own cash-flow ledger and
+  current executable prices; and
 - the current daily turn number and hard limit.
 
 The provider adapter adds one typed `decision_constraints` projection with
@@ -241,10 +256,12 @@ can change the economy.
 
 ## Memory, durability, and replay
 
-Every company has its own token-budgeted `ConversationMemory`. Recent complete
-Turn/Command/Outcome exchanges remain verbatim; older complete exchanges compact
-into a deterministic summary. Memory has no seven-day cutoff and never replaces
-current authoritative facts.
+Every company has its own token-budgeted `ConversationMemory`. Recent compact
+decision records keep only time, wake, command, disposition, and rejection
+category; older records compact into a deterministic summary. Full observations
+and outcomes remain in the journal instead of being duplicated into every model
+request. Memory has no seven-day cutoff and never replaces current authoritative
+facts.
 
 The immutable journal records company turns and ordered system steps. A
 `RunCheckpoint` captures all state needed to resume exactly, including books and
@@ -256,7 +273,7 @@ virtual-time boundary.
 
 Replay uses the same runtime and engine without model calls. Observation hashes,
 commands or protocol rejections, outcomes, `apply_sequence`, system effects,
-events, snapshots, and final score must match exactly.
+events, snapshots, final score, and episode quality must match exactly.
 
 ## Episode evaluation
 
@@ -280,9 +297,10 @@ Under `s9-enterprise-v2`, these formulas retain full intermediate precision;
 each published `CompanyScore` and `ScoreCard` Decimal is normalized to four
 places only at its public boundary.
 
-Economic outcomes do not create eligibility gates. An incomplete,
-protocol-invalid, technically failed, or replay-divergent episode produces no
-score.
+Economic outcomes do not create eligibility gates. A completed episode always
+receives its diagnostic economic score. Protocol-invalid completion is marked
+`benchmark_eligible=false` and excluded from model comparison; an incomplete,
+technically failed, or replay-divergent episode still produces no final result.
 
 ## Core invariants
 

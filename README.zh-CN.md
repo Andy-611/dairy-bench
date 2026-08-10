@@ -75,7 +75,7 @@ start.cmd --configure-newapi
 
 该命令会通过 `/v1/models` 校验 key，将凭据按当前 Windows 用户加密保存，并把完整的
 非敏感模型目录写入 `.dairy-bench/credentials/`。更换 key 或刷新模型列表时重新执行
-即可；若后端已运行，配置后需要重启后端。
+即可；该操作会使旧路由验证得到的模型能力失效。若后端已运行，配置后需要重启后端。
 
 启动项目：
 
@@ -88,8 +88,10 @@ start.cmd
 
 UI 的模型下拉框来自 NewAPI 模型目录。由于 `/v1/models` 本身不能证明工具调用兼容性，
 系统仍要求模型恰好返回一个已授权函数调用。Adapter 优先发送 `tool_choice="required"`；
-只有 Provider 明确拒绝该参数时（例如部分 thinking 模型）才会省略它重试。所有请求的
-输出预算固定为 `max_tokens=131072`。系统不会回退到自由文本或另一个 Provider。
+只有 Provider 明确拒绝该参数时（例如部分 thinking 模型）才会省略它重试。模型第一次
+提交 Run 前，系统会用一条短请求确认文档候选上限，或从 NewAPI 的明确参数拒绝中提取
+准确上限，并写入本地版本化能力目录。运行时直接把确认值作为 `max_tokens`，不做阶梯式
+增长。系统不会回退到自由文本或另一个 Provider。
 
 解密后的 key 只存在于后端进程环境，不进入浏览器、Journal 或 SQLite 数据库。
 
@@ -105,6 +107,8 @@ interrupted 会在后端重启时自动恢复。未完成 Run 不生成最终分
 ```text
 .dairy-bench/
 |-- credentials/
+|   |-- newapi-model-capabilities.json
+|   `-- newapi-models.json
 `-- data/runs.sqlite3
 ```
 

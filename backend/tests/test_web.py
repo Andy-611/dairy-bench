@@ -10,8 +10,10 @@ import company_bench.application as application_module
 from company_bench.agents.factory import AgentFactory
 from company_bench.application import BenchmarkApplication
 from company_bench.domain.models import (
+    EpisodeQuality,
     EpisodeResult,
     PolicyKind,
+    ProtocolReport,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
@@ -157,6 +159,7 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
                 scenario_id=DAIRY_S9_SCENARIO.scenario_id,
                 total_days=DAIRY_S9_SCENARIO.days,
                 submitted_at=submitted_at + timedelta(minutes=sequence),
+                quality=_clean_quality() if status is RunStatus.COMPLETED else None,
             )
             for sequence, status in enumerate(RunStatus)
         )
@@ -221,7 +224,11 @@ def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> No
         update={"run_id": "http_resume_failed", "status": RunStatus.FAILED}
     )
     completed = stopped.model_copy(
-        update={"run_id": "http_resume_completed", "status": RunStatus.COMPLETED}
+        update={
+            "run_id": "http_resume_completed",
+            "status": RunStatus.COMPLETED,
+            "quality": _clean_quality(),
+        }
     )
     for job in (stopped, failed, completed):
         repository.save_job(job)
@@ -253,6 +260,7 @@ def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
             scenario_id=DAIRY_S9_SCENARIO.scenario_id,
             total_days=DAIRY_S9_SCENARIO.days,
             submitted_at=submitted_at + timedelta(minutes=sequence),
+            quality=_clean_quality(),
         )
         for sequence in range(501)
     )
@@ -263,6 +271,7 @@ def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
             update={
                 "run_id": "newer_failed_run",
                 "status": RunStatus.FAILED,
+                "quality": None,
                 "submitted_at": submitted_at + timedelta(minutes=501),
             }
         )
@@ -275,8 +284,20 @@ def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
     sources = tuple(ReplaySource.model_validate(item) for item in response.json())
     assert len(sources) == 501
     assert sources == tuple(
-        ReplaySource(run_id=job.run_id, submitted_at=job.submitted_at)
+        ReplaySource(
+            run_id=job.run_id,
+            submitted_at=job.submitted_at,
+            benchmark_eligible=True,
+        )
         for job in reversed(completed_jobs)
+    )
+
+
+def _clean_quality() -> EpisodeQuality:
+    """Build protocol-clean quality metadata for lifecycle-only HTTP tests."""
+    return EpisodeQuality(
+        benchmark_eligible=True,
+        protocol=ProtocolReport(total_turn_count=0, invalid_turn_count=0),
     )
 
 

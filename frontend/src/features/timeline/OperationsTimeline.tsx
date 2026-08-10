@@ -2,7 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { MarketDisplay } from "../market/MarketDisplay";
 import { companyLabel } from "../../shared/labels";
-import { formatExactDecimal, formatValue } from "../../shared/format";
+import {
+  formatExactDecimal,
+  formatPercent,
+  formatValue,
+} from "../../shared/format";
 import { isAbortError, requestErrorMessage } from "../../shared/requestErrors";
 import {
   ACCEPTED_BY_ENGINE_LABEL,
@@ -165,6 +169,7 @@ export function OperationsTimeline({
       {timeline && (
         <>
           <RunProvenanceBanner context={timeline.context} />
+          <RunDiagnosticsPanel context={timeline.context} />
           <DayNavigator
             day={day}
             onSelect={onDayChange}
@@ -248,10 +253,11 @@ function checkpointSummary(context: TimelineContextView): string {
 
 function RunProvenanceBanner({ context }: { readonly context: TimelineContextView }) {
   if (!context.isReplay) {
+    const active = context.status === "queued" || context.status === "running";
     return (
       <div className="trace-provenance live">
         <span className="provenance-icon" aria-hidden="true">
-          LIVE
+          {active ? "LIVE" : context.status.toUpperCase()}
         </span>
         <div>
           <strong>{context.currentModelCallCount} model calls in this run</strong>
@@ -285,6 +291,74 @@ function RunProvenanceBanner({ context }: { readonly context: TimelineContextVie
         </p>
       </div>
     </div>
+  );
+}
+
+function RunDiagnosticsPanel({ context }: { readonly context: TimelineContextView }) {
+  const diagnostics = context.diagnostics;
+  const lastTrade =
+    diagnostics.lastTradeDay === null ? "none" : `Day ${diagnostics.lastTradeDay}`;
+  return (
+    <section aria-label="Run diagnostics" className="run-diagnostics">
+      <header>
+        <span>RUN HEALTH</span>
+        <strong>
+          {diagnostics.benchmarkEligible === false
+            ? "Diagnostic only"
+            : diagnostics.benchmarkEligible === true
+              ? "Benchmark eligible"
+              : "In progress"}
+        </strong>
+      </header>
+      <dl>
+        <div>
+          <dt>Protocol-invalid</dt>
+          <dd>{formatValue(diagnostics.protocolInvalidTurns)} turns</dd>
+        </div>
+        <div>
+          <dt>Trades</dt>
+          <dd>
+            {formatValue(diagnostics.tradeCount)} · last {lastTrade}
+          </dd>
+        </div>
+        <div>
+          <dt>Consumer fill</dt>
+          <dd>
+            {formatPercent(Number(diagnostics.consumerFillRate))} ·{" "}
+            {formatExactDecimal(diagnostics.consumerSales)} /{" "}
+            {formatExactDecimal(diagnostics.consumerDemand)}
+          </dd>
+        </div>
+        <div>
+          <dt>Expired</dt>
+          <dd>{formatExactDecimal(diagnostics.expiredQuantity)}</dd>
+        </div>
+        <div>
+          <dt>Rejected commands</dt>
+          <dd>
+            {formatValue(diagnostics.economicRejections)} economic ·{" "}
+            {formatValue(diagnostics.waitPlanRejections)} wait-plan
+          </dd>
+        </div>
+        <div>
+          <dt>Solvency warning</dt>
+          <dd>
+            {diagnostics.nearInsolventCompanyIds.length === 0
+              ? "none"
+              : diagnostics.nearInsolventCompanyIds
+                  .map((companyId) => companyLabel(companyId))
+                  .join(", ")}
+          </dd>
+        </div>
+      </dl>
+      {diagnostics.zeroTradeDayStreak > 0 && (
+        <p>
+          No trades for the latest {formatValue(diagnostics.zeroTradeDayStreak)} completed{" "}
+          {plural(diagnostics.zeroTradeDayStreak, "day")}. The Trade Tape below
+          shows only the selected minute, while this card summarizes the full run.
+        </p>
+      )}
+    </section>
   );
 }
 

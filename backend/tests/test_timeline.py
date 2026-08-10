@@ -32,7 +32,6 @@ from company_bench.runtime.models import (
     Produce,
     QuoteLevel,
     SetQuoteLadder,
-    SimTime,
     SystemStepRecord,
     TurnRecord,
     Wait,
@@ -74,6 +73,7 @@ def _complete(
             submitted_at=result.started_at,
             started_at=result.started_at,
             finished_at=result.finished_at,
+            quality=result.quality,
         ),
     )
 
@@ -217,6 +217,16 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
 
     assert page.context.model_call_count == 0
     assert page.context.current_usage == TokenUsage()
+    diagnostics = page.context.diagnostics
+    assert diagnostics.completed_days == 1
+    assert diagnostics.benchmark_eligible
+    assert diagnostics.protocol_invalid_turns == 0
+    assert diagnostics.trade_count == sum(
+        isinstance(record.event, TradeExecutedEvent)
+        for record in execution.episode.events
+    )
+    assert diagnostics.consumer_demand == execution.episode.snapshots[0].consumer_demand
+    assert diagnostics.consumer_sales == execution.episode.snapshots[0].consumer_sales
     steps = tuple(step for moment in page.moments for step in moment.system_steps)
     assert {step.kind.value for step in steps}.issuperset(
         {"day_open", "market_close", "consumer_sales", "day_close"}
@@ -272,12 +282,11 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
             ),
         }
     )
-    invalid_deadline = SimTime(
-        absolute_minute=(scenario.runtime.open_minute + scenario.runtime.max_wait_minutes + 1)
-    )
     agents = {
         company.company_id: FixedCommandAgent(
-            (Wait(until=invalid_deadline),) if company.company_id == "farm_a" else (Wait(),)
+            (Wait(review_after_minutes=scenario.runtime.max_wait_minutes + 1),)
+            if company.company_id == "farm_a"
+            else (Wait(),)
         )
         for company in scenario.companies
     }

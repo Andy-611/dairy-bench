@@ -6,8 +6,8 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from company_bench.domain.models import Identifier, StrictModel
-from company_bench.runs.models import TokenUsage
+from company_bench.domain.models import Identifier, ProtocolIssueKind, StrictModel
+from company_bench.runs.models import ProviderAttempt, ProviderCallAudit, TokenUsage
 from company_bench.runtime.models import (
     AgentTurn,
     CompanyCommand,
@@ -50,7 +50,7 @@ class CommandModelRequest(StrictModel):
     allowed_commands: tuple[CommandName, ...] = Field(min_length=1)
 
 
-class CommandModelResult(StrictModel):
+class CommandModelResult(ProviderCallAudit):
     """Validated atomic command plus provider observability metadata."""
 
     command: CompanyCommand
@@ -58,9 +58,7 @@ class CommandModelResult(StrictModel):
     model: str
     response_id: str | None = None
     request_id: str | None = None
-    usage: TokenUsage = TokenUsage()
     attempts: int = Field(default=1, ge=1)
-    latency_ms: int = Field(default=0, ge=0)
 
 
 class ModelCallError(RuntimeError):
@@ -74,18 +72,30 @@ class ModelCallError(RuntimeError):
         response_id: str | None = None,
         usage: TokenUsage | None = None,
         attempts: int = 1,
+        attempt_history: tuple[ProviderAttempt, ...] = (),
         latency_ms: int = 0,
     ) -> None:
         super().__init__(message)
         self.request_id = request_id
         self.response_id = response_id
         self.usage = usage or TokenUsage()
-        self.attempts = attempts
+        self.attempt_history = attempt_history
+        self.attempts = len(attempt_history) or attempts
         self.latency_ms = latency_ms
 
 
 class ModelOutputError(ModelCallError):
     """The Agent returned no schema-valid command."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        issue_kind: ProtocolIssueKind = ProtocolIssueKind.INVALID_RESPONSE,
+        **metadata: object,
+    ) -> None:
+        super().__init__(message, **metadata)
+        self.issue_kind = issue_kind
 
 
 class ModelCompatibilityError(ModelOutputError):

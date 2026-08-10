@@ -20,6 +20,7 @@ from company_bench.domain.models import (
     PositiveMoney,
     PositiveQuantity,
     ProductId,
+    ProtocolIssueKind,
     Quantity,
     StrictModel,
 )
@@ -42,6 +43,9 @@ __all__ = [
     "OperationJobView",
     "OrderBookView",
     "PriceLevelView",
+    "PrivateCashFlow",
+    "PrivateEconomicsView",
+    "PrivateUnitEconomics",
     "Produce",
     "QuoteAlert",
     "QuoteLadder",
@@ -49,6 +53,7 @@ __all__ = [
     "QuoteLevel",
     "QuoteLevelAction",
     "QuoteLevelResult",
+    "RejectionCategory",
     "ScheduledCompletion",
     "SetQuoteLadder",
     "SetRetailPrice",
@@ -265,10 +270,10 @@ class QuoteAlert(StrictModel):
 
 
 class Wait(StrictModel):
-    """Yield until a bounded review time or a visible quote alert."""
+    """Yield for a bounded duration or until a visible quote alert fires."""
 
     kind: Literal["wait"] = "wait"
-    until: SimTime | None = None
+    review_after_minutes: int | None = Field(default=None, ge=1)
     alerts: tuple[QuoteAlert, ...] = Field(default=(), max_length=3)
 
 
@@ -294,6 +299,14 @@ class CommandStatus(StrEnum):
 
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+
+
+class RejectionCategory(StrEnum):
+    """Authority responsible for rejecting one submitted command."""
+
+    ECONOMIC = "economic"
+    PROTOCOL = "protocol"
+    WAIT_PLAN = "wait_plan"
 
 
 class QuoteLevelAction(StrEnum):
@@ -382,6 +395,7 @@ class CommandOutcome(StrictModel):
     occurred_at: SimTime
     status: CommandStatus
     accepted: bool
+    rejection_category: RejectionCategory | None = None
     reason: str | None = Field(default=None, min_length=1, max_length=500)
     resulting_state_version: int = Field(ge=0)
     apply_sequence: int = Field(ge=1)
@@ -398,6 +412,8 @@ class CommandOutcome(StrictModel):
             raise ValueError("accepted must agree with status")
         if self.status is CommandStatus.REJECTED and self.reason is None:
             raise ValueError("rejected commands require a reason")
+        if self.accepted != (self.rejection_category is None):
+            raise ValueError("rejection_category is required only for rejected commands")
         if (
             self.next_available_at is not None
             and self.next_available_at.absolute_minute < self.occurred_at.absolute_minute
@@ -509,6 +525,38 @@ class OperationJobView(StrictModel):
     output_quantity: PositiveQuantity
 
 
+class PrivateCashFlow(StrictModel):
+    """Cumulative cash-flow facts visible only to their owning company."""
+
+    purchase_spend: Money = ZERO
+    wholesale_revenue: Money = ZERO
+    operation_cost: Money = ZERO
+    consumer_revenue: Money = ZERO
+    expiry_reference_loss: Money = ZERO
+    net_cash_flow: EconomicDecimal = ZERO
+
+
+class PrivateUnitEconomics(StrictModel):
+    """Current executable prices and private break-even economics."""
+
+    input_product: ProductId | None = None
+    output_product: ProductId | None = None
+    best_input_ask: PositiveMoney | None = None
+    best_output_bid: PositiveMoney | None = None
+    marginal_operation_cost: Money | None = None
+    output_per_input: PositiveQuantity | None = None
+    break_even_output_price: Money | None = None
+    consumer_unit_price: Money | None = None
+    expected_unit_margin: EconomicDecimal | None = None
+
+
+class PrivateEconomicsView(StrictModel):
+    """Decision-ready private ledger and unit economics for one Agent."""
+
+    cash_flow: PrivateCashFlow = PrivateCashFlow()
+    unit_economics: PrivateUnitEconomics = PrivateUnitEconomics()
+
+
 class AgentTurn(StrictModel):
     """Runtime-bound input metadata for one company decision."""
 
@@ -529,6 +577,7 @@ class AgentTurn(StrictModel):
     order_books: tuple[OrderBookView, ...] = ()
     pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
     active_operation: OperationJobView | None = None
+    private_economics: PrivateEconomicsView = PrivateEconomicsView()
     visible_events: tuple[DomainEvent, ...] = ()
     previous_outcome: CommandOutcome | None = None
 
@@ -649,6 +698,7 @@ class TurnRecord(StrictModel):
     envelope: CommandEnvelope
     outcome: CommandOutcome
     observation_hash: Identifier
+    protocol_issue_kind: ProtocolIssueKind | None = None
     protocol_error: str | None = Field(default=None, min_length=1, max_length=450)
     journal_sequence: int | None = Field(default=None, ge=1)
     replay_origin: TurnReplayOrigin | None = None
@@ -686,9 +736,13 @@ class TurnRecord(StrictModel):
             and self.outcome.apply_sequence <= self.turn.previous_outcome.apply_sequence
         ):
             raise ValueError("apply_sequence must advance beyond the previous outcome")
+        if (self.protocol_issue_kind is None) != (self.protocol_error is None):
+            raise ValueError("protocol issue kind and message must be paired")
         if self.protocol_error is not None:
             if self.outcome.accepted:
                 raise ValueError("a protocol error cannot produce an accepted outcome")
+            if self.outcome.rejection_category is not RejectionCategory.PROTOCOL:
+                raise ValueError("protocol errors require a protocol rejection category")
             if not isinstance(self.envelope.command, Wait):
                 raise ValueError("protocol errors must normalize to a wait command")
             if self.outcome.reason != f"{PROTOCOL_ERROR_PREFIX}{self.protocol_error}":

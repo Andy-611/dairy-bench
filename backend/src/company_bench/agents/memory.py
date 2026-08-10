@@ -9,11 +9,15 @@ from typing import Final, Literal, Self
 from pydantic import Field, model_validator
 
 from company_bench.domain.models import CompanyId, Identifier, StrictModel
-from company_bench.runtime.models import TurnRecord
+from company_bench.runtime.models import (
+    CompanyCommand,
+    RejectionCategory,
+    TurnRecord,
+)
 
-_CHECKPOINT_SCHEMA_VERSION: Final = 5
+_CHECKPOINT_SCHEMA_VERSION: Final = 6
 _DEFAULT_MAX_TOKENS: Final = 16_384
-_DEFAULT_CHARS_PER_TOKEN: Final = 4
+_DEFAULT_CHARS_PER_TOKEN: Final = 2
 _SUMMARY_OMISSION: Final = "[older memory omitted]"
 
 
@@ -30,13 +34,50 @@ class MemorySummary(StrictModel):
     content: str = Field(min_length=1)
 
 
-class MemoryExchange(TurnRecord):
-    """One complete private AgentTurn to command to outcome cycle."""
+class MemoryExchange(StrictModel):
+    """Compact private decision and outcome retained for future reasoning."""
+
+    run_id: Identifier
+    company_id: CompanyId
+    turn_id: Identifier
+    sim_minute: int = Field(ge=0)
+    apply_sequence: int = Field(ge=1)
+    resulting_state_version: int = Field(ge=0)
+    command: CompanyCommand
+    accepted: bool
+    rejection_category: RejectionCategory | None = None
+    reason: str | None = Field(default=None, max_length=500)
+    protocol_error: str | None = Field(default=None, max_length=450)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> Self:
+        """Keep the compact disposition internally consistent."""
+        if self.accepted != (self.rejection_category is None):
+            raise ValueError("rejection_category is required only for rejected decisions")
+        if not self.accepted and self.reason is None:
+            raise ValueError("rejected decisions require a reason")
+        if (self.protocol_error is not None) != (
+            self.rejection_category is RejectionCategory.PROTOCOL
+        ):
+            raise ValueError("protocol_error must match the rejection category")
+        return self
 
     @classmethod
     def from_record(cls, record: TurnRecord) -> Self:
-        """Convert an authoritative journal record into Agent memory."""
-        return cls.model_validate(record.model_dump())
+        """Project an authoritative journal record into compact private memory."""
+        return cls(
+            run_id=record.run_id,
+            company_id=record.turn.company_id,
+            turn_id=record.turn.turn_id,
+            sim_minute=record.turn.sim_time.absolute_minute,
+            apply_sequence=record.outcome.apply_sequence,
+            resulting_state_version=record.outcome.resulting_state_version,
+            command=record.envelope.command,
+            accepted=record.outcome.accepted,
+            rejection_category=record.outcome.rejection_category,
+            reason=record.outcome.reason,
+            protocol_error=record.protocol_error,
+        )
 
 
 type MemorySummarizer = Callable[
@@ -48,7 +89,7 @@ type MemorySummarizer = Callable[
 class AgentCheckpoint(StrictModel):
     """Portable state required to restore one company's memory exactly."""
 
-    schema_version: Literal[5] = _CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[6] = _CHECKPOINT_SCHEMA_VERSION
     run_id: Identifier
     company_id: CompanyId
     revision: int = Field(ge=0)
@@ -73,30 +114,42 @@ class AgentCheckpoint(StrictModel):
             previous_apply_sequence = self.summary.through_apply_sequence
 
         turn_ids: set[str] = set()
-        command_ids: set[str] = set()
         for exchange in self.exchanges:
             if exchange.run_id != self.run_id:
                 raise ValueError("exchange run_id must match the checkpoint")
-            if exchange.turn.company_id != self.company_id:
+            if exchange.company_id != self.company_id:
                 raise ValueError("exchange company_id must match the checkpoint")
-            if exchange.turn.turn_id in turn_ids:
+            if exchange.turn_id in turn_ids:
                 raise ValueError("turn_id must be unique in active memory")
-            if exchange.envelope.command_id in command_ids:
-                raise ValueError("command_id must be unique in active memory")
-            if exchange.turn.sim_time.absolute_minute < previous_minute:
+            if exchange.sim_minute < previous_minute:
                 raise ValueError("memory exchanges must be chronological")
-            if exchange.outcome.apply_sequence <= previous_apply_sequence:
+            if exchange.apply_sequence <= previous_apply_sequence:
                 raise ValueError("memory apply_sequence must increase")
-            turn_ids.add(exchange.turn.turn_id)
-            command_ids.add(exchange.envelope.command_id)
-            previous_minute = exchange.turn.sim_time.absolute_minute
-            previous_apply_sequence = exchange.outcome.apply_sequence
+            turn_ids.add(exchange.turn_id)
+            previous_minute = exchange.sim_minute
+            previous_apply_sequence = exchange.apply_sequence
 
         if self.summary is not None and self.summary.through_turn_id in turn_ids:
             raise ValueError("a summarized turn cannot remain in active memory")
         if self.revision != compacted + len(self.exchanges):
             raise ValueError("revision must equal summarized and active exchanges")
         return self
+
+    def provider_view(self) -> AgentMemoryView:
+        """Return only decision-relevant memory fields for the model request."""
+        return AgentMemoryView(
+            revision=self.revision,
+            summary=None if self.summary is None else self.summary.content,
+            recent_decisions=self.exchanges,
+        )
+
+
+class AgentMemoryView(StrictModel):
+    """Minimal checkpoint-derived memory supplied to a model."""
+
+    revision: int = Field(ge=0)
+    summary: str | None = None
+    recent_decisions: tuple[MemoryExchange, ...] = ()
 
 
 class ConversationMemory:
@@ -184,8 +237,7 @@ class ConversationMemory:
 
     def context_json(self) -> str:
         """Render only Agent-visible memory state for a provider request."""
-        return self.checkpoint().model_dump_json(
-            include={"summary", "exchanges"},
+        return self.checkpoint().provider_view().model_dump_json(
             exclude_defaults=True,
             exclude_none=True,
         )
@@ -220,9 +272,9 @@ class ConversationMemory:
         return MemorySummary(
             run_id=self._run_id,
             company_id=self._company_id,
-            through_turn_id=latest.turn.turn_id,
-            through_absolute_minute=latest.turn.sim_time.absolute_minute,
-            through_apply_sequence=latest.outcome.apply_sequence,
+            through_turn_id=latest.turn_id,
+            through_absolute_minute=latest.sim_minute,
+            through_apply_sequence=latest.apply_sequence,
             exchange_count=(previous.exchange_count if previous else 0) + len(removed),
             source_hash=_source_hash(previous, removed),
             content=content,
@@ -259,8 +311,7 @@ class ConversationMemory:
         """Estimate tokens using the configured characters-per-token ratio."""
         checkpoint = self._build_checkpoint(summary, exchanges)
         characters = len(
-            checkpoint.model_dump_json(
-                include={"summary", "exchanges"},
+            checkpoint.provider_view().model_dump_json(
                 exclude_defaults=True,
                 exclude_none=True,
             )
@@ -297,16 +348,14 @@ def deterministic_summary(
 
 def _exchange_line(exchange: MemoryExchange) -> str:
     """Render one compact, deterministic, provider-neutral memory line."""
-    outcome = exchange.outcome
-    ladder = outcome.quote_ladder_result
-    order_ids = ",".join(level.order_id for level in ladder.levels) if ladder else ""
-    detail = outcome.reason or order_ids or "-"
+    detail = exchange.reason or "-"
     detail = " ".join(detail.split())
     return (
-        f"{exchange.turn.turn_id}@{exchange.turn.sim_time.absolute_minute}:"
-        f"{exchange.envelope.command.model_dump_json()}"
-        f"=>{outcome.status.value}[state={outcome.resulting_state_version},"
-        f"apply={outcome.apply_sequence},detail={detail}]"
+        f"{exchange.turn_id}@{exchange.sim_minute}:"
+        f"{exchange.command.model_dump_json()}"
+        f"=>{'accepted' if exchange.accepted else 'rejected'}"
+        f"[state={exchange.resulting_state_version},"
+        f"apply={exchange.apply_sequence},detail={detail}]"
     )
 
 

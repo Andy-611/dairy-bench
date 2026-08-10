@@ -31,10 +31,13 @@ from company_bench.domain.models import (
     CompanyId,
     DaySnapshot,
     DomainEvent,
+    EpisodeQuality,
     EpisodeResult,
     EventRecord,
     PolicyDescriptor,
     PolicyKind,
+    ProtocolIssueKind,
+    ProtocolReport,
     ScenarioSpec,
     TradeExecutedEvent,
 )
@@ -51,6 +54,7 @@ from company_bench.runtime.attention import (
     AttentionMatch,
     AttentionRejected,
 )
+from company_bench.runtime.economics import PrivateEconomicsProjector
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
@@ -60,6 +64,7 @@ from company_bench.runtime.models import (
     CompanyCommand,
     JournalEntryKind,
     JournalEntryReference,
+    RejectionCategory,
     SimTime,
     SystemEventKind,
     SystemStepRecord,
@@ -98,10 +103,6 @@ class EpisodeExecution:
     turns: tuple[TurnRecord, ...]
 
 
-class EpisodeProtocolError(RuntimeError):
-    """Reject a technically invalid episode before benchmark scoring."""
-
-
 @dataclass(slots=True)
 class _Cursor:
     next_turn_sequence: int = 1
@@ -114,6 +115,7 @@ class _Cursor:
 class _PendingTurn:
     turn: AgentTurn
     command: CompanyCommand
+    protocol_issue_kind: ProtocolIssueKind | None = None
     protocol_error: str | None = None
     command_error: str | None = None
     attention_plan: ArmedWait | None = None
@@ -140,6 +142,7 @@ class EpisodeRuntime:
         self.scenario = scenario
         self._engine = engine or EconomyEngine()
         self._attention = AgentAttention()
+        self._economics = PrivateEconomicsProjector()
         self._evaluator = evaluator or Evaluator()
         self._agent_timeout_seconds = agent_timeout_seconds
 
@@ -458,6 +461,7 @@ class EpisodeRuntime:
                     envelope=envelope,
                     outcome=outcome,
                     observation_hash=observation_hash(item.turn),
+                    protocol_issue_kind=item.protocol_issue_kind,
                     protocol_error=item.protocol_error,
                     journal_sequence=next_journal_sequence,
                     replay_origin=self._replay_origin(
@@ -539,11 +543,12 @@ class EpisodeRuntime:
         for agent in agents.values():
             if isinstance(agent, EpisodeCompletionGuard):
                 agent.ensure_episode_complete()
-        protocol_error_count = sum(record.protocol_error is not None for record in turns)
-        if protocol_error_count:
-            raise EpisodeProtocolError(
-                f"episode contains {protocol_error_count} protocol-invalid turn(s)"
-            )
+        protocol_issues = tuple(
+            record.protocol_issue_kind
+            for record in turns
+            if record.protocol_issue_kind is not None
+        )
+        protocol = ProtocolReport.from_issues(len(turns), protocol_issues)
         events = tuple(record.event for record in event_records)
         episode = EpisodeResult(
             run_id=run_id,
@@ -561,14 +566,19 @@ class EpisodeRuntime:
                 tuple(snapshots),
                 events,
             ),
+            quality=EpisodeQuality(
+                benchmark_eligible=protocol.invalid_turn_count == 0,
+                protocol=protocol,
+            ),
         )
         if replay_source is not None and (
             episode.events != replay_source.events
             or episode.snapshots != replay_source.snapshots
             or episode.score != replay_source.score
+            or episode.quality != replay_source.quality
         ):
             raise ReplayDriftError(
-                "replay final events, snapshots, or score drifted from the source run"
+                "replay final events, snapshots, score, or quality drifted from the source run"
             )
         return EpisodeExecution(episode=episode, turns=tuple(turns))
 
@@ -836,6 +846,7 @@ class EpisodeRuntime:
         )
         cursor.last_visible_event_sequence = len(event_records)
         observation = self._engine.observe_active(economy, company_id)
+        order_books = self._engine.order_books(economy, company_id)
         return AgentTurn(
             turn_id=f"{run_id}.{company_id}.t{sequence}",
             company_id=company_id,
@@ -851,12 +862,18 @@ class EpisodeRuntime:
             marked_surplus=self._engine.marked_surplus(economy, company_id),
             inventory_expiry=self._engine.inventory_expiry(economy, company_id),
             open_orders=self._engine.company_orders(economy, company_id),
-            order_books=self._engine.order_books(economy, company_id),
+            order_books=order_books,
             pending_deliveries=self._engine.pending_delivery_views(
                 economy,
                 company_id,
             ),
             active_operation=self._engine.operation_view(economy, company_id),
+            private_economics=self._economics.project(
+                company_id,
+                observation,
+                order_books,
+                tuple(record.event for record in event_records),
+            ),
             visible_events=visible,
             previous_outcome=previous_outcome,
         )
@@ -903,6 +920,7 @@ class EpisodeRuntime:
             return _PendingTurn(
                 turn=turn,
                 command=Wait(),
+                protocol_issue_kind=error.issue_kind,
                 protocol_error=str(error),
             )
         except (ModelOutputError, ValidationError) as error:
@@ -910,6 +928,11 @@ class EpisodeRuntime:
             return _PendingTurn(
                 turn=turn,
                 command=Wait(),
+                protocol_issue_kind=(
+                    error.issue_kind
+                    if isinstance(error, ModelOutputError)
+                    else ProtocolIssueKind.INVALID_ARGUMENTS
+                ),
                 protocol_error=reason or type(error).__name__,
             )
         except Exception as error:
@@ -985,6 +1008,11 @@ class EpisodeRuntime:
                     occurred_at=envelope.issued_at,
                     status=CommandStatus.REJECTED,
                     accepted=False,
+                    rejection_category=(
+                        RejectionCategory.PROTOCOL
+                        if item.protocol_error is not None
+                        else RejectionCategory.WAIT_PLAN
+                    ),
                     reason=reason,
                     resulting_state_version=state_version,
                     apply_sequence=first_apply_sequence + offset,

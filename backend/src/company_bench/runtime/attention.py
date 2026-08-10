@@ -66,7 +66,7 @@ class AgentAttention:
         return ArmedWait(
             source_turn_id=turn.turn_id,
             armed_at=turn.sim_time,
-            review_at=self._review_at(command.until, turn),
+            review_at=self._review_at(command.review_after_minutes, turn),
             alerts=command.alerts,
         )
 
@@ -88,27 +88,23 @@ class AgentAttention:
         )
 
     @staticmethod
-    def _review_at(until: SimTime | None, turn: AgentTurn) -> SimTime | None:
+    def _review_at(
+        review_after_minutes: int | None,
+        turn: AgentTurn,
+    ) -> SimTime | None:
         runtime = turn.observation.runtime
         now = turn.sim_time
-        if until is None:
-            review_at = now.plus(runtime.max_wait_minutes)
-            return (
-                review_at
-                if review_at.day == now.day and review_at.minute_of_day < runtime.close_minute
-                else None
-            )
-        if until.absolute_minute <= now.absolute_minute:
-            raise AttentionRejected("wait deadline must be later than current time")
-        if until.day != now.day:
-            raise AttentionRejected("wait deadline must be on the current business day")
-        if not runtime.open_minute <= until.minute_of_day < runtime.close_minute:
-            raise AttentionRejected("wait deadline must be inside business hours")
-        if until.absolute_minute - now.absolute_minute > runtime.max_wait_minutes:
+        delay = review_after_minutes or runtime.max_wait_minutes
+        if delay > runtime.max_wait_minutes:
             raise AttentionRejected(
-                f"wait deadline cannot exceed {runtime.max_wait_minutes} minutes"
+                f"wait review delay cannot exceed {runtime.max_wait_minutes} minutes"
             )
-        return until
+        review_at = now.plus(delay)
+        if review_at.day != now.day or review_at.minute_of_day >= runtime.close_minute:
+            if review_after_minutes is None:
+                return None
+            raise AttentionRejected("wait review must remain inside the current business day")
+        return review_at
 
     def _validate_alerts(
         self,

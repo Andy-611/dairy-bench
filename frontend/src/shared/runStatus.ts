@@ -5,5 +5,5 @@ export function isActiveRun(status: RunStatus): boolean {
 }
 
 export function isResumableRun(status: RunStatus): boolean {
-  return status === "failed" || status === "interrupted" || status === "stopped";
+  return status === "interrupted" || status === "stopped";
 }

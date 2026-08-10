@@ -22,6 +22,7 @@ from company_bench.runtime.models import (
     CommandOutcome,
     CommandStatus,
     SimTime,
+    TurnRecord,
     Wait,
     WakeReason,
 )
@@ -37,20 +38,16 @@ def observations() -> dict[str, CompanyObservation]:
     return {observation.company_id: observation for observation in engine.observe(state)}
 
 
-def test_memory_exchange_reuses_complete_runtime_validation(
+def test_memory_exchange_keeps_only_decision_relevant_runtime_facts(
     observations: dict[str, CompanyObservation],
 ) -> None:
     exchange = _exchange(observations["farm_a"], 1)
-    invalid = exchange.outcome.model_copy(update={"command_id": "other_command"})
+    payload = exchange.model_dump()
 
-    with pytest.raises(ValidationError, match="outcome command_id"):
-        MemoryExchange(
-            run_id=RUN_ID,
-            turn=exchange.turn,
-            envelope=exchange.envelope,
-            outcome=invalid,
-            observation_hash=exchange.observation_hash,
-        )
+    assert exchange.turn_id == "turn_farm_a_1"
+    assert exchange.command == Wait()
+    assert "turn" not in payload
+    assert "observation" not in payload
 
 
 def test_memory_rejects_cross_company_and_cross_run_state(
@@ -63,7 +60,7 @@ def test_memory_rejects_cross_company_and_cross_run_state(
         memory.remember(_exchange(observations["processor_a"], 2))
 
     checkpoint = memory.checkpoint()
-    assert checkpoint.schema_version == 5
+    assert checkpoint.schema_version == 6
     with pytest.raises(ValueError, match="another company"):
         ConversationMemory.restore(RUN_ID, "farm_b", checkpoint)
     with pytest.raises(ValueError, match="another run"):
@@ -94,7 +91,7 @@ def test_budget_compacts_old_cycles_and_always_keeps_latest(
 
     assert memory.summary is not None
     assert memory.summary.exchange_count == 4
-    assert memory.summary.content == "compacted through turn_farm_a_4"
+    assert memory.summary.through_turn_id == "turn_farm_a_4"
     assert memory.exchanges == (_exchange(observations["farm_a"], 5),)
     assert memory.estimated_tokens <= memory.max_tokens
 
@@ -152,7 +149,7 @@ def test_default_summary_is_deterministic(
 
     assert first.checkpoint() == second.checkpoint()
     assert first.summary is not None
-    assert '"kind":"wait"' in first.summary.content
+    assert first.summary.exchange_count == 2
     assert first.summary.source_hash == second.summary.source_hash
 
 
@@ -237,12 +234,14 @@ def _exchange(
         apply_sequence=index,
         next_available_at=sim_time.plus(30),
     )
-    return MemoryExchange(
-        run_id=run_id,
-        turn=turn,
-        envelope=envelope,
-        outcome=outcome,
-        observation_hash=f"observation_hash_{company_id}_{index}",
+    return MemoryExchange.from_record(
+        TurnRecord(
+            run_id=run_id,
+            turn=turn,
+            envelope=envelope,
+            outcome=outcome,
+            observation_hash=f"observation_hash_{company_id}_{index}",
+        )
     )
 
 
@@ -251,7 +250,7 @@ def _short_summary(
     exchanges: tuple[MemoryExchange, ...],
 ) -> str:
     """Return a compact deterministic test summary."""
-    return f"compacted through {exchanges[-1].turn.turn_id}"
+    return f"compacted through {exchanges[-1].turn_id}"
 
 
 def _failing_summary(

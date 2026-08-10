@@ -20,12 +20,13 @@ from company_bench.domain.models import (
     PolicyKind,
     PolicyMetadata,
     ProductId,
+    ProtocolIssueKind,
     ScenarioSpec,
     TradeExecutedEvent,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import RunCheckpoint, RunRecovery
-from company_bench.runtime.episode import EpisodeExecution, EpisodeProtocolError, EpisodeRuntime
+from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
     AgentTurn,
@@ -208,13 +209,12 @@ def _timed_retail_agents(
     trade_at = SimTime(absolute_minute=trade_minute)
 
     def wait_toward(turn: AgentTurn) -> Wait:
-        deadline = SimTime(
-            absolute_minute=min(
-                trade_at.absolute_minute,
-                turn.sim_time.absolute_minute + turn.observation.runtime.max_wait_minutes,
-            )
+        return Wait(
+            review_after_minutes=min(
+                trade_at.absolute_minute - turn.sim_time.absolute_minute,
+                turn.observation.runtime.max_wait_minutes,
+            ),
         )
-        return Wait(until=deadline)
 
     def decide(turn: AgentTurn) -> CompanyCommand:
         if turn.company_id == "farm_a":
@@ -537,13 +537,16 @@ async def test_protocol_rejection_retries_after_exactly_one_virtual_minute() -> 
     async def remember(record: TurnRecord) -> None:
         turns.append(record)
 
-    with pytest.raises(EpisodeProtocolError, match="9 protocol-invalid turn"):
-        await EpisodeRuntime(scenario).run(
-            _agents(scenario, broken),
-            29,
-            run_id="protocol_rejection",
-            on_turn_completed=remember,
-        )
+    execution = await EpisodeRuntime(scenario).run(
+        _agents(scenario, broken),
+        29,
+        run_id="protocol_rejection",
+        on_turn_completed=remember,
+    )
+
+    assert not execution.episode.quality.benchmark_eligible
+    assert execution.episode.quality.protocol.invalid_turn_count == 9
+    assert execution.episode.quality.protocol.issues[0].kind is ProtocolIssueKind.INVALID_RESPONSE
 
     for company in scenario.companies:
         records = tuple(record for record in turns if record.turn.company_id == company.company_id)
@@ -572,7 +575,9 @@ async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> 
 
     def decide(turn: AgentTurn) -> CompanyCommand:
         if WakeReason.DAY_OPEN in turn.wake_reasons:
-            return Wait(until=turn.sim_time.plus(turn.observation.runtime.max_wait_minutes + 1))
+            return Wait(
+                review_after_minutes=turn.observation.runtime.max_wait_minutes + 1
+            )
         return Wait()
 
     execution = await EpisodeRuntime(scenario).run(
@@ -583,7 +588,7 @@ async def test_invalid_attention_plan_is_rejected_without_changing_economy() -> 
     first, correction = execution.turns
 
     assert not first.outcome.accepted
-    assert first.outcome.reason == "wait deadline cannot exceed 120 minutes"
+    assert first.outcome.reason == "wait review delay cannot exceed 120 minutes"
     assert first.outcome.resulting_state_version == first.turn.state_version
     assert correction.turn.sim_time == first.turn.sim_time.plus(1)
     assert correction.turn.wake_reasons == (WakeReason.COMMAND_REJECTED,)
