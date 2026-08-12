@@ -263,7 +263,10 @@ function RunProvenanceBanner({ context }: { readonly context: TimelineContextVie
           {active ? "LIVE" : context.status.toUpperCase()}
         </span>
         <div>
-          <strong>{context.currentModelCallCount} model calls in this run</strong>
+          <strong>
+            {context.profileId ?? context.mode} · {context.currentModelCallCount} model calls
+            in this run
+          </strong>
           <p>
             Trace material and {formatValue(context.currentUsage.totalTokens)} tokens
             belong to run <code>{context.currentRunId}</code>.

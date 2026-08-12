@@ -153,6 +153,25 @@ class PolicyKind(StrEnum):
     REPLAY = "replay"
 
 
+class PolicyProfileId(StrEnum):
+    """Stable selectable policy identity persisted with every run."""
+
+    BASELINE = "baseline"
+    NEWAPI_MODEL = "newapi-model"
+    NEWAPI_CODEX = "newapi-codex"
+    NEWAPI_CLAUDE_CODE = "newapi-claude-code"
+    REPLAY = "replay"
+
+    @property
+    def kind(self) -> PolicyKind:
+        """Return the provider-neutral controller kind for this profile."""
+        if self is self.BASELINE:
+            return PolicyKind.BASELINE
+        if self is self.REPLAY:
+            return PolicyKind.REPLAY
+        return PolicyKind.MODEL
+
+
 class ProductSpec(StrictModel):
     """Immutable physical and accounting rules for a product."""
 
@@ -276,10 +295,7 @@ class CostFunction(StrictModel):
         weekly_base_unit_cost: Decimal,
     ) -> Money:
         total = weekly_base_unit_cost * quantity + (
-            self.curvature
-            * weekly_base_unit_cost
-            * quantity**2
-            / (Decimal("2") * weekly_capacity)
+            self.curvature * weekly_base_unit_cost * quantity**2 / (Decimal("2") * weekly_capacity)
         )
         return EconomicPrecision.round(total)
 
@@ -889,11 +905,36 @@ class PolicyMetadata(StrictModel):
 
     name: Identifier
     kind: PolicyKind = PolicyKind.BASELINE
+    profile_id: PolicyProfileId
     provider: Identifier | None = None
     model: Identifier | None = None
+    wire_protocol: Identifier | None = None
+    adapter_version: Identifier | None = None
     prompt_version: Identifier | None = None
     config_fingerprint: Identifier | None = None
     source_run_id: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_profile_identity(self) -> Self:
+        """Keep persisted profile identity and adapter evidence inseparable."""
+        if self.profile_id.kind is not self.kind:
+            raise ValueError("profile_id and kind must describe the same policy")
+        adapter_fields = (
+            self.provider,
+            self.model,
+            self.wire_protocol,
+            self.adapter_version,
+            self.prompt_version,
+            self.config_fingerprint,
+        )
+        if self.kind is PolicyKind.MODEL and any(value is None for value in adapter_fields):
+            raise ValueError(
+                "model policies require provider, model, wire protocol, adapter version, "
+                "prompt version, and config fingerprint"
+            )
+        if self.kind is not PolicyKind.MODEL and any(value is not None for value in adapter_fields):
+            raise ValueError("non-model policies cannot carry model adapter metadata")
+        return self
 
 
 class PolicyDescriptor(PolicyMetadata):

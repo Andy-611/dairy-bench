@@ -686,7 +686,7 @@ class SQLiteRunStore:
 
         CREATE TABLE IF NOT EXISTS run_jobs (
             run_id TEXT PRIMARY KEY,
-            mode TEXT NOT NULL,
+            kind TEXT NOT NULL,
             status TEXT NOT NULL,
             seed INTEGER NOT NULL,
             source_run_id TEXT,
@@ -762,12 +762,12 @@ class SQLiteRunStore:
         self._connection.execute(
             """
             INSERT INTO run_jobs (
-                run_id, mode, status, seed, source_run_id, scenario_id,
+                run_id, kind, status, seed, source_run_id, scenario_id,
                 current_absolute_day, total_weeks, submitted_at, started_at, finished_at,
                 error_message, payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
-                mode = excluded.mode,
+                kind = excluded.kind,
                 status = excluded.status,
                 seed = excluded.seed,
                 source_run_id = excluded.source_run_id,
@@ -782,7 +782,7 @@ class SQLiteRunStore:
             """,
             (
                 job.run_id,
-                job.mode.value,
+                job.kind.value,
                 job.status.value,
                 job.seed,
                 job.source_run_id,

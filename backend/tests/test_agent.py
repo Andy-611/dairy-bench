@@ -18,13 +18,18 @@ from company_bench.agents.contracts import (
     ModelOutputError,
     ModelQuotaExhaustedError,
 )
-from company_bench.agents.factory import AgentFactory
+from company_bench.agents.factory import AgentFactory, ModelGatewayFactory, ModelPolicyProfile
 from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
-from company_bench.agents.providers.newapi import NewApiConfig, NewApiModelConfig
+from company_bench.agents.providers.newapi import (
+    NewApiConfig,
+    NewApiModelConfig,
+    NewApiWireProtocol,
+)
 from company_bench.domain.models import (
     CompanyObservation,
     PolicyKind,
     PolicyMetadata,
+    PolicyProfileId,
     ProtocolIssueKind,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
@@ -77,6 +82,68 @@ def _capabilities() -> ModelCapabilityCatalog:
     )
 
 
+def _model_profile(
+    gateway_factory: ModelGatewayFactory,
+    *,
+    profile_id: PolicyProfileId = PolicyProfileId.NEWAPI_MODEL,
+) -> ModelPolicyProfile:
+    """Build one configured generic NewAPI profile for Agent tests."""
+    return ModelPolicyProfile(
+        profile_id=profile_id,
+        label=profile_id.value,
+        description="test profile",
+        gateway_factory=gateway_factory,
+        config=_config(),
+        capabilities=_capabilities(),
+    )
+
+
+@pytest.mark.parametrize(
+    "selected_profile",
+    (
+        PolicyProfileId.NEWAPI_MODEL,
+        PolicyProfileId.NEWAPI_CODEX,
+        PolicyProfileId.NEWAPI_CLAUDE_CODE,
+    ),
+)
+def test_model_profile_registry_routes_only_to_the_selected_adapter(
+    selected_profile: PolicyProfileId,
+) -> None:
+    repository = InMemoryRunStore()
+    factories = {
+        profile_id: _RecordingGatewayFactory()
+        for profile_id in (
+            PolicyProfileId.NEWAPI_MODEL,
+            PolicyProfileId.NEWAPI_CODEX,
+            PolicyProfileId.NEWAPI_CLAUDE_CODE,
+        )
+    }
+    factory = AgentFactory(
+        DAIRY_S9_SCENARIO,
+        repository,
+        model_profiles=tuple(
+            _model_profile(gateway_factory, profile_id=profile_id)
+            for profile_id, gateway_factory in factories.items()
+        ),
+    )
+
+    bundle = factory.create_agents(
+        run_id="profile_route",
+        profile_id=selected_profile,
+        model="gpt-test-default",
+    )
+    asyncio.run(bundle.close())
+
+    expected_count = len(DAIRY_S9_SCENARIO.companies)
+    assert len(factories[selected_profile].gateways) == expected_count
+    assert all(
+        not gateway_factory.gateways
+        for profile_id, gateway_factory in factories.items()
+        if profile_id is not selected_profile
+    )
+    assert {agent.metadata.profile_id for agent in bundle.agents.values()} == {selected_profile}
+
+
 class _TrackedScriptedGateway(ScriptedDecisionGateway):
     """Expose adapter closure for lifecycle assertions."""
 
@@ -92,6 +159,9 @@ class _TrackedScriptedGateway(ScriptedDecisionGateway):
 
 class _RecordingGatewayFactory:
     """Create and retain one observable gateway per company Agent."""
+
+    wire_protocol = NewApiWireProtocol.CHAT_COMPLETIONS
+    adapter_version = "test-chat-completions-v1"
 
     def __init__(self, create: Callable[[], DecisionGateway] = _TrackedScriptedGateway) -> None:
         self._create = create
@@ -112,14 +182,12 @@ def test_model_mode_owns_nine_independent_newapi_gateways() -> None:
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
-        newapi_config=_config(),
-        model_capabilities=_capabilities(),
-        gateway_factory=gateway_factory,
+        model_profiles=(_model_profile(gateway_factory),),
     )
 
     bundle = factory.create_agents(
         run_id="model_run",
-        mode=PolicyKind.MODEL,
+        profile_id=PolicyProfileId.NEWAPI_MODEL,
         model="gemini-test-selected",
     )
     agents = tuple(bundle.agents.values())
@@ -136,6 +204,12 @@ def test_model_mode_owns_nine_independent_newapi_gateways() -> None:
     assert all(agent.metadata.kind is PolicyKind.MODEL for agent in agents)
     assert all(agent.metadata.provider == "newapi" for agent in agents)
     assert all(agent.metadata.model == "gemini-test-selected" for agent in agents)
+    assert all(
+        agent.metadata.wire_protocol == gateway_factory.wire_protocol.value for agent in agents
+    )
+    assert all(
+        agent.metadata.adapter_version == gateway_factory.adapter_version for agent in agents
+    )
     assert all(agent.metadata.prompt_version == DECISION_PROMPT_VERSION for agent in agents)
 
 
@@ -249,8 +323,12 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
         metadata=PolicyMetadata(
             name="model-company-agent",
             kind=PolicyKind.MODEL,
+            profile_id=PolicyProfileId.NEWAPI_MODEL,
             provider="newapi",
             model="gpt-test",
+            wire_protocol="chat_completions",
+            adapter_version="newapi-chat-completions-v1",
+            config_fingerprint="test-config",
             prompt_version=DECISION_PROMPT_VERSION,
         ),
     )
@@ -323,7 +401,7 @@ async def _run_model_job_until(
     await coordinator.start()
     try:
         submitted = await coordinator.submit(
-            mode=PolicyKind.MODEL,
+            profile_id=PolicyProfileId.NEWAPI_MODEL,
             model="gpt-test-default",
             seed=42,
         )
@@ -343,15 +421,14 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
-        newapi_config=_config(),
-        model_capabilities=_capabilities(),
-        gateway_factory=gateway_factory,
+        model_profiles=(_model_profile(gateway_factory),),
     )
 
     interrupted = asyncio.run(_run_model_job_until(repository, factory, RunStatus.INTERRUPTED))
 
     assert interrupted.status is RunStatus.INTERRUPTED
     assert interrupted.current_absolute_day == 0
+    assert interrupted.prompt_version == DECISION_PROMPT_VERSION
     assert "PolicyInfrastructureError" in (interrupted.error_message or "")
     assert repository.get(interrupted.run_id) is None
     assert repository.get_checkpoint(interrupted.run_id) is not None
@@ -375,14 +452,14 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     }
 
 
-def test_quota_exhaustion_stops_job_with_checkpoint_for_explicit_resume() -> None:
+def test_quota_exhaustion_stops_job_and_prompt_drift_blocks_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     repository = InMemoryRunStore()
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
-        newapi_config=_config(),
-        model_capabilities=_capabilities(),
-        gateway_factory=_RecordingGatewayFactory(_QuotaExhaustedGateway),
+        model_profiles=(_model_profile(_RecordingGatewayFactory(_QuotaExhaustedGateway)),),
     )
 
     stopped = asyncio.run(_run_model_job_until(repository, factory, RunStatus.STOPPED))
@@ -395,6 +472,25 @@ def test_quota_exhaustion_stops_job_with_checkpoint_for_explicit_resume() -> Non
         invocation.outcome is InvocationOutcome.INFRASTRUCTURE_ERROR
         for invocation in repository.list_invocations(stopped.run_id)
     )
+
+    monkeypatch.setattr(
+        "company_bench.agents.factory.DECISION_PROMPT_VERSION",
+        "decision-prompt-test-drift",
+    )
+
+    async def resume_with_drift() -> None:
+        coordinator = RunCoordinator(
+            repository,
+            factory,
+            runtime=EpisodeRuntime(DAIRY_S9_SCENARIO),
+        )
+        try:
+            await coordinator.resume(stopped.run_id)
+        finally:
+            await coordinator.close()
+
+    with pytest.raises(ValueError, match="policy profile differs"):
+        asyncio.run(resume_with_drift())
 
 
 @pytest.mark.parametrize(
@@ -423,9 +519,7 @@ def test_permanent_model_failure_marks_job_failed_without_result(
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
-        newapi_config=_config(),
-        model_capabilities=_capabilities(),
-        gateway_factory=gateway_factory,
+        model_profiles=(_model_profile(gateway_factory),),
     )
 
     failed = asyncio.run(_run_model_job_until(repository, factory, RunStatus.FAILED))

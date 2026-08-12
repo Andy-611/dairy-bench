@@ -12,7 +12,12 @@ from company_bench.agents.contracts import (
 )
 from company_bench.agents.factory import AgentFactory
 from company_bench.diagnostics import bounded_error
-from company_bench.domain.models import MAX_SEED, PolicyKind
+from company_bench.domain.models import (
+    MAX_SEED,
+    PolicyKind,
+    PolicyMetadata,
+    PolicyProfileId,
+)
 from company_bench.runs.models import PolicyProfileView, RunJob
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.settings import MAX_PARALLELISM, require_parallelism
@@ -55,13 +60,14 @@ class RunCoordinator:
     async def submit(
         self,
         *,
-        mode: PolicyKind,
+        profile_id: PolicyProfileId,
         model: str | None = None,
         seed: int | None = None,
         source_run_id: str | None = None,
     ) -> RunJob:
         """Persist and enqueue one validated run request."""
-        if mode is PolicyKind.REPLAY:
+        kind = profile_id.kind
+        if kind is PolicyKind.REPLAY:
             if seed is not None:
                 raise ValueError("replay mode inherits the source seed")
             source = self._repository.get(source_run_id) if source_run_id is not None else None
@@ -82,11 +88,18 @@ class RunCoordinator:
         if source_run_id is not None and not self._repository.list_turns(source_run_id):
             raise ValueError("replay source has no event-driven turn journal")
         run_id = f"run_{uuid4().hex}"
-        await self._policy_factory.ensure_available(mode, model)
+        await self._policy_factory.ensure_available(profile_id, model)
+        metadata = self._policy_factory.profile_metadata(profile_id, model)
         job = RunJob(
             run_id=run_id,
-            mode=mode,
+            profile_id=profile_id,
+            kind=kind,
+            provider=metadata.provider,
             model=model,
+            wire_protocol=metadata.wire_protocol,
+            adapter_version=metadata.adapter_version,
+            prompt_version=metadata.prompt_version,
+            config_fingerprint=metadata.config_fingerprint,
             seed=active_seed,
             source_run_id=source_run_id,
             scenario_id=scenario.scenario_id,
@@ -139,6 +152,11 @@ class RunCoordinator:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         current = self._repository.get_job(run_id) or job
+        await self._policy_factory.ensure_available(current.profile_id, current.model)
+        _require_active_profile(
+            current,
+            self._policy_factory.profile_metadata(current.profile_id, current.model),
+        )
         queued = current.queue_for_resume()
         self._repository.save_job(queued)
         self._schedule(queued)
@@ -172,12 +190,13 @@ class RunCoordinator:
         try:
             async with self._run_slots:
                 scenario = self._runtime.scenario
-                if (
-                    job.scenario_id != scenario.scenario_id
-                    or job.total_weeks != scenario.weeks
-                ):
+                if job.scenario_id != scenario.scenario_id or job.total_weeks != scenario.weeks:
                     raise ValueError("persisted job scenario does not match the active runtime")
-                await self._policy_factory.ensure_available(job.mode, job.model)
+                await self._policy_factory.ensure_available(job.profile_id, job.model)
+                _require_active_profile(
+                    job,
+                    self._policy_factory.profile_metadata(job.profile_id, job.model),
+                )
                 job = job.mark_running(datetime.now(UTC))
                 self._repository.save_job(job)
                 source = self._repository.get(job.source_run_id) if job.source_run_id else None
@@ -191,7 +210,7 @@ class RunCoordinator:
                 checkpoint = recovery.checkpoint if recovery is not None else None
                 agent_bundle = self._policy_factory.create_agents(
                     run_id=job.run_id,
-                    mode=job.mode,
+                    profile_id=job.profile_id,
                     model=job.model,
                     source_turns=(
                         self._repository.list_turns(job.source_run_id)
@@ -256,3 +275,29 @@ class RunCoordinator:
                         bounded_error(error),
                     )
                 )
+
+
+def _require_active_profile(job: RunJob, metadata: PolicyMetadata) -> None:
+    """Reject resume when the configured adapter identity has changed."""
+    expected = (
+        job.profile_id,
+        job.kind,
+        job.provider,
+        job.model,
+        job.wire_protocol,
+        job.adapter_version,
+        job.prompt_version,
+        job.config_fingerprint,
+    )
+    active = (
+        metadata.profile_id,
+        metadata.kind,
+        metadata.provider,
+        metadata.model,
+        metadata.wire_protocol,
+        metadata.adapter_version,
+        metadata.prompt_version,
+        metadata.config_fingerprint,
+    )
+    if active != expected:
+        raise ValueError("persisted job policy profile differs from the active adapter")

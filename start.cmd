@@ -4,10 +4,14 @@ setlocal
 set "DAIRY_BENCH_HOME=%~dp0.dairy-bench"
 set "BACKEND_URL=http://127.0.0.1:8000"
 set "FRONTEND_URL=http://127.0.0.1:5173"
-set "EXPECTED_API_VERSION=0.6.0"
+set "EXPECTED_API_VERSION=0.7.0"
 
 if /i "%~1"=="--configure-newapi" (
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\configure_newapi.ps1"
+  if "%~2"=="" (
+    echo Usage: start.cmd --configure-newapi ^<model^|codex^|claude-code^>
+    exit /b 2
+  )
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\configure_newapi.ps1" -Profile "%~2"
   if errorlevel 1 (
     pause
     exit /b 1
@@ -61,13 +65,19 @@ if errorlevel 1 (
 exit /b 0
 
 :report_newapi_status
-if not exist "%DAIRY_BENCH_HOME%\credentials\newapi-token.clixml" goto :newapi_not_configured
-if not exist "%DAIRY_BENCH_HOME%\credentials\newapi-models.json" goto :newapi_not_configured
-echo [Dairy Bench] NewAPI: configured in the project runtime directory
+call :report_newapi_profile newapi-model
+call :report_newapi_profile newapi-codex
+call :report_newapi_profile newapi-claude-code
 exit /b 0
 
-:newapi_not_configured
-echo [Dairy Bench] NewAPI: not configured; run start.cmd --configure-newapi
+:report_newapi_profile
+if not exist "%DAIRY_BENCH_HOME%\credentials\%~1\token.clixml" goto :newapi_profile_not_configured
+if not exist "%DAIRY_BENCH_HOME%\credentials\%~1\models.json" goto :newapi_profile_not_configured
+echo [Dairy Bench] %~1: configured
+exit /b 0
+
+:newapi_profile_not_configured
+echo [Dairy Bench] %~1: not configured
 exit /b 0
 
 :probe_backend

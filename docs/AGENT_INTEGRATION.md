@@ -2,9 +2,14 @@
 
 ## 1. Provider boundary
 
-Model-backed companies are exposed only through NewAPI's Chat Completions
-transport. Each company owns an isolated `LlmCompanyAgent`, memory, and policy
-metadata; runs share only the HTTP connection pool and request semaphore.
+Model-backed companies use NewAPI Chat Completions, Responses, or Anthropic
+Messages adapters behind one `DecisionGateway` seam. Each company owns an
+isolated `LlmCompanyAgent`, memory, and policy metadata; profiles share one
+global request semaphore while each credential owns its HTTP connection pool.
+
+Codex and Claude Code are protocol-profile labels. Dairy Bench remains the
+Agent runtime and never launches their local coding-agent processes or grants
+shell, filesystem, MCP, plugin, or workspace access.
 
 The adapter requires exactly one authorized function call. It never accepts a
 free-text command, multiple calls, an unknown tool, or a provider-specific
@@ -135,9 +140,10 @@ speed cannot improve market priority.
 
 After application, the Agent-owned memory receives the complete turn/outcome
 cycle. Compaction is deterministic and private to that company. Every physical
-provider call records model, provider, usage, latency, attempts, prompt version,
-prompt hash, and whether it was applied to a committed turn. Credentials and
-raw secrets are never journaled.
+provider call records profile ID, wire protocol, adapter version, configuration
+fingerprint, model, provider, usage, latency, attempts, prompt version, prompt
+hash, and whether it was applied to a committed turn. Credentials and raw
+secrets are never journaled.
 
 Replay Agents consume persisted source turns and make no provider call. They
 must match company, simulation day, observation, decision, and recomputed

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import Field
 
-from company_bench.domain.models import StrictModel
+from company_bench.domain.models import PolicyProfileId, StrictModel
 
 MAX_PARALLELISM = 100
 
@@ -59,10 +59,9 @@ class RuntimePaths:
         """Return the current weekly-runtime SQLite database path."""
         return self.root / "data" / "runs-v7.sqlite3"
 
-    @property
-    def model_capabilities(self) -> Path:
-        """Return the versioned NewAPI model-capability catalog path."""
-        return self.root / "credentials" / "newapi-model-capabilities.json"
+    def model_capabilities(self, profile_id: PolicyProfileId) -> Path:
+        """Return one profile's versioned NewAPI capability catalog path."""
+        return self.root / "credentials" / profile_id.value / "model-capabilities.json"
 
 
 def _repository_root() -> Path:

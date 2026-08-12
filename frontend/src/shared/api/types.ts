@@ -1,6 +1,16 @@
 export type CompanyRole = "farm" | "processor" | "retailer";
 export type CompanyStatus = "active" | "bankrupt";
 export type PolicyMode = "baseline" | "model" | "replay";
+export type PolicyProfileId =
+  | "baseline"
+  | "newapi-model"
+  | "newapi-codex"
+  | "newapi-claude-code"
+  | "replay";
+export type ModelPolicyProfileId = Exclude<
+  PolicyProfileId,
+  "baseline" | "replay"
+>;
 export type InvocationOutcome =
   | "success"
   | "agent_error"
@@ -108,8 +118,7 @@ export interface EpisodeView {
   readonly snapshots: readonly WeeklySnapshotView[];
 }
 
-export interface PolicyProfileView {
-  readonly mode: PolicyMode;
+interface PolicyProfileFields {
   readonly label: string;
   readonly available: boolean;
   readonly provider: string | null;
@@ -119,6 +128,13 @@ export interface PolicyProfileView {
   readonly unavailableReason: string | null;
 }
 
+export type PolicyProfileView = PolicyProfileFields &
+  (
+    | { readonly profileId: "baseline"; readonly kind: "baseline" }
+    | { readonly profileId: ModelPolicyProfileId; readonly kind: "model" }
+    | { readonly profileId: "replay"; readonly kind: "replay" }
+  );
+
 export interface RunProgressView {
   readonly runId: string;
   readonly status: RunStatus;
@@ -127,9 +143,8 @@ export interface RunProgressView {
   readonly errorMessage: string | null;
 }
 
-export interface RunJobView extends RunProgressView {
+interface RunJobFields extends RunProgressView {
   readonly revision: number;
-  readonly mode: PolicyMode;
   readonly model: string | null;
   readonly seed: number;
   readonly sourceRunId: string | null;
@@ -140,6 +155,13 @@ export interface RunJobView extends RunProgressView {
   readonly stopReason: RunStopReason | null;
   readonly quality: EpisodeQualityView | null;
 }
+
+export type RunJobView = RunJobFields &
+  (
+    | { readonly profileId: "baseline"; readonly mode: "baseline" }
+    | { readonly profileId: ModelPolicyProfileId; readonly mode: "model" }
+    | { readonly profileId: "replay"; readonly mode: "replay" }
+  );
 
 export interface ReplaySourceView {
   readonly runId: string;
@@ -169,6 +191,7 @@ export interface TimelineContextView {
   readonly scenarioVersion: number;
   readonly totalWeeks: number;
   readonly status: RunStatus;
+  readonly profileId: PolicyProfileId | null;
   readonly mode: string;
   readonly isReplay: boolean;
   readonly sourceRunId: string | null;
@@ -527,8 +550,12 @@ export interface TracePreviewView {
   readonly traceRunId: string;
   readonly invocationId: string;
   readonly isSourceTrace: boolean;
+  readonly profileId: PolicyProfileId;
   readonly provider: string;
   readonly model: string;
+  readonly wireProtocol: string;
+  readonly adapterVersion: string;
+  readonly configFingerprint: string;
   readonly outcome: InvocationOutcome;
   readonly usage: TokenUsageView;
   readonly latencyMs: number;
@@ -622,15 +649,18 @@ export interface TimelineDetailView {
 
 export type RunRequest =
   | {
-      readonly policyMode: "baseline";
+      readonly kind: "baseline";
+      readonly profileId: "baseline";
       readonly seed: number;
     }
   | {
-      readonly policyMode: "model";
+      readonly kind: "model";
+      readonly profileId: ModelPolicyProfileId;
       readonly model: string;
       readonly seed: number;
     }
   | {
-      readonly policyMode: "replay";
+      readonly kind: "replay";
+      readonly profileId: "replay";
       readonly sourceRunId: string;
     };

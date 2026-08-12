@@ -574,6 +574,15 @@ function TraceProvenance({
             </header>
             <dl className="detail-metadata trace-metadata">
               <Meta label="Trace run" value={trace.preview.traceRunId} />
+              <Meta label="Policy profile" value={trace.preview.profileId} />
+              <Meta
+                label="Wire adapter"
+                value={`${trace.preview.wireProtocol} / ${trace.preview.adapterVersion}`}
+              />
+              <Meta
+                label="Configuration"
+                value={trace.preview.configFingerprint}
+              />
               <Meta label="Invocation" value={trace.preview.invocationId} />
               <Meta
                 label="Provider outcome"

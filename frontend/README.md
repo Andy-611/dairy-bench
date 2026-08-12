@@ -4,10 +4,13 @@ A React and TypeScript dashboard that creates runs, monitors progress, and
 renders backend projections. Economic settlement and NewAPI credentials remain
 on the backend.
 
-The dashboard exposes exactly three policy modes:
+The single Company Policy dropdown exposes five backend policy profiles plus
+the local **All Runs** view:
 
 - **Rule baseline** — deterministic and credential-free.
 - **Model agents via NewAPI** — selects any configured NewAPI model.
+- **Codex via NewAPI** — uses the Codex-compatible Responses route.
+- **Claude Code via NewAPI** — uses the Claude-compatible Messages route.
 - **Completed Run Replay** — reproduces a completed source Turn Journal without model
   calls.
 

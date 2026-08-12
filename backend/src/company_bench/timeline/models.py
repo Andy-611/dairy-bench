@@ -16,6 +16,7 @@ from company_bench.domain.models import (
     Identifier,
     InventoryPosition,
     Money,
+    PolicyProfileId,
     PositiveMoney,
     PositiveQuantity,
     ProductId,
@@ -69,6 +70,7 @@ class TimelineRunContext(StrictModel):
     scenario_version: int = Field(ge=2)
     total_weeks: int = Field(ge=1)
     status: RunStatus
+    profile_id: PolicyProfileId | None = None
     mode: str
     source_run_id: Identifier | None = None
     trace_run_id: Identifier
@@ -150,8 +152,12 @@ class AgentTracePreview(StrictModel):
     trace_run_id: Identifier
     invocation_id: Identifier
     source_trace: bool
+    profile_id: PolicyProfileId
     provider: str
     model: str
+    wire_protocol: Identifier
+    adapter_version: Identifier
+    config_fingerprint: Identifier
     outcome: InvocationOutcome
     usage: TokenUsage
     latency_ms: int = Field(ge=0)

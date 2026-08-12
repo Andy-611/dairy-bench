@@ -18,6 +18,7 @@ from company_bench.domain.models import (
     Identifier,
     PolicyDescriptor,
     PolicyKind,
+    PolicyProfileId,
     StrictModel,
     WeekSnapshot,
 )
@@ -68,8 +69,14 @@ class RunJob(StrictModel):
     """Progress record returned immediately by the run API."""
 
     run_id: Identifier
-    mode: PolicyKind
+    profile_id: PolicyProfileId
+    kind: PolicyKind
+    provider: Identifier | None = None
     model: str | None = Field(default=None, min_length=1, max_length=256)
+    wire_protocol: Identifier | None = None
+    adapter_version: Identifier | None = None
+    prompt_version: Identifier | None = None
+    config_fingerprint: Identifier | None = None
     status: RunStatus = RunStatus.QUEUED
     revision: int = Field(default=0, ge=0)
     seed: int
@@ -89,18 +96,25 @@ class RunJob(StrictModel):
         """Keep reported progress inside the scenario duration."""
         if self.current_absolute_day > self.total_weeks * 7:
             raise ValueError("current_absolute_day exceeds the scenario calendar")
-        if self.mode is PolicyKind.MODEL and self.model is None:
-            raise ValueError("Model Agent jobs require a model")
-        if self.mode is not PolicyKind.MODEL and self.model is not None:
-            raise ValueError("model is only valid for Model Agent jobs")
+        if self.profile_id.kind is not self.kind:
+            raise ValueError("profile_id and kind must describe the same policy")
+        route_fields = (
+            self.provider,
+            self.model,
+            self.wire_protocol,
+            self.adapter_version,
+            self.prompt_version,
+            self.config_fingerprint,
+        )
+        if self.kind is PolicyKind.MODEL and any(value is None for value in route_fields):
+            raise ValueError("Model Agent jobs require complete adapter identity")
+        if self.kind is not PolicyKind.MODEL and any(value is not None for value in route_fields):
+            raise ValueError("model adapter identity is only valid for Model Agent jobs")
         if (self.status is RunStatus.COMPLETED) != (self.quality is not None):
             raise ValueError("only completed runs require quality metadata")
         if self.status is not RunStatus.STOPPED and self.stop_reason is not None:
             raise ValueError("stop_reason is only valid for stopped runs")
-        if (
-            self.stop_reason is RunStopReason.QUOTA_EXHAUSTED
-            and self.error_message is None
-        ):
+        if self.stop_reason is RunStopReason.QUOTA_EXHAUSTED and self.error_message is None:
             raise ValueError("quota-exhausted runs require the provider diagnostic")
         return self
 
@@ -324,7 +338,8 @@ class RunRecovery(StrictModel):
 class PolicyProfileView(StrictModel):
     """Safe server-side policy configuration exposed to the browser."""
 
-    mode: PolicyKind
+    profile_id: PolicyProfileId
+    kind: PolicyKind
     label: str
     available: bool
     provider: str | None = None
@@ -431,8 +446,12 @@ class PolicyInvocation(ProviderCallAudit):
     company_id: CompanyId
     week: int = Field(ge=1)
     observation: CompanyObservation
+    profile_id: PolicyProfileId
     provider: str
     model: str
+    wire_protocol: Identifier
+    adapter_version: Identifier
+    config_fingerprint: Identifier
     prompt_version: str
     prompt_hash: str
     started_at: datetime
@@ -518,10 +537,7 @@ def _validate_runtime_commitments(checkpoint: RunCheckpoint) -> None:
     calendar = checkpoint.economy.scenario.calendar
     if any(
         event.kind is SystemEventKind.COMPANY_WAKE
-        and (
-            not calendar.contains(event.scheduled_for)
-            or not event.scheduled_for.is_decision_day
-        )
+        and (not calendar.contains(event.scheduled_for) or not event.scheduled_for.is_decision_day)
         for event in pending
     ):
         raise ValueError("company wakes must remain on Monday-Saturday")
@@ -559,9 +575,7 @@ def _validate_attention_commitments(
         if derived != plan:
             raise ValueError("active attention must match its source Turn")
         if plan.review_on is not None:
-            expected.append(
-                (cursor.company_id, plan.review_on.absolute_day, plan.source_turn_id)
-            )
+            expected.append((cursor.company_id, plan.review_on.absolute_day, plan.source_turn_id))
 
     actual: list[tuple[CompanyId, int, Identifier]] = []
     for event in checkpoint.scheduler.pending_events:

@@ -35,19 +35,24 @@ normal capacity `60`, processor normal capacity `50`, and retailer base demand
 cost are realized once per company-week; potential demand is realized once per
 retailer-week and purchased once on Sunday.
 
-## Policy modes
+## Policy profiles
 
-Dairy Bench exposes exactly three modes:
+Dairy Bench exposes five policy profiles:
 
 - **Rule baseline**: deterministic rules and no model call.
 - **Model agents via NewAPI**: one isolated Agent per company. Any model family
   in the configured NewAPI catalog may be used if it supports the required
   function-call contract.
+- **Codex via NewAPI**: uses the Codex-compatible Responses route; Dairy Bench
+  remains the Agent runtime.
+- **Claude Code via NewAPI**: uses the Claude-compatible Messages route; Dairy
+  Bench remains the Agent runtime.
 - **Completed Run Replay**: replays a completed Turn Journal without model calls
   and rejects observation or outcome drift.
 
-All model traffic uses one NewAPI adapter. There is no direct Codex, OpenAI
-Company Agent, Claude, or provider-specific execution path.
+All model traffic crosses one `DecisionGateway` seam. Protocol adapters normalize
+Chat Completions, Responses, and Anthropic Messages into the same typed company
+decision. The benchmark does not launch Codex CLI or Claude Code processes.
 
 ## Determinism and concurrency
 
@@ -82,15 +87,19 @@ npm.cmd install
 cd ..
 ```
 
-Configure or replace the NewAPI key:
+Configure or replace each NewAPI profile independently:
 
 ```bat
-start.cmd --configure-newapi
+start.cmd --configure-newapi model
+start.cmd --configure-newapi codex
+start.cmd --configure-newapi claude-code
 ```
 
 The command validates `/v1/models`, stores a Windows-user-encrypted credential,
-and refreshes the local model/capability catalogs. Restart a running backend
-after changing credentials.
+and refreshes the isolated profile's model catalog. Before a model run is queued,
+the backend also validates its wire protocol, canonical tool call, and output
+limit, then refreshes the capability catalog. Restart a running backend after
+changing credentials.
 
 Start the application:
 
@@ -120,8 +129,9 @@ Mutable state is Git-ignored:
 ```text
 .dairy-bench/
 |-- credentials/
-|   |-- newapi-model-capabilities.json
-|   `-- newapi-models.json
+|   |-- newapi-model/{token.clixml,models.json,model-capabilities.json}
+|   |-- newapi-codex/{token.clixml,models.json,model-capabilities.json}
+|   `-- newapi-claude-code/{token.clixml,models.json,model-capabilities.json}
 `-- data/runs-v7.sqlite3
 ```
 

@@ -5,27 +5,41 @@ $backendDirectory = Split-Path -Parent $PSScriptRoot
 $runtimePathsScript = Join-Path $PSScriptRoot "runtime_paths.ps1"
 . $runtimePathsScript
 $runtimeHome = Get-DairyBenchRuntimeHome -BackendDirectory $backendDirectory
-$newApiStateDirectory = Join-Path $runtimeHome "credentials"
-$newApiCredentialPath = Join-Path $newApiStateDirectory "newapi-token.clixml"
-$newApiModelsPath = Join-Path $newApiStateDirectory "newapi-models.json"
-$newApiPlainKey = $null
+$newApiProfiles = @(
+    @{ Id = "newapi-model"; Prefix = "DAIRY_BENCH_NEWAPI_MODEL" },
+    @{ Id = "newapi-codex"; Prefix = "DAIRY_BENCH_NEWAPI_CODEX" },
+    @{ Id = "newapi-claude-code"; Prefix = "DAIRY_BENCH_NEWAPI_CLAUDE" }
+)
+$configuredVariables = [Collections.Generic.List[string]]::new()
 
 try {
-    if ((Test-Path -LiteralPath $newApiCredentialPath) -and
-        (Test-Path -LiteralPath $newApiModelsPath)) {
-        $newApiCredential = Import-Clixml -LiteralPath $newApiCredentialPath
-        $newApiPlainKey = $newApiCredential.GetNetworkCredential().Password
-        $newApiCatalog = Get-Content -LiteralPath $newApiModelsPath -Raw |
-            ConvertFrom-Json
-        $newApiModels = @(
-            $newApiCatalog |
-                ForEach-Object { [string]$_ } |
-                Where-Object { $_ }
-        )
-        if ($newApiPlainKey -and $newApiModels.Count -gt 0) {
-            $env:NEWAPI_API_KEY = $newApiPlainKey
-            $env:DAIRY_BENCH_NEWAPI_MODELS = $newApiModels -join ","
-            $env:DAIRY_BENCH_NEWAPI_MODEL = $newApiModels[0]
+    foreach ($profile in $newApiProfiles) {
+        $profileDirectory = Join-Path $runtimeHome "credentials\$($profile.Id)"
+        $credentialPath = Join-Path $profileDirectory "token.clixml"
+        $modelsPath = Join-Path $profileDirectory "models.json"
+        if ((Test-Path -LiteralPath $credentialPath) -and
+            (Test-Path -LiteralPath $modelsPath)) {
+            $credential = Import-Clixml -LiteralPath $credentialPath
+            $plainKey = $credential.GetNetworkCredential().Password
+            $models = @(
+                Get-Content -LiteralPath $modelsPath -Raw |
+                    ConvertFrom-Json |
+                    ForEach-Object { [string]$_ } |
+                    Where-Object { $_ }
+            )
+            if ($plainKey -and $models.Count -gt 0) {
+                $values = @{
+                    "$($profile.Prefix)_API_KEY" = $plainKey
+                    "$($profile.Prefix)_MODELS" = $models -join ","
+                    "$($profile.Prefix)_MODEL" = $models[0]
+                }
+                foreach ($entry in $values.GetEnumerator()) {
+                    [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+                    $configuredVariables.Add($entry.Key)
+                }
+            }
+            $plainKey = $null
+            $credential = $null
         }
     }
 
@@ -37,8 +51,7 @@ try {
     }
 }
 finally {
-    Remove-Item Env:NEWAPI_API_KEY -ErrorAction SilentlyContinue
-    Remove-Item Env:DAIRY_BENCH_NEWAPI_MODELS -ErrorAction SilentlyContinue
-    Remove-Item Env:DAIRY_BENCH_NEWAPI_MODEL -ErrorAction SilentlyContinue
-    $newApiPlainKey = $null
+    foreach ($variable in $configuredVariables) {
+        [Environment]::SetEnvironmentVariable($variable, $null, "Process")
+    }
 }

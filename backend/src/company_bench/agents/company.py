@@ -36,6 +36,7 @@ from company_bench.domain.models import (
     FarmOperation,
     PolicyKind,
     PolicyMetadata,
+    PolicyProfileId,
     ProcessorOperation,
     ProductId,
     ProtocolIssueKind,
@@ -355,8 +356,12 @@ class LlmCompanyAgent:
             "company_id": turn.company_id,
             "week": turn.sim_day.week,
             "observation": turn.observation,
+            "profile_id": self.metadata.profile_id,
             "provider": self.metadata.provider or "unknown",
             "model": self.metadata.model or "unknown",
+            "wire_protocol": self.metadata.wire_protocol or "unknown",
+            "adapter_version": self.metadata.adapter_version or "unknown",
+            "config_fingerprint": self.metadata.config_fingerprint or "unknown",
             "prompt_version": self.metadata.prompt_version or DECISION_PROMPT_VERSION,
             "prompt_hash": hashlib.sha256(
                 f"{request.instructions}\0{request.input_text}".encode()
@@ -374,6 +379,7 @@ class BaselineCompanyAgent:
     metadata = PolicyMetadata(
         name="event-baseline",
         kind=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
     )
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
@@ -492,6 +498,7 @@ class ReplayCompanyAgent:
         self.metadata = PolicyMetadata(
             name="turn-replay",
             kind=PolicyKind.REPLAY,
+            profile_id=PolicyProfileId.REPLAY,
             source_run_id=source_run_ids.pop(),
         )
         self._company_id = company_id

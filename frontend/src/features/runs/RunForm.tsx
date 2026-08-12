@@ -1,14 +1,14 @@
 import type { FormEvent } from "react";
 
 import type {
-  PolicyMode,
+  PolicyProfileId,
   PolicyProfileView,
   ReplaySourceView,
   RunJobView,
 } from "../../shared/api/types";
 import { AllRuns } from "./AllRuns";
 
-export type RunFormMode = PolicyMode | "all-runs";
+export type RunFormSelection = PolicyProfileId | "all-runs";
 
 export type RunControl =
   | { readonly state: "idle" }
@@ -20,7 +20,7 @@ interface RunFormProps {
   readonly canLoadMoreRuns: boolean;
   readonly jobs: readonly RunJobView[];
   readonly model: string;
-  readonly mode: RunFormMode;
+  readonly profileId: RunFormSelection;
   readonly profiles: readonly PolicyProfileView[];
   readonly replaySources: readonly ReplaySourceView[];
   readonly replaySourcesLoading: boolean;
@@ -29,7 +29,7 @@ interface RunFormProps {
   readonly sourceRunId: string;
   readonly control: RunControl;
   readonly onLoadMoreRuns: () => void;
-  readonly onModeChange: (mode: RunFormMode) => void;
+  readonly onProfileChange: (profileId: RunFormSelection) => void;
   readonly onModelChange: (model: string) => void;
   readonly onSeedChange: (seed: string) => void;
   readonly onSourceRunIdChange: (runId: string) => void;
@@ -44,7 +44,7 @@ export function RunForm({
   canLoadMoreRuns,
   jobs,
   model,
-  mode,
+  profileId,
   profiles,
   replaySources,
   replaySourcesLoading,
@@ -54,7 +54,7 @@ export function RunForm({
   control,
   onLoadMoreRuns,
   onModelChange,
-  onModeChange,
+  onProfileChange,
   onSeedChange,
   onSourceRunIdChange,
   onRun,
@@ -63,12 +63,17 @@ export function RunForm({
   onStop,
   runHistoryLoading,
 }: RunFormProps) {
-  const selectedProfile = profiles.find((profile) => profile.mode === mode);
+  const selectedProfile = profiles.find(
+    (profile) => profile.profileId === profileId,
+  );
+  const kind = selectedProfile?.kind;
   const formLocked = control.state !== "idle";
+  const modelSelected =
+    kind !== "model" || Boolean(selectedProfile?.models.includes(model));
   const canStart =
     Boolean(selectedProfile?.available) &&
-    (mode !== "replay" || Boolean(sourceRunId)) &&
-    (mode !== "model" || Boolean(model));
+    (kind !== "replay" || Boolean(sourceRunId)) &&
+    modelSelected;
 
   function handleSubmit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault();
@@ -83,14 +88,16 @@ export function RunForm({
         <span>Company policy</span>
         <select
           disabled={formLocked}
-          onChange={(event) => onModeChange(event.target.value as RunFormMode)}
-          value={mode}
+          onChange={(event) =>
+            onProfileChange(event.target.value as RunFormSelection)
+          }
+          value={profileId}
         >
           {profiles.map((profile) => (
             <option
               disabled={!profile.available}
-              key={profile.mode}
-              value={profile.mode}
+              key={profile.profileId}
+              value={profile.profileId}
             >
               {profile.label}
               {!profile.available ? " (not configured)" : ""}
@@ -100,7 +107,7 @@ export function RunForm({
         </select>
       </label>
 
-      {mode === "all-runs" ? (
+      {profileId === "all-runs" ? (
         <AllRuns
           busy={formLocked}
           canLoadMore={canLoadMoreRuns}
@@ -110,11 +117,12 @@ export function RunForm({
           onResume={onResume}
           onSelect={onRunSelect}
           onStop={onStop}
+          profiles={profiles}
           resumingRunId={control.state === "resuming" ? control.runId : null}
           selectedJob={selectedJob}
           stoppingRunId={control.state === "stopping" ? control.runId : null}
         />
-      ) : mode === "replay" ? (
+      ) : kind === "replay" ? (
         <label className="run-field replay-field">
           <span>Source run ID</span>
           <select
@@ -159,7 +167,7 @@ export function RunForm({
         </label>
       )}
 
-      {mode === "model" && selectedProfile && (
+      {kind === "model" && selectedProfile && (
         <label className="run-field model-field">
           <span>Model</span>
           <select
@@ -181,23 +189,23 @@ export function RunForm({
       <span className="sr-only" id="seed-help">
         Use the same seed to reproduce the economic environment.
       </span>
-      {mode !== "all-runs" && (
+      {profileId !== "all-runs" && (
         <RunActionButton
           canStart={canStart}
-          completedReplay={mode === "replay"}
+          completedReplay={kind === "replay"}
           control={control}
         />
       )}
-      {mode === "all-runs" && (
+      {profileId === "all-runs" && (
         <span className="profile-hint">
           Browse every persisted run, including incomplete runs.
         </span>
       )}
       {selectedProfile && (
         <span className="profile-hint" title={selectedProfile.description}>
-          {mode === "replay"
+          {kind === "replay"
             ? "Creates a new deterministic run from a completed source; no agents are called."
-            : mode === "model" && model
+            : kind === "model" && model
             ? [selectedProfile.provider, model].filter(Boolean).join(" / ")
             : selectedProfile.description}
           {!selectedProfile.available && selectedProfile.unavailableReason
