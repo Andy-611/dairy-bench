@@ -19,6 +19,7 @@ from company_bench.agents.company import (
 from company_bench.agents.contracts import ModelOutputError
 from company_bench.domain.calendar import SimDay, Weekday
 from company_bench.domain.models import (
+    CompanyBankruptEvent,
     ConsumerSaleEvent,
     DeliveryCompletedEvent,
     MilkProducedEvent,
@@ -238,7 +239,6 @@ async def test_runtime_orders_seven_days_and_sunday_settlement() -> None:
         run_id="calendar_order",
         store=repository,
     )
-
     steps = tuple(
         step
         for step in repository.list_system_steps("calendar_order")
@@ -258,6 +258,41 @@ async def test_runtime_orders_seven_days_and_sunday_settlement() -> None:
         (SystemEventKind.WEEK_CLOSE, Weekday.SUNDAY),
     )
 
+
+@pytest.mark.asyncio
+async def test_runtime_never_calls_an_agent_after_initial_bankruptcy() -> None:
+    base = _scenario(max_turns=1)
+    scenario = ScenarioSpec.model_validate(
+        base.model_copy(
+            update={
+                "companies": tuple(
+                    company.model_copy(update={"initial_cash": Decimal("0.5")})
+                    if company.company_id == "farm_a"
+                    else company
+                    for company in base.companies
+                )
+            }
+        )
+    )
+    calls = {company.company_id: 0 for company in scenario.companies}
+
+    def count_call(turn: AgentTurn) -> CompanyDecision:
+        calls[turn.company_id] += 1
+        return company_decision()
+
+    execution = await EpisodeRuntime(scenario).run(
+        _agents(scenario, count_call),
+        7,
+        run_id="initial_bankruptcy",
+    )
+
+    assert calls["farm_a"] == 0
+    assert all(turn.turn.company_id != "farm_a" for turn in execution.turns)
+    assert tuple(
+        event.event.company_id
+        for event in execution.episode.events
+        if isinstance(event.event, CompanyBankruptEvent)
+    ) == ("farm_a",)
 
 @pytest.mark.asyncio
 async def test_one_week_has_six_decision_days_and_no_sunday_agent_turn() -> None:
@@ -727,39 +762,32 @@ async def test_checkpoint_restores_attention_and_review_wake_exactly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_accepts_a_scoring_only_contract_upgrade() -> None:
+async def test_checkpoint_rejects_any_scenario_contract_change() -> None:
     scenario = _scenario(max_turns=3)
-    legacy_scenario = scenario.model_copy(
-        update={
-            "scoring": scenario.scoring.model_copy(
-                update={"score_version": "s9-enterprise-v3"}
-            )
-        }
+    incompatible_scenario = scenario.model_copy(
+        update={"scenario_id": "test.runtime.incompatible"}
     )
-    run_id = "resume_scoring_upgrade"
+    run_id = "reject_scenario_change"
     repository = InMemoryRunStore()
 
     with pytest.raises(RuntimeError, match="durable attention plan"):
-        await EpisodeRuntime(legacy_scenario).run(
-            _agents(legacy_scenario, _idle),
+        await EpisodeRuntime(incompatible_scenario).run(
+            _agents(incompatible_scenario, _idle),
             40,
             run_id=run_id,
             store=_InterruptOnAttention(repository),
         )
     recovery = repository.load_recovery(run_id)
     assert recovery is not None
-    assert recovery.checkpoint.economy.scenario.scoring.score_version == "s9-enterprise-v3"
 
-    resumed = await EpisodeRuntime(scenario).run(
-        _agents(scenario, _idle),
-        40,
-        run_id=run_id,
-        store=repository,
-        recovery=recovery,
-    )
-
-    assert resumed.episode.scenario == scenario
-    assert resumed.episode.score.score_version == "s9-enterprise-v4"
+    with pytest.raises(ValueError, match="different scenario"):
+        await EpisodeRuntime(scenario).run(
+            _agents(scenario, _idle),
+            40,
+            run_id=run_id,
+            store=repository,
+            recovery=recovery,
+        )
 
 
 @pytest.mark.asyncio

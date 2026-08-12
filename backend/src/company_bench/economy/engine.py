@@ -1,4 +1,4 @@
-"""Deterministic V6 economy engine for weekly dairy-market episodes."""
+"""Deterministic V7 economy engine for weekly dairy-market episodes."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from company_bench.domain.calendar import SimDay
 from company_bench.domain.models import (
     MAX_SEED,
     ZERO,
+    CompanyBankruptEvent,
     CompanyId,
     CompanyObservation,
     CompanySnapshot,
@@ -59,6 +60,7 @@ from company_bench.economy.market import (
     TradeFill,
 )
 from company_bench.economy.operations import OperatingEconomics
+from company_bench.economy.valuation import EnterpriseValuation
 from company_bench.runtime.models import (
     DecisionEnvelope,
     DecisionOutcome,
@@ -113,6 +115,16 @@ class ProductionJob(StrictModel):
         if self.unit_cost != EconomicPrecision.round(self.cash_cost / self.quantity):
             raise ValueError("production unit cost must equal its rounded batch average")
         return self
+
+    @property
+    def output_product(self) -> ProductId:
+        """Return the guaranteed output product."""
+        return self.product
+
+    @property
+    def output_quantity(self) -> Quantity:
+        """Return the guaranteed output quantity."""
+        return self.quantity
 
 
 class TransformationJob(StrictModel):
@@ -308,6 +320,13 @@ class EconomyState(StrictModel):
             raise ValueError("pending delivery belongs to an unknown buyer")
         if any(price.company_id not in known for price in self.retail_prices):
             raise ValueError("retail price belongs to an unknown company")
+        bankrupt = {
+            company.company_id for company in self.companies if not company.is_active
+        }
+        if any(order.owner_id in bankrupt for order in orders):
+            raise ValueError("bankrupt companies cannot retain market orders")
+        if any(price.company_id in bankrupt for price in self.retail_prices):
+            raise ValueError("bankrupt retailers cannot retain consumer prices")
         if len({market.is_open for market in self.markets}) != 1:
             raise ValueError("product markets must open and close together")
         if any(job.completes_on.week != self.week for job in self.jobs):
@@ -331,6 +350,10 @@ class EconomyState(StrictModel):
     def seed(self) -> int:
         """Return the episode seed."""
         return self.base_state.seed
+
+    def is_active(self, company_id: CompanyId) -> bool:
+        """Return whether one known company may still operate."""
+        return _company_state(self.companies, company_id).is_active
 
     def _with_market_session(self, snapshot: _SessionSnapshot) -> Self:
         """Commit common ledger and order-book fields from one transaction."""
@@ -397,6 +420,78 @@ class _MarketSession:
         )
 
 
+class BankruptcyManager:
+    """Atomically delist every active company whose guaranteed assets fall below one."""
+
+    threshold = Decimal("1.0000")
+
+    def __init__(self, valuation: EnterpriseValuation) -> None:
+        self._valuation = valuation
+
+    def settle(self, economy: EconomyState, on: SimDay) -> EconomyState:
+        """Declare new bankruptcies and release their reversible commitments."""
+        candidates = tuple(
+            (company.company_id, total_assets)
+            for company in economy.companies
+            if company.is_active
+            and (
+                total_assets := self._valuation.active_value(
+                    economy,
+                    company.company_id,
+                )
+            )
+            < self.threshold
+        )
+        if not candidates:
+            return economy
+
+        session = _MarketSession.from_economy(economy)
+        cancelled_by_company: dict[CompanyId, tuple[Identifier, ...]] = {}
+        for company_id, _ in candidates:
+            cancelled_by_company[company_id] = tuple(
+                order.order_id
+                for market in session.markets.values()
+                if market.state.is_open
+                for order in market.cancel_company_orders(company_id)
+            )
+        snapshot = session.freeze()
+        bankrupt_ids = {company_id for company_id, _ in candidates}
+        prices_removed = {
+            company_id
+            for company_id in bankrupt_ids
+            if any(price.company_id == company_id for price in economy.retail_prices)
+        }
+        assets = dict(candidates)
+        events = tuple(
+            CompanyBankruptEvent(
+                occurred_on=on,
+                company_id=company_id,
+                total_assets=assets[company_id],
+                cancelled_order_ids=cancelled_by_company[company_id],
+                retail_price_removed=company_id in prices_removed,
+            )
+            for company_id, _ in candidates
+        )
+        return economy.model_copy(
+            update={
+                "companies": tuple(
+                    company.declare_bankrupt(on)
+                    if company.company_id in bankrupt_ids
+                    else company
+                    for company in snapshot.companies
+                ),
+                "markets": snapshot.markets,
+                "retail_prices": tuple(
+                    price
+                    for price in economy.retail_prices
+                    if price.company_id not in bankrupt_ids
+                ),
+                "next_lot_sequence": snapshot.next_lot_sequence,
+                "events": (*economy.events, *events),
+            }
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _DecisionEffect:
     """One successfully applied decision and its immediate audit output."""
@@ -404,7 +499,6 @@ class _DecisionEffect:
     economy: EconomyState
     quote_ladder_result: QuoteLadderResult | None = None
     job_id: Identifier | None = None
-    events: tuple[DomainEvent, ...] = ()
     completions: tuple[ScheduledCompletion, ...] = ()
 
 
@@ -420,10 +514,14 @@ class _TradeEffects:
 
 
 class EconomyEngine:
-    """Own every V6 cash, inventory, market, operation, and delivery transition."""
+    """Own every V7 cash, inventory, market, operation, delivery, and exit transition."""
+
+    def __init__(self, valuation: EnterpriseValuation | None = None) -> None:
+        self._valuation = valuation or EnterpriseValuation()
+        self._bankruptcies = BankruptcyManager(self._valuation)
 
     def initial_state(self, scenario: ScenarioSpec, seed: int) -> WorldState:
-        """Create an empty-inventory V6 world."""
+        """Create an empty-inventory V7 world."""
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
             raise ValueError(f"seed must be an integer from 0 to {MAX_SEED}")
         economics = OperatingEconomics(scenario, seed)
@@ -447,7 +545,7 @@ class EconomyEngine:
             next_lot_sequence=state.next_lot_sequence,
         )
         week = state.completed_weeks + 1
-        return EconomyState(
+        economy = EconomyState(
             base_state=state,
             week=week,
             state_version=state_version,
@@ -462,6 +560,7 @@ class EconomyEngine:
             ).open_week(week, state.operation_states),
             next_lot_sequence=state.next_lot_sequence,
         )
+        return self._bankruptcies.settle(economy, SimDay.at(week=week))
 
     def observe(self, state: WorldState) -> tuple[CompanyObservation, ...]:
         """Project next-week Monday facts without opening mutable runtime state."""
@@ -477,14 +576,15 @@ class EconomyEngine:
                 state=state,
                 sim_day=sim_day,
                 company_id=company.company_id,
-                company_state=_company_state(state.companies, company.company_id),
+                company_states=state.companies,
                 weekly_operation=_optional_operation_state(
                     operation_states,
                     company.company_id,
                 ),
                 retail_price=None,
             )
-            for company in state.scenario.companies
+            for company in state.companies
+            if company.is_active
         )
 
     def observe_active(
@@ -498,6 +598,9 @@ class EconomyEngine:
             raise ValueError("observation day must belong to the current active week")
         if not sim_day.is_decision_day:
             raise ValueError("company observations require a Monday-Saturday decision day")
+        company_state = _company_state(economy.companies, company_id)
+        if not company_state.is_active:
+            raise ValueError("bankrupt companies cannot receive observations")
         price = next(
             (item.unit_price for item in economy.retail_prices if item.company_id == company_id),
             None,
@@ -506,7 +609,7 @@ class EconomyEngine:
             state=economy.base_state,
             sim_day=sim_day,
             company_id=company_id,
-            company_state=_company_state(economy.companies, company_id),
+            company_states=economy.companies,
             weekly_operation=_optional_operation_state(
                 economy.operation_states,
                 company_id,
@@ -547,30 +650,16 @@ class EconomyEngine:
             start=ZERO,
         )
 
-    @staticmethod
     def marked_surplus(
+        self,
         economy: EconomyState,
         company_id: CompanyId,
     ) -> EconomicDecimal:
         """Mark guaranteed owned assets against the episode's initial value."""
-        company = _company_state(economy.companies, company_id)
-        owned_lots = (
-            *company.inventory,
-            *_reserved_lots(economy, company_id),
-            *(
-                lot
-                for delivery in economy.deliveries
-                if delivery.buyer_id == company_id
-                for lot in delivery.lots
-            ),
+        return (
+            self._valuation.active_value(economy, company_id)
+            - economy.scenario.company(company_id).initial_cash
         )
-        marked_value = (
-            company.cash
-            + EconomyEngine.reserved_cash(economy, company_id)
-            + economy.scenario.inventory_value(owned_lots)
-            + _operation_output_value(economy, company_id)
-        )
-        return marked_value - economy.scenario.company(company_id).initial_cash
 
     @staticmethod
     def inventory_expiry(
@@ -735,7 +824,7 @@ class EconomyEngine:
                 output_lot_id=lot.lot_id,
             )
         )
-        return economy._with_market_session(
+        updated = economy._with_market_session(
             session.freeze(next_lot_sequence=next_lot_sequence)
         ).model_copy(
             update={
@@ -745,6 +834,7 @@ class EconomyEngine:
                 "events": (*economy.events, event),
             }
         )
+        return self._bankruptcies.settle(updated, on)
 
     def complete_delivery(
         self,
@@ -771,7 +861,7 @@ class EconomyEngine:
             product=delivery.product,
             quantity=delivery.quantity,
         )
-        return economy._with_market_session(session.freeze()).model_copy(
+        updated = economy._with_market_session(session.freeze()).model_copy(
             update={
                 "deliveries": tuple(
                     candidate
@@ -781,6 +871,7 @@ class EconomyEngine:
                 "events": (*economy.events, event),
             }
         )
+        return self._bankruptcies.settle(updated, on)
 
     def close_markets(self, economy: EconomyState, on: SimDay) -> EconomyState:
         """Expire every weekly order and release its remaining collateral."""
@@ -790,7 +881,10 @@ class EconomyEngine:
         session = _MarketSession.from_economy(economy)
         for market in session.markets.values():
             market.close()
-        return economy._with_market_session(session.freeze())
+        return self._bankruptcies.settle(
+            economy._with_market_session(session.freeze()),
+            on,
+        )
 
     def settle_consumer_sales(self, economy: EconomyState, on: SimDay) -> EconomyState:
         """Execute the sole Sunday consumer purchase event."""
@@ -849,7 +943,7 @@ class EconomyEngine:
             demand_total += demand
             sold_total += sold
 
-        return economy._with_market_session(session.freeze()).model_copy(
+        updated = economy._with_market_session(session.freeze()).model_copy(
             update={
                 "consumer_settlement": ConsumerSettlement(
                     week=economy.week,
@@ -860,6 +954,7 @@ class EconomyEngine:
                 "events": (*economy.events, *events),
             }
         )
+        return self._bankruptcies.settle(updated, on)
 
     def close_week(self, economy: EconomyState, on: SimDay) -> WeekResult:
         """Assert a drained runtime, expire inventory, and freeze the weekly result."""
@@ -874,13 +969,22 @@ class EconomyEngine:
             raise ValueError("consumer sales must settle before day close")
 
         companies, expiry_events = self._expire_inventory(economy, on)
-        events = (*economy.events, *expiry_events)
+        settled = self._bankruptcies.settle(
+            economy.model_copy(
+                update={
+                    "companies": companies,
+                    "events": (*economy.events, *expiry_events),
+                }
+            ),
+            on,
+        )
+        events = settled.events
         markets = tuple(_market_summary(market) for market in economy.markets)
         state = WorldState(
             scenario=economy.scenario,
             seed=economy.seed,
             completed_weeks=economy.week,
-            companies=companies,
+            companies=settled.companies,
             operation_states=economy.operation_states,
             previous_markets=markets,
             next_lot_sequence=economy.next_lot_sequence,
@@ -925,14 +1029,15 @@ class EconomyEngine:
                 accepted=False,
                 reason=f"numeric value exceeds the supported range: {type(error).__name__}",
             )
-        return effect.economy, self._outcome(
-            effect.economy,
+        settled = self._bankruptcies.settle(effect.economy, envelope.issued_on)
+        return settled, self._outcome(
+            settled,
             envelope,
             apply_sequence,
             accepted=True,
             quote_ladder_result=effect.quote_ladder_result,
             job_id=effect.job_id,
-            events=effect.events,
+            events=settled.events[len(economy.events) :],
             completions=effect.completions,
         )
 
@@ -1189,7 +1294,6 @@ class EconomyEngine:
         return _DecisionEffect(
             economy=updated,
             quote_ladder_result=result,
-            events=trade_effects.events,
             completions=trade_effects.completions,
         )
 
@@ -1289,6 +1393,8 @@ class EconomyEngine:
 
     @staticmethod
     def _validate_decision_time(economy: EconomyState, envelope: DecisionEnvelope) -> None:
+        if not economy.is_active(envelope.company_id):
+            raise _DecisionRejected("company is bankrupt and delisted")
         day = envelope.issued_on
         if day.week != economy.week:
             raise _DecisionRejected("decision targets a different trading week")
@@ -1320,12 +1426,16 @@ class EconomyEngine:
         state: WorldState,
         sim_day: SimDay,
         company_id: CompanyId,
-        company_state: CompanyState,
+        company_states: tuple[CompanyState, ...],
         weekly_operation: WeeklyOperationState | None,
         retail_price: Money | None,
     ) -> CompanyObservation:
         scenario = state.scenario
         company = scenario.company(company_id)
+        company_state = _company_state(company_states, company_id)
+        status_by_company = {
+            candidate.company_id: candidate.status for candidate in company_states
+        }
         return CompanyObservation(
             observation_id=(
                 f"{scenario.scenario_id}|d{sim_day.absolute_day}|{company_id}"
@@ -1352,6 +1462,7 @@ class EconomyEngine:
                     company_id=public.company_id,
                     name=public.name,
                     tier=public.tier,
+                    status=status_by_company[public.company_id],
                 )
                 for public in scenario.companies
             ),
@@ -1415,6 +1526,7 @@ class EconomyEngine:
                     week=state.completed_weeks,
                     company_id=company.company_id,
                     tier=company.tier,
+                    status=current.status,
                     cash=current.cash,
                     raw_milk_quantity=_inventory_quantity(current, ProductId.RAW_MILK),
                     bottled_milk_quantity=_inventory_quantity(
@@ -1468,20 +1580,6 @@ def _expiry_quantities(
         key = (lot.product, lot.expires_end_of_week)
         quantities[key] = quantities.get(key, ZERO) + lot.quantity
     return quantities
-
-
-def _operation_output_value(economy: EconomyState, company_id: CompanyId) -> Money:
-    """Mark the guaranteed output of one funded active operation."""
-    job = next((job for job in economy.jobs if job.company_id == company_id), None)
-    if job is None:
-        return ZERO
-    if isinstance(job, ProductionJob):
-        product = job.product
-        quantity = job.quantity
-    else:
-        product = job.output_product
-        quantity = job.output_quantity
-    return EconomicPrecision.round(quantity * economy.scenario.product(product).reference_value)
 
 
 def _persisted_lots(economy: EconomyState) -> Iterable[InventoryLot]:

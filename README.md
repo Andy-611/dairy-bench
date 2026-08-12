@@ -2,7 +2,7 @@
 
 Dairy Bench is an event-driven benchmark for nine independent companies in a
 perishable dairy supply chain: three farms, three processors, and three
-retailers. The default scenario is `flow.dairy.base.s9.v6` and spans 52 trading
+retailers. The default scenario is `flow.dairy.base.s9.v7` and spans 52 trading
 weeks.
 
 Every decision crosses one typed boundary:
@@ -122,7 +122,7 @@ Mutable state is Git-ignored:
 |-- credentials/
 |   |-- newapi-model-capabilities.json
 |   `-- newapi-models.json
-`-- data/runs-v6.sqlite3
+`-- data/runs-v7.sqlite3
 ```
 
 Override the runtime root only when necessary with `DAIRY_BENCH_HOME`.

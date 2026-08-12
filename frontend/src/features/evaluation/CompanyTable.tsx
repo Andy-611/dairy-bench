@@ -66,7 +66,12 @@ export function CompanyTable({ companies }: CompanyTableProps) {
                     <span className={`role-dot ${company.role}`} />
                     <span>
                       <small>{ROLE_LABELS[company.role]}</small>
-                      <strong>{company.companyName}</strong>
+                      <strong>
+                        {company.companyName}
+                        {company.status === "bankrupt" && (
+                          <span className="company-status">BANKRUPT</span>
+                        )}
+                      </strong>
                     </span>
                   </div>
                 </td>

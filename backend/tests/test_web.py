@@ -91,12 +91,11 @@ def test_run_list_and_detail_http_flow() -> None:
             "efficiency_raw",
             "efficiency_reference",
             "efficiency_score",
-            "farm_gini",
-            "processor_gini",
-            "retailer_gini",
+            "global_gini",
             "fairness_score",
+            "profit_participation_score",
             "bankrupt_company_count",
-            "bankruptcy_rate",
+            "loss_making_company_count",
             "companies",
         }
         result = EpisodeResult.model_validate(detail_payload)
@@ -400,7 +399,7 @@ def test_default_repository_uses_configured_database(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    database = tmp_path / "data" / "runs-v6.sqlite3"
+    database = tmp_path / "data" / "runs-v7.sqlite3"
     monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
@@ -412,7 +411,7 @@ def test_default_repository_uses_configured_database(
     assert database.is_file()
 
 
-def test_default_app_runs_the_v6_scenario(monkeypatch: MonkeyPatch) -> None:
+def test_default_app_runs_the_v7_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)

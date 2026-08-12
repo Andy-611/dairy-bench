@@ -278,7 +278,7 @@ export function App() {
         <section className="hero">
           <div>
             <span className="eyebrow">
-              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v6").toUpperCase()}
+              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v7").toUpperCase()}
             </span>
             <h1>Independent companies. One living dairy economy.</h1>
             <p>
@@ -410,7 +410,7 @@ export function App() {
       </main>
 
       <footer>
-        <span>Dairy Bench V6</span>
+        <span>Dairy Bench V7</span>
         <span>NewAPI credentials remain on the backend.</span>
       </footer>
     </div>

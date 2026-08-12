@@ -72,7 +72,7 @@ class TimelineNotFoundError(LookupError):
 
 
 class TimelineUnsupportedError(ValueError):
-    """Raised when a run predates V6 weekly-market semantics."""
+    """Raised when a run predates V7 weekly-market semantics."""
 
 
 class TimelineSource(Protocol):

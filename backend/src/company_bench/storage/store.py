@@ -22,8 +22,8 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 13
-_PAYLOAD_SCHEMA_VERSION = 7
+_DATABASE_SCHEMA_VERSION = 14
+_PAYLOAD_SCHEMA_VERSION = 8
 _AUTO_RESUME_STATUSES = (
     RunStatus.QUEUED,
     RunStatus.RUNNING,
@@ -664,7 +664,7 @@ class SQLiteRunStore:
             )
 
     def _create_schema(self) -> None:
-        """Create the current V6 schema for a fresh benchmark database."""
+        """Create the current V7 schema for a fresh benchmark database."""
         current_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
         if current_version not in (0, _DATABASE_SCHEMA_VERSION):
             raise RuntimeError(f"unsupported database schema version: {current_version}")

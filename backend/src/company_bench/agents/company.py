@@ -67,7 +67,7 @@ from company_bench.runtime.models import (
     WakeReason,
 )
 
-DECISION_PROMPT_VERSION: Final = "dairy-company-v6.0"
+DECISION_PROMPT_VERSION: Final = "dairy-company-v7.0"
 
 
 class CompanyAgent(Protocol):
@@ -170,7 +170,7 @@ class AgentDecisionInput(StrictModel):
 
 
 class LlmCompanyAgent:
-    """Use one isolated provider gateway and Agent-owned V6 memory."""
+    """Use one isolated provider gateway and Agent-owned V7 memory."""
 
     metadata: PolicyMetadata
 
@@ -369,7 +369,7 @@ class LlmCompanyAgent:
 
 
 class BaselineCompanyAgent:
-    """Transparent V6 actor for the weekly dairy market."""
+    """Transparent V7 actor for the weekly dairy market."""
 
     metadata = PolicyMetadata(
         name="event-baseline",
@@ -599,7 +599,10 @@ def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
         "quantities by expiry; in-transit lots remain in pending_deliveries. "
         "marked_surplus is guaranteed marked asset value minus initial cash, including "
         "reserved assets, pending deliveries, and active-operation output at reference "
-        "values. For productive companies, observation.weekly_operation supplies "
+        "values. If that guaranteed asset value falls below 1, the company is "
+        "irreversibly bankrupt, delisted, and receives no future turn. Public company "
+        "status and bankruptcy events identify exited firms. For productive companies, "
+        "observation.weekly_operation supplies "
         "K=weekly_capacity and c=weekly_base_unit_cost; decision_constraints supplies "
         "u=used_operation_capacity and remaining_operation_capacity, while "
         "observation.operation.cost.curvature supplies curvature; "

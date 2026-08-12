@@ -1,8 +1,8 @@
-# V6 架构与不变量
+# V7 架构与不变量
 
 ## 1. 模拟边界
 
-当前场景 `flow.dairy.base.s9.v6` 包含 9 家独立公司和 52 个经营周。权威时钟是
+当前场景 `flow.dairy.base.s9.v7` 包含 9 家独立公司和 52 个经营周。权威时钟是
 `SimDay`，一个 Episode 共 364 天，不再存在分钟级经济时间。
 
 ```text
@@ -41,7 +41,7 @@ AgentTurn -> CompanyDecision -> DecisionEnvelope -> EconomyEngine -> DecisionOut
 1. 开启经营周。
 2. 用原有 Seed 公式实现每家生产企业的私有产能与基础单位成本。
 3. 重置本周订单簿、零售价、已用产能和 Turn 预算。
-4. 唤醒全部 9 家公司。
+4. 唤醒所有仍在经营的公司。
 
 ### 周二至周六
 
@@ -115,10 +115,21 @@ Journal 与策略实例；只共享 NewAPI HTTP Transport 和有界 Semaphore。
 使用相同 Run ID 恢复。
 
 Completed Replay 使用源 Observation/Decision，但重新计算 Engine Outcome；Journal、事件、
-快照、分数或质量任一漂移都会失败。V6 使用新的 `runs-v6.sqlite3`，不读取旧 Runtime
+快照、分数或质量任一漂移都会失败。V7 使用新的 `runs-v7.sqlite3`，不读取旧 Runtime
 Payload。
 
-## 9. 评分
+## 9. 破产与退市
+
+每次权威经济状态变化后，引擎都会按固定产品参考价计算有保障的企业总资产，包括：
+可用和挂单抵押现金、在手和挂单抵押库存、在途采购，以及已经付款的生产任务所保证的
+产出。
+
+只有总资产严格小于 `1.0000` 才宣告破产；恰好等于 `1.0000` 仍可经营。破产不可逆：
+立即撤销全部挂单、删除零售价、取消未来所有 Agent Wake，并且只记录一次
+`CompanyBankruptEvent`。破产前已经付款的生产和在途交割仍进入清算资产，但不能让公司
+恢复经营。
+
+## 10. 评分
 
 52 个周快照完整后计算：
 
@@ -126,16 +137,19 @@ Payload。
 E_raw = Σ_i [V_i(T) - V_i(0)]
 E_ref = 52 个 retailer-week 市场的 Seed 最大净价值
 E = clip(E_raw / E_ref, 0, 1)
-F = 1 - mean(各层 Gini) / (2/3)
-B = 破产公司数 / 9
-Score = 100 × E × sqrt(F × (1 - B))
+G_all = Gini(V_1(T), ..., V_9(T))
+F_all = clip(1 - G_all / (8/9), 0, 1)
+L = 满足 V_i(T) - V_i(0) < 0 的公司数
+P = 1 - L / 9
+Score = 100 × E × sqrt(F_all × P)
 ```
 
-`V_i` 为现金加参考价库存。`s9-enterprise-v4` 在任一周快照中发现公司净资产小于等于
-`1.0000` 时，即将该公司计为破产，且全程只计一次。协议质量独立计算，任意无效
-Agent Turn 都会使结果只能用于诊断。
+`V_i(T)` 为最终现金加参考价库存。`s9-enterprise-v5` 使用九家公司最终资产的标准
+Gini，不使用资本增长率或分层 Gini。UI 另行展示不可逆破产事件数 `D` 和最终亏损公司
+数 `L`，不展示两者的比例。协议质量独立计算，任意无效 Agent Turn 都会使结果只能
+用于诊断。
 
-## 10. 必须保持的不变量
+## 11. 必须保持的不变量
 
 1. Episode 恰好完成 52 次周结算和 52 个周快照。
 2. 每个 Timeline Week 恰好包含按序排列的 7 个 Day Frame。
@@ -146,3 +160,4 @@ Agent Turn 都会使结果只能用于诊断。
 7. 同日并行推理必须按确定性顺序串行应用。
 8. 只有 EconomyEngine 能修改经济状态。
 9. Journal/Checkpoint 原子提交，Replay 漂移必须失败。
+10. 总资产低于 `1.0000` 时立即且永久退市，之后不得再调用该公司 Agent。

@@ -202,9 +202,9 @@ class CompanyRuntimeCursor(StrictModel):
 
 
 class RunCheckpoint(StrictModel):
-    """Current mutable state needed to resume one V6 episode."""
+    """Current mutable state needed to resume one V7 episode."""
 
-    schema_version: Literal[10] = 10
+    schema_version: Literal[11] = 11
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -424,7 +424,7 @@ class ProviderCallAudit(StrictModel):
 
 
 class PolicyInvocation(ProviderCallAudit):
-    """Auditable provider call for one V6 atomic company turn."""
+    """Auditable provider call for one V7 atomic company turn."""
 
     invocation_id: Identifier
     run_id: Identifier

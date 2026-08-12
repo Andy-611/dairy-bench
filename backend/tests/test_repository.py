@@ -226,8 +226,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
-        assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 8
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
             "result_json",
@@ -273,7 +273,7 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
-    assert checkpoint.schema_version == 10
+    assert checkpoint.schema_version == 11
 
     with SQLiteRunStore(database) as repository:
         repository.save_progress((first,), (), checkpoint)

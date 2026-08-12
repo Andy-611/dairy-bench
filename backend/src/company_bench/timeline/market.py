@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from company_bench.domain.models import (
     ZERO,
+    CompanyBankruptEvent,
     Identifier,
     PositiveMoney,
     ProductId,
@@ -68,6 +69,9 @@ class _MarketReplay:
 
     def apply_system_step(self, step: SystemStepRecord) -> None:
         """Apply the only system transitions that mutate the order book."""
+        for record in step.effects:
+            if isinstance(record.event, CompanyBankruptEvent):
+                self._remove_bankrupt_orders(record.event)
         if step.kind is SystemEventKind.WEEK_OPEN:
             self.reset_week()
         elif step.kind is SystemEventKind.MARKET_CLOSE:
@@ -84,10 +88,20 @@ class _MarketReplay:
         events = tuple(
             event for event in record.outcome.events if isinstance(event, TradeExecutedEvent)
         )
+        bankruptcies = tuple(
+            event
+            for event in record.outcome.events
+            if isinstance(event, CompanyBankruptEvent)
+        )
         if not isinstance(action, SetQuoteLadder):
             if events or record.outcome.quote_ladder_result is not None:
                 raise MarketProjectionError("only a quote ladder may carry market results")
-            return _TurnMarketProjection()
+            return _TurnMarketProjection(
+                flows=self._bankruptcy_flows(
+                    bankruptcies,
+                    record.outcome.apply_sequence,
+                )
+            )
         result = record.outcome.quote_ladder_result
         if result is None or tuple(level.level for level in result.levels) != action.levels:
             raise MarketProjectionError("accepted quote ladder has no matching result")
@@ -177,7 +191,33 @@ class _MarketReplay:
         )
         for event in events:
             self.last_trade_price[event.product] = event.unit_price
+        flows.extend(
+            self._bankruptcy_flows(
+                bankruptcies,
+                record.outcome.apply_sequence,
+            )
+        )
         return _TurnMarketProjection(flows=tuple(flows), trades=trades)
+
+    def _bankruptcy_flows(
+        self,
+        events: tuple[CompanyBankruptEvent, ...],
+        apply_sequence: int,
+    ) -> tuple[MarketOrderFlowItem, ...]:
+        """Apply forced exchange exits and expose their cancelled orders."""
+        return tuple(
+            MarketOrderCancelled(
+                apply_sequence=apply_sequence,
+                cancelled_order=self._remove(order_id),
+            )
+            for event in events
+            for order_id in event.cancelled_order_ids
+        )
+
+    def _remove_bankrupt_orders(self, event: CompanyBankruptEvent) -> None:
+        """Apply a system-triggered forced exit without synthesizing a turn flow."""
+        for order_id in event.cancelled_order_ids:
+            self._remove(order_id)
 
     def frame(
         self,

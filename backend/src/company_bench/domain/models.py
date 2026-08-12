@@ -62,7 +62,7 @@ type BenchmarkScore = Annotated[
     economic_field(ge=ZERO, le=Decimal("100")),
     ECONOMIC_NORMALIZER,
 ]
-type ScoreVersion = Literal["s9-enterprise-v3", "s9-enterprise-v4"]
+type ScoreVersion = Literal["s9-enterprise-v5"]
 
 
 class InvalidOrderQuantity(ValueError):
@@ -136,6 +136,13 @@ class CompanyTier(StrEnum):
     FARM = "farm"
     PROCESSOR = "processor"
     RETAILER = "retailer"
+
+
+class CompanyStatus(StrEnum):
+    """Irreversible operating status of one company."""
+
+    ACTIVE = "active"
+    BANKRUPT = "bankrupt"
 
 
 class PolicyKind(StrEnum):
@@ -376,7 +383,7 @@ class DemandSpec(StrictModel):
 class ScoringSpec(StrictModel):
     """Immutable identity of the active benchmark scoring contract."""
 
-    score_version: ScoreVersion = "s9-enterprise-v4"
+    score_version: ScoreVersion = "s9-enterprise-v5"
 
 
 class RuntimeSpec(StrictModel):
@@ -492,6 +499,29 @@ class CompanyState(StrictModel):
     company_id: CompanyId
     cash: Money
     inventory: tuple[InventoryLot, ...] = ()
+    status: CompanyStatus = CompanyStatus.ACTIVE
+    bankrupt_on: SimDay | None = None
+
+    @model_validator(mode="after")
+    def validate_status(self) -> Self:
+        """Pair irreversible bankruptcy status with its declaration day."""
+        bankrupt = self.status is CompanyStatus.BANKRUPT
+        if bankrupt != (self.bankrupt_on is not None):
+            raise ValueError("bankrupt status and declaration day must be paired")
+        return self
+
+    @property
+    def is_active(self) -> bool:
+        """Return whether this company may still operate."""
+        return self.status is CompanyStatus.ACTIVE
+
+    def declare_bankrupt(self, on: SimDay) -> CompanyState:
+        """Enter the terminal bankrupt state exactly once."""
+        if not self.is_active:
+            return self
+        return self.model_copy(
+            update={"status": CompanyStatus.BANKRUPT, "bankrupt_on": on}
+        )
 
 
 class MarketSummary(StrictModel):
@@ -552,6 +582,7 @@ class PublicCompany(StrictModel):
     company_id: CompanyId
     name: str
     tier: CompanyTier
+    status: CompanyStatus
 
 
 class CompanyObservation(StrictModel):
@@ -675,13 +706,23 @@ class InventoryExpiredEvent(CompanyEvent):
     reference_value_loss: PositiveMoney
 
 
+class CompanyBankruptEvent(CompanyEvent):
+    """One irreversible exchange exit triggered by sub-threshold assets."""
+
+    event_type: Literal["company_bankrupt"] = "company_bankrupt"
+    total_assets: Money
+    cancelled_order_ids: tuple[Identifier, ...] = ()
+    retail_price_removed: bool = False
+
+
 type DomainEvent = Annotated[
     MilkProducedEvent
     | TradeExecutedEvent
     | DeliveryCompletedEvent
     | MilkProcessedEvent
     | ConsumerSaleEvent
-    | InventoryExpiredEvent,
+    | InventoryExpiredEvent
+    | CompanyBankruptEvent,
     Field(discriminator="event_type"),
 ]
 
@@ -699,6 +740,7 @@ class CompanySnapshot(StrictModel):
     week: int = Field(ge=1)
     company_id: CompanyId
     tier: CompanyTier
+    status: CompanyStatus
     cash: Money
     raw_milk_quantity: Quantity
     bottled_milk_quantity: Quantity
@@ -733,6 +775,7 @@ class CompanyScore(StrictModel):
 
     company_id: CompanyId
     tier: CompanyTier
+    status: CompanyStatus
     initial_value: PositiveMoney
     final_cash: Money
     final_inventory_value: Money
@@ -749,30 +792,27 @@ class ScoreCard(StrictModel):
     efficiency_raw: EconomicDecimal
     efficiency_reference: Money
     efficiency_score: UnitInterval
-    farm_gini: UnitInterval
-    processor_gini: UnitInterval
-    retailer_gini: UnitInterval
+    global_gini: UnitInterval
     fairness_score: UnitInterval
+    profit_participation_score: UnitInterval
     bankrupt_company_count: int = Field(ge=0)
-    bankruptcy_rate: UnitInterval
+    loss_making_company_count: int = Field(ge=0)
     companies: tuple[CompanyScore, ...]
 
     @model_validator(mode="after")
-    def validate_bankruptcy_rate(self) -> Self:
-        """Keep the aggregate bankruptcy facts aligned with company detail."""
+    def validate_company_counts(self) -> Self:
+        """Keep aggregate bankruptcy and loss facts aligned with company detail."""
         company_ids = [company.company_id for company in self.companies]
         if len(company_ids) != len(set(company_ids)):
             raise ValueError("score companies must be unique")
-        if self.bankrupt_company_count > len(self.companies):
-            raise ValueError("bankrupt_company_count cannot exceed company count")
-        if self.companies:
-            expected_rate = EconomicPrecision.round(
-                Decimal(self.bankrupt_company_count) / Decimal(len(self.companies))
-            )
-            if self.bankruptcy_rate != expected_rate:
-                raise ValueError("bankruptcy_rate must match bankrupt_company_count")
-        elif self.bankrupt_company_count or self.bankruptcy_rate:
-            raise ValueError("an empty company score cannot report bankruptcy")
+        bankrupt = sum(
+            company.status is CompanyStatus.BANKRUPT for company in self.companies
+        )
+        losses = sum(company.surplus < ZERO for company in self.companies)
+        if self.bankrupt_company_count != bankrupt:
+            raise ValueError("bankrupt_company_count must match company status")
+        if self.loss_making_company_count != losses:
+            raise ValueError("loss_making_company_count must match company surplus")
         return self
 
 

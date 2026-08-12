@@ -236,6 +236,8 @@ export function effectSummary(effect: EconomicEffectView): string {
       return `${companyLabel(effect.companyId)} sold ${formatExactDecimal(effect.soldQuantity)} to consumers for ${formatExactDecimal(effect.revenue)}`;
     case "inventory_expired":
       return `${companyLabel(effect.companyId)} discarded ${formatExactDecimal(effect.quantity)} ${productLabel(effect.product)}`;
+    case "company_bankrupt":
+      return `${companyLabel(effect.companyId)} exited with ${formatExactDecimal(effect.totalAssets)} in total assets`;
   }
 }
 

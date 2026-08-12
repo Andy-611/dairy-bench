@@ -1,4 +1,5 @@
 export type CompanyRole = "farm" | "processor" | "retailer";
+export type CompanyStatus = "active" | "bankrupt";
 export type PolicyMode = "baseline" | "model" | "replay";
 export type InvocationOutcome =
   | "success"
@@ -29,12 +30,11 @@ export interface ScoreView {
   readonly efficiencyRaw: DecimalText;
   readonly efficiencyReference: DecimalText;
   readonly efficiencyScore: DecimalText;
-  readonly farmGini: DecimalText;
-  readonly processorGini: DecimalText;
-  readonly retailerGini: DecimalText;
+  readonly globalGini: DecimalText;
   readonly fairnessScore: DecimalText;
+  readonly profitParticipationScore: DecimalText;
   readonly bankruptCompanyCount: number;
-  readonly bankruptcyRate: DecimalText;
+  readonly lossMakingCompanyCount: number;
 }
 
 export interface TokenUsageView {
@@ -77,6 +77,7 @@ export interface CompanyResultView {
   readonly companyId: string;
   readonly companyName: string;
   readonly role: CompanyRole;
+  readonly status: CompanyStatus;
   readonly policyName: string;
   readonly initialCash: DecimalText;
   readonly finalCash: DecimalText;
@@ -257,6 +258,13 @@ export type EconomicEffectView =
       readonly product: string;
       readonly quantity: DecimalText;
       readonly valueLoss: DecimalText;
+    }
+  | {
+      readonly kind: "company_bankrupt";
+      readonly companyId: string;
+      readonly totalAssets: DecimalText;
+      readonly cancelledOrderIds: readonly string[];
+      readonly retailPriceRemoved: boolean;
     }
 ;
 

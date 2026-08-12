@@ -5,7 +5,9 @@ import pytest
 from company_bench.domain.calendar import SimDay, Weekday
 from company_bench.domain.models import (
     ZERO,
+    CompanyBankruptEvent,
     CompanySnapshot,
+    CompanyStatus,
     ConsumerSaleEvent,
     DomainEvent,
     RetailerOperation,
@@ -34,6 +36,7 @@ def _state(
     scenario: ScenarioSpec,
     week: int,
     cash: dict[str, Decimal] | None = None,
+    bankrupt: frozenset[str] = frozenset(),
 ) -> WorldState:
     initial = EconomyEngine().initial_state(scenario, seed=42)
     if week == 0:
@@ -48,7 +51,17 @@ def _state(
                         "cash": balances.get(
                             company.company_id,
                             scenario.company(company.company_id).initial_cash,
-                        )
+                        ),
+                        "status": (
+                            CompanyStatus.BANKRUPT
+                            if company.company_id in bankrupt
+                            else CompanyStatus.ACTIVE
+                        ),
+                        "bankrupt_on": (
+                            SimDay.at(week=1)
+                            if company.company_id in bankrupt
+                            else None
+                        ),
                     }
                 )
                 for company in initial.companies
@@ -63,6 +76,7 @@ def _snapshot(
     cash: dict[str, Decimal] | None = None,
     *,
     potential_demand: Decimal = Decimal("40"),
+    bankrupt: frozenset[str] = frozenset(),
 ) -> WeekSnapshot:
     balances = cash or {}
     companies = tuple(
@@ -71,6 +85,11 @@ def _snapshot(
             week,
             company.company_id,
             balances.get(company.company_id, company.initial_cash),
+            (
+                CompanyStatus.BANKRUPT
+                if company.company_id in bankrupt
+                else CompanyStatus.ACTIVE
+            ),
         )
         for company in scenario.companies
     )
@@ -92,12 +111,14 @@ def _company_snapshot(
     week: int,
     company_id: str,
     cash: Decimal,
+    status: CompanyStatus,
 ) -> CompanySnapshot:
     company = scenario.company(company_id)
     return CompanySnapshot(
         week=week,
         company_id=company_id,
         tier=company.tier,
+        status=status,
         cash=cash,
         raw_milk_quantity=ZERO,
         bottled_milk_quantity=ZERO,
@@ -135,11 +156,12 @@ def _evaluate(
     final_cash: dict[str, Decimal],
     snapshots: tuple[WeekSnapshot, ...],
     events: tuple[DomainEvent, ...] | None = None,
+    bankrupt: frozenset[str] = frozenset(),
 ) -> ScoreCard:
     return Evaluator().evaluate(
         scenario,
         _state(scenario, 0),
-        _state(scenario, scenario.weeks, final_cash),
+        _state(scenario, scenario.weeks, final_cash, bankrupt),
         snapshots,
         _consumer_events(scenario) if events is None else events,
     )
@@ -152,16 +174,16 @@ def test_score_card_exposes_only_the_official_s9_contract() -> None:
         "efficiency_raw",
         "efficiency_reference",
         "efficiency_score",
-        "farm_gini",
-        "processor_gini",
-        "retailer_gini",
+        "global_gini",
         "fairness_score",
+        "profit_participation_score",
         "bankrupt_company_count",
-        "bankruptcy_rate",
+        "loss_making_company_count",
         "companies",
     }
 
-def test_evaluator_combines_continuous_efficiency_fairness_and_survival() -> None:
+
+def test_evaluator_combines_efficiency_global_fairness_and_profit_participation() -> None:
     scenario = _scenario()
     expected_reference = Decimal("273.375")
     per_company_gain = expected_reference / Decimal("18")
@@ -172,70 +194,97 @@ def test_evaluator_combines_continuous_efficiency_fairness_and_survival() -> Non
 
     score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
 
-    assert score.score_version == "s9-enterprise-v4"
+    assert score.score_version == "s9-enterprise-v5"
     assert score.efficiency_raw == expected_reference / Decimal("2")
     assert score.efficiency_reference == expected_reference
     assert score.efficiency_score == Decimal("0.5")
-    assert score.farm_gini == score.processor_gini == score.retailer_gini == ZERO
+    assert score.global_gini == ZERO
     assert score.fairness_score == Decimal("1")
+    assert score.profit_participation_score == Decimal("1")
     assert score.bankrupt_company_count == 0
-    assert score.bankruptcy_rate == ZERO
+    assert score.loss_making_company_count == 0
     assert score.final_score == Decimal("50.0")
 
 
-def test_three_company_tier_gini_uses_two_thirds_maximum() -> None:
+def test_global_gini_uses_all_nine_companies_final_assets() -> None:
     scenario = _scenario()
-    final_cash = {company.company_id: company.initial_cash for company in scenario.companies}
-    final_cash.update(
-        {
-            "farm_a": ZERO,
-            "farm_b": ZERO,
-            "farm_c": Decimal("3000"),
-        }
+    surviving_id = scenario.companies[-1].company_id
+    bankrupt = frozenset(
+        company.company_id
+        for company in scenario.companies
+        if company.company_id != surviving_id
+    )
+    final_cash = {company_id: ZERO for company_id in bankrupt}
+    final_cash[surviving_id] = Decimal("9000")
+    bankruptcies = tuple(
+        CompanyBankruptEvent(
+            occurred_on=SimDay.at(week=1),
+            company_id=company_id,
+            total_assets=ZERO,
+        )
+        for company_id in bankrupt
     )
 
-    score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
+    score = _evaluate(
+        scenario,
+        final_cash,
+        (_snapshot(scenario, 1, final_cash, bankrupt=bankrupt),),
+        (*_consumer_events(scenario), *bankruptcies),
+        bankrupt,
+    )
 
     assert score.efficiency_raw == ZERO
-    assert score.farm_gini == Decimal("0.6667")
-    assert score.processor_gini == score.retailer_gini == ZERO
-    assert score.fairness_score == Decimal("0.6667")
-    assert score.bankrupt_company_count == 2
-    assert score.bankruptcy_rate == Decimal("0.2222")
+    assert score.global_gini == Decimal("0.8889")
+    assert score.fairness_score == ZERO
+    assert score.profit_participation_score == Decimal("0.1111")
+    assert score.bankrupt_company_count == 8
+    assert score.loss_making_company_count == 8
     assert score.final_score == ZERO
 
 
-def test_bankruptcy_counts_net_worth_at_or_below_one_even_after_recovery() -> None:
-    scenario = _scenario(weeks=2)
-    expected_reference = Decimal("546.750")
-    per_company_gain = expected_reference / Decimal("18")
+def test_profit_participation_counts_only_negative_final_surplus() -> None:
+    scenario = _scenario()
     final_cash = {
-        company.company_id: company.initial_cash + per_company_gain
+        company.company_id: Decimal("900" if index < 6 else "1400")
+        for index, company in enumerate(scenario.companies)
+    }
+
+    score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
+
+    assert score.efficiency_score == Decimal("1")
+    assert score.loss_making_company_count == 6
+    assert score.profit_participation_score == Decimal("0.3333")
+    assert score.final_score == Decimal("54.2467")
+
+
+def test_bankruptcy_count_comes_from_irreversible_exit_events() -> None:
+    scenario = _scenario(weeks=2)
+    final_cash = {
+        company.company_id: company.initial_cash
         for company in scenario.companies
     }
-    week_one_cash = {
-        company.company_id: company.initial_cash for company in scenario.companies
-    }
-    week_one_cash["farm_a"] = Decimal("1.0000")
+    bankrupt = frozenset({"processor_a"})
+    week_one_cash = dict(final_cash)
     week_one_cash["processor_a"] = Decimal("0.9999")
-    week_one_cash["retailer_a"] = Decimal("1.0001")
+    bankruptcy = CompanyBankruptEvent(
+        occurred_on=SimDay.at(week=1),
+        company_id="processor_a",
+        total_assets=Decimal("0.9999"),
+    )
 
     score = _evaluate(
         scenario,
         final_cash,
         (
-            _snapshot(scenario, 1, week_one_cash),
-            _snapshot(scenario, 2, final_cash),
+            _snapshot(scenario, 1, week_one_cash, bankrupt=bankrupt),
+            _snapshot(scenario, 2, final_cash, bankrupt=bankrupt),
         ),
+        (*_consumer_events(scenario), bankruptcy),
+        bankrupt,
     )
 
-    assert score.efficiency_reference == expected_reference
-    assert score.efficiency_score == Decimal("0.5")
-    assert score.fairness_score == Decimal("1")
-    assert score.bankrupt_company_count == 2
-    assert score.bankruptcy_rate == Decimal("0.2222")
-    expected = Decimal("50") * (Decimal("7") / Decimal("9")).sqrt()
-    assert score.final_score == expected.quantize(Decimal("0.0001"))
+    assert score.bankrupt_company_count == 1
+    assert score.loss_making_company_count == 0
 
 
 def test_evaluator_rejects_an_incomplete_company_snapshot() -> None:

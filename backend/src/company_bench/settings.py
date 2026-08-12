@@ -57,7 +57,7 @@ class RuntimePaths:
     @property
     def database(self) -> Path:
         """Return the current weekly-runtime SQLite database path."""
-        return self.root / "data" / "runs-v6.sqlite3"
+        return self.root / "data" / "runs-v7.sqlite3"
 
     @property
     def model_capabilities(self) -> Path:

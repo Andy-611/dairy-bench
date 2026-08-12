@@ -2,9 +2,11 @@ from decimal import Decimal
 
 from company_bench.domain.models import (
     ZERO,
+    CompanyBankruptEvent,
     CompanyId,
     CompanyScore,
     CompanyState,
+    CompanyStatus,
     CompanyTier,
     ConsumerSaleEvent,
     DomainEvent,
@@ -17,15 +19,17 @@ from company_bench.domain.models import (
 )
 from company_bench.domain.precision import EconomicPrecision
 from company_bench.economy.demand import ConsumerDemandCurve
+from company_bench.economy.valuation import EnterpriseValuation
 
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
-_BANKRUPTCY_NET_WORTH_THRESHOLD = Decimal("1.0000")
-_S9_TIER_GINI_MAX = Decimal("2") / Decimal("3")
 
 
 class Evaluator:
     """Calculate the complete S9 benchmark score behind one pure interface."""
+
+    def __init__(self, valuation: EnterpriseValuation | None = None) -> None:
+        self._valuation = valuation or EnterpriseValuation()
 
     def evaluate(
         self,
@@ -72,28 +76,27 @@ class Evaluator:
             if efficiency_reference_raw > ZERO
             else ZERO
         )
-        farm_gini_raw = self._tier_gini(company_scores, CompanyTier.FARM)
-        processor_gini_raw = self._tier_gini(company_scores, CompanyTier.PROCESSOR)
-        retailer_gini_raw = self._tier_gini(company_scores, CompanyTier.RETAILER)
-        mean_gini = (
-            farm_gini_raw + processor_gini_raw + retailer_gini_raw
-        ) / Decimal("3")
-        fairness_score_raw = self._unit_interval(
-            _ONE - mean_gini / _S9_TIER_GINI_MAX
+        company_count = len(company_scores)
+        global_gini_raw = self._gini(
+            tuple(company.final_value for company in company_scores)
         )
-        bankrupt_company_ids = {
-            company.company_id
-            for snapshot in snapshots
-            for company in snapshot.companies
-            if company.net_worth <= _BANKRUPTCY_NET_WORTH_THRESHOLD
-        }
-        bankrupt_company_count = len(bankrupt_company_ids)
-        bankruptcy_rate_raw = Decimal(bankrupt_company_count) / Decimal(len(company_scores))
-        survival_score = _ONE - bankruptcy_rate_raw
+        maximum_gini = Decimal(company_count - 1) / Decimal(company_count)
+        fairness_score_raw = (
+            self._unit_interval(_ONE - global_gini_raw / maximum_gini)
+            if maximum_gini > ZERO
+            else _ONE
+        )
+        loss_making_company_count = sum(
+            company.surplus < ZERO for company in company_scores
+        )
+        profit_participation_raw = (
+            _ONE - Decimal(loss_making_company_count) / Decimal(company_count)
+        )
+        bankrupt_company_count = self._bankrupt_company_count(events, final_state)
         final_score = EconomicPrecision.round(
             _HUNDRED
             * efficiency_score_raw
-            * (fairness_score_raw * survival_score).sqrt()
+            * (fairness_score_raw * profit_participation_raw).sqrt()
         )
 
         return ScoreCard(
@@ -102,17 +105,18 @@ class Evaluator:
             efficiency_raw=efficiency_raw,
             efficiency_reference=EconomicPrecision.round(efficiency_reference_raw),
             efficiency_score=EconomicPrecision.round(efficiency_score_raw),
-            farm_gini=EconomicPrecision.round(farm_gini_raw),
-            processor_gini=EconomicPrecision.round(processor_gini_raw),
-            retailer_gini=EconomicPrecision.round(retailer_gini_raw),
+            global_gini=EconomicPrecision.round(global_gini_raw),
             fairness_score=EconomicPrecision.round(fairness_score_raw),
+            profit_participation_score=EconomicPrecision.round(
+                profit_participation_raw
+            ),
             bankrupt_company_count=bankrupt_company_count,
-            bankruptcy_rate=EconomicPrecision.round(bankruptcy_rate_raw),
+            loss_making_company_count=loss_making_company_count,
             companies=company_scores,
         )
 
-    @staticmethod
     def _company_score(
+        self,
         scenario: ScenarioSpec,
         company_id: CompanyId,
         tier: CompanyTier,
@@ -120,36 +124,21 @@ class Evaluator:
         final: CompanyState,
     ) -> CompanyScore:
         """Value one company's cash and inventory at fixed references."""
-        initial_inventory = scenario.inventory_value(initial.inventory)
         final_inventory = scenario.inventory_value(final.inventory)
-        initial_value = initial.cash + initial_inventory
-        final_value = final.cash + final_inventory
+        initial_value = self._valuation.settled_value(scenario, initial)
+        final_value = self._valuation.settled_value(scenario, final)
         if initial_value <= ZERO:
             raise ValueError("company initial value must be positive")
         return CompanyScore(
             company_id=company_id,
             tier=tier,
+            status=final.status,
             initial_value=initial_value,
             final_cash=final.cash,
             final_inventory_value=final_inventory,
             final_value=final_value,
             surplus=final_value - initial_value,
             growth=EconomicPrecision.round(final_value / initial_value),
-        )
-
-    @classmethod
-    def _tier_gini(
-        cls,
-        companies: tuple[CompanyScore, ...],
-        tier: CompanyTier,
-    ) -> Decimal:
-        """Calculate one tier's raw Gini from final capital growth."""
-        return cls._gini(
-            tuple(
-                company.final_value / company.initial_value
-                for company in companies
-                if company.tier is tier
-            )
         )
 
     @staticmethod
@@ -163,6 +152,29 @@ class Evaluator:
             start=ZERO,
         )
         return absolute_differences / (Decimal("2") * Decimal(len(values)) * total)
+
+    @staticmethod
+    def _bankrupt_company_count(
+        events: tuple[DomainEvent, ...],
+        final_state: WorldState,
+    ) -> int:
+        """Count unique authoritative exits and validate terminal company status."""
+        bankruptcies = tuple(
+            event for event in events if isinstance(event, CompanyBankruptEvent)
+        )
+        event_ids = [event.company_id for event in bankruptcies]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("each company may declare bankruptcy only once")
+        if any(event.total_assets >= _ONE for event in bankruptcies):
+            raise ValueError("bankruptcy requires total assets below one")
+        final_ids = {
+            company.company_id
+            for company in final_state.companies
+            if company.status is CompanyStatus.BANKRUPT
+        }
+        if set(event_ids) != final_ids:
+            raise ValueError("bankruptcy events must match final company status")
+        return len(bankruptcies)
 
     @staticmethod
     def _validate_consumer_sales(
@@ -278,8 +290,11 @@ class Evaluator:
 
         expected_company_ids = tuple(company.company_id for company in scenario.companies)
         initial_companies = {company.company_id: company for company in initial_state.companies}
+        if any(not company.is_active for company in initial_state.companies):
+            raise ValueError("evaluation must begin with active companies")
         raw_reference = scenario.product(ProductId.RAW_MILK).reference_value
         bottled_reference = scenario.product(ProductId.BOTTLED_MILK).reference_value
+        bankrupt_ids: set[CompanyId] = set()
         for snapshot in snapshots:
             if tuple(company.company_id for company in snapshot.companies) != expected_company_ids:
                 raise ValueError("every snapshot must contain each scenario company exactly once")
@@ -288,6 +303,13 @@ class Evaluator:
                     raise ValueError("company snapshot week does not match its parent snapshot")
                 if company.tier is not scenario.company(company.company_id).tier:
                     raise ValueError("company snapshot tier does not match the scenario")
+                if (
+                    company.company_id in bankrupt_ids
+                    and company.status is CompanyStatus.ACTIVE
+                ):
+                    raise ValueError("bankrupt companies cannot become active again")
+                if company.status is CompanyStatus.BANKRUPT:
+                    bankrupt_ids.add(company.company_id)
                 expected_inventory_value = EconomicPrecision.round(
                     company.raw_milk_quantity * raw_reference
                     + company.bottled_milk_quantity * bottled_reference
@@ -304,7 +326,9 @@ class Evaluator:
         final_companies = {company.company_id: company for company in final_state.companies}
         for company in snapshots[-1].companies:
             final = final_companies[company.company_id]
-            if company.cash != final.cash or company.inventory_value != scenario.inventory_value(
-                final.inventory
+            if (
+                company.cash != final.cash
+                or company.status is not final.status
+                or company.inventory_value != scenario.inventory_value(final.inventory)
             ):
                 raise ValueError("final snapshot does not match final state")

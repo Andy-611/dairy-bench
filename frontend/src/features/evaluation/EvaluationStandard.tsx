@@ -26,7 +26,7 @@ interface SymbolDefinition {
 interface MetricDefinition {
   readonly detail: string;
   readonly symbol: SymbolDefinition;
-  readonly tone?: "bankruptcy" | "farm" | "processor" | "retailer";
+  readonly tone?: "bankruptcy" | "loss";
   readonly value: string;
 }
 
@@ -97,48 +97,59 @@ const FORMULAS: readonly FormulaDefinition[] = [
   {
     label: "Fairness",
     expression: (
-      <Formula
-        spoken="F equals one minus the sum of farm, processor, and retailer Gini coefficients divided by two"
-      >
+      <>
+        <Formula spoken="G all is the Gini coefficient of all nine companies' final assets">
+          <mrow>
+            <MathSubscript base="G" subscript="all" /><mo>=</mo>
+            <mfrac>
+              <mrow>
+                <BoundedSum index="i" upper="9" />
+                <BoundedSum index="j" upper="9" />
+                <mo>|</mo><MathSubscript base="V" subscript="i" />
+                <mo>−</mo><MathSubscript base="V" subscript="j" /><mo>|</mo>
+              </mrow>
+              <mrow>
+                <mn>18</mn><BoundedSum index="i" upper="9" />
+                <MathSubscript base="V" subscript="i" />
+              </mrow>
+            </mfrac>
+          </mrow>
+        </Formula>
+        <Formula spoken="F all equals one minus nine eighths times G all, clipped between zero and one">
+          <mrow>
+            <MathSubscript base="F" subscript="all" /><mo>=</mo><mi>clip</mi>
+            <mo>(</mo><mn>1</mn><mo>−</mo>
+            <mfrac><mn>9</mn><mn>8</mn></mfrac><mo>·</mo>
+            <MathSubscript base="G" subscript="all" />
+            <mo>,</mo><mn>0</mn><mo>,</mo><mn>1</mn><mo>)</mo>
+          </mrow>
+        </Formula>
+      </>
+    ),
+    description: "Equality across all 9 companies, measured from final assets.",
+  },
+  {
+    label: "Enterprise outcomes",
+    expression: (
+      <Formula spoken="P equals one minus loss-making company count L divided by nine">
         <mrow>
-          <mi>F</mi><mo>=</mo><mn>1</mn><mo>−</mo>
-          <mfrac>
-            <mrow>
-              <MathSubscript base="G" subscript="farm" />
-              <mo>+</mo>
-              <MathSubscript base="G" subscript="processor" />
-              <mo>+</mo>
-              <MathSubscript base="G" subscript="retailer" />
-            </mrow>
-            <mn>2</mn>
-          </mfrac>
+          <mi>P</mi><mo>=</mo><mn>1</mn><mo>−</mo><mfrac><mi>L</mi><mn>9</mn></mfrac>
         </mrow>
       </Formula>
     ),
-    description: "Normalized equality across the three peer-company tiers.",
-  },
-  {
-    label: "Bankruptcy",
-    expression: (
-      <Formula spoken="B equals D divided by 9">
-        <mrow><mi>B</mi><mo>=</mo><mfrac><mi>D</mi><mn>9</mn></mfrac></mrow>
-      </Formula>
-    ),
-    description: "The share of companies that became economically bankrupt.",
+    description: "P is the share of companies that finish without a loss.",
   },
   {
     label: "Final composition",
     expression: (
-      <Formula spoken="Score equals 100 times E times the square root of F times one minus B">
+      <Formula spoken="Score equals 100 times E times the square root of F all times P">
         <mrow>
           <mtext>Score</mtext><mo>=</mo><mn>100</mn><mo>·</mo><mi>E</mi><mo>·</mo>
-          <msqrt>
-            <mi>F</mi><mo>(</mo><mn>1</mn><mo>−</mo><mi>B</mi><mo>)</mo>
-          </msqrt>
+          <msqrt><MathSubscript base="F" subscript="all" /><mi>P</mi></msqrt>
         </mrow>
       </Formula>
     ),
-    description: "Efficiency leads; fairness and survival jointly preserve quality.",
+    description: "Efficiency has full weight; fairness and profitable participation each have half weight.",
   },
 ];
 
@@ -161,41 +172,39 @@ export function EvaluationStandard({
           value: formatExactDecimal(score.efficiencyReference),
           detail: "Seed-specific reference",
         },
+        {
+          symbol: { base: "E" },
+          value: formatExactDecimal(score.efficiencyScore),
+          detail: "Normalized efficiency",
+        },
       ],
     },
     {
-      title: "Within-tier Gini",
-      detail: "Lower is fairer",
+      title: "Global fairness",
+      detail: "Lower Gini is fairer",
       metrics: [
         {
-          symbol: { base: "G", subscript: "farm" },
-          value: formatExactDecimal(score.farmGini),
-          detail: "Farm",
-          tone: "farm",
-        },
-        {
-          symbol: { base: "G", subscript: "processor" },
-          value: formatExactDecimal(score.processorGini),
-          detail: "Processor",
-          tone: "processor",
-        },
-        {
-          symbol: { base: "G", subscript: "retailer" },
-          value: formatExactDecimal(score.retailerGini),
-          detail: "Retailer",
-          tone: "retailer",
+          symbol: { base: "G", subscript: "all" },
+          value: formatExactDecimal(score.globalGini),
+          detail: "Final-asset Gini",
         },
       ],
     },
     {
-      title: "Bankruptcy",
-      detail: "Company count",
+      title: "Enterprise outcomes",
+      detail: "Company counts",
       metrics: [
         {
           symbol: { base: "D" },
           value: formatValue(score.bankruptCompanyCount),
-          detail: "of 9 companies",
+          detail: "Bankrupt companies",
           tone: "bankruptcy",
+        },
+        {
+          symbol: { base: "L" },
+          value: formatValue(score.lossMakingCompanyCount),
+          detail: "Loss-making companies",
+          tone: "loss",
         },
       ],
     },
@@ -211,8 +220,8 @@ export function EvaluationStandard({
           <h2 id="evaluation-title">Evaluation standard</h2>
         </div>
         <p>
-          One final score combines system efficiency, within-tier fairness, and
-          company survival.
+          One final score combines system efficiency, global fairness, and
+          profitable participation.
         </p>
       </header>
 
@@ -254,8 +263,8 @@ export function EvaluationStandard({
         <p className="formula-note">
           <MathSymbol base="V" subscript="i" /> is cash plus reference-valued
           inventory; <MathSymbol base="A" subscript="w,r" /> is seed-derived potential
-          demand. Gini is measured among the three companies in each tier. D counts any
-          company whose net worth is at or below 1.0000 at a week end.
+          demand. Gini uses all 9 companies' final assets. L counts negative final
+          surplus.
         </p>
       </div>
     </section>

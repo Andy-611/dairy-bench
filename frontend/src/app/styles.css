@@ -532,6 +532,10 @@ button:disabled {
   background: var(--orange);
 }
 
+.role-dot.loss {
+  background: var(--red);
+}
+
 .formula-section {
   padding: 22px 26px 24px;
   border-top: 1px solid #e5ebe6;
@@ -897,6 +901,16 @@ tbody tr:hover {
 
 .company-cell strong {
   font-size: 12px;
+}
+
+.company-status {
+  margin-left: 7px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #f9e4df;
+  color: var(--red);
+  font-size: 9px;
+  letter-spacing: 0.04em;
 }
 
 .role-dot {

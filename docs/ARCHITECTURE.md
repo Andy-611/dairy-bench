@@ -1,8 +1,8 @@
-# V6 Architecture and Invariants
+# V7 Architecture and Invariants
 
 ## 1. Simulation boundary
 
-The active scenario, `flow.dairy.base.s9.v6`, contains nine independent
+The active scenario, `flow.dairy.base.s9.v7`, contains nine independent
 companies and 52 trading weeks. The authoritative clock is `SimDay`; an episode
 contains 364 days and no minute-level economic time.
 
@@ -47,7 +47,7 @@ and UI projections never become economic authorities.
 2. Realize private productive capacity and base unit cost from the existing
    seeded formulas.
 3. Reset weekly order books, retail prices, used capacity, and turn budgets.
-4. Wake all nine companies.
+4. Wake every active company.
 
 ### Tuesday-Saturday
 
@@ -151,10 +151,24 @@ checkpoint. Interrupted/stopped runs resume from the same run ID. Completed
 replay uses the source observations and decisions but recomputes every engine
 outcome; any journal, event, snapshot, score, or quality drift fails replay.
 
-V6 intentionally uses a fresh `runs-v6.sqlite3` schema and does not read older
+V7 intentionally uses a fresh `runs-v7.sqlite3` schema and does not read older
 runtime payloads.
 
-## 9. Scoring
+## 9. Bankruptcy and delisting
+
+After every authoritative economic transition, the engine marks guaranteed
+enterprise assets at fixed product references. This includes available and
+order-reserved cash, on-hand and order-reserved inventory, in-transit purchases,
+and the guaranteed output of funded operations.
+
+An active company is declared bankrupt only when this value is strictly below
+`1.0000`; equality remains active. Declaration is terminal: all open orders are
+cancelled, any retail price is removed, future Agent wakes are cancelled, and a
+single `CompanyBankruptEvent` is journaled. Already funded operations and
+in-transit deliveries still settle into the estate, but cannot reactivate the
+company.
+
+## 10. Scoring
 
 One valid episode produces one score after all 52 weekly snapshots exist:
 
@@ -162,17 +176,21 @@ One valid episode produces one score after all 52 weekly snapshots exist:
 E_raw = Σ_i [V_i(T) - V_i(0)]
 E_ref = seeded maximum net value across 52 retailer-week markets
 E = clip(E_raw / E_ref, 0, 1)
-F = 1 - mean(tier Gini) / (2/3)
-B = bankrupt companies / 9
-Score = 100 × E × sqrt(F × (1 - B))
+G_all = Gini(V_1(T), ..., V_9(T))
+F_all = clip(1 - G_all / (8/9), 0, 1)
+L = companies with V_i(T) - V_i(0) < 0
+P = 1 - L / 9
+Score = 100 × E × sqrt(F_all × P)
 ```
 
-`V_i` is cash plus reference-valued inventory. Under `s9-enterprise-v4`, a
-company is counted once as bankrupt when its net worth is at or below `1.0000`
-in any weekly snapshot. Protocol validity is independent: any invalid Agent
-turn makes the result diagnostic-only.
+`V_i(T)` is final cash plus reference-valued inventory. Under
+`s9-enterprise-v5`, fairness uses the standard Gini over all nine final asset
+values, not capital-growth rates or tier-specific Ginis. The UI also reports
+`D`, the number of irreversible bankruptcy events, and `L`, the number of
+loss-making companies; neither rate is displayed. Protocol validity remains
+independent: any invalid Agent turn makes the result diagnostic-only.
 
-## 10. Required invariants
+## 11. Required invariants
 
 1. Exactly 52 weekly settlements and 52 snapshots complete an episode.
 2. Every projected week contains exactly seven ordered `TimelineDayFrame`s.
@@ -183,3 +201,5 @@ turn makes the result diagnostic-only.
 7. Same-day concurrent inference always has deterministic serial application.
 8. Only the engine mutates economic state.
 9. Journal/checkpoint progress is atomic and replay drift is fatal.
+10. Bankruptcy below `1.0000` is immediate and irreversible; a bankrupt company
+    receives no future Agent call.

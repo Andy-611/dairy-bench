@@ -6,7 +6,9 @@ from pydantic import ValidationError
 from company_bench.domain.calendar import SimDay, Weekday
 from company_bench.domain.models import (
     MAX_SEED,
+    CompanyBankruptEvent,
     CompanyState,
+    CompanyStatus,
     ConsumerSaleEvent,
     DeliveryCompletedEvent,
     FarmOperation,
@@ -240,6 +242,129 @@ def test_scenario_uses_52_weeks_and_formula_driven_weekly_quantities(
 def test_engine_rejects_invalid_seed(engine: EconomyEngine, seed: int) -> None:
     with pytest.raises(ValueError, match="seed must be an integer"):
         engine.initial_state(DAIRY_S9_SCENARIO, seed)
+
+
+def test_bankruptcy_uses_a_strict_sub_one_asset_threshold(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    companies = tuple(
+        company.model_copy(
+            update={
+                "cash": (
+                    Decimal("1.0000")
+                    if company.company_id == "farm_a"
+                    else Decimal("0.9999")
+                    if company.company_id == "farm_b"
+                    else company.cash
+                )
+            }
+        )
+        for company in world.companies
+    )
+
+    economy = engine.open_week(world.model_copy(update={"companies": companies}))
+
+    assert _company(economy, "farm_a").status is CompanyStatus.ACTIVE
+    assert _company(economy, "farm_b").status is CompanyStatus.BANKRUPT
+    assert tuple(
+        event.company_id
+        for event in economy.events
+        if isinstance(event, CompanyBankruptEvent)
+    ) == ("farm_b",)
+    with pytest.raises(ValueError, match="bankrupt companies"):
+        engine.observe_active(economy, "farm_b", _day(Weekday.MONDAY))
+
+
+def test_bankruptcy_delists_company_without_cancelling_funded_delivery(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    raw_lot = InventoryLot(
+        lot_id="seed.farm_a.raw",
+        product=ProductId.RAW_MILK,
+        quantity=Decimal("0.5"),
+        produced_week=1,
+        expires_end_of_week=2,
+    )
+    bottled_lot = InventoryLot(
+        lot_id="seed.processor_a.bottled",
+        product=ProductId.BOTTLED_MILK,
+        quantity=Decimal("0.2"),
+        produced_week=1,
+        expires_end_of_week=4,
+    )
+    companies = tuple(
+        company.model_copy(update={"inventory": (raw_lot,)})
+        if company.company_id == "farm_a"
+        else company.model_copy(
+            update={"cash": Decimal("1.6"), "inventory": (bottled_lot,)}
+        )
+        if company.company_id == "processor_a"
+        else company
+        for company in world.companies
+    )
+    economy = engine.open_week(world.model_copy(update={"companies": companies}))
+    monday = _day(Weekday.MONDAY)
+    economy, bottled_ask = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _quote(MarketSide.SELL, ProductId.BOTTLED_MILK, "0.2", "2"),
+        monday,
+        1,
+    )
+    economy, _ = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "0.5", "3.2"),
+        monday,
+        2,
+    )
+    economy, purchase = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _quote(MarketSide.BUY, ProductId.RAW_MILK, "0.5", "3.2"),
+        monday,
+        3,
+    )
+
+    bankruptcy = next(
+        event
+        for event in purchase.events
+        if isinstance(event, CompanyBankruptEvent)
+    )
+    assert purchase.accepted
+    assert _company(economy, "processor_a").status is CompanyStatus.BANKRUPT
+    assert bankruptcy.total_assets == Decimal("0.8500")
+    assert bankruptcy.cancelled_order_ids == (
+        bottled_ask.quote_ladder_result.levels[0].order_id,
+    )
+    assert economy.deliveries
+    assert all(
+        order.owner_id != "processor_a"
+        for market in economy.markets
+        for order in market.orders
+    )
+
+    delivery = economy.deliveries[0]
+    delivered = engine.complete_delivery(economy, delivery.delivery_id, delivery.arrives_on)
+
+    assert _company(delivered, "processor_a").status is CompanyStatus.BANKRUPT
+    assert _quantity(delivered, "processor_a", ProductId.RAW_MILK) == Decimal("0.5")
+    rejected, outcome = _apply(
+        engine,
+        delivered,
+        "processor_a",
+        SetRetailPrice(product=ProductId.BOTTLED_MILK, unit_price=Decimal("3")),
+        delivery.arrives_on,
+        4,
+    )
+    assert rejected == delivered
+    assert not outcome.accepted
+    assert outcome.reason == "company is bankrupt and delisted"
 
 
 def test_observations_expose_monday_and_private_weekly_economics(

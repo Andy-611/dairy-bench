@@ -6,6 +6,7 @@ import type {
   AttentionPlanView,
   CompanyResultView,
   CompanyRole,
+  CompanyStatus,
   WeeklySnapshotView,
   DecimalText,
   DecisionDispositionSource,
@@ -384,15 +385,20 @@ function parseScore(score: JsonRecord): ScoreView {
       "score.efficiency_reference",
     ),
     efficiencyScore: decimalText(score.efficiency_score, "score.efficiency_score"),
-    farmGini: decimalText(score.farm_gini, "score.farm_gini"),
-    processorGini: decimalText(score.processor_gini, "score.processor_gini"),
-    retailerGini: decimalText(score.retailer_gini, "score.retailer_gini"),
+    globalGini: decimalText(score.global_gini, "score.global_gini"),
     fairnessScore: decimalText(score.fairness_score, "score.fairness_score"),
+    profitParticipationScore: decimalText(
+      score.profit_participation_score,
+      "score.profit_participation_score",
+    ),
     bankruptCompanyCount: number(
       score.bankrupt_company_count,
       "score.bankrupt_company_count",
     ),
-    bankruptcyRate: decimalText(score.bankruptcy_rate, "score.bankruptcy_rate"),
+    lossMakingCompanyCount: number(
+      score.loss_making_company_count,
+      "score.loss_making_company_count",
+    ),
   };
 }
 
@@ -493,6 +499,7 @@ function parseCompany(
       text(companySpec.name, `company ${companyId}.name`),
     ),
     role: role(companyScore.tier, `${path}.tier`),
+    status: companyStatus(companyScore.status, `${path}.status`),
     policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "Unknown policy",
     initialCash: decimalText(companyScore.initial_value, `${path}.initial_value`),
     finalCash: decimalText(companyScore.final_cash, `${path}.final_cash`),
@@ -1417,6 +1424,29 @@ function parseTimelineEffects(
         ),
       };
     }
+    if (kind === "company_bankrupt") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        totalAssets: decimalText(
+          effect.total_assets,
+          `${effectPath}.total_assets`,
+        ),
+        cancelledOrderIds: array(
+          effect.cancelled_order_ids,
+          `${effectPath}.cancelled_order_ids`,
+        ).map((orderId, orderIndex) =>
+          text(
+            orderId,
+            `${effectPath}.cancelled_order_ids[${orderIndex}]`,
+          ),
+        ),
+        retailPriceRemoved: boolean(
+          effect.retail_price_removed,
+          `${effectPath}.retail_price_removed`,
+        ),
+      };
+    }
     throw new Error(`Backend field ${effectPath}.event_type is unknown.`);
   });
 }
@@ -1783,6 +1813,13 @@ function invocationOutcome(value: unknown, path: string): InvocationOutcome {
     return value;
   }
   throw new Error(`Backend field ${path} is not a known invocation outcome.`);
+}
+
+function companyStatus(value: unknown, path: string): CompanyStatus {
+  if (value === "active" || value === "bankrupt") {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known company status.`);
 }
 
 function nullableRunStopReason(

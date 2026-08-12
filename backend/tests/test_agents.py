@@ -58,7 +58,7 @@ def _llm_agent(
     repository: InMemoryRunStore | None = None,
     memory_token_budget: int = 12_288,
 ) -> tuple[LlmCompanyAgent, ScriptedDecisionGateway, InMemoryRunStore]:
-    """Create one isolated scripted V6 Agent and its audit repository."""
+    """Create one isolated scripted V7 Agent and its audit repository."""
     audit_repository = repository if repository is not None else InMemoryRunStore()
     gateway = ScriptedDecisionGateway(lambda _: decision)
     agent = LlmCompanyAgent(
@@ -70,7 +70,7 @@ def _llm_agent(
             name="bounded-agent",
             kind=PolicyKind.MODEL,
             provider="scripted",
-            model="scripted-v6",
+            model="scripted-v7",
             prompt_version=DECISION_PROMPT_VERSION,
         ),
         memory_token_budget=memory_token_budget,
@@ -88,7 +88,7 @@ def _turn(
     pending_deliveries: tuple[IncomingDeliveryView, ...] = (),
     active_operation: OperationJobView | None = None,
 ) -> AgentTurn:
-    """Create one runtime-owned V6 company turn."""
+    """Create one runtime-owned V7 company turn."""
     return AgentTurn(
         turn_id=f"{run_id}.{observation.company_id}.t1",
         company_id=observation.company_id,
@@ -108,7 +108,7 @@ def _turn(
 
 
 def _observation(company_id: str) -> CompanyObservation:
-    """Read one company's initial V6 observation."""
+    """Read one company's initial V7 observation."""
     engine = EconomyEngine()
     world = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return next(
@@ -140,7 +140,7 @@ def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decima
     return first, second, quantity - first - second
 
 
-def test_quote_ladder_uses_the_strict_v6_action_schema() -> None:
+def test_quote_ladder_uses_the_strict_v7_action_schema() -> None:
     adapter = TypeAdapter(EconomicCommand)
     command = adapter.validate_json(
         '{"kind":"set_quote_ladder","product":"raw_milk",'
@@ -222,7 +222,7 @@ def test_quote_ladder_enforces_depth_order_and_exact_quantities() -> None:
         ),
     ),
 )
-async def test_llm_agent_exposes_v6_commands_and_weekly_market_facts(
+async def test_llm_agent_exposes_v7_commands_and_weekly_market_facts(
     company_id: str,
     allowed_tools: tuple[str, ...],
 ) -> None:

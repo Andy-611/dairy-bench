@@ -13,6 +13,7 @@ from company_bench.domain.models import (
     ZERO,
     CompanyId,
     CompanyState,
+    CompanyStatus,
     Identifier,
     InventoryLot,
     Money,
@@ -151,6 +152,8 @@ class _Account:
     company_id: CompanyId
     cash: Money
     inventory: list[InventoryLot]
+    status: CompanyStatus
+    bankrupt_on: SimDay | None
 
 
 class AssetLedger:
@@ -180,6 +183,8 @@ class AssetLedger:
                 company_id=state.company_id,
                 cash=state.cash,
                 inventory=list(state.inventory),
+                status=state.status,
+                bankrupt_on=state.bankrupt_on,
             )
             for state in states
         }
@@ -308,6 +313,8 @@ class AssetLedger:
                 company_id=company_id,
                 cash=(account := self._account(company_id)).cash,
                 inventory=tuple(sorted(account.inventory, key=_lot_priority)),
+                status=account.status,
+                bankrupt_on=account.bankrupt_on,
             )
             for company_id in self._company_order
         )
@@ -330,6 +337,8 @@ class AssetLedger:
                 company_id=company_id,
                 cash=(account := staged._account(company_id)).cash,
                 inventory=list(account.inventory),
+                status=account.status,
+                bankrupt_on=account.bankrupt_on,
             )
             for company_id in self._company_order
         }
@@ -779,6 +788,14 @@ class ContinuousSpotMarket:
             self._release(order)
         self._state = self._state.model_copy(update={"is_open": False, "orders": ()})
         return released
+
+    def cancel_company_orders(self, owner_id: CompanyId) -> tuple[LimitOrder, ...]:
+        """Release every active commitment owned by one exiting company."""
+        self._require_open()
+        orders = tuple(order for order in self._state.orders if order.owner_id == owner_id)
+        for order in orders:
+            self._cancel(order_id=order.order_id, owner_id=owner_id)
+        return orders
 
     def view(self) -> OrderBookView:
         """Return all anonymous public price levels."""

@@ -28,6 +28,7 @@ from company_bench.agents.contracts import (
     PolicyTerminalError,
 )
 from company_bench.domain.models import (
+    CompanyBankruptEvent,
     CompanyEvent,
     CompanyId,
     DomainEvent,
@@ -129,7 +130,7 @@ class _PendingTurn:
 
 
 class EpisodeRuntime:
-    """Run one V6 episode with deterministic daily scheduling and atomic decisions."""
+    """Run one V7 episode with deterministic daily scheduling and atomic decisions."""
 
     def __init__(
         self,
@@ -183,12 +184,15 @@ class EpisodeRuntime:
             self._schedule_week(scheduler, economy.week)
             turns: list[TurnRecord] = []
             system_steps: list[SystemStepRecord] = []
-            event_records: list[EventRecord] = []
+            event_records = [
+                EventRecord(sequence=index, event=event)
+                for index, event in enumerate(economy.events, start=1)
+            ]
             snapshots: list[WeekSnapshot] = []
             cursors = {company.company_id: _Cursor() for company in self.scenario.companies}
         else:
-            economy = self._restore_economy(checkpoint.economy)
             self._validate_recovery(recovery, run_id, seed, agents)
+            economy = checkpoint.economy
             scheduler = Scheduler.restore(checkpoint.scheduler)
             turns = list(recovery.turns)
             system_steps = list(recovery.system_steps)
@@ -257,6 +261,7 @@ class EpisodeRuntime:
                 snapshots,
                 next_journal_sequence,
             )
+            self._retire_bankrupt_companies(economy, scheduler, cursors)
             self._expire_attention(bucket, cursors)
             pending_system_steps = list(new_steps)
             pending_completed_weeks = list(completed_weeks)
@@ -300,6 +305,7 @@ class EpisodeRuntime:
                     snapshots,
                     next_journal_sequence,
                 )
+                self._retire_bankrupt_companies(economy, scheduler, cursors)
                 self._expire_attention(same_day, cursors)
                 pending_system_steps.extend(step_delta)
                 pending_completed_weeks.extend(week_delta)
@@ -328,7 +334,14 @@ class EpisodeRuntime:
                     for completed_week in pending_completed_weeks:
                         await on_week_completed(completed_week)
                 break
-            merged_wakes = self._merge_wakes(tuple(wake_events))
+            merged_wakes = self._merge_wakes(
+                tuple(
+                    wake
+                    for wake in wake_events
+                    if wake.company_id is not None
+                    and economy.is_active(wake.company_id)
+                )
+            )
             ready_wakes = self._defer_busy_wakes(
                 scheduler,
                 merged_wakes,
@@ -437,6 +450,7 @@ class EpisodeRuntime:
                 first_apply_sequence=next_apply_sequence,
                 apply_sequences=accepted_sequences,
             )
+            self._retire_bankrupt_companies(economy, scheduler, cursors)
             outcomes = self._merge_outcomes(
                 ordered,
                 envelopes,
@@ -500,6 +514,7 @@ class EpisodeRuntime:
                 )
                 self._schedule_trade_wakes(scheduler, record)
             self._schedule_price_alerts(scheduler, economy, cursors)
+            self._retire_bankrupt_companies(economy, scheduler, cursors)
             for record in new_records:
                 company_id = record.turn.company_id
                 audit_key = (economy.week, company_id)
@@ -678,7 +693,9 @@ class EpisodeRuntime:
             snapshot_week: int | None = None
             entry_id = system_step_id(run_id, event.event_id)
             if event.kind is SystemEventKind.WEEK_OPEN:
-                for company in self.scenario.companies:
+                for company in economy.companies:
+                    if not company.is_active:
+                        continue
                     scheduler.schedule_wake(
                         company.company_id,
                         event.scheduled_for,
@@ -713,7 +730,7 @@ class EpisodeRuntime:
                 if event.company_id is None:
                     raise ValueError("completion event is missing company_id")
                 wake_on = self.scenario.calendar.next_decision_day(event.scheduled_for)
-                if wake_on is not None:
+                if wake_on is not None and economy.is_active(event.company_id):
                     scheduler.schedule_wake(
                         event.company_id,
                         wake_on,
@@ -729,7 +746,9 @@ class EpisodeRuntime:
                         reference_ids=(reference_id,),
                     )
             elif event.kind is SystemEventKind.MARKET_CLOSE:
+                before = len(economy.events)
                 economy = self._engine.close_markets(economy, event.scheduled_for)
+                self._append_events(event_records, economy.events[before:])
             elif event.kind is SystemEventKind.CONSUMER_SALES:
                 before = len(economy.events)
                 economy = self._engine.settle_consumer_sales(
@@ -820,7 +839,7 @@ class EpisodeRuntime:
                 turn_counts.get((economy.week, event.company_id), 0) + 1,
             )
             for event in sorted(wake_events, key=lambda item: item.company_id or "")
-            if event.company_id is not None
+            if event.company_id is not None and economy.is_active(event.company_id)
         )
         tasks = tuple(
             asyncio.create_task(self._ask_agent(turn, agents[turn.company_id])) for turn in turns
@@ -1431,24 +1450,14 @@ class EpisodeRuntime:
             raise ValueError("checkpoint belongs to another run")
         if checkpoint.economy.seed != seed:
             raise ValueError("checkpoint uses a different seed")
+        if checkpoint.economy.scenario != self.scenario:
+            raise ValueError("checkpoint uses a different scenario")
         if checkpoint.policies != _policy_descriptors(self.scenario, agents):
             raise ValueError("checkpoint policy metadata differs from the active Agents")
         expected = {company.company_id for company in self.scenario.companies}
         actual = {cursor.company_id for cursor in checkpoint.cursors}
         if actual != expected:
             raise ValueError("checkpoint must contain one cursor per company")
-
-    def _restore_economy(self, economy: EconomyState) -> EconomyState:
-        """Rebind a scoring-only checkpoint upgrade to the active scenario."""
-        compatible_scenario = economy.scenario.model_copy(
-            update={"scoring": self.scenario.scoring}
-        )
-        if compatible_scenario != self.scenario:
-            raise ValueError("checkpoint uses a different economic scenario")
-        if economy.scenario == self.scenario:
-            return economy
-        base_state = economy.base_state.model_copy(update={"scenario": self.scenario})
-        return economy.model_copy(update={"base_state": base_state})
 
     @staticmethod
     def _append_events(
@@ -1463,11 +1472,26 @@ class EpisodeRuntime:
 
     @staticmethod
     def _event_is_visible(event: DomainEvent, company_id: CompanyId) -> bool:
+        if isinstance(event, CompanyBankruptEvent):
+            return True
         if isinstance(event, TradeExecutedEvent):
             return company_id in {event.seller_id, event.buyer_id}
         if isinstance(event, CompanyEvent):
             return event.company_id == company_id
         return False
+
+    @staticmethod
+    def _retire_bankrupt_companies(
+        economy: EconomyState,
+        scheduler: Scheduler,
+        cursors: Mapping[str, _Cursor],
+    ) -> None:
+        """Remove every future Agent wake and attention plan after delisting."""
+        for company in economy.companies:
+            if company.is_active:
+                continue
+            scheduler.cancel_company_wakes(company.company_id)
+            cursors[company.company_id].active_attention = None
 
     def _validate_agent_set(self, agents: Mapping[str, CompanyAgent]) -> None:
         expected = {company.company_id for company in self.scenario.companies}
