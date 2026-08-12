@@ -140,16 +140,16 @@ class PrivateEconomicsProjector:
 def _marginal_cost(observation: CompanyObservation) -> Decimal | None:
     """Return the next minimum batch's private cost per input unit."""
     operation = observation.operation
-    daily = observation.daily_operation
-    if not isinstance(operation, (FarmOperation, ProcessorOperation)) or daily is None:
+    weekly = observation.weekly_operation
+    if not isinstance(operation, (FarmOperation, ProcessorOperation)) or weekly is None:
         return None
-    if daily.remaining_capacity < ECONOMIC_QUANTUM:
+    if weekly.remaining_capacity < ECONOMIC_QUANTUM:
         return None
     cost = operation.cost.incremental_cost(
-        daily_capacity=daily.daily_capacity,
-        used_capacity=daily.used_capacity,
+        weekly_capacity=weekly.weekly_capacity,
+        used_capacity=weekly.used_capacity,
         quantity=ECONOMIC_QUANTUM,
-        daily_base_unit_cost=daily.daily_base_unit_cost,
+        weekly_base_unit_cost=weekly.weekly_base_unit_cost,
     )
     return EconomicPrecision.round(cost / ECONOMIC_QUANTUM)
 

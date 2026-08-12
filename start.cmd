@@ -4,6 +4,7 @@ setlocal
 set "DAIRY_BENCH_HOME=%~dp0.dairy-bench"
 set "BACKEND_URL=http://127.0.0.1:8000"
 set "FRONTEND_URL=http://127.0.0.1:5173"
+set "EXPECTED_API_VERSION=0.6.0"
 
 if /i "%~1"=="--configure-newapi" (
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\scripts\configure_newapi.ps1"
@@ -70,7 +71,7 @@ echo [Dairy Bench] NewAPI: not configured; run start.cmd --configure-newapi
 exit /b 0
 
 :probe_backend
-powershell.exe -NoProfile -Command "$listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $listener) { exit 1 }; try { $api = Invoke-RestMethod -Uri '%BACKEND_URL%/openapi.json' -TimeoutSec 10; if ($api.info.title -eq 'Dairy Bench API') { Write-Host ('[Dairy Bench] Backend already running on port 8000, PID ' + $listener.OwningProcess + '; reusing it.'); exit 0 } } catch {}; $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $listener.OwningProcess); Write-Host ('[Dairy Bench] Port 8000 is occupied by PID ' + $listener.OwningProcess + ': ' + $process.CommandLine); exit 2"
+powershell.exe -NoProfile -Command "$listener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $listener) { exit 1 }; try { $api = Invoke-RestMethod -Uri '%BACKEND_URL%/openapi.json' -TimeoutSec 10; if ($api.info.title -eq 'Dairy Bench API' -and $api.info.version -eq '%EXPECTED_API_VERSION%') { Write-Host ('[Dairy Bench] Backend already running on port 8000, PID ' + $listener.OwningProcess + '; reusing it.'); exit 0 } } catch {}; $process = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $listener.OwningProcess); Write-Host ('[Dairy Bench] Port 8000 is occupied by an incompatible process, PID ' + $listener.OwningProcess + ': ' + $process.CommandLine); exit 2"
 exit /b %errorlevel%
 
 :probe_frontend
@@ -88,7 +89,7 @@ start "Dairy Bench Frontend" cmd.exe /k "cd /d ""%~dp0frontend"" && call npm.cmd
 exit /b 0
 
 :wait_for_services
-powershell.exe -NoProfile -Command "$deadline = (Get-Date).AddSeconds(60); $backendReady = $false; $frontendReady = $false; while ((Get-Date) -lt $deadline -and -not ($backendReady -and $frontendReady)) { if (-not $backendReady) { try { $api = Invoke-RestMethod -Uri '%BACKEND_URL%/openapi.json' -TimeoutSec 10; $backendReady = $api.info.title -eq 'Dairy Bench API' } catch {} }; if (-not $frontendReady) { try { $page = Invoke-WebRequest -UseBasicParsing -Uri '%FRONTEND_URL%' -TimeoutSec 2; $health = Invoke-RestMethod -Uri '%FRONTEND_URL%/api/health' -TimeoutSec 10; $frontendReady = $page.StatusCode -eq 200 -and $page.Content -match '<title>Dairy Bench</title>' -and $health.status -eq 'ok' } catch {} }; if (-not ($backendReady -and $frontendReady)) { Start-Sleep -Milliseconds 250 } }; if ($backendReady -and $frontendReady) { exit 0 }; Write-Host ('[Dairy Bench] Readiness timeout. Backend=' + $backendReady + ', Frontend=' + $frontendReady); exit 1"
+powershell.exe -NoProfile -Command "$deadline = (Get-Date).AddSeconds(60); $backendReady = $false; $frontendReady = $false; while ((Get-Date) -lt $deadline -and -not ($backendReady -and $frontendReady)) { if (-not $backendReady) { try { $api = Invoke-RestMethod -Uri '%BACKEND_URL%/openapi.json' -TimeoutSec 10; $backendReady = $api.info.title -eq 'Dairy Bench API' -and $api.info.version -eq '%EXPECTED_API_VERSION%' } catch {} }; if (-not $frontendReady) { try { $page = Invoke-WebRequest -UseBasicParsing -Uri '%FRONTEND_URL%' -TimeoutSec 2; $health = Invoke-RestMethod -Uri '%FRONTEND_URL%/api/health' -TimeoutSec 10; $frontendReady = $page.StatusCode -eq 200 -and $page.Content -match '<title>Dairy Bench</title>' -and $health.status -eq 'ok' } catch {} }; if (-not ($backendReady -and $frontendReady)) { Start-Sleep -Milliseconds 250 } }; if ($backendReady -and $frontendReady) { exit 0 }; Write-Host ('[Dairy Bench] Readiness timeout. Backend=' + $backendReady + ', Frontend=' + $frontendReady); exit 1"
 exit /b %errorlevel%
 
 :port_conflict

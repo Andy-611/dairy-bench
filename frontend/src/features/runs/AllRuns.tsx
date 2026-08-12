@@ -1,5 +1,6 @@
 import type { RunJobView } from "../../shared/api/types";
 import { isActiveRun, isResumableRun } from "../../shared/runStatus";
+import { completedWeeks } from "../../shared/simulationCalendar";
 
 interface AllRunsProps {
   readonly busy: boolean;
@@ -103,11 +104,18 @@ function runLabel(job: RunJobView): string {
       : job.mode === "replay"
         ? "completed replay"
         : "rule baseline";
-  const status =
-    job.status === "completed" && job.quality?.benchmarkEligible === false
-      ? "COMPLETED · DIAGNOSTIC"
-      : job.status.toUpperCase();
-  return `${status} · ${shortRunId(job.runId)} · ${policy} · day ${job.currentDay}/${job.totalDays}`;
+  const status = runStatusLabel(job);
+  return `${status} · ${shortRunId(job.runId)} · ${policy} · week ${completedWeeks(job.currentAbsoluteDay)}/${job.totalWeeks}`;
+}
+
+function runStatusLabel(job: RunJobView): string {
+  if (job.status === "completed" && job.quality?.benchmarkEligible === false) {
+    return "COMPLETED · DIAGNOSTIC";
+  }
+  if (job.status === "stopped" && job.stopReason === "quota_exhausted") {
+    return "STOPPED · QUOTA EXHAUSTED";
+  }
+  return job.status.toUpperCase();
 }
 
 function shortRunId(runId: string): string {

@@ -7,12 +7,12 @@ from company_bench.domain.models import (
     CompanyState,
     CompanyTier,
     ConsumerSaleEvent,
-    DaySnapshot,
     DomainEvent,
     ProductId,
     RetailerOperation,
     ScenarioSpec,
     ScoreCard,
+    WeekSnapshot,
     WorldState,
 )
 from company_bench.domain.precision import EconomicPrecision
@@ -20,6 +20,7 @@ from company_bench.economy.demand import ConsumerDemandCurve
 
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
+_BANKRUPTCY_NET_WORTH_THRESHOLD = Decimal("1.0000")
 _S9_TIER_GINI_MAX = Decimal("2") / Decimal("3")
 
 
@@ -31,7 +32,7 @@ class Evaluator:
         scenario: ScenarioSpec,
         initial_state: WorldState,
         final_state: WorldState,
-        snapshots: tuple[DaySnapshot, ...],
+        snapshots: tuple[WeekSnapshot, ...],
         events: tuple[DomainEvent, ...],
     ) -> ScoreCard:
         """Validate and score one complete deterministic episode."""
@@ -84,7 +85,7 @@ class Evaluator:
             company.company_id
             for snapshot in snapshots
             for company in snapshot.companies
-            if company.net_worth == ZERO
+            if company.net_worth <= _BANKRUPTCY_NET_WORTH_THRESHOLD
         }
         bankrupt_company_count = len(bankrupt_company_ids)
         bankruptcy_rate_raw = Decimal(bankrupt_company_count) / Decimal(len(company_scores))
@@ -167,7 +168,7 @@ class Evaluator:
     def _validate_consumer_sales(
         scenario: ScenarioSpec,
         seed: int,
-        snapshots: tuple[DaySnapshot, ...],
+        snapshots: tuple[WeekSnapshot, ...],
         events: tuple[DomainEvent, ...],
         demand_curve: ConsumerDemandCurve,
     ) -> None:
@@ -178,17 +179,23 @@ class Evaluator:
             if isinstance(company.operation, RetailerOperation)
         )
         expected_keys = tuple(
-            (day, company_id) for day in range(1, scenario.days + 1) for company_id in retailer_ids
+            (week, company_id)
+            for week in range(1, scenario.weeks + 1)
+            for company_id in retailer_ids
         )
         sales = tuple(event for event in events if isinstance(event, ConsumerSaleEvent))
-        indexed_sales = {(event.day, event.company_id): event for event in sales}
+        indexed_sales = {(event.occurred_on.week, event.company_id): event for event in sales}
         if len(indexed_sales) != len(sales):
-            raise ValueError("consumer sale events must be unique per day and retailer")
+            raise ValueError("consumer sale events must be unique per week and retailer")
         if set(indexed_sales) != set(expected_keys):
-            raise ValueError("consumer sale events must cover every day and retailer exactly once")
+            raise ValueError("consumer sale events must cover every week and retailer exactly once")
 
         for sale in sales:
-            expected_potential = demand_curve.potential(seed, sale.day, sale.company_id)
+            expected_potential = demand_curve.potential(
+                seed,
+                sale.occurred_on.week,
+                sale.company_id,
+            )
             if sale.potential_demand_quantity != expected_potential:
                 raise ValueError("consumer sale potential does not match the episode seed")
             expected_demand = demand_curve.quantity(
@@ -209,17 +216,19 @@ class Evaluator:
             if sale.retail_price is None and sale.sold_quantity != ZERO:
                 raise ValueError("a retailer without a price cannot complete consumer sales")
 
-        snapshots_by_day = {snapshot.day: snapshot for snapshot in snapshots}
-        for day in range(1, scenario.days + 1):
-            daily_sales = tuple(indexed_sales[(day, company_id)] for company_id in retailer_ids)
-            snapshot = snapshots_by_day[day]
+        snapshots_by_week = {snapshot.week: snapshot for snapshot in snapshots}
+        for week in range(1, scenario.weeks + 1):
+            weekly_sales = tuple(
+                indexed_sales[(week, company_id)] for company_id in retailer_ids
+            )
+            snapshot = snapshots_by_week[week]
             if snapshot.consumer_demand != sum(
-                (sale.potential_demand_quantity for sale in daily_sales),
+                (sale.potential_demand_quantity for sale in weekly_sales),
                 start=ZERO,
             ):
                 raise ValueError("snapshot consumer demand does not match consumer events")
             if snapshot.consumer_sales != sum(
-                (sale.sold_quantity for sale in daily_sales),
+                (sale.sold_quantity for sale in weekly_sales),
                 start=ZERO,
             ):
                 raise ValueError("snapshot consumer sales do not match consumer events")
@@ -230,14 +239,14 @@ class Evaluator:
         seed: int,
         demand_curve: ConsumerDemandCurve,
     ) -> Decimal:
-        """Derive this seed's reference directly from every retailer-day market."""
+        """Derive this seed's reference directly from every retailer-week market."""
         total = ZERO
-        for day in range(1, scenario.days + 1):
+        for week in range(1, scenario.weeks + 1):
             for company in scenario.companies:
                 operation = company.operation
                 if not isinstance(operation, RetailerOperation):
                     continue
-                potential = demand_curve.potential(seed, day, company.company_id)
+                potential = demand_curve.potential(seed, week, company.company_id)
                 unit_cost = scenario.product(operation.input_product).reference_value
                 total += demand_curve.max_net_value(potential, unit_cost)
         return total
@@ -252,20 +261,20 @@ class Evaluator:
         scenario: ScenarioSpec,
         initial_state: WorldState,
         final_state: WorldState,
-        snapshots: tuple[DaySnapshot, ...],
+        snapshots: tuple[WeekSnapshot, ...],
     ) -> None:
         """Reject mismatched, incomplete, or internally inconsistent episode facts."""
         if initial_state.scenario != scenario or final_state.scenario != scenario:
             raise ValueError("states do not belong to the supplied scenario")
         if initial_state.seed != final_state.seed:
             raise ValueError("initial and final seeds differ")
-        if initial_state.day != 0:
-            raise ValueError("evaluation must start from day zero")
-        if final_state.day != scenario.days:
+        if initial_state.completed_weeks != 0:
+            raise ValueError("evaluation must start before week one")
+        if final_state.completed_weeks != scenario.weeks:
             raise ValueError("evaluation requires a complete episode")
-        expected_days = tuple(range(1, scenario.days + 1))
-        if tuple(snapshot.day for snapshot in snapshots) != expected_days:
-            raise ValueError("snapshots must cover every day exactly once")
+        expected_weeks = tuple(range(1, scenario.weeks + 1))
+        if tuple(snapshot.week for snapshot in snapshots) != expected_weeks:
+            raise ValueError("snapshots must cover every week exactly once")
 
         expected_company_ids = tuple(company.company_id for company in scenario.companies)
         initial_companies = {company.company_id: company for company in initial_state.companies}
@@ -275,8 +284,8 @@ class Evaluator:
             if tuple(company.company_id for company in snapshot.companies) != expected_company_ids:
                 raise ValueError("every snapshot must contain each scenario company exactly once")
             for company in snapshot.companies:
-                if company.day != snapshot.day:
-                    raise ValueError("company snapshot day does not match its parent snapshot")
+                if company.week != snapshot.week:
+                    raise ValueError("company snapshot week does not match its parent snapshot")
                 if company.tier is not scenario.company(company.company_id).tier:
                     raise ValueError("company snapshot tier does not match the scenario")
                 expected_inventory_value = EconomicPrecision.round(

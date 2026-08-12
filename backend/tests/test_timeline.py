@@ -14,6 +14,7 @@ from company_bench.agents.company import (
     ReplayCompanyAgent,
 )
 from company_bench.agents.contracts import DecisionModelRequest, DecisionModelResult
+from company_bench.domain.calendar import Weekday
 from company_bench.domain.models import PolicyKind, PolicyMetadata, ProductId, TradeExecutedEvent
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
@@ -35,7 +36,6 @@ from company_bench.runtime.models import (
     SetQuoteLadder,
     SystemStepRecord,
     TurnRecord,
-    WakeReason,
 )
 from company_bench.storage.store import InMemoryRunStore, SQLiteRunStore
 from company_bench.timeline.market import MarketProjectionError, MarketTimelineProjector
@@ -68,8 +68,8 @@ def _complete(
             seed=result.seed,
             source_run_id=source_run_id,
             scenario_id=result.scenario.scenario_id,
-            current_day=result.scenario.days,
-            total_days=result.scenario.days,
+            current_absolute_day=result.scenario.calendar.total_days,
+            total_weeks=result.scenario.weeks,
             submitted_at=result.started_at,
             started_at=result.started_at,
             finished_at=result.finished_at,
@@ -106,7 +106,7 @@ class _AuditedUnauthorizedGateway:
                     ProductId.RAW_MILK,
                     ("10", "1.40"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             ),
             provider="scripted",
             model="rejection-model",
@@ -127,29 +127,28 @@ class _MarketTimelineAgent:
     metadata = PolicyMetadata(name="market-timeline", kind=PolicyKind.BASELINE)
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
-        """Return one deterministic decision from the current virtual minute."""
-        minute = turn.sim_time.minute_of_day
-        open_minute = turn.observation.runtime.open_minute
-        if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
+        """Return one deterministic decision from the current simulated day."""
+        weekday = turn.sim_day.weekday
+        if turn.company_id == "processor_a" and weekday is Weekday.MONDAY:
             return company_decision(
                 _ladder(
                     MarketSide.BUY,
                     ProductId.RAW_MILK,
                     ("40", "1.66"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             )
         if turn.company_id != "farm_a":
             return company_decision()
-        if WakeReason.DAY_OPEN in turn.wake_reasons:
+        if weekday is Weekday.MONDAY:
             return company_decision(
                 Produce(
                     product=ProductId.RAW_MILK,
                     quantity=Decimal("60"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             )
-        if minute == open_minute + 30:
+        if weekday is Weekday.TUESDAY:
             return company_decision(
                 _ladder(
                     MarketSide.SELL,
@@ -157,9 +156,9 @@ class _MarketTimelineAgent:
                     ("50", "1.65"),
                     ("10", "1.80"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             )
-        if minute == open_minute + 31 and turn.open_orders:
+        if weekday is Weekday.WEDNESDAY and turn.open_orders:
             return company_decision(
                 _ladder(
                     MarketSide.SELL,
@@ -167,12 +166,12 @@ class _MarketTimelineAgent:
                     ("10", "1.65"),
                     ("10", "1.75"),
                 ),
-                review_after_minutes=1,
+                review_after_days=1,
             )
-        if minute == open_minute + 32 and turn.open_orders:
+        if weekday is Weekday.THURSDAY and turn.open_orders:
             return company_decision(
                 _ladder(MarketSide.SELL, ProductId.RAW_MILK),
-                review_after_minutes=30,
+                review_after_days=1,
             )
         return company_decision()
 
@@ -181,14 +180,14 @@ class _TwoBidMarketTimelineAgent(_MarketTimelineAgent):
     """Add a second same-price processor bid for priority-corruption tests."""
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
-        if turn.company_id.startswith("processor_") and WakeReason.DAY_OPEN in turn.wake_reasons:
+        if turn.company_id.startswith("processor_") and turn.sim_day.weekday is Weekday.MONDAY:
             return company_decision(
                 _ladder(
                     MarketSide.BUY,
                     ProductId.RAW_MILK,
                     ("40", "1.66"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             )
         return await super().act(turn)
 
@@ -199,7 +198,7 @@ class _ThreeFillMarketTimelineAgent:
     metadata = PolicyMetadata(name="three-fill-timeline", kind=PolicyKind.BASELINE)
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
-        if turn.company_id == "processor_a" and WakeReason.DAY_OPEN in turn.wake_reasons:
+        if turn.company_id == "processor_a" and turn.sim_day.weekday is Weekday.MONDAY:
             return company_decision(
                 _ladder(
                     MarketSide.BUY,
@@ -208,16 +207,16 @@ class _ThreeFillMarketTimelineAgent:
                     ("10", "1.60"),
                     ("10", "1.50"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             )
         if turn.company_id != "farm_a":
             return company_decision()
-        if WakeReason.DAY_OPEN in turn.wake_reasons:
+        if turn.sim_day.weekday is Weekday.MONDAY:
             return company_decision(
                 Produce(product=ProductId.RAW_MILK, quantity=Decimal("30")),
-                review_after_minutes=30,
+                review_after_days=1,
             )
-        if WakeReason.OPERATION_COMPLETED in turn.wake_reasons:
+        if turn.sim_day.weekday is Weekday.TUESDAY:
             return company_decision(
                 _ladder(
                     MarketSide.SELL,
@@ -226,14 +225,14 @@ class _ThreeFillMarketTimelineAgent:
                     ("10", "1.45"),
                     ("10", "1.50"),
                 ),
-                review_after_minutes=30,
+                review_after_days=1,
             )
         return company_decision()
 
 
 @pytest.mark.asyncio
 async def test_timeline_projects_system_steps_turns_and_typed_state_changes() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -243,12 +242,12 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
     )
     _complete(repository, execution, mode=PolicyKind.BASELINE)
 
-    page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
+    page = RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
 
     assert page.context.model_call_count == 0
     assert page.context.current_usage == TokenUsage()
     diagnostics = page.context.diagnostics
-    assert diagnostics.completed_days == 1
+    assert diagnostics.completed_weeks == 1
     assert diagnostics.benchmark_eligible
     assert diagnostics.protocol_invalid_turns == 0
     assert diagnostics.trade_count == sum(
@@ -256,30 +255,32 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
     )
     assert diagnostics.consumer_demand == execution.episode.snapshots[0].consumer_demand
     assert diagnostics.consumer_sales == execution.episode.snapshots[0].consumer_sales
-    steps = tuple(step for moment in page.moments for step in moment.system_steps)
+    steps = tuple(step for moment in page.days for step in moment.system_steps)
     assert {step.kind.value for step in steps}.issuperset(
-        {"day_open", "market_close", "consumer_sales", "day_close"}
+        {"week_open", "day_started", "market_close", "consumer_sales", "week_close"}
     )
-    assert sum(len(moment.turns) for moment in page.moments) == len(execution.turns)
-    assert any(turn.state_changes for moment in page.moments for turn in moment.turns)
+    assert tuple(day.sim_day.weekday for day in page.days) == tuple(Weekday)
+    assert page.week_summaries[0].week == 1
+    assert sum(len(moment.turns) for moment in page.days) == len(execution.turns)
+    assert any(turn.state_changes for moment in page.days for turn in moment.turns)
     assert all(
         turn.observation.visible_event_count == len(turn.observation.visible_events)
-        for moment in page.moments
+        for moment in page.days
         for turn in moment.turns
     )
     assert all(
         turn.observation.cash >= 0 and turn.observation.reserved_cash >= 0
-        for moment in page.moments
+        for moment in page.days
         for turn in moment.turns
     )
     assert all(
         turn.disposition_source is DecisionDispositionSource.ECONOMIC_ENGINE
-        for moment in page.moments
+        for moment in page.days
         for turn in moment.turns
         if turn.outcome.accepted
     )
     close = next(
-        step for moment in page.moments for step in moment.system_steps if step.kind == "day_close"
+        step for moment in page.days for step in moment.system_steps if step.kind == "week_close"
     )
     assert close.state_version_after >= close.state_version_before
 
@@ -305,15 +306,15 @@ async def test_timeline_projects_system_steps_turns_and_typed_state_changes() ->
 async def test_timeline_identifies_runtime_attention_rejection() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(
         update={
-            "days": 1,
+            "weeks": 1,
             "runtime": DAIRY_S9_SCENARIO.runtime.model_copy(
-                update={"max_turns_per_company_day": 1}
+                update={"max_turns_per_company_week": 1}
             ),
         }
     )
     agents = {
         company.company_id: FixedDecisionAgent(
-            (company_decision(review_after_minutes=scenario.runtime.max_review_minutes + 1),)
+            (company_decision(review_after_days=scenario.runtime.max_review_days + 1),)
             if company.company_id == "farm_a"
             else (company_decision(),)
         )
@@ -328,9 +329,9 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
     )
     _complete(repository, execution, mode=PolicyKind.BASELINE)
 
-    page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
+    page = RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
     farm_turn = next(
-        turn for moment in page.moments for turn in moment.turns if turn.company_id == "farm_a"
+        turn for moment in page.days for turn in moment.turns if turn.company_id == "farm_a"
     )
 
     assert not farm_turn.outcome.accepted
@@ -345,7 +346,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     scenario = DAIRY_S9_SCENARIO.model_copy(
         update={
             "scenario_id": "timeline.market.current",
-            "days": 1,
+            "weeks": 1,
             "companies": companies,
         }
     )
@@ -358,30 +359,30 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     )
     _complete(repository, execution, mode=PolicyKind.BASELINE)
 
-    page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
-    frames = {moment.sim_time.minute_of_day: moment.market for moment in page.moments}
+    page = RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
+    frames = {day.sim_day.weekday: day.market for day in page.days}
     raw_at_open = next(
         book
-        for book in frames[scenario.runtime.open_minute].closing_order_books
+        for book in frames[Weekday.MONDAY].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
     raw_after_fill = next(
         book
-        for book in frames[scenario.runtime.open_minute + 30].closing_order_books
+        for book in frames[Weekday.TUESDAY].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
 
     assert raw_at_open.best_bid == Decimal("1.66")
     assert raw_at_open.bids[0].size == Decimal("40")
     assert raw_at_open.bids[0].orders[0].owner_id == "processor_a"
-    open_flow = frames[scenario.runtime.open_minute].order_flow
+    open_flow = frames[Weekday.MONDAY].order_flow
     assert len(open_flow) == 1
     assert isinstance(open_flow[0], MarketOrderPlaced)
     assert open_flow[0].incoming_order.owner_id == "processor_a"
     assert open_flow[0].matched_quantity == 0
     assert open_flow[0].remaining_quantity == Decimal("40")
 
-    fill_frame = frames[scenario.runtime.open_minute + 30]
+    fill_frame = frames[Weekday.TUESDAY]
     assert len(fill_frame.order_flow) == 2
     assert len({flow.apply_sequence for flow in fill_frame.order_flow}) == 1
     fill_flow = fill_frame.order_flow[0]
@@ -396,7 +397,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert tuple(trade.quantity for trade in fill_frame.trades) == (Decimal("40"),)
     assert fill_frame.trades[0].maker_order_id == fill_flow.matches[0].maker_order.order_id
     assert fill_frame.trades[0].taker_order_id == fill_flow.incoming_order.order_id
-    assert fill_frame.trades[0].arrives_at.minute_of_day == scenario.runtime.open_minute + 60
+    assert fill_frame.trades[0].arrives_on.weekday is Weekday.WEDNESDAY
     passive_flow = fill_frame.order_flow[1]
     assert isinstance(passive_flow, MarketOrderPlaced)
     assert passive_flow.incoming_order.limit_price == Decimal("1.80")
@@ -415,10 +416,10 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
     raw_after_replace = next(
         book
-        for book in frames[scenario.runtime.open_minute + 31].closing_order_books
+        for book in frames[Weekday.WEDNESDAY].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
-    replace_flow = frames[scenario.runtime.open_minute + 31].order_flow
+    replace_flow = frames[Weekday.WEDNESDAY].order_flow
     assert len(replace_flow) == 2
     assert len({flow.apply_sequence for flow in replace_flow}) == 1
     assert isinstance(replace_flow[0], MarketOrderPreserved)
@@ -434,10 +435,10 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
 
     raw_after_cancel = next(
         book
-        for book in frames[scenario.runtime.open_minute + 32].closing_order_books
+        for book in frames[Weekday.THURSDAY].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
-    cancel_flow = frames[scenario.runtime.open_minute + 32].order_flow
+    cancel_flow = frames[Weekday.THURSDAY].order_flow
     assert len(cancel_flow) == 2
     assert len({flow.apply_sequence for flow in cancel_flow}) == 1
     assert all(isinstance(flow, MarketOrderCancelled) for flow in cancel_flow)
@@ -447,17 +448,17 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
     assert raw_after_cancel.bids == ()
     assert raw_after_cancel.asks == ()
 
-    cancel_minute = scenario.runtime.open_minute + 32
-    partial_projection = MarketTimelineProjector().project_day(
+    cancel_day = 4
+    partial_projection = MarketTimelineProjector().project_week(
         scenario,
         1,
         repository.list_turns(execution.episode.run_id),
         repository.list_system_steps(execution.episode.run_id),
-        (cancel_minute,),
+        (cancel_day,),
     )
     partial_raw_book = next(
         book
-        for book in partial_projection[cancel_minute].closing_order_books
+        for book in partial_projection[cancel_day].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
     assert partial_raw_book.bids == ()
@@ -472,7 +473,7 @@ async def test_market_timeline_replays_three_independently_filled_ladder_levels(
     scenario = DAIRY_S9_SCENARIO.model_copy(
         update={
             "scenario_id": "timeline.market.three-fill.current",
-            "days": 1,
+            "weeks": 1,
             "companies": companies,
         }
     )
@@ -485,11 +486,11 @@ async def test_market_timeline_replays_three_independently_filled_ladder_levels(
     )
     _complete(repository, execution, mode=PolicyKind.BASELINE)
 
-    fill_minute = scenario.runtime.open_minute + 30
+    fill_day = 2
     ladder_record = next(
         record
         for record in execution.turns
-        if record.turn.company_id == "farm_a" and record.turn.sim_time.minute_of_day == fill_minute
+        if record.turn.company_id == "farm_a" and record.turn.sim_day.absolute_day == fill_day
     )
     result = ladder_record.outcome.quote_ladder_result
     assert result is not None
@@ -507,9 +508,9 @@ async def test_market_timeline_replays_three_independently_filled_ladder_levels(
         == 3
     )
 
-    page = RunTimelineProjector(repository).read_day(execution.episode.run_id, 1)
+    page = RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
     fill_frame = next(
-        moment.market for moment in page.moments if moment.sim_time.minute_of_day == fill_minute
+        day.market for day in page.days if day.sim_day.absolute_day == fill_day
     )
     assert len(fill_frame.order_flow) == 3
     assert all(isinstance(flow, MarketOrderPlaced) for flow in fill_frame.order_flow)
@@ -539,14 +540,14 @@ async def test_market_timeline_replays_three_independently_filled_ladder_levels(
     assert raw_book.bids == ()
     assert raw_book.asks == ()
 
-    replayed = MarketTimelineProjector().project_day(
+    replayed = MarketTimelineProjector().project_week(
         scenario,
         1,
         repository.list_turns(execution.episode.run_id),
         repository.list_system_steps(execution.episode.run_id),
-        (fill_minute,),
+        (fill_day,),
     )
-    assert replayed[fill_minute] == fill_frame
+    assert replayed[fill_day] == fill_frame
 
 
 @pytest.mark.asyncio
@@ -558,7 +559,7 @@ async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> Non
     scenario = DAIRY_S9_SCENARIO.model_copy(
         update={
             "scenario_id": "timeline.market.priority.current",
-            "days": 1,
+            "weeks": 1,
             "companies": companies,
         }
     )
@@ -570,21 +571,21 @@ async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> Non
         store=repository,
     )
     system_steps = repository.list_system_steps(execution.episode.run_id)
-    frames = MarketTimelineProjector().project_day(
+    frames = MarketTimelineProjector().project_week(
         scenario,
         1,
         execution.turns,
         system_steps,
-        (scenario.runtime.open_minute, scenario.runtime.open_minute + 30),
+        (1, 2),
     )
     raw_at_open = next(
         book
-        for book in frames[scenario.runtime.open_minute].closing_order_books
+        for book in frames[1].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
     raw_after_fill = next(
         book
-        for book in frames[scenario.runtime.open_minute + 30].closing_order_books
+        for book in frames[2].closing_order_books
         if book.product is ProductId.RAW_MILK
     )
     assert tuple(order.queue_ahead_quantity for order in raw_at_open.bids[0].orders) == (
@@ -622,18 +623,18 @@ async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> Non
     )
 
     with pytest.raises(MarketProjectionError, match="price-time maker priority"):
-        MarketTimelineProjector().project_day(
+        MarketTimelineProjector().project_week(
             scenario,
             1,
             corrupted_turns,
             system_steps,
-            (scenario.runtime.open_minute + 30,),
+            (2,),
         )
 
 
 @pytest.mark.asyncio
 async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -651,7 +652,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
                 invocation_id=f"inv_{index}",
                 run_id=source.episode.run_id,
                 company_id=source_turn.turn.company_id,
-                day=source_turn.turn.observation.day,
+                week=source_turn.turn.sim_day.week,
                 observation=source_turn.turn.observation,
                 provider="newapi",
                 model="test-model",
@@ -661,7 +662,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
                 finished_at=started_at,
                 outcome=InvocationOutcome.SUCCESS,
                 domain_turn_id=source_turn.turn.turn_id,
-                sim_minute=source_turn.turn.sim_time.absolute_minute,
+                absolute_day=source_turn.turn.sim_day.absolute_day,
                 state_version=source_turn.turn.state_version,
                 apply_sequence=(source_turn.outcome.apply_sequence if applied else None),
                 decision=source_turn.envelope.decision,
@@ -691,7 +692,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
     )
 
     projector = RunTimelineProjector(repository)
-    page = projector.read_day(replay.episode.run_id, 1)
+    page = projector.read_week(replay.episode.run_id, 1)
     replay_turn_id = next(
         record.turn.turn_id
         for record in replay.turns
@@ -714,7 +715,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
 async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
     tmp_path: Path,
 ) -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     memory = InMemoryRunStore()
     await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -735,7 +736,7 @@ async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
 
 @pytest.mark.asyncio
 async def test_timeline_does_not_invent_unpersisted_system_steps() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     durable = InMemoryRunStore()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -752,10 +753,10 @@ async def test_timeline_does_not_invent_unpersisted_system_steps() -> None:
     journal_only.record_system_step(recovery.system_steps[-1])
     _complete(journal_only, execution, mode=PolicyKind.BASELINE)
 
-    page = RunTimelineProjector(journal_only).read_day(execution.episode.run_id, 1)
-    steps = tuple(step for moment in page.moments for step in moment.system_steps)
+    page = RunTimelineProjector(journal_only).read_week(execution.episode.run_id, 1)
+    steps = tuple(step for moment in page.days for step in moment.system_steps)
     assert len(steps) == 1
-    assert steps[0].kind == "day_close"
+    assert steps[0].kind == "week_close"
 
 
 class _StopAfterFirstProgress:
@@ -775,7 +776,7 @@ class _StopAfterFirstProgress:
 
 @pytest.mark.asyncio
 async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     run_id = "failed_ladder_history"
     agents: dict[str, CompanyAgent] = {
@@ -813,7 +814,7 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
             status=RunStatus.FAILED,
             seed=17,
             scenario_id=scenario.scenario_id,
-            total_days=scenario.days,
+            total_weeks=scenario.weeks,
             submitted_at=checkpoint.episode_started_at,
             started_at=checkpoint.episode_started_at,
             finished_at=datetime.now(UTC),
@@ -821,9 +822,9 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
         )
     )
 
-    page = RunTimelineProjector(repository).read_day(run_id, 1)
+    page = RunTimelineProjector(repository).read_week(run_id, 1)
     turn = next(
-        turn for moment in page.moments for turn in moment.turns if turn.company_id == "farm_a"
+        turn for moment in page.days for turn in moment.turns if turn.company_id == "farm_a"
     )
     invocation = repository.list_invocations(run_id)[0]
 
@@ -834,7 +835,7 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
             ProductId.RAW_MILK,
             ("10", "1.40"),
         ),
-        review_after_minutes=30,
+        review_after_days=1,
     )
     assert not turn.outcome.accepted
     assert turn.disposition_source is DecisionDispositionSource.ECONOMIC_ENGINE
@@ -847,13 +848,13 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
     assert invocation.usage.total_tokens == 5
     assert invocation.attempts == 2
     assert invocation.latency_ms == 17
-    assert page.context.checkpoint_at == checkpoint.scheduler.now
+    assert page.context.checkpoint_on == checkpoint.scheduler.today
     assert page.context.checkpoint_state_version == checkpoint.economy.state_version
 
 
 @pytest.mark.asyncio
 async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -889,23 +890,23 @@ async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
             seed=7,
             source_run_id=source.episode.run_id,
             scenario_id=scenario.scenario_id,
-            total_days=1,
+            total_weeks=1,
             submitted_at=checkpoint.episode_started_at,
             started_at=checkpoint.episode_started_at,
         )
     )
 
-    page = RunTimelineProjector(repository).read_day("prefix_replay", 1)
+    page = RunTimelineProjector(repository).read_week("prefix_replay", 1)
     assert page.context.replay is True
-    assert page.context.checkpoint_at == checkpoint.scheduler.now
+    assert page.context.checkpoint_on == checkpoint.scheduler.today
     assert page.context.checkpoint_state_version == checkpoint.economy.state_version
-    assert sum(len(moment.turns) for moment in page.moments) == len(recovery.turns)
-    assert all(turn.replay_origin is not None for moment in page.moments for turn in moment.turns)
+    assert sum(len(moment.turns) for moment in page.days) == len(recovery.turns)
+    assert all(turn.replay_origin is not None for moment in page.days for turn in moment.turns)
 
 
 @pytest.mark.asyncio
 async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
@@ -956,8 +957,8 @@ async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
     )
 
     projector = RunTimelineProjector(repository)
-    page = projector.read_day(second.episode.run_id, 1)
-    first_turn = next(turn for moment in page.moments for turn in moment.turns)
+    page = projector.read_week(second.episode.run_id, 1)
+    first_turn = next(turn for moment in page.days for turn in moment.turns)
     assert page.context.source_run_id == first.episode.run_id
     assert page.context.trace_run_id == source.episode.run_id
     assert first_turn.replay_origin is not None

@@ -16,6 +16,7 @@ from company_bench.agents.contracts import (
     ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
+    ModelQuotaExhaustedError,
 )
 from company_bench.agents.providers import newapi as newapi_module
 from company_bench.agents.providers.capabilities import ModelCapabilityError
@@ -36,7 +37,7 @@ from company_bench.runtime.models import (
     MarketSide,
     QuoteLevel,
     SetQuoteLadder,
-    SimTime,
+    SimDay,
     WakeReason,
 )
 
@@ -78,11 +79,11 @@ def _turn(observation: CompanyObservation) -> AgentTurn:
     return AgentTurn.model_construct(
         turn_id="newapi_test.farm_a.t1",
         company_id="farm_a",
-        sim_time=SimTime(absolute_minute=540),
+        sim_day=SimDay(absolute_day=540),
         state_version=0,
-        turn_number_today=1,
-        turn_limit_today=observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.DAY_OPEN,),
+        turn_number_this_week=1,
+        turn_limit_this_week=observation.runtime.max_turns_per_company_week,
+        wake_reasons=(WakeReason.WEEK_OPEN,),
         observation=observation,
         available_cash=observation.cash,
         marked_surplus=Decimal(),
@@ -618,6 +619,46 @@ def test_gateway_does_not_retry_authentication_failure() -> None:
     with pytest.raises(ModelConfigurationError, match="NewAPI HTTP 401"):
         asyncio.run(_with_gateway(handler, operation, max_attempts=3))
     assert calls == 1
+
+
+@pytest.mark.parametrize("status_code", (403, 429))
+def test_gateway_classifies_balance_exhaustion_without_retrying(
+    status_code: int,
+) -> None:
+    observation = _observation()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _error_response(
+            request,
+            status_code,
+            "insufficient_quota",
+            "预扣费额度失败, 用户剩余额度: $0.10, 需要预扣费额度: $0.30",
+        )
+
+    async def operation(gateway: NewApiModelGateway) -> object:
+        return await gateway.generate_decision(_decision_request(observation))
+
+    with pytest.raises(ModelQuotaExhaustedError, match="预扣费额度失败") as raised:
+        asyncio.run(_with_gateway(handler, operation, max_attempts=3))
+    assert calls == 1
+    assert raised.value.request_id == "req_error"
+    assert raised.value.attempts == 1
+
+
+def test_gateway_keeps_unrelated_403_as_configuration_failure() -> None:
+    observation = _observation()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _error_response(request, 403, "permission_denied", "model access denied")
+
+    async def operation(gateway: NewApiModelGateway) -> object:
+        return await gateway.generate_decision(_decision_request(observation))
+
+    with pytest.raises(ModelConfigurationError, match="model access denied"):
+        asyncio.run(_with_gateway(handler, operation, max_attempts=3))
 
 
 @pytest.mark.parametrize(

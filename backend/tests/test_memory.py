@@ -23,7 +23,6 @@ from company_bench.runtime.models import (
     DecisionOutcome,
     DecisionStatus,
     IdleDecision,
-    SimTime,
     TurnRecord,
     WakeReason,
 )
@@ -33,7 +32,7 @@ RUN_ID = "memory_run"
 
 @pytest.fixture(scope="module")
 def observations() -> dict[str, CompanyObservation]:
-    """Return one private day-one observation per company."""
+    """Return one private week-one Monday observation per company."""
     engine = EconomyEngine()
     state = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return {observation.company_id: observation for observation in engine.observe(state)}
@@ -61,7 +60,7 @@ def test_memory_rejects_cross_company_and_cross_run_state(
         memory.remember(_exchange(observations["processor_a"], 2))
 
     checkpoint = memory.checkpoint()
-    assert checkpoint.schema_version == 7
+    assert checkpoint.schema_version == 8
     with pytest.raises(ValueError, match="another company"):
         ConversationMemory.restore(RUN_ID, "farm_b", checkpoint)
     with pytest.raises(ValueError, match="another run"):
@@ -201,18 +200,19 @@ def _exchange(
     run_id: str = RUN_ID,
 ) -> MemoryExchange:
     company_id = observation.company_id
-    sim_time = SimTime(absolute_minute=540 + index * 30)
+    sim_day = observation.sim_day.plus_days(index - 1)
+    observed_today = observation.model_copy(update={"sim_day": sim_day})
     turn_id = f"turn_{company_id}_{index}"
     decision_id = f"decision_{company_id}_{index}"
     turn = AgentTurn(
         turn_id=turn_id,
         company_id=company_id,
-        sim_time=sim_time,
+        sim_day=sim_day,
         state_version=index - 1,
-        turn_number_today=index,
-        turn_limit_today=observation.runtime.max_turns_per_company_day,
+        turn_number_this_week=index,
+        turn_limit_this_week=observation.runtime.max_turns_per_company_week,
         wake_reasons=(WakeReason.REVIEW_DUE,),
-        observation=observation,
+        observation=observed_today,
         available_cash=observation.cash,
         marked_surplus=Decimal(),
     )
@@ -220,7 +220,7 @@ def _exchange(
         turn_id=turn_id,
         decision_id=decision_id,
         company_id=company_id,
-        issued_at=sim_time,
+        issued_on=sim_day,
         state_version=index - 1,
         decision=IdleDecision(attention=AttentionPlan()),
     )
@@ -228,12 +228,12 @@ def _exchange(
         turn_id=turn_id,
         decision_id=decision_id,
         company_id=company_id,
-        occurred_at=sim_time,
+        occurred_on=sim_day,
         status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=index,
         apply_sequence=index,
-        next_available_at=sim_time.plus(30),
+        next_available_on=sim_day.plus_days(1),
     )
     return MemoryExchange.from_record(
         TurnRecord(

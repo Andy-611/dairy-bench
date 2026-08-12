@@ -3,6 +3,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+from company_bench.domain.calendar import SimDay, Weekday
 from company_bench.domain.models import CompanyObservation, ProductId, RuntimeSpec
 from company_bench.runtime.attention import AgentAttention, ArmedAttention, AttentionRejected
 from company_bench.runtime.models import (
@@ -11,7 +12,6 @@ from company_bench.runtime.models import (
     OrderBookView,
     PriceLevelView,
     QuoteAlert,
-    SimTime,
     WakeReason,
 )
 
@@ -36,19 +36,21 @@ def _alert(
 def _turn(
     observation: CompanyObservation,
     *,
-    minute: int = 9 * 60,
+    weekday: Weekday = Weekday.MONDAY,
     order_books: tuple[OrderBookView, ...] = (),
     turn_number: int = 1,
 ) -> AgentTurn:
+    sim_day = SimDay.at(week=1, weekday=weekday)
+    observed_today = observation.model_copy(update={"sim_day": sim_day})
     return AgentTurn(
         turn_id="run_1.farm_a.t1",
         company_id=observation.company_id,
-        sim_time=SimTime(absolute_minute=minute),
+        sim_day=sim_day,
         state_version=0,
-        turn_number_today=turn_number,
-        turn_limit_today=observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.DAY_OPEN,),
-        observation=observation,
+        turn_number_this_week=turn_number,
+        turn_limit_this_week=observation.runtime.max_turns_per_company_week,
+        wake_reasons=(WakeReason.WEEK_OPEN,),
+        observation=observed_today,
         available_cash=observation.cash,
         marked_surplus=Decimal(),
         order_books=order_books,
@@ -66,8 +68,9 @@ def _level(price: str) -> PriceLevelView:
 def test_runtime_defaults_bound_attention_without_periodic_order_review() -> None:
     runtime = RuntimeSpec()
 
-    assert runtime.max_review_minutes == 120
-    assert runtime.max_turns_per_company_day == 25
+    assert runtime.default_review_days == 1
+    assert runtime.max_review_days == 2
+    assert runtime.max_turns_per_company_week == 6
     assert "order_review_interval_minutes" not in RuntimeSpec.model_fields
 
 
@@ -83,23 +86,23 @@ def test_attention_accepts_at_most_three_typed_alerts() -> None:
         AttentionPlan(alerts=(*alerts, _alert(price="1.20")))
 
 
-def test_agent_turn_exposes_a_consistent_daily_budget(
+def test_agent_turn_exposes_a_consistent_weekly_budget(
     first_observation: CompanyObservation,
 ) -> None:
-    turn = _turn(first_observation, turn_number=25)
+    turn = _turn(first_observation, turn_number=6)
 
-    assert turn.turn_number_today == turn.turn_limit_today == 25
+    assert turn.turn_number_this_week == turn.turn_limit_this_week == 6
     with pytest.raises(ValidationError, match="cannot exceed"):
-        _turn(first_observation, turn_number=26)
+        _turn(first_observation, turn_number=7)
     with pytest.raises(ValidationError, match="must match the runtime turn limit"):
         AgentTurn(
             turn_id="run_1.farm_a.t1",
             company_id=first_observation.company_id,
-            sim_time=SimTime.at(day=0, hour=9),
+            sim_day=first_observation.sim_day,
             state_version=0,
-            turn_number_today=1,
-            turn_limit_today=24,
-            wake_reasons=(WakeReason.DAY_OPEN,),
+            turn_number_this_week=1,
+            turn_limit_this_week=5,
+            wake_reasons=(WakeReason.WEEK_OPEN,),
             observation=first_observation,
             available_cash=first_observation.cash,
             marked_surplus=Decimal(),
@@ -114,17 +117,17 @@ def test_arm_uses_the_bounded_default_review(
     plan = AgentAttention().arm(AttentionPlan(), turn)
 
     assert plan.source_turn_id == turn.turn_id
-    assert plan.armed_at == turn.sim_time
-    assert plan.review_at == SimTime.at(day=0, hour=11)
+    assert plan.armed_on == turn.sim_day
+    assert plan.review_on == SimDay.at(week=1, weekday=Weekday.TUESDAY)
     assert plan.alerts == ()
 
 
-def test_default_review_does_not_cross_market_close(
+def test_default_review_does_not_cross_sunday_settlement(
     first_observation: CompanyObservation,
 ) -> None:
-    turn = _turn(first_observation, minute=17 * 60)
+    turn = _turn(first_observation, weekday=Weekday.SATURDAY)
 
-    assert AgentAttention().arm(AttentionPlan(), turn).review_at is None
+    assert AgentAttention().arm(AttentionPlan(), turn).review_on is None
 
 
 def test_explicit_review_must_obey_attention_bound(
@@ -132,17 +135,17 @@ def test_explicit_review_must_obey_attention_bound(
 ) -> None:
     turn = _turn(first_observation)
 
-    with pytest.raises(AttentionRejected, match="cannot exceed 120 minutes"):
-        AgentAttention().arm(AttentionPlan(review_after_minutes=121), turn)
+    with pytest.raises(AttentionRejected, match="cannot exceed 2 days"):
+        AgentAttention().arm(AttentionPlan(review_after_days=3), turn)
 
 
-def test_explicit_review_must_remain_inside_business_day(
+def test_explicit_review_must_remain_on_a_decision_day_in_the_same_week(
     first_observation: CompanyObservation,
 ) -> None:
-    turn = _turn(first_observation, minute=17 * 60)
+    turn = _turn(first_observation, weekday=Weekday.FRIDAY)
 
-    with pytest.raises(AttentionRejected, match="business day"):
-        AgentAttention().arm(AttentionPlan(review_after_minutes=120), turn)
+    with pytest.raises(AttentionRejected, match="Monday-Saturday"):
+        AgentAttention().arm(AttentionPlan(review_after_days=2), turn)
 
 
 def test_explicit_review_accepts_the_exact_maximum(
@@ -150,8 +153,8 @@ def test_explicit_review_accepts_the_exact_maximum(
 ) -> None:
     turn = _turn(first_observation)
 
-    assert AgentAttention().arm(AttentionPlan(review_after_minutes=120), turn).review_at == (
-        SimTime.at(day=0, hour=11)
+    assert AgentAttention().arm(AttentionPlan(review_after_days=2), turn).review_on == (
+        SimDay.at(week=1, weekday=Weekday.WEDNESDAY)
     )
 
 
@@ -172,7 +175,7 @@ def test_arm_rejects_hidden_duplicate_and_already_true_alerts(
     with pytest.raises(ValidationError, match="must be unique"):
         ArmedAttention(
             source_turn_id=turn.turn_id,
-            armed_at=turn.sim_time,
+            armed_on=turn.sim_day,
             alerts=(duplicate, duplicate),
         )
     with pytest.raises(AttentionRejected, match="must be false"):

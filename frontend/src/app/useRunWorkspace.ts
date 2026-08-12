@@ -10,7 +10,7 @@ import type {
 } from "../shared/api/types";
 
 interface LocationSelection {
-  readonly day: number | null;
+  readonly week: number | null;
   readonly runId: string;
 }
 
@@ -28,11 +28,11 @@ export interface RunWorkspace {
   readonly loadMoreRuns: () => void;
   readonly replaySourceError: string | null;
   readonly replaySources: readonly ReplaySourceView[];
-  readonly selectedDay: number | null;
+  readonly selectedWeek: number | null;
   readonly selectedJob: RunJobView | null;
   readonly selectedReplaySourceId: string;
   readonly selectedRunId: string;
-  readonly selectDay: (day: number) => void;
+  readonly selectWeek: (week: number) => void;
   readonly selectReplaySource: (runId: string) => void;
   readonly selectRun: (runId: string) => void;
   readonly timelineRevision: number;
@@ -51,8 +51,8 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     readonly ReplaySourceView[]
   >([]);
   const [selectedRunId, setSelectedRunId] = useState(initialSelection.runId);
-  const [selectedDay, setSelectedDay] = useState<number | null>(
-    initialSelection.day,
+  const [selectedWeek, setSelectedWeek] = useState<number | null>(
+    initialSelection.week,
   );
   const [episode, setEpisode] = useState<EpisodeView | null>(null);
   const [episodeError, setEpisodeError] = useState<string | null>(null);
@@ -86,10 +86,10 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
   const selectRun = useCallback(
     (runId: string, historyMode: "push" | "replace" = "push") => {
       const job = jobs.find((candidate) => candidate.runId === runId);
-      const day = job ? latestTimelineDay(job) : null;
+      const week = job ? latestTimelineWeek(job) : null;
       setSelectedRunId(runId);
-      setSelectedDay(day);
-      writeLocation(runId, day ?? 1, historyMode);
+      setSelectedWeek(week);
+      writeLocation(runId, week ?? 1, historyMode);
     },
     [jobs],
   );
@@ -103,14 +103,14 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     [selectRun, selectedRunId],
   );
 
-  const selectDay = useCallback(
-    (day: number) => {
+  const selectWeek = useCallback(
+    (week: number) => {
       if (!selectedJob) {
         return;
       }
-      const nextDay = clampDay(day, selectedJob);
-      setSelectedDay(nextDay);
-      writeLocation(selectedJob.runId, nextDay, "push");
+      const nextWeek = clampWeek(week, selectedJob);
+      setSelectedWeek(nextWeek);
+      writeLocation(selectedJob.runId, nextWeek, "push");
     },
     [selectedJob],
   );
@@ -132,10 +132,10 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
   const trackJob = useCallback((job: RunJobView, select: boolean) => {
     recordJobs([job]);
     if (select) {
-      const day = latestTimelineDay(job);
+      const week = latestTimelineWeek(job);
       setSelectedRunId(job.runId);
-      setSelectedDay(day);
-      writeLocation(job.runId, day, "push");
+      setSelectedWeek(week);
+      writeLocation(job.runId, week, "push");
     }
   }, [recordJobs]);
 
@@ -250,7 +250,7 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     function restoreLocation(): void {
       const selection = readLocationSelection();
       setSelectedRunId(selection.runId);
-      setSelectedDay(selection.day);
+      setSelectedWeek(selection.week);
     }
 
     window.addEventListener("popstate", restoreLocation);
@@ -329,15 +329,15 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     if (!selectedJob) {
       return;
     }
-    const clampedDay = clampDay(
-      selectedDay ?? latestTimelineDay(selectedJob),
+    const clampedWeek = clampWeek(
+      selectedWeek ?? latestTimelineWeek(selectedJob),
       selectedJob,
     );
-    if (clampedDay !== selectedDay) {
-      setSelectedDay(clampedDay);
-      writeLocation(selectedJob.runId, clampedDay, "replace");
+    if (clampedWeek !== selectedWeek) {
+      setSelectedWeek(clampedWeek);
+      writeLocation(selectedJob.runId, clampedWeek, "replace");
     }
-  }, [selectedDay, selectedJob]);
+  }, [selectedWeek, selectedJob]);
 
   useEffect(() => {
     if (!selectedJob || !isActiveRun(selectedJob.status)) {
@@ -394,11 +394,11 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
     loadMoreRuns,
     replaySourceError,
     replaySources,
-    selectedDay,
+    selectedWeek,
     selectedJob,
     selectedReplaySourceId,
     selectedRunId,
-    selectDay,
+    selectWeek,
     selectReplaySource,
     selectRun,
     timelineRevision,
@@ -440,32 +440,32 @@ function byNewestSubmission(
   return Date.parse(right.submittedAt) - Date.parse(left.submittedAt);
 }
 
-function latestTimelineDay(job: RunJobView): number {
+function latestTimelineWeek(job: RunJobView): number {
   return job.status === "completed"
-    ? job.totalDays
-    : Math.min(job.totalDays, job.currentDay + 1);
+    ? job.totalWeeks
+    : Math.min(job.totalWeeks, Math.floor(job.currentAbsoluteDay / 7) + 1);
 }
 
-function clampDay(day: number, job: RunJobView): number {
-  return Math.max(1, Math.min(latestTimelineDay(job), Math.trunc(day)));
+function clampWeek(week: number, job: RunJobView): number {
+  return Math.max(1, Math.min(job.totalWeeks, Math.trunc(week)));
 }
 
 function readLocationSelection(): LocationSelection {
   const query = new URLSearchParams(window.location.search);
-  const rawDay = Number(query.get("day"));
+  const rawWeek = Number(query.get("week"));
   return {
     runId: query.get("run")?.trim() ?? "",
-    day: Number.isInteger(rawDay) && rawDay > 0 ? rawDay : null,
+    week: Number.isInteger(rawWeek) && rawWeek > 0 ? rawWeek : null,
   };
 }
 
 function writeLocation(
   runId: string,
-  day: number,
+  week: number,
   mode: "push" | "replace",
 ): void {
   const url = new URL(window.location.href);
   url.searchParams.set("run", runId);
-  url.searchParams.set("day", String(day));
+  url.searchParams.set("week", String(week));
   window.history[`${mode}State`](null, "", url);
 }

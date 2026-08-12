@@ -7,6 +7,7 @@ from typing import Annotated, Final, Literal, Self
 
 from pydantic import Field, model_validator
 
+from company_bench.domain.calendar import SimDay
 from company_bench.domain.models import (
     ZERO,
     CompanyId,
@@ -61,7 +62,7 @@ __all__ = [
     "ScheduledCompletion",
     "SetQuoteLadder",
     "SetRetailPrice",
-    "SimTime",
+    "SimDay",
     "SystemEventKind",
     "SystemStepRecord",
     "Transform",
@@ -72,57 +73,14 @@ __all__ = [
     "system_step_id",
 ]
 
-MINUTES_PER_DAY = 24 * 60
 PROTOCOL_ERROR_PREFIX: Final = "agent protocol error: "
-
-
-class SimTime(StrictModel):
-    """One absolute, monotonic minute on the simulation clock."""
-
-    absolute_minute: int = Field(ge=0)
-
-    @classmethod
-    def at(cls, *, day: int, hour: int = 0, minute: int = 0) -> SimTime:
-        """Build time from a zero-based day and wall-clock minute."""
-        if day < 0:
-            raise ValueError("day must be non-negative")
-        if not 0 <= hour < 24:
-            raise ValueError("hour must be between 0 and 23")
-        if not 0 <= minute < 60:
-            raise ValueError("minute must be between 0 and 59")
-        return cls(absolute_minute=day * MINUTES_PER_DAY + hour * 60 + minute)
-
-    @property
-    def day(self) -> int:
-        """Return the zero-based simulation day."""
-        return self.absolute_minute // MINUTES_PER_DAY
-
-    @property
-    def hour(self) -> int:
-        """Return the wall-clock hour."""
-        return self.minute_of_day // 60
-
-    @property
-    def minute(self) -> int:
-        """Return the wall-clock minute within the hour."""
-        return self.absolute_minute % 60
-
-    @property
-    def minute_of_day(self) -> int:
-        """Return the minute offset within the current day."""
-        return self.absolute_minute % MINUTES_PER_DAY
-
-    def plus(self, minutes: int) -> SimTime:
-        """Return a later time without mutating this value."""
-        if minutes < 0:
-            raise ValueError("minutes must be non-negative")
-        return SimTime(absolute_minute=self.absolute_minute + minutes)
 
 
 class WakeReason(StrEnum):
     """Why a company is receiving a new Agent turn."""
 
-    DAY_OPEN = "day_open"
+    WEEK_OPEN = "week_open"
+    DECISION_DAY_STARTED = "decision_day_started"
     REVIEW_DUE = "review_due"
     PRICE_ALERT = "price_alert"
     TRADE_EXECUTED = "trade_executed"
@@ -164,8 +122,9 @@ class WakeSignal(StrictModel):
 class SystemEventKind(StrEnum):
     """Kinds understood by the simulation runtime."""
 
-    DAY_OPEN = "day_open"
-    DAY_CLOSE = "day_close"
+    WEEK_OPEN = "week_open"
+    DAY_STARTED = "day_started"
+    WEEK_CLOSE = "week_close"
     COMPANY_WAKE = "company_wake"
     OPERATION_COMPLETED = "operation_completed"
     DELIVERY_COMPLETED = "delivery_completed"
@@ -176,14 +135,15 @@ class SystemEventKind(StrEnum):
 
     @property
     def priority(self) -> int:
-        """Define economic ordering for events sharing one virtual minute."""
+        """Define economic ordering for events sharing one simulation day."""
         return {
-            self.DAY_OPEN: 10,
+            self.WEEK_OPEN: 10,
+            self.DAY_STARTED: 10,
             self.OPERATION_COMPLETED: 20,
             self.DELIVERY_COMPLETED: 20,
             self.MARKET_CLOSE: 30,
             self.CONSUMER_SALES: 40,
-            self.DAY_CLOSE: 50,
+            self.WEEK_CLOSE: 50,
             self.TURN_LIMIT_REACHED: 90,
             self.AGENT_WAKE_SUPPRESSED: 90,
             self.COMPANY_WAKE: 100,
@@ -274,7 +234,7 @@ class QuoteAlert(StrictModel):
 class AttentionPlan(StrictModel):
     """Declare when a company should next receive an Agent turn."""
 
-    review_after_minutes: int | None = Field(default=None, ge=1)
+    review_after_days: int | None = Field(default=None, ge=1)
     alerts: tuple[QuoteAlert, ...] = Field(default=(), max_length=3)
 
 
@@ -311,7 +271,7 @@ class DecisionEnvelope(StrictModel):
     turn_id: Identifier
     decision_id: Identifier
     company_id: CompanyId
-    issued_at: SimTime
+    issued_on: SimDay
     state_version: int = Field(ge=0)
     decision: CompanyDecision
 
@@ -397,7 +357,7 @@ class ScheduledCompletion(StrictModel):
 
     event_id: Identifier
     kind: SystemEventKind
-    at: SimTime
+    scheduled_for: SimDay
     reference_id: Identifier
     company_id: CompanyId
 
@@ -419,7 +379,7 @@ class DecisionOutcome(StrictModel):
     turn_id: Identifier
     decision_id: Identifier
     company_id: CompanyId
-    occurred_at: SimTime
+    occurred_on: SimDay
     status: DecisionStatus
     accepted: bool
     rejection_category: RejectionCategory | None = None
@@ -430,7 +390,7 @@ class DecisionOutcome(StrictModel):
     job_id: Identifier | None = None
     events: tuple[DomainEvent, ...] = ()
     scheduled_completions: tuple[ScheduledCompletion, ...] = ()
-    next_available_at: SimTime | None = None
+    next_available_on: SimDay | None = None
 
     @model_validator(mode="after")
     def validate_outcome(self) -> Self:
@@ -442,10 +402,10 @@ class DecisionOutcome(StrictModel):
         if self.accepted != (self.rejection_category is None):
             raise ValueError("rejection_category is required only for rejected decisions")
         if (
-            self.next_available_at is not None
-            and self.next_available_at.absolute_minute < self.occurred_at.absolute_minute
+            self.next_available_on is not None
+            and self.next_available_on.absolute_day < self.occurred_on.absolute_day
         ):
-            raise ValueError("next_available_at cannot precede occurred_at")
+            raise ValueError("next_available_on cannot precede occurred_on")
         return self
 
 
@@ -458,7 +418,7 @@ class OpenOrderView(StrictModel):
     product: ProductId
     remaining_quantity: PositiveQuantity
     limit_price: PositiveMoney
-    placed_at: SimTime
+    placed_on: SimDay
     priority_sequence: int = Field(ge=1)
     queue_ahead_quantity: Quantity
 
@@ -478,7 +438,7 @@ class OrderBookView(StrictModel):
     bids: tuple[PriceLevelView, ...] = ()
     asks: tuple[PriceLevelView, ...] = ()
     last_trade_price: PositiveMoney | None = None
-    daily_volume: Quantity = ZERO
+    weekly_volume: Quantity = ZERO
 
     @model_validator(mode="after")
     def validate_book(self) -> Self:
@@ -500,10 +460,10 @@ class OrderBookView(StrictModel):
 
 
 class InventoryExpiryBucket(StrictModel):
-    """Owned spot inventory sharing one product and expiry day."""
+    """Owned spot inventory sharing one product and expiry week."""
 
     product: ProductId
-    expires_end_of_day: int = Field(ge=1)
+    expires_end_of_week: int = Field(ge=1)
     available_quantity: Quantity
     reserved_quantity: Quantity
 
@@ -516,10 +476,10 @@ class InventoryExpiryBucket(StrictModel):
 
 
 class DeliveryExpiryBucket(StrictModel):
-    """Quantity within one incoming delivery sharing an expiry day."""
+    """Quantity within one incoming delivery sharing an expiry week."""
 
     quantity: PositiveQuantity
-    expires_end_of_day: int = Field(ge=1)
+    expires_end_of_week: int = Field(ge=1)
 
 
 class IncomingDeliveryView(StrictModel):
@@ -528,14 +488,14 @@ class IncomingDeliveryView(StrictModel):
     trade_id: Identifier
     product: ProductId
     quantity: PositiveQuantity
-    arrives_at: SimTime
+    arrives_on: SimDay
     expiry_buckets: tuple[DeliveryExpiryBucket, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_expiry_buckets(self) -> Self:
         """Keep expiry detail ordered, unique, and quantity preserving."""
-        days = tuple(bucket.expires_end_of_day for bucket in self.expiry_buckets)
-        if days != tuple(sorted(set(days))):
+        weeks = tuple(bucket.expires_end_of_week for bucket in self.expiry_buckets)
+        if weeks != tuple(sorted(set(weeks))):
             raise ValueError("delivery expiry buckets must be unique and ordered")
         if sum((bucket.quantity for bucket in self.expiry_buckets), start=ZERO) != (self.quantity):
             raise ValueError("delivery expiry buckets must sum to quantity")
@@ -547,7 +507,7 @@ class OperationJobView(StrictModel):
 
     job_id: Identifier
     kind: Literal["production", "transformation"]
-    completes_at: SimTime
+    completes_on: SimDay
     output_product: ProductId
     output_quantity: PositiveQuantity
 
@@ -589,10 +549,10 @@ class AgentTurn(StrictModel):
 
     turn_id: Identifier
     company_id: CompanyId
-    sim_time: SimTime
+    sim_day: SimDay
     state_version: int = Field(ge=0)
-    turn_number_today: int = Field(ge=1)
-    turn_limit_today: int = Field(ge=1)
+    turn_number_this_week: int = Field(ge=1)
+    turn_limit_this_week: int = Field(ge=1)
     wake_reasons: tuple[WakeReason, ...] = Field(min_length=1)
     wake_signals: tuple[WakeSignal, ...] = ()
     observation: CompanyObservation
@@ -611,16 +571,19 @@ class AgentTurn(StrictModel):
     @property
     def remaining_operation_capacity(self) -> Quantity | None:
         """Derive remaining capacity from the sole private operation state."""
-        operation = self.observation.daily_operation
+        operation = self.observation.weekly_operation
         return None if operation is None else operation.remaining_capacity
 
     @model_validator(mode="after")
     def validate_turn(self) -> Self:
         """Reject inconsistent identity, version, and wake metadata."""
-        if self.turn_number_today > self.turn_limit_today:
-            raise ValueError("turn_number_today cannot exceed turn_limit_today")
-        if self.turn_limit_today != self.observation.runtime.max_turns_per_company_day:
-            raise ValueError("turn_limit_today must match the runtime turn limit")
+        if self.turn_number_this_week > self.turn_limit_this_week:
+            raise ValueError("turn_number_this_week cannot exceed turn_limit_this_week")
+        if (
+            self.turn_limit_this_week
+            != self.observation.runtime.max_turns_per_company_week
+        ):
+            raise ValueError("turn_limit_this_week must match the runtime turn limit")
         if len(self.wake_reasons) != len(set(self.wake_reasons)):
             raise ValueError("wake_reasons must be unique")
         if self.wake_signals:
@@ -629,6 +592,8 @@ class AgentTurn(StrictModel):
                 raise ValueError("wake_signals must cover wake_reasons in order")
         if self.observation.company_id != self.company_id:
             raise ValueError("observation company_id must match the turn")
+        if self.observation.sim_day != self.sim_day:
+            raise ValueError("observation sim_day must match the turn")
         if self.observation.cash != self.available_cash:
             raise ValueError("available_cash must match the observed cash")
         if any(order.owner_id != self.company_id for order in self.open_orders):
@@ -637,7 +602,7 @@ class AgentTurn(StrictModel):
             product.product: index for index, product in enumerate(self.observation.products)
         }
         expiry_keys = tuple(
-            (bucket.product, bucket.expires_end_of_day) for bucket in self.inventory_expiry
+            (bucket.product, bucket.expires_end_of_week) for bucket in self.inventory_expiry
         )
         if len(expiry_keys) != len(set(expiry_keys)):
             raise ValueError("inventory_expiry keys must be unique")
@@ -659,7 +624,7 @@ class AgentTurn(StrictModel):
                 raise ValueError("previous outcome company_id must match the turn")
             if self.previous_outcome.resulting_state_version > self.state_version:
                 raise ValueError("previous outcome cannot exceed the observed state version")
-            if self.previous_outcome.occurred_at.absolute_minute > self.sim_time.absolute_minute:
+            if self.previous_outcome.occurred_on.absolute_day > self.sim_day.absolute_day:
                 raise ValueError("previous outcome cannot occur after the turn")
         return self
 
@@ -678,7 +643,7 @@ class SystemStepRecord(StrictModel):
     entry_id: Identifier
     journal_sequence: int = Field(ge=1)
     scheduled_event_id: Identifier
-    occurred_at: SimTime
+    occurred_on: SimDay
     kind: SystemEventKind
     company_id: CompanyId | None = None
     reference_ids: tuple[Identifier, ...] = ()
@@ -686,7 +651,7 @@ class SystemStepRecord(StrictModel):
     state_version_before: int = Field(ge=0)
     state_version_after: int = Field(ge=0)
     effects: tuple[EventRecord, ...] = ()
-    snapshot_day: int | None = Field(default=None, ge=1)
+    snapshot_week: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_step(self) -> Self:
@@ -704,11 +669,10 @@ class SystemStepRecord(StrictModel):
             raise ValueError("suppressed-wake steps require their causal signals")
         if self.state_version_after < self.state_version_before:
             raise ValueError("system step cannot move the state version backwards")
-        expected_day = self.occurred_at.day + 1
-        if any(record.event.day != expected_day for record in self.effects):
+        if any(record.event.occurred_on != self.occurred_on for record in self.effects):
             raise ValueError("system step effects must occur on its simulation day")
-        if self.snapshot_day is not None and self.snapshot_day != expected_day:
-            raise ValueError("system step snapshot_day must match its simulation day")
+        if self.snapshot_week is not None and self.snapshot_week != self.occurred_on.week:
+            raise ValueError("system step snapshot_week must match its simulation week")
         return self
 
 
@@ -737,8 +701,8 @@ class TurnRecord(StrictModel):
             raise ValueError("envelope turn_id must match the turn")
         if self.envelope.company_id != self.turn.company_id:
             raise ValueError("decision company_id must match the turn")
-        if self.envelope.issued_at != self.turn.sim_time:
-            raise ValueError("decision issued_at must match the turn time")
+        if self.envelope.issued_on != self.turn.sim_day:
+            raise ValueError("decision issued_on must match the turn day")
         if self.envelope.state_version != self.turn.state_version:
             raise ValueError("decision state_version must match the turn")
         if self.outcome.turn_id != self.turn.turn_id:
@@ -749,7 +713,7 @@ class TurnRecord(StrictModel):
             raise ValueError("outcome decision_id must match the decision")
         if self.outcome.resulting_state_version < self.envelope.state_version:
             raise ValueError("outcome cannot move the state version backwards")
-        if self.outcome.occurred_at.absolute_minute < self.envelope.issued_at.absolute_minute:
+        if self.outcome.occurred_on.absolute_day < self.envelope.issued_on.absolute_day:
             raise ValueError("outcome cannot precede the decision")
         action = self.envelope.action
         result = self.outcome.quote_ladder_result

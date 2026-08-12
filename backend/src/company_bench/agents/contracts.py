@@ -133,6 +133,10 @@ class ModelConfigurationError(ModelCallError):
     """The provider permanently rejected the configured request or credential."""
 
 
+class ModelQuotaExhaustedError(ModelCallError):
+    """The provider rejected the request because paid quota was exhausted."""
+
+
 class ModelInfrastructureError(ModelCallError):
     """The provider could not reliably execute the request."""
 
@@ -153,7 +157,15 @@ class PolicyExecutionError(PolicyTerminalError):
     """The policy implementation failed outside a recognized provider condition."""
 
 
-class PolicyInfrastructureError(RuntimeError):
+class PolicyRecoverableError(RuntimeError):
+    """A policy failure that preserves enough state to continue the same run."""
+
+
+class PolicyQuotaExhaustedError(PolicyRecoverableError):
+    """Paid provider quota was exhausted and requires an explicit resume."""
+
+
+class PolicyInfrastructureError(PolicyRecoverableError):
     """A transient provider failure that interrupts a recoverable run."""
 
 

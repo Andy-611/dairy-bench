@@ -1,19 +1,19 @@
-import type { DailySnapshotView } from "../../shared/api/types";
+import type { WeeklySnapshotView } from "../../shared/api/types";
 import { formatValue } from "../../shared/format";
 
 interface MetricChartProps {
-  readonly snapshots: readonly DailySnapshotView[];
+  readonly snapshots: readonly WeeklySnapshotView[];
 }
 
-interface DayMetrics {
-  readonly day: number;
+interface WeekMetrics {
+  readonly week: number;
   readonly efficiency: number;
   readonly inventoryValue: number;
   readonly consumerSales: number;
 }
 
 interface Series {
-  readonly key: keyof Omit<DayMetrics, "day">;
+  readonly key: keyof Omit<WeekMetrics, "week">;
   readonly label: string;
   readonly color: string;
 }
@@ -29,23 +29,23 @@ const ROW_GAP = 25;
 const SERIES: readonly Series[] = [
   { key: "efficiency", label: "Cumulative surplus", color: "#147d64" },
   { key: "inventoryValue", label: "Inventory value", color: "#2d6cdf" },
-  { key: "consumerSales", label: "Daily consumer sales", color: "#e08c30" },
+  { key: "consumerSales", label: "Weekly consumer sales", color: "#e08c30" },
 ];
 
 function aggregateSnapshots(
-  snapshots: readonly DailySnapshotView[],
-): readonly DayMetrics[] {
-  const byDay = new Map<number, DayMetrics>();
+  snapshots: readonly WeeklySnapshotView[],
+): readonly WeekMetrics[] {
+  const byWeek = new Map<number, WeekMetrics>();
 
   for (const snapshot of snapshots) {
-    const current = byDay.get(snapshot.day) ?? {
-      day: snapshot.day,
+    const current = byWeek.get(snapshot.week) ?? {
+      week: snapshot.week,
       efficiency: 0,
       inventoryValue: 0,
       consumerSales: 0,
     };
-    byDay.set(snapshot.day, {
-      day: snapshot.day,
+    byWeek.set(snapshot.week, {
+      week: snapshot.week,
       efficiency: current.efficiency + Number(snapshot.cumulativeSurplus),
       inventoryValue: current.inventoryValue + Number(snapshot.inventoryValue),
       consumerSales:
@@ -53,11 +53,11 @@ function aggregateSnapshots(
     });
   }
 
-  return [...byDay.values()].sort((left, right) => left.day - right.day);
+  return [...byWeek.values()].sort((left, right) => left.week - right.week);
 }
 
 function linePath(
-  metrics: readonly DayMetrics[],
+  metrics: readonly WeekMetrics[],
   series: Series,
   row: number,
 ): string {
@@ -65,15 +65,15 @@ function linePath(
   const minimum = Math.min(0, ...values);
   const maximum = Math.max(0, ...values);
   const span = maximum - minimum || 1;
-  const firstDay = metrics[0]?.day ?? 1;
-  const lastDay = metrics.at(-1)?.day ?? firstDay + 1;
-  const daySpan = lastDay - firstDay || 1;
+  const firstWeek = metrics[0]?.week ?? 1;
+  const lastWeek = metrics.at(-1)?.week ?? firstWeek + 1;
+  const weekSpan = lastWeek - firstWeek || 1;
   const rowTop = TOP + row * (ROW_HEIGHT + ROW_GAP);
 
   return metrics
     .map((metric, index) => {
       const x =
-        LEFT + ((metric.day - firstDay) / daySpan) * (WIDTH - LEFT - RIGHT);
+        LEFT + ((metric.week - firstWeek) / weekSpan) * (WIDTH - LEFT - RIGHT);
       const y =
         rowTop + ROW_HEIGHT - ((metric[series.key] - minimum) / span) * ROW_HEIGHT;
       return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
@@ -83,18 +83,18 @@ function linePath(
 
 export function MetricChart({ snapshots }: MetricChartProps) {
   const metrics = aggregateSnapshots(snapshots);
-  const firstDay = metrics[0]?.day ?? 1;
-  const lastDay = metrics.at(-1)?.day ?? 30;
-  const tickDays = [1, 5, 10, 15, 20, 25, 30].filter(
-    (day) => day >= firstDay && day <= lastDay,
+  const firstWeek = metrics[0]?.week ?? 1;
+  const lastWeek = metrics.at(-1)?.week ?? 52;
+  const tickWeeks = [1, 13, 26, 39, 52].filter(
+    (week) => week >= firstWeek && week <= lastWeek,
   );
-  const daySpan = lastDay - firstDay || 1;
+  const weekSpan = lastWeek - firstWeek || 1;
 
   return (
     <section className="panel chart-panel">
       <div className="section-heading">
         <div>
-          <span className="eyebrow">30-DAY TREND</span>
+          <span className="eyebrow">52-WEEK TREND</span>
           <h2>Supply-chain trends</h2>
         </div>
         <p>Each series uses its own vertical scale.</p>
@@ -106,15 +106,15 @@ export function MetricChart({ snapshots }: MetricChartProps) {
           role="img"
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         >
-          <title id="trend-title">30-day supply-chain trends</title>
+          <title id="trend-title">52-week supply-chain trends</title>
           <desc id="trend-description">
-            Cumulative system surplus, inventory value, and daily consumer
+            Cumulative system surplus, inventory value, and weekly consumer
             sales.
           </desc>
-          {tickDays.map((day) => {
-            const x = LEFT + ((day - firstDay) / daySpan) * (WIDTH - LEFT - RIGHT);
+          {tickWeeks.map((week) => {
+            const x = LEFT + ((week - firstWeek) / weekSpan) * (WIDTH - LEFT - RIGHT);
             return (
-              <g key={day}>
+              <g key={week}>
                 <line
                   className="chart-grid"
                   x1={x}
@@ -123,7 +123,7 @@ export function MetricChart({ snapshots }: MetricChartProps) {
                   y2={HEIGHT - 24}
                 />
                 <text className="chart-tick" textAnchor="middle" x={x} y={HEIGHT - 4}>
-                  Day {day}
+                  Week {week}
                 </text>
               </g>
             );
@@ -159,7 +159,7 @@ export function MetricChart({ snapshots }: MetricChartProps) {
                   const span = maximum - minimum || 1;
                   const x =
                     LEFT +
-                    ((metric.day - firstDay) / daySpan) *
+                    ((metric.week - firstWeek) / weekSpan) *
                       (WIDTH - LEFT - RIGHT);
                   const y =
                     rowTop +
@@ -171,11 +171,11 @@ export function MetricChart({ snapshots }: MetricChartProps) {
                       cx={x}
                       cy={y}
                       fill={series.color}
-                      key={metric.day}
+                      key={metric.week}
                       r={3}
                     >
                       <title>
-                        Day {metric.day}: {formatValue(metric[series.key])}
+                        Week {metric.week}: {formatValue(metric[series.key])}
                       </title>
                     </circle>
                   );

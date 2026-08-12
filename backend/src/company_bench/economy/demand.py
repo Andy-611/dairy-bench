@@ -20,9 +20,9 @@ class ConsumerDemandCurve(StrictModel):
 
     spec: DemandSpec
 
-    def potential(self, seed: int, day: int, retailer_id: CompanyId) -> Quantity:
-        """Return one stable retailer-day demand potential."""
-        stream = f"{seed}|consumer_demand|{day}|{retailer_id}".encode()
+    def potential(self, seed: int, week: int, retailer_id: CompanyId) -> Quantity:
+        """Return one stable retailer-week demand potential."""
+        stream = f"{seed}|consumer_demand|{week}|{retailer_id}".encode()
         value = int.from_bytes(hashlib.sha256(stream).digest()[:8], "big")
         shock = self.spec.shock_min + value % (self.spec.shock_max - self.spec.shock_min + 1)
         return max(ZERO, self.spec.base_demand + Decimal(shock))

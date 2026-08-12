@@ -77,10 +77,10 @@ class ScriptedDecisionGateway:
 def company_decision(
     action: EconomicCommand | None = None,
     *,
-    review_after_minutes: int | None = None,
+    review_after_days: int | None = None,
 ) -> CompanyDecision:
     """Build one typed test decision with an empty alert set."""
-    attention = AttentionPlan(review_after_minutes=review_after_minutes)
+    attention = AttentionPlan(review_after_days=review_after_days)
     return (
         IdleDecision(attention=attention)
         if action is None

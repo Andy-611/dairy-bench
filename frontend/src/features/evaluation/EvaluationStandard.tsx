@@ -1,9 +1,11 @@
+import type { ReactNode } from "react";
+
+import type { ScoreView } from "../../shared/api/types";
 import {
   formatExactDecimal,
   formatSignedExactDecimal,
   formatValue,
 } from "../../shared/format";
-import type { ScoreView } from "../../shared/api/types";
 
 interface EvaluationStandardProps {
   readonly benchmarkEligible: boolean;
@@ -12,13 +14,18 @@ interface EvaluationStandardProps {
 
 interface FormulaDefinition {
   readonly description: string;
-  readonly expression: string;
+  readonly expression: ReactNode;
   readonly label: string;
+}
+
+interface SymbolDefinition {
+  readonly base: string;
+  readonly subscript?: string;
 }
 
 interface MetricDefinition {
   readonly detail: string;
-  readonly label: string;
+  readonly symbol: SymbolDefinition;
   readonly tone?: "bankruptcy" | "farm" | "processor" | "retailer";
   readonly value: string;
 }
@@ -32,26 +39,105 @@ interface MetricGroupDefinition {
 const FORMULAS: readonly FormulaDefinition[] = [
   {
     label: "Efficiency",
-    expression:
-      "E_raw = sum_(i=1..9) [V_i(T) - V_i(0)]\n" +
-      "E_ref = sum_(d=1..30,r=1..3) (A_(d,r) + 14)^2 / 32\n" +
-      "E = clip(E_raw / E_ref, 0, 1)",
+    expression: (
+      <>
+        <Formula spoken="E raw equals the sum from i equals 1 to 9 of V i at T minus V i at zero">
+          <mrow>
+            <MathSubscript base="E" subscript="raw" />
+            <mo>=</mo>
+            <BoundedSum index="i" upper="9" />
+            <mo>[</mo>
+            <MathSubscript base="V" subscript="i" />
+            <mo>(</mo><mi>T</mi><mo>)</mo>
+            <mo>−</mo>
+            <MathSubscript base="V" subscript="i" />
+            <mo>(</mo><mn>0</mn><mo>)</mo>
+            <mo>]</mo>
+          </mrow>
+        </Formula>
+        <Formula
+          spoken="E reference equals the sum over 52 weeks and 3 retailers of A w r plus 14 squared, divided by 32"
+        >
+          <mrow>
+            <MathSubscript base="E" subscript="ref" />
+            <mo>=</mo>
+            <BoundedSum index="w" upper="52" />
+            <BoundedSum index="r" upper="3" />
+            <mfrac>
+              <msup>
+                <mrow>
+                  <mo>(</mo>
+                  <MathSubscript base="A" subscript="w,r" />
+                  <mo>+</mo><mn>14</mn>
+                  <mo>)</mo>
+                </mrow>
+                <mn>2</mn>
+              </msup>
+              <mn>32</mn>
+            </mfrac>
+          </mrow>
+        </Formula>
+        <Formula spoken="E equals E raw divided by E reference, clipped between zero and one">
+          <mrow>
+            <mi>E</mi><mo>=</mo><mi>clip</mi>
+            <mo>(</mo>
+            <mfrac>
+              <MathSubscript base="E" subscript="raw" />
+              <MathSubscript base="E" subscript="ref" />
+            </mfrac>
+            <mo>,</mo><mn>0</mn><mo>,</mo><mn>1</mn>
+            <mo>)</mo>
+          </mrow>
+        </Formula>
+      </>
+    ),
     description:
-      "Value growth across 9 companies, normalized by this seed's 30-day demand ceiling.",
+      "Value growth across 9 companies, normalized by this seed's 52-week demand ceiling.",
   },
   {
     label: "Fairness",
-    expression: "F = 1 - (G_farm + G_processor + G_retailer) / 2",
+    expression: (
+      <Formula
+        spoken="F equals one minus the sum of farm, processor, and retailer Gini coefficients divided by two"
+      >
+        <mrow>
+          <mi>F</mi><mo>=</mo><mn>1</mn><mo>−</mo>
+          <mfrac>
+            <mrow>
+              <MathSubscript base="G" subscript="farm" />
+              <mo>+</mo>
+              <MathSubscript base="G" subscript="processor" />
+              <mo>+</mo>
+              <MathSubscript base="G" subscript="retailer" />
+            </mrow>
+            <mn>2</mn>
+          </mfrac>
+        </mrow>
+      </Formula>
+    ),
     description: "Normalized equality across the three peer-company tiers.",
   },
   {
     label: "Bankruptcy",
-    expression: "B = D / 9",
+    expression: (
+      <Formula spoken="B equals D divided by 9">
+        <mrow><mi>B</mi><mo>=</mo><mfrac><mi>D</mi><mn>9</mn></mfrac></mrow>
+      </Formula>
+    ),
     description: "The share of companies that became economically bankrupt.",
   },
   {
     label: "Final composition",
-    expression: "Score = 100 * E * sqrt(F * (1 - B))",
+    expression: (
+      <Formula spoken="Score equals 100 times E times the square root of F times one minus B">
+        <mrow>
+          <mtext>Score</mtext><mo>=</mo><mn>100</mn><mo>·</mo><mi>E</mi><mo>·</mo>
+          <msqrt>
+            <mi>F</mi><mo>(</mo><mn>1</mn><mo>−</mo><mi>B</mi><mo>)</mo>
+          </msqrt>
+        </mrow>
+      </Formula>
+    ),
     description: "Efficiency leads; fairness and survival jointly preserve quality.",
   },
 ];
@@ -66,12 +152,12 @@ export function EvaluationStandard({
       detail: "System value",
       metrics: [
         {
-          label: "E_raw",
+          symbol: { base: "E", subscript: "raw" },
           value: formatSignedExactDecimal(score.efficiencyRaw),
           detail: "Realized surplus",
         },
         {
-          label: "E_ref",
+          symbol: { base: "E", subscript: "ref" },
           value: formatExactDecimal(score.efficiencyReference),
           detail: "Seed-specific reference",
         },
@@ -82,19 +168,19 @@ export function EvaluationStandard({
       detail: "Lower is fairer",
       metrics: [
         {
-          label: "G_farm",
+          symbol: { base: "G", subscript: "farm" },
           value: formatExactDecimal(score.farmGini),
           detail: "Farm",
           tone: "farm",
         },
         {
-          label: "G_processor",
+          symbol: { base: "G", subscript: "processor" },
           value: formatExactDecimal(score.processorGini),
           detail: "Processor",
           tone: "processor",
         },
         {
-          label: "G_retailer",
+          symbol: { base: "G", subscript: "retailer" },
           value: formatExactDecimal(score.retailerGini),
           detail: "Retailer",
           tone: "retailer",
@@ -106,7 +192,7 @@ export function EvaluationStandard({
       detail: "Company count",
       metrics: [
         {
-          label: "D",
+          symbol: { base: "D" },
           value: formatValue(score.bankruptCompanyCount),
           detail: "of 9 companies",
           tone: "bankruptcy",
@@ -160,19 +246,16 @@ export function EvaluationStandard({
           {FORMULAS.map((formula) => (
             <article key={formula.label}>
               <span>{formula.label}</span>
-              <div className="formula-expression">
-                {formula.expression.split("\n").map((expression) => (
-                  <code key={expression}>{expression}</code>
-                ))}
-              </div>
+              <div className="formula-expression">{formula.expression}</div>
               <p>{formula.description}</p>
             </article>
           ))}
         </div>
         <p className="formula-note">
-          V_i is cash plus reference-valued inventory; A_(d,r) is seed-derived
-          potential demand. Gini is measured among the three companies in each
-          tier. D counts any company whose net worth reaches zero at a day end.
+          <MathSymbol base="V" subscript="i" /> is cash plus reference-valued
+          inventory; <MathSymbol base="A" subscript="w,r" /> is seed-derived potential
+          demand. Gini is measured among the three companies in each tier. D counts any
+          company whose net worth is at or below 1.0000 at a week end.
         </p>
       </div>
     </section>
@@ -188,11 +271,11 @@ function MetricGroup({ group }: { readonly group: MetricGroupDefinition }) {
       </header>
       <dl className="evaluation-metric-list">
         {group.metrics.map((metric) => (
-          <div key={metric.label}>
+          <div key={`${metric.symbol.base}-${metric.symbol.subscript ?? "plain"}`}>
             <dt>
               {metric.tone && <span className={`role-dot ${metric.tone}`} />}
               <span>
-                <strong>{metric.label}</strong>
+                <MathSymbol {...metric.symbol} />
                 <small>{metric.detail}</small>
               </span>
             </dt>
@@ -201,5 +284,36 @@ function MetricGroup({ group }: { readonly group: MetricGroupDefinition }) {
         ))}
       </dl>
     </article>
+  );
+}
+
+function MathSymbol({ base, subscript }: SymbolDefinition) {
+  return (
+    <span className="math-symbol">
+      <var>{base}</var>
+      {subscript && <sub>{subscript}</sub>}
+    </span>
+  );
+}
+
+function Formula({ children, spoken }: { readonly children: ReactNode; readonly spoken: string }) {
+  return (
+    <math aria-label={spoken} className="math-formula">
+      {children}
+    </math>
+  );
+}
+
+function MathSubscript({ base, subscript }: Required<SymbolDefinition>) {
+  return <msub><mi>{base}</mi><mi>{subscript}</mi></msub>;
+}
+
+function BoundedSum({ index, upper }: { readonly index: string; readonly upper: string }) {
+  return (
+    <munderover>
+      <mo>∑</mo>
+      <mrow><mi>{index}</mi><mo>=</mo><mn>1</mn></mrow>
+      <mn>{upper}</mn>
+    </munderover>
   );
 }

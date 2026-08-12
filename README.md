@@ -1,72 +1,77 @@
 # Dairy Bench
 
-Dairy Bench is an event-driven multi-agent benchmark for a perishable dairy
-supply chain. Three farms, three processors, and three retailers share two spot
-markets; each company is controlled by an independent Agent.
+Dairy Bench is an event-driven benchmark for nine independent companies in a
+perishable dairy supply chain: three farms, three processors, and three
+retailers. The default scenario is `flow.dairy.base.s9.v6` and spans 52 trading
+weeks.
 
-The default scenario is `flow.dairy.base.s9.v5`. One episode lasts 30 simulated
-days, and every decision follows one typed boundary:
+Every decision crosses one typed boundary:
 
 ```text
 Wake -> AgentTurn -> one CompanyDecision -> EconomyEngine -> Journal -> next Wake
 ```
 
-Only `EconomyEngine` may mutate cash, inventory, orders, jobs, deliveries, or
-trade results. Model text never settles a transaction.
+Only `EconomyEngine` may mutate money, inventory, orders, jobs, deliveries, or
+trades. Model text never settles an economic transaction.
+
+## Calendar and settlement
+
+The smallest simulation unit is one day. Each week contains exactly seven
+frames in the operations timeline:
+
+| Day | Runtime behavior |
+|---|---|
+| Monday | Open the week, realize private capacity/cost formulas, wake companies |
+| Tuesday-Saturday | Complete due work and deliveries, then run company decisions |
+| Sunday | Complete due commitments, close wholesale markets, settle consumer sales, expire inventory, snapshot the week |
+
+There are no Agent calls on Sunday. A company can act at most once per day and
+six times per week. Production, transformation, and delivery each take one day.
+Raw milk expires after two weekly settlements and bottled milk after four.
+
+Capacity and demand are **not fixed realized quantities**. Values such as farm
+normal capacity `60`, processor normal capacity `50`, and retailer base demand
+`40` remain inputs to the existing deterministic formulas. Capacity and unit
+cost are realized once per company-week; potential demand is realized once per
+retailer-week and purchased once on Sunday.
 
 ## Policy modes
 
 Dairy Bench exposes exactly three modes:
 
-- **Rule baseline** — deterministic rules; no model call.
-- **Model agents via NewAPI** — one isolated Agent and gateway per company,
-  backed by one application-wide NewAPI HTTP transport. The configured catalog
-  may contain any model family that supports function calls through NewAPI's
-  common Chat Completions interface.
-- **Completed Run Replay** — reproduces a completed Turn Journal without calling a
-  model and rejects observation or outcome drift.
+- **Rule baseline**: deterministic rules and no model call.
+- **Model agents via NewAPI**: one isolated Agent per company. Any model family
+  in the configured NewAPI catalog may be used if it supports the required
+  function-call contract.
+- **Completed Run Replay**: replays a completed Turn Journal without model calls
+  and rejects observation or outcome drift.
 
-There is no direct model-provider path. All model-backed runs go through the
-single NewAPI adapter and validate into the same Pydantic decision union.
+All model traffic uses one NewAPI adapter. There is no direct Codex, OpenAI
+Company Agent, Claude, or provider-specific execution path.
 
-## V4 behavior
+## Determinism and concurrency
 
-- Continuous, fully collateralized limit-order books for raw and bottled milk.
-- Atomic target ladders with up to three price levels and price-time priority.
-- FEFO inventory reservation and a shared `0.0001` economic quantum.
-- Concurrent same-minute model inference followed by deterministic persisted
-  decision application order.
-- Every `ActionDecision` and `IdleDecision` carries an `AttentionPlan`. Accepted
-  decisions do not create an automatic next-minute turn; companies wake for
-  their own trades, operation or delivery completion, price alerts, bounded
-  review, or the next market open. Only rejected decisions receive a bounded
-  correction retry.
-- Thirty-minute production, transformation, and delivery events.
-- Private per-company memory, immutable journals, atomic checkpoints, recovery,
-  and deterministic completed-run replay.
+Independent `RunJob`s execute concurrently. Within one run, Agents woken on the
+same day observe the same base state and may infer concurrently. Their decisions
+are then applied serially in persisted order:
 
-The daily clock is:
+```text
+SHA256(seed | absolute_day | company_id)
+```
 
-| Time | Event |
-|---|---|
-| 09:00 | Open markets and wake all companies |
-| 09:00–18:59 | Accept decisions and continuously match orders |
-| 19:00 | Complete due work, close books, then run consumer sales |
-| 19:00–19:29 | Process previously committed completions and deliveries |
-| 19:30 | Expire inventory and commit the daily snapshot |
+Provider latency therefore cannot change the economy. By default the backend
+allows up to 100 concurrent runs and 100 concurrent NewAPI requests. Lower the
+limits when required by the gateway:
 
-See [Architecture and invariants](docs/ARCHITECTURE.md) and
-[Agent integration](docs/AGENT_INTEGRATION.md) for the full contracts.
+```powershell
+$env:DAIRY_BENCH_MAX_CONCURRENT_RUNS = "20"
+$env:DAIRY_BENCH_MAX_CONCURRENT_NEWAPI_REQUESTS = "50"
+```
 
 ## Install and start
 
-Requirements:
-
-- Python 3.12+
-- Node.js 20.19+
-- A NewAPI key only for model-backed runs
-
-Install once:
+Requirements: Python 3.12+, Node.js 20.19+, and a NewAPI key only for
+model-backed runs.
 
 ```powershell
 cd backend
@@ -77,17 +82,15 @@ npm.cmd install
 cd ..
 ```
 
-Configure or replace the NewAPI key from the repository root:
+Configure or replace the NewAPI key:
 
 ```bat
 start.cmd --configure-newapi
 ```
 
-The configuration command validates the key through `/v1/models`, stores a
-Windows-user-encrypted credential, and saves the complete non-secret model
-catalog under `.dairy-bench/credentials/`. Run it again whenever the key or
-catalog changes; doing so invalidates capabilities verified through the previous
-route. If the backend is already open, restart it after configuration.
+The command validates `/v1/models`, stores a Windows-user-encrypted credential,
+and refreshes the local model/capability catalogs. Restart a running backend
+after changing credentials.
 
 Start the application:
 
@@ -95,77 +98,59 @@ Start the application:
 start.cmd
 ```
 
-The launcher opens `http://127.0.0.1:5173`. Use `start.cmd --check` to inspect
-local prerequisites and NewAPI configuration without starting services.
+The UI opens at `http://127.0.0.1:5173`. Use `start.cmd --check` for a read-only
+prerequisite and credential check.
 
-The model selector is populated from the NewAPI catalog. Because `/v1/models`
-does not prove decision-tool compatibility, Dairy Bench still requires exactly
-one authorized function call whose input includes an attention plan. The adapter
-prefers `tool_choice="required"` and
-omits that hint only when the provider explicitly rejects it, as some thinking
-models do. It always disables parallel tool calls and gives an invalid completion
-one structured repair attempt. Before the first run of a model is queued, a short
-calibration request confirms its documented maximum output limit or extracts the
-exact limit from an explicit NewAPI rejection. The confirmed value is cached in a
-versioned local capability catalog and sent directly as `max_tokens`; there is no
-staircase growth. Complete serialized input is checked before transport. The
-adapter never falls back to unstructured text or another provider.
+The adapter requires exactly one authorized function call, disables parallel
+tool calls, and gives an invalid completion one structured repair attempt.
+Model output limits are calibrated once and cached locally; the confirmed model
+limit is sent directly, without staircase growth. The NewAPI key remains only
+in the backend process.
 
-The decrypted key exists only in the backend process environment. It never
-enters the browser, journal, or SQLite database.
+## Runs, recovery, and data
 
-## Runs and data
+The selected view is stored in `?run=...&week=...`. The UI always offers 52 week
+buttons; selecting one loads its Monday-Sunday frames. Stopped and interrupted
+runs retain their journal and atomic checkpoint and can resume under the same
+run ID. Failed runs are terminal. Protocol-invalid runs may retain a diagnostic
+score but are excluded from benchmark ranking.
 
-The selected run and day live in `?run=...&day=...`, so refresh and browser
-navigation preserve the view. **All Runs** browses every persisted lifecycle
-state and its committed timeline. **Completed Run Replay** uses only a completed
-source run and inherits its seed. Stopped and interrupted runs can resume under
-the same run ID; only interrupted work auto-resumes after a backend restart.
-Failed runs are terminal. A protocol-invalid episode still completes with a
-diagnostic score and replay source, but is explicitly excluded from benchmark
-comparison.
-
-Run submissions are independent: the backend executes up to 100 `RunJob`s at
-once and queues later jobs. All model runs share one HTTP connection pool and a
-100-request NewAPI semaphore; retry backoff happens after releasing its permit.
-The UI keeps every active job refreshed, so another model can be submitted while
-earlier runs continue. **All Runs** selects, stops, or resumes one job at a time.
-
-Both concurrency limits default to, and cannot exceed, 100. They can be lowered
-for a constrained gateway with `DAIRY_BENCH_MAX_CONCURRENT_RUNS` and
-`DAIRY_BENCH_MAX_CONCURRENT_NEWAPI_REQUESTS`.
-
-All mutable state stays under the Git-ignored `.dairy-bench/` directory:
+Mutable state is Git-ignored:
 
 ```text
 .dairy-bench/
 |-- credentials/
 |   |-- newapi-model-capabilities.json
 |   `-- newapi-models.json
-`-- data/runs.sqlite3
+`-- data/runs-v6.sqlite3
 ```
 
-Override the root only when necessary with `DAIRY_BENCH_HOME`.
+Override the runtime root only when necessary with `DAIRY_BENCH_HOME`.
 
 ## Verification
 
 ```powershell
 cd backend
-python -m pytest -q
-python -m ruff check .
+python -m pytest -q -p no:cacheprovider
+python -m ruff check src tests
 
 cd "..\frontend"
 npm.cmd run build
 ```
 
-## Main HTTP interfaces
+## HTTP interfaces
 
 - `GET /api/policy-profiles`
 - `POST /api/runs`
 - `GET /api/run-jobs`
 - `GET /api/run-jobs/{run_id}`
+- `POST /api/run-jobs/{run_id}/stop`
+- `POST /api/run-jobs/{run_id}/resume`
 - `GET /api/runs/{run_id}`
-- `GET /api/runs/{run_id}/timeline?day={day}`
+- `GET /api/runs/{run_id}/timeline?week={week}`
 - `GET /api/runs/{run_id}/timeline/{entry_id}`
 - `GET /api/runs/{run_id}/turns`
 - `GET /api/runs/{run_id}/invocations`
+
+See [Architecture and invariants](docs/ARCHITECTURE.md) and
+[Agent integration](docs/AGENT_INTEGRATION.md) for the complete contracts.

@@ -24,7 +24,7 @@ from company_bench.runs.models import (
     RunJob,
 )
 from company_bench.runtime.models import TurnRecord
-from company_bench.timeline.models import TimelineDay, TimelineDetail
+from company_bench.timeline.models import TimelineDetail, TimelineWeek
 from company_bench.timeline.projector import (
     TimelineNotFoundError,
     TimelineUnsupportedError,
@@ -74,7 +74,7 @@ def create_app(
 
     app = FastAPI(
         title="Dairy Bench API",
-        version="0.4.0",
+        version="0.6.0",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -202,15 +202,15 @@ def create_app(
 
     @app.get(
         "/api/runs/{run_id}/timeline",
-        response_model=TimelineDay,
+        response_model=TimelineWeek,
         tags=["runs"],
     )
-    def read_timeline_day(
+    def read_timeline_week(
         run_id: str,
-        day: Annotated[int, Query(ge=1)],
-    ) -> TimelineDay:
+        week: Annotated[int, Query(ge=1)],
+    ) -> TimelineWeek:
         try:
-            return active_application.timeline_day(run_id, day)
+            return active_application.timeline_week(run_id, week)
         except (TimelineNotFoundError, TimelineUnsupportedError, ValueError) as error:
             raise _timeline_http_error(error) from error
 

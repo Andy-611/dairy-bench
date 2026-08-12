@@ -12,13 +12,13 @@ from company_bench.domain.models import (
     CompanyEvent,
     CompanyId,
     ConsumerSaleEvent,
-    DaySnapshot,
     DomainEvent,
     EpisodeResult,
     EventRecord,
     InventoryExpiredEvent,
     ScenarioSpec,
     TradeExecutedEvent,
+    WeekSnapshot,
 )
 from company_bench.domain.precision import EconomicPrecision
 from company_bench.runs.models import (
@@ -36,7 +36,7 @@ from company_bench.runtime.models import (
     RejectionCategory,
     SetQuoteLadder,
     SetRetailPrice,
-    SimTime,
+    SimDay,
     SystemEventKind,
     SystemStepRecord,
     Transform,
@@ -48,7 +48,6 @@ from company_bench.timeline.market import MarketTimelineProjector
 from company_bench.timeline.models import (
     AgentTraceDetail,
     AgentTracePreview,
-    DayTimelineSummary,
     DecisionDispositionSource,
     InventoryQuantityChange,
     ObservationDelta,
@@ -59,11 +58,12 @@ from company_bench.timeline.models import (
     RetailPriceChanged,
     RunDiagnostics,
     SystemTimelineItem,
-    TimelineDay,
+    TimelineDayFrame,
     TimelineDetail,
-    TimelineMoment,
     TimelineRunContext,
+    TimelineWeek,
     TurnTimelineItem,
+    WeekTimelineSummary,
 )
 
 
@@ -72,7 +72,7 @@ class TimelineNotFoundError(LookupError):
 
 
 class TimelineUnsupportedError(ValueError):
-    """Raised when a run predates V4 continuous-market semantics."""
+    """Raised when a run predates V6 weekly-market semantics."""
 
 
 class TimelineSource(Protocol):
@@ -119,53 +119,47 @@ class RunTimelineProjector:
         self._source = source
         self._market = MarketTimelineProjector()
 
-    def read_day(self, run_id: str, day: int) -> TimelineDay:
-        """Return one 1-based simulation day with run-wide summaries."""
+    def read_week(self, run_id: str, week: int) -> TimelineWeek:
+        """Return one seven-day trading week with run-wide summaries."""
         data = self._load(run_id)
-        if not 1 <= day <= data.scenario.days:
-            raise ValueError(f"day must be between 1 and {data.scenario.days}")
+        if not 1 <= week <= data.scenario.weeks:
+            raise ValueError(f"week must be between 1 and {data.scenario.weeks}")
         selected_turn_records = tuple(
-            record for record in data.turns if record.turn.sim_time.day + 1 == day
+            record for record in data.turns if record.turn.sim_day.week == week
         )
         selected_step_records = tuple(
-            record for record in data.system_steps if record.occurred_at.day + 1 == day
+            record for record in data.system_steps if record.occurred_on.week == week
         )
         selected_turns = self._turn_items(
             data,
             selected_turn_records,
         )
         selected_steps = self._system_items(selected_step_records)
-        minutes = tuple(
-            sorted(
-                {
-                    *(item.sim_time.absolute_minute for item in selected_turns),
-                    *(item.sim_time.absolute_minute for item in selected_steps),
-                }
-            )
-        )
-        market_by_minute = self._market.project_day(
+        days = data.scenario.calendar.days_of_week(week)
+        absolute_days = tuple(day.absolute_day for day in days)
+        market_by_day = self._market.project_week(
             data.scenario,
-            day,
+            week,
             selected_turn_records,
             selected_step_records,
-            minutes,
+            absolute_days,
         )
-        return TimelineDay(
+        return TimelineWeek(
             context=data.context,
-            selected_day=day,
-            day_summaries=self._day_summaries(data),
-            moments=tuple(
-                TimelineMoment(
-                    sim_time=SimTime(absolute_minute=minute),
+            selected_week=week,
+            week_summaries=self._week_summaries(data),
+            days=tuple(
+                TimelineDayFrame(
+                    sim_day=day,
                     system_steps=tuple(
-                        item for item in selected_steps if item.sim_time.absolute_minute == minute
+                        item for item in selected_steps if item.sim_day == day
                     ),
                     turns=tuple(
-                        item for item in selected_turns if item.sim_time.absolute_minute == minute
+                        item for item in selected_turns if item.sim_day == day
                     ),
-                    market=market_by_minute[minute],
+                    market=market_by_day[day.absolute_day],
                 )
-                for minute in minutes
+                for day in days
             ),
         )
 
@@ -230,7 +224,7 @@ class RunTimelineProjector:
             sorted(
                 stored_system_steps,
                 key=lambda step: (
-                    step.occurred_at.absolute_minute,
+                    step.occurred_on.absolute_day,
                     step.journal_sequence,
                     step.entry_id,
                 ),
@@ -282,7 +276,7 @@ class RunTimelineProjector:
             run_id=run_id,
             scenario_id=scenario.scenario_id,
             scenario_version=scenario.version,
-            total_days=scenario.days,
+            total_weeks=scenario.weeks,
             status=job.status if job is not None else RunStatus.COMPLETED,
             mode=mode,
             source_run_id=source_run_id,
@@ -292,7 +286,7 @@ class RunTimelineProjector:
             source_model_call_count=len(trace_invocations),
             current_usage=_sum_usage(current_invocations),
             source_usage=_sum_usage(trace_invocations),
-            checkpoint_at=checkpoint.scheduler.now if checkpoint is not None else None,
+            checkpoint_on=checkpoint.scheduler.today if checkpoint is not None else None,
             checkpoint_state_version=(
                 checkpoint.economy.state_version if checkpoint is not None else None
             ),
@@ -342,15 +336,15 @@ class RunTimelineProjector:
         )
         return TurnTimelineItem(
             entry_id=record.turn.turn_id,
-            sim_time=record.turn.sim_time,
+            sim_day=record.turn.sim_day,
             company_id=record.turn.company_id,
             company_name=data.scenario.company(record.turn.company_id).name,
             tier=data.scenario.company(record.turn.company_id).tier,
             state_version=record.turn.state_version,
             apply_sequence=record.outcome.apply_sequence,
             journal_sequence=record.journal_sequence,
-            turn_number_today=record.turn.turn_number_today,
-            turn_limit_today=record.turn.turn_limit_today,
+            turn_number_this_week=record.turn.turn_number_this_week,
+            turn_limit_this_week=record.turn.turn_limit_this_week,
             wake_signals=signals,
             observation=ObservationFacts(
                 cash=record.turn.available_cash,
@@ -373,8 +367,8 @@ class RunTimelineProjector:
             disposition_source=_disposition_source(record),
             effects=record.outcome.events,
             state_changes=_state_changes(record),
-            next_available_at=record.outcome.next_available_at,
-            review_at=_review_at(record),
+            next_available_on=record.outcome.next_available_on,
+            review_on=_review_on(record),
             replay_origin=origin,
             traces=tuple(preview for _, preview in self._trace_pairs(data, record)),
             protocol_error=record.protocol_error,
@@ -394,7 +388,7 @@ class RunTimelineProjector:
     ) -> SystemTimelineItem:
         return SystemTimelineItem(
             entry_id=step.entry_id,
-            sim_time=step.occurred_at,
+            sim_day=step.occurred_on,
             kind=step.kind,
             journal_sequence=step.journal_sequence,
             state_version_before=step.state_version_before,
@@ -485,10 +479,10 @@ class RunTimelineProjector:
             open_order_count_after=len(record.turn.open_orders),
         )
 
-    def _day_summaries(
+    def _week_summaries(
         self,
         data: _TimelineData,
-    ) -> tuple[DayTimelineSummary, ...]:
+    ) -> tuple[WeekTimelineSummary, ...]:
         all_events = (
             tuple(record.event for record in data.result.events)
             if data.result is not None
@@ -500,8 +494,8 @@ class RunTimelineProjector:
             )
         )
         return tuple(
-            _day_summary(day, data.turns, data.system_steps, all_events)
-            for day in range(1, data.scenario.days + 1)
+            _week_summary(week, data.turns, data.system_steps, all_events)
+            for week in range(1, data.scenario.weeks + 1)
         )
 
     def _resolve_lineage(
@@ -612,33 +606,43 @@ def _is_applied_invocation(
     )
 
 
-def _day_summary(
-    day: int,
+def _week_summary(
+    week: int,
     turns: tuple[TurnRecord, ...],
     steps: tuple[SystemStepRecord, ...],
     events: tuple[DomainEvent, ...],
-) -> DayTimelineSummary:
-    day_turns = tuple(item for item in turns if item.turn.sim_time.day + 1 == day)
-    day_steps = tuple(item for item in steps if item.occurred_at.day + 1 == day)
-    day_events = tuple(event for event in events if event.day == day)
-    return DayTimelineSummary(
-        day=day,
-        turn_count=len(day_turns),
-        accepted_count=sum(item.outcome.accepted for item in day_turns),
-        rejected_count=sum(not item.outcome.accepted for item in day_turns),
-        idle_count=sum(isinstance(item.envelope.decision, IdleDecision) for item in day_turns),
-        system_step_count=len(day_steps),
-        event_count=len(day_events),
+) -> WeekTimelineSummary:
+    week_turns = tuple(item for item in turns if item.turn.sim_day.week == week)
+    week_steps = tuple(item for item in steps if item.occurred_on.week == week)
+    week_events = tuple(event for event in events if event.occurred_on.week == week)
+    return WeekTimelineSummary(
+        week=week,
+        turn_count=len(week_turns),
+        accepted_count=sum(item.outcome.accepted for item in week_turns),
+        rejected_count=sum(not item.outcome.accepted for item in week_turns),
+        idle_count=sum(
+            isinstance(item.envelope.decision, IdleDecision) for item in week_turns
+        ),
+        system_step_count=len(week_steps),
+        event_count=len(week_events),
         trade_quantity=sum(
-            (event.quantity for event in day_events if isinstance(event, TradeExecutedEvent)),
+            (event.quantity for event in week_events if isinstance(event, TradeExecutedEvent)),
             Decimal(),
         ),
         consumer_sales=sum(
-            (event.sold_quantity for event in day_events if isinstance(event, ConsumerSaleEvent)),
+            (
+                event.sold_quantity
+                for event in week_events
+                if isinstance(event, ConsumerSaleEvent)
+            ),
             Decimal(),
         ),
         expired_quantity=sum(
-            (event.quantity for event in day_events if isinstance(event, InventoryExpiredEvent)),
+            (
+                event.quantity
+                for event in week_events
+                if isinstance(event, InventoryExpiredEvent)
+            ),
             Decimal(),
         ),
     )
@@ -648,14 +652,16 @@ def _run_diagnostics(
     scenario: ScenarioSpec,
     result: EpisodeResult | None,
     turns: tuple[TurnRecord, ...],
-    snapshots: tuple[DaySnapshot, ...],
+    snapshots: tuple[WeekSnapshot, ...],
     event_records: tuple[EventRecord, ...],
 ) -> RunDiagnostics:
     """Derive protocol and market-health facts from authoritative journals."""
-    trade_days = tuple(
-        record.event.day for record in event_records if isinstance(record.event, TradeExecutedEvent)
+    trade_weeks = tuple(
+        record.event.occurred_on.week
+        for record in event_records
+        if isinstance(record.event, TradeExecutedEvent)
     )
-    completed_days = len(snapshots)
+    completed_weeks = len(snapshots)
     demand = sum((snapshot.consumer_demand for snapshot in snapshots), Decimal())
     sales = sum((snapshot.consumer_sales for snapshot in snapshots), Decimal())
     fill_rate = EconomicPrecision.round(sales / demand) if demand else Decimal()
@@ -677,7 +683,7 @@ def _run_diagnostics(
         <= EconomicPrecision.round(company.initial_cash * Decimal("0.01"))
     )
     return RunDiagnostics(
-        completed_days=completed_days,
+        completed_weeks=completed_weeks,
         benchmark_eligible=(result.quality.benchmark_eligible if result is not None else None),
         protocol_invalid_turns=(
             result.quality.protocol.invalid_turn_count
@@ -690,10 +696,12 @@ def _run_diagnostics(
         attention_rejections=sum(
             record.outcome.rejection_category is RejectionCategory.ATTENTION for record in turns
         ),
-        trade_count=len(trade_days),
-        last_trade_day=max(trade_days, default=None),
-        zero_trade_day_streak=(
-            max(0, completed_days - max(trade_days)) if trade_days else completed_days
+        trade_count=len(trade_weeks),
+        last_trade_week=max(trade_weeks, default=None),
+        zero_trade_week_streak=(
+            max(0, completed_weeks - max(trade_weeks))
+            if trade_weeks
+            else completed_weeks
         ),
         consumer_demand=demand,
         consumer_sales=sales,
@@ -733,11 +741,11 @@ def _decision_title(record: TurnRecord) -> str:
     return "Idle"
 
 
-def _review_at(record: TurnRecord) -> SimTime | None:
+def _review_on(record: TurnRecord) -> SimDay | None:
     """Rebuild the installed fallback review for an accepted decision."""
     if not record.outcome.accepted:
         return None
-    return AgentAttention().arm(record.envelope.decision.attention, record.turn).review_at
+    return AgentAttention().arm(record.envelope.decision.attention, record.turn).review_on
 
 
 def _disposition_source(record: TurnRecord) -> DecisionDispositionSource:
@@ -816,31 +824,34 @@ def _state_changes(
 
 def _system_title(step: SystemStepRecord) -> str:
     return {
-        SystemEventKind.DAY_OPEN: "Continuous markets opened",
+        SystemEventKind.WEEK_OPEN: "Trading week opened",
+        SystemEventKind.DAY_STARTED: "Simulation day started",
         SystemEventKind.OPERATION_COMPLETED: "Operation completed",
         SystemEventKind.DELIVERY_COMPLETED: "Delivery completed",
         SystemEventKind.MARKET_CLOSE: "Continuous markets closed",
         SystemEventKind.CONSUMER_SALES: "Consumer sales settled",
-        SystemEventKind.DAY_CLOSE: "Simulation day closed",
-        SystemEventKind.TURN_LIMIT_REACHED: "Daily Agent turn limit reached",
+        SystemEventKind.WEEK_CLOSE: "Trading week closed",
+        SystemEventKind.TURN_LIMIT_REACHED: "Weekly Agent turn limit reached",
         SystemEventKind.AGENT_WAKE_SUPPRESSED: "Agent wake suppressed",
     }[step.kind]
 
 
 def _system_summary(step: SystemStepRecord) -> str:
     effect_count = len(step.effects)
-    if step.kind is SystemEventKind.DAY_OPEN:
-        return "Companies may trade and start operations from 09:00"
+    if step.kind is SystemEventKind.WEEK_OPEN:
+        return "Weekly books and operating resources opened on Monday"
+    if step.kind is SystemEventKind.DAY_STARTED:
+        return f"{step.occurred_on.weekday.value.title()} began"
     if step.kind is SystemEventKind.MARKET_CLOSE:
-        return "Resting DAY orders were cancelled and reserved assets released"
+        return "Resting weekly orders were cancelled and reserved assets released"
     if step.kind is SystemEventKind.CONSUMER_SALES:
         return f"{effect_count} consumer settlement effect{'s' if effect_count != 1 else ''}"
-    if step.kind is SystemEventKind.DAY_CLOSE:
+    if step.kind is SystemEventKind.WEEK_CLOSE:
         return f"{effect_count} expiry effect{'s' if effect_count != 1 else ''}"
     if step.kind is SystemEventKind.TURN_LIMIT_REACHED:
-        return f"{step.company_id} used its complete daily Agent turn budget"
+        return f"{step.company_id} used its complete weekly Agent turn budget"
     if step.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED:
         reasons = ", ".join(signal.reason.value for signal in step.suppressed_wake_signals)
-        return f"{step.company_id} was not called at the daily limit: {reasons}"
+        return f"{step.company_id} was not called at the weekly limit: {reasons}"
     reference = "" if not step.reference_ids else f" for {', '.join(step.reference_ids)}"
     return f"{effect_count} economic effect{'s' if effect_count != 1 else ''}{reference}"

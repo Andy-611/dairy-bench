@@ -240,7 +240,7 @@ function RunActionButton({
   return (
     <button className="run-button" disabled={!canStart} type="submit">
       <span aria-hidden="true">▶</span>
-      {completedReplay ? "Start completed replay" : "Run 30 days"}
+      {completedReplay ? "Start completed replay" : "Run 52 weeks"}
     </button>
   );
 }

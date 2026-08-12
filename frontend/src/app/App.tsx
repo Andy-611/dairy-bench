@@ -19,6 +19,7 @@ import type {
   RunRequest,
 } from "../shared/api/types";
 import { isAbortError, requestErrorMessage } from "../shared/requestErrors";
+import { completedWeeks, DAYS_PER_WEEK } from "../shared/simulationCalendar";
 import { EmptyState } from "../shared/ui/EmptyState";
 import { useRunWorkspace } from "./useRunWorkspace";
 
@@ -200,7 +201,7 @@ export function App() {
     }
   }
 
-  const { selectedDay, selectedJob } = workspace;
+  const { selectedJob, selectedWeek } = workspace;
   const replaySourceError =
     mode === "replay" ? workspace.replaySourceError : null;
   const selectedFailure =
@@ -231,10 +232,10 @@ export function App() {
       : selectedJob?.status === "interrupted"
         ? interruptionNotice(selectedJob)
         : null);
-  const timelineDay =
+  const timelineWeek =
     selectedJob?.status === "stopped" && selectedJob.startedAt === null
       ? null
-      : selectedDay;
+      : selectedWeek;
 
   return (
     <div className="app-shell">
@@ -277,7 +278,7 @@ export function App() {
         <section className="hero">
           <div>
             <span className="eyebrow">
-              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v5").toUpperCase()}
+              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v6").toUpperCase()}
             </span>
             <h1>Independent companies. One living dairy economy.</h1>
             <p>
@@ -298,7 +299,7 @@ export function App() {
               </div>
               <div>
                 <dt>Horizon</dt>
-                <dd>{selectedJob.totalDays} days</dd>
+                <dd>{selectedJob.totalWeeks} weeks</dd>
               </div>
             </dl>
           )}
@@ -350,8 +351,8 @@ export function App() {
                   )}
                 </span>
                 <progress
-                  max={activeProgress.totalDays}
-                  value={activeProgress.currentDay}
+                  max={activeProgress.totalWeeks * DAYS_PER_WEEK}
+                  value={activeProgress.currentAbsoluteDay}
                 />
               </div>
             </div>
@@ -391,17 +392,17 @@ export function App() {
                 <MetricChart snapshots={episode.snapshots} />
               </>
             )}
-            {timelineDay !== null && (
+            {timelineWeek !== null && (
               <OperationsTimeline
-                day={timelineDay}
-                days={selectedJob.totalDays}
                 key={selectedJob.runId}
                 loadDetail={loadTimelineDetail}
-                loadTimeline={loadTimelineDay}
-                onDayChange={workspace.selectDay}
-                revision={`${selectedJob.status}:${selectedJob.currentDay}:${workspace.timelineRevision}`}
+                loadTimeline={loadTimelineWeek}
+                onWeekChange={workspace.selectWeek}
+                revision={`${selectedJob.status}:${selectedJob.currentAbsoluteDay}:${workspace.timelineRevision}`}
                 runId={selectedJob.runId}
                 timelinePending={selectedJob.status === "queued"}
+                week={timelineWeek}
+                weeks={selectedJob.totalWeeks}
               />
             )}
           </div>
@@ -409,7 +410,7 @@ export function App() {
       </main>
 
       <footer>
-        <span>Dairy Bench V4</span>
+        <span>Dairy Bench V6</span>
         <span>NewAPI credentials remain on the backend.</span>
       </footer>
     </div>
@@ -462,10 +463,13 @@ function activeRunText(
   const subject = selected ? "Selected run" : "Latest active run";
   return job.status === "queued"
     ? `${summary}. ${subject} is queued.`
-    : `${summary}. ${subject} is on day ${job.currentDay} of ${job.totalDays}.`;
+    : `${summary}. ${subject} has completed ${completedWeeks(job.currentAbsoluteDay)} of ${job.totalWeeks} weeks (${job.currentAbsoluteDay} simulated days).`;
 }
 
 function stopNotice(job: RunJobView): string {
+  if (job.stopReason === "quota_exhausted") {
+    return "NewAPI balance was exhausted. Recorded progress and any checkpoint were preserved; recharge NewAPI, then resume this run.";
+  }
   return job.startedAt === null
     ? "Run stopped before execution began. It can be resumed from the beginning."
     : "Run stopped. Its timeline and checkpoint remain available for resume.";
@@ -476,12 +480,12 @@ function interruptionNotice(job: RunJobView): string {
   return `Run interrupted by a temporary infrastructure issue.${reason} Its timeline and checkpoint remain available for resume.`;
 }
 
-function loadTimelineDay(
+function loadTimelineWeek(
   runId: string,
-  day: number,
+  week: number,
   signal?: AbortSignal,
 ) {
-  return api.timelineDay(runId, day, signal);
+  return api.timelineWeek(runId, week, signal);
 }
 
 function loadTimelineDetail(

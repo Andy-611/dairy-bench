@@ -16,7 +16,7 @@ from company_bench.economy.market import (
     SellOrder,
     TradeFill,
 )
-from company_bench.runtime.models import MarketSide, QuoteLadder, QuoteLevel, SimTime
+from company_bench.runtime.models import MarketSide, QuoteLadder, QuoteLevel, SimDay
 
 RAW_MILK = ProductId.RAW_MILK
 
@@ -25,15 +25,15 @@ def _lot(
     lot_id: str,
     quantity: str,
     *,
-    produced_day: int = 1,
-    expires_end_of_day: int = 2,
+    produced_week: int = 1,
+    expires_end_of_week: int = 2,
 ) -> InventoryLot:
     return InventoryLot(
         lot_id=lot_id,
         product=RAW_MILK,
         quantity=Decimal(quantity),
-        produced_day=produced_day,
-        expires_end_of_day=expires_end_of_day,
+        produced_week=produced_week,
+        expires_end_of_week=expires_end_of_week,
     )
 
 
@@ -77,7 +77,7 @@ def _place(
                 ),
             ),
         ),
-        placed_at=SimTime(absolute_minute=minute),
+        placed_on=SimDay(absolute_day=minute),
         order_identity_factory=lambda _: OrderIdentity(
             order_id=order_id,
             priority_sequence=priority,
@@ -95,7 +95,7 @@ def _clear(
     market.set_quote_ladder(
         owner_id=owner_id,
         ladder=QuoteLadder(side=side),
-        placed_at=SimTime(absolute_minute=541),
+        placed_on=SimDay(absolute_day=541),
         order_identity_factory=lambda _: OrderIdentity(
             order_id=f"unused_{priority}",
             priority_sequence=priority,
@@ -123,7 +123,7 @@ def _ladder(
                 for price, quantity in levels
             ),
         ),
-        placed_at=SimTime(absolute_minute=minute),
+        placed_on=SimDay(absolute_day=minute),
         order_identity_factory=lambda offset: OrderIdentity(
             order_id=f"{prefix}_{offset}",
             priority_sequence=first_priority + offset - 1,
@@ -413,7 +413,7 @@ def test_failed_replace_is_atomic_on_the_same_market_instance() -> None:
                 side=MarketSide.BUY,
                 levels=(QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("2")),),
             ),
-            placed_at=SimTime(absolute_minute=541),
+            placed_on=SimDay(absolute_day=541),
             order_identity_factory=lambda _: OrderIdentity(
                 order_id="too_large",
                 priority_sequence=2,
@@ -453,8 +453,8 @@ def test_fefo_fill_and_partial_lot_slices_keep_unique_ids() -> None:
         _company(
             "seller",
             inventory=(
-                _lot("old", "5", expires_end_of_day=1),
-                _lot("new", "5", expires_end_of_day=2),
+                _lot("old", "5", expires_end_of_week=1),
+                _lot("new", "5", expires_end_of_week=2),
             ),
         ),
     )
@@ -477,7 +477,7 @@ def test_fefo_fill_and_partial_lot_slices_keep_unique_ids() -> None:
 
     fills = _place(market, "bid", "buyer", MarketSide.BUY, "6", "2", 2)
 
-    assert tuple(lot.expires_end_of_day for lot in fills[0].delivery_lots) == (1, 2)
+    assert tuple(lot.expires_end_of_week for lot in fills[0].delivery_lots) == (1, 2)
     assert tuple(lot.quantity for lot in fills[0].delivery_lots) == (
         Decimal("5"),
         Decimal("1"),
@@ -636,7 +636,7 @@ def test_exact_target_ladder_preserves_every_order_identity_and_priority() -> No
             side=MarketSide.SELL,
             levels=tuple(level.level for level in first.result.levels),
         ),
-        placed_at=SimTime(absolute_minute=600),
+        placed_on=SimDay(absolute_day=600),
         order_identity_factory=lambda _: (_ for _ in ()).throw(
             AssertionError("an unchanged ladder must not allocate an identity")
         ),

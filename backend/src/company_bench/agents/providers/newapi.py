@@ -33,9 +33,11 @@ from company_bench.agents.contracts import (
     ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
+    ModelQuotaExhaustedError,
     decision_tool_model,
 )
 from company_bench.agents.providers.capabilities import ModelCapabilityError
+from company_bench.agents.quota import QUOTA_EXHAUSTION_MATCHER
 from company_bench.diagnostics import bounded_error
 from company_bench.domain.models import ProtocolIssueKind, StrictModel
 from company_bench.domain.precision import require_numeric_economic_schema
@@ -49,6 +51,12 @@ from company_bench.settings import MAX_PARALLELISM, require_parallelism
 
 type JsonValue = str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+type AuditedModelError = (
+    ModelOutputError
+    | ModelConfigurationError
+    | ModelInfrastructureError
+    | ModelQuotaExhaustedError
+)
 
 DEFAULT_NEWAPI_BASE_URL = "https://newapi.deepwisdom.ai/v1"
 _DECISION_ADAPTER = TypeAdapter(CompanyDecision)
@@ -769,9 +777,9 @@ def _attempt_latency(attempts: tuple[ProviderAttempt, ...]) -> int:
 
 
 def _audited_error(
-    error: ModelOutputError | ModelConfigurationError | ModelInfrastructureError,
+    error: AuditedModelError,
     attempts: tuple[ProviderAttempt, ...],
-) -> ModelOutputError | ModelConfigurationError | ModelInfrastructureError:
+) -> AuditedModelError:
     """Attach cumulative immutable provider audit metadata to one failure."""
     error.attempt_history = attempts
     error.attempts = len(attempts) or error.attempts
@@ -782,7 +790,7 @@ def _audited_error(
 
 def _retryable_response(response: httpx.Response) -> bool:
     """Retry temporary states and NewAPI-wrapped upstream failures."""
-    return (
+    return not _is_quota_exhaustion(response) and (
         response.status_code in {408, 409, 429}
         or response.status_code >= 500
         or _error_type(response) == _PROXY_UPSTREAM_ERROR_TYPE
@@ -878,9 +886,16 @@ def _response_error(
     api_key: SecretStr,
     attempts: int,
     latency_ms: int,
-) -> ModelCompatibilityError | ModelConfigurationError | ModelInfrastructureError:
+) -> AuditedModelError:
     """Classify a bounded HTTP failure without exposing credentials."""
     message = _safe_error_message(response, api_key)
+    metadata = {
+        "request_id": _request_id(response),
+        "attempts": attempts,
+        "latency_ms": latency_ms,
+    }
+    if _is_quota_exhaustion(response):
+        return ModelQuotaExhaustedError(message, **metadata)
     error_type = _error_type(response)
     if error_type != _PROXY_UPSTREAM_ERROR_TYPE and response.status_code in {
         400,
@@ -890,9 +905,7 @@ def _response_error(
     }:
         return ModelCompatibilityError(
             message,
-            request_id=_request_id(response),
-            attempts=attempts,
-            latency_ms=latency_ms,
+            **metadata,
         )
     error_class = (
         ModelInfrastructureError
@@ -903,9 +916,19 @@ def _response_error(
     )
     return error_class(
         message,
-        request_id=_request_id(response),
-        attempts=attempts,
-        latency_ms=latency_ms,
+        **metadata,
+    )
+
+
+def _is_quota_exhaustion(response: httpx.Response) -> bool:
+    """Recognize paid-quota exhaustion without swallowing rate or permission errors."""
+    message = _provider_error_message(response)
+    explicit_diagnostic = (
+        message is not None and QUOTA_EXHAUSTION_MATCHER.matches(message)
+    )
+    return response.status_code in {402, 403, 429} and (
+        explicit_diagnostic
+        or _error_type(response) in {"insufficient_balance", "insufficient_quota"}
     )
 
 

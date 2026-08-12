@@ -2,15 +2,16 @@ from decimal import Decimal
 
 import pytest
 
+from company_bench.domain.calendar import SimDay, Weekday
 from company_bench.domain.models import (
     ZERO,
     CompanySnapshot,
     ConsumerSaleEvent,
-    DaySnapshot,
     DomainEvent,
     RetailerOperation,
     ScenarioSpec,
     ScoreCard,
+    WeekSnapshot,
     WorldState,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
@@ -18,10 +19,10 @@ from company_bench.economy.engine import EconomyEngine
 from company_bench.economy.scoring import Evaluator
 
 
-def _scenario(days: int = 1) -> ScenarioSpec:
+def _scenario(weeks: int = 1) -> ScenarioSpec:
     return DAIRY_S9_SCENARIO.model_copy(
         update={
-            "days": days,
+            "weeks": weeks,
             "demand": DAIRY_S9_SCENARIO.demand.model_copy(
                 update={"shock_min": 0, "shock_max": 0}
             ),
@@ -31,16 +32,16 @@ def _scenario(days: int = 1) -> ScenarioSpec:
 
 def _state(
     scenario: ScenarioSpec,
-    day: int,
+    week: int,
     cash: dict[str, Decimal] | None = None,
 ) -> WorldState:
     initial = EconomyEngine().initial_state(scenario, seed=42)
-    if day == 0:
+    if week == 0:
         return initial
     balances = cash or {}
     return initial.model_copy(
         update={
-            "day": day,
+            "completed_weeks": week,
             "companies": tuple(
                 company.model_copy(
                     update={
@@ -58,16 +59,16 @@ def _state(
 
 def _snapshot(
     scenario: ScenarioSpec,
-    day: int,
+    week: int,
     cash: dict[str, Decimal] | None = None,
     *,
     potential_demand: Decimal = Decimal("40"),
-) -> DaySnapshot:
+) -> WeekSnapshot:
     balances = cash or {}
     companies = tuple(
         _company_snapshot(
             scenario,
-            day,
+            week,
             company.company_id,
             balances.get(company.company_id, company.initial_cash),
         )
@@ -76,8 +77,8 @@ def _snapshot(
     retailer_count = sum(
         isinstance(company.operation, RetailerOperation) for company in scenario.companies
     )
-    return DaySnapshot(
-        day=day,
+    return WeekSnapshot(
+        week=week,
         companies=companies,
         markets=(),
         consumer_demand=potential_demand * retailer_count,
@@ -88,13 +89,13 @@ def _snapshot(
 
 def _company_snapshot(
     scenario: ScenarioSpec,
-    day: int,
+    week: int,
     company_id: str,
     cash: Decimal,
 ) -> CompanySnapshot:
     company = scenario.company(company_id)
     return CompanySnapshot(
-        day=day,
+        week=week,
         company_id=company_id,
         tier=company.tier,
         cash=cash,
@@ -103,8 +104,8 @@ def _company_snapshot(
         inventory_value=ZERO,
         net_worth=cash,
         surplus=cash - company.initial_cash,
-        daily_consumer_sales=ZERO,
-        daily_expired_quantity=ZERO,
+        weekly_consumer_sales=ZERO,
+        weekly_expired_quantity=ZERO,
     )
 
 
@@ -115,7 +116,7 @@ def _consumer_events(
 ) -> tuple[DomainEvent, ...]:
     return tuple(
         ConsumerSaleEvent(
-            day=day,
+            occurred_on=SimDay.at(week=week, weekday=Weekday.SUNDAY),
             company_id=company.company_id,
             potential_demand_quantity=potential_demand,
             demand_quantity=potential_demand,
@@ -123,7 +124,7 @@ def _consumer_events(
             retail_price=None,
             revenue=ZERO,
         )
-        for day in range(1, scenario.days + 1)
+        for week in range(1, scenario.weeks + 1)
         for company in scenario.companies
         if isinstance(company.operation, RetailerOperation)
     )
@@ -132,13 +133,13 @@ def _consumer_events(
 def _evaluate(
     scenario: ScenarioSpec,
     final_cash: dict[str, Decimal],
-    snapshots: tuple[DaySnapshot, ...],
+    snapshots: tuple[WeekSnapshot, ...],
     events: tuple[DomainEvent, ...] | None = None,
 ) -> ScoreCard:
     return Evaluator().evaluate(
         scenario,
         _state(scenario, 0),
-        _state(scenario, scenario.days, final_cash),
+        _state(scenario, scenario.weeks, final_cash),
         snapshots,
         _consumer_events(scenario) if events is None else events,
     )
@@ -171,7 +172,7 @@ def test_evaluator_combines_continuous_efficiency_fairness_and_survival() -> Non
 
     score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
 
-    assert score.score_version == "s9-enterprise-v2"
+    assert score.score_version == "s9-enterprise-v4"
     assert score.efficiency_raw == expected_reference / Decimal("2")
     assert score.efficiency_reference == expected_reference
     assert score.efficiency_score == Decimal("0.5")
@@ -204,22 +205,26 @@ def test_three_company_tier_gini_uses_two_thirds_maximum() -> None:
     assert score.final_score == ZERO
 
 
-def test_bankruptcy_counts_any_zero_net_worth_day_even_after_recovery() -> None:
-    scenario = _scenario(days=2)
+def test_bankruptcy_counts_net_worth_at_or_below_one_even_after_recovery() -> None:
+    scenario = _scenario(weeks=2)
     expected_reference = Decimal("546.750")
     per_company_gain = expected_reference / Decimal("18")
     final_cash = {
         company.company_id: company.initial_cash + per_company_gain
         for company in scenario.companies
     }
-    day_one_cash = {company.company_id: company.initial_cash for company in scenario.companies}
-    day_one_cash["farm_a"] = ZERO
+    week_one_cash = {
+        company.company_id: company.initial_cash for company in scenario.companies
+    }
+    week_one_cash["farm_a"] = Decimal("1.0000")
+    week_one_cash["processor_a"] = Decimal("0.9999")
+    week_one_cash["retailer_a"] = Decimal("1.0001")
 
     score = _evaluate(
         scenario,
         final_cash,
         (
-            _snapshot(scenario, 1, day_one_cash),
+            _snapshot(scenario, 1, week_one_cash),
             _snapshot(scenario, 2, final_cash),
         ),
     )
@@ -227,9 +232,9 @@ def test_bankruptcy_counts_any_zero_net_worth_day_even_after_recovery() -> None:
     assert score.efficiency_reference == expected_reference
     assert score.efficiency_score == Decimal("0.5")
     assert score.fairness_score == Decimal("1")
-    assert score.bankrupt_company_count == 1
-    assert score.bankruptcy_rate == Decimal("0.1111")
-    expected = Decimal("50") * (Decimal("8") / Decimal("9")).sqrt()
+    assert score.bankrupt_company_count == 2
+    assert score.bankruptcy_rate == Decimal("0.2222")
+    expected = Decimal("50") * (Decimal("7") / Decimal("9")).sqrt()
     assert score.final_score == expected.quantize(Decimal("0.0001"))
 
 
@@ -248,7 +253,7 @@ def test_evaluator_rejects_an_incomplete_consumer_sale_grid() -> None:
     final_cash = {company.company_id: company.initial_cash for company in scenario.companies}
     events = _consumer_events(scenario)
 
-    with pytest.raises(ValueError, match="every day and retailer exactly once"):
+    with pytest.raises(ValueError, match="every week and retailer exactly once"):
         _evaluate(
             scenario,
             final_cash,

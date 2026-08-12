@@ -34,7 +34,7 @@ from company_bench.runtime.models import (
     OpenOrderView,
     OperationJobView,
     OrderBookView,
-    SimTime,
+    SimDay,
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
@@ -46,14 +46,14 @@ from company_bench.runtime.models import (
 class RunDiagnostics(StrictModel):
     """Run-wide protocol and economic health facts for diagnosis."""
 
-    completed_days: int = Field(ge=0)
+    completed_weeks: int = Field(ge=0)
     benchmark_eligible: bool | None = None
     protocol_invalid_turns: int = Field(ge=0)
     economic_rejections: int = Field(ge=0)
     attention_rejections: int = Field(ge=0)
     trade_count: int = Field(ge=0)
-    last_trade_day: int | None = Field(default=None, ge=1)
-    zero_trade_day_streak: int = Field(ge=0)
+    last_trade_week: int | None = Field(default=None, ge=1)
+    zero_trade_week_streak: int = Field(ge=0)
     consumer_demand: Quantity
     consumer_sales: Quantity
     consumer_fill_rate: UnitInterval
@@ -67,7 +67,7 @@ class TimelineRunContext(StrictModel):
     run_id: Identifier
     scenario_id: Identifier
     scenario_version: int = Field(ge=2)
-    total_days: int = Field(ge=1)
+    total_weeks: int = Field(ge=1)
     status: RunStatus
     mode: str
     source_run_id: Identifier | None = None
@@ -77,22 +77,22 @@ class TimelineRunContext(StrictModel):
     source_model_call_count: int = Field(ge=0)
     current_usage: TokenUsage
     source_usage: TokenUsage
-    checkpoint_at: SimTime | None = None
+    checkpoint_on: SimDay | None = None
     checkpoint_state_version: int | None = Field(default=None, ge=0)
     diagnostics: RunDiagnostics
 
     @model_validator(mode="after")
     def validate_checkpoint_reference(self) -> Self:
         """Keep checkpoint time and state version present or absent together."""
-        if (self.checkpoint_at is None) != (self.checkpoint_state_version is None):
-            raise ValueError("checkpoint time and state version must be paired")
+        if (self.checkpoint_on is None) != (self.checkpoint_state_version is None):
+            raise ValueError("checkpoint day and state version must be paired")
         return self
 
 
-class DayTimelineSummary(StrictModel):
-    """Compact activity and economic totals for one simulation day."""
+class WeekTimelineSummary(StrictModel):
+    """Compact activity and economic totals for one simulation week."""
 
-    day: int = Field(ge=1)
+    week: int = Field(ge=1)
     turn_count: int = Field(ge=0)
     accepted_count: int = Field(ge=0)
     rejected_count: int = Field(ge=0)
@@ -215,15 +215,15 @@ class TurnTimelineItem(StrictModel):
 
     entry_type: Literal["turn"] = "turn"
     entry_id: Identifier
-    sim_time: SimTime
+    sim_day: SimDay
     company_id: CompanyId
     company_name: str
     tier: CompanyTier
     state_version: int = Field(ge=0)
     apply_sequence: int = Field(ge=1)
     journal_sequence: int | None = Field(default=None, ge=1)
-    turn_number_today: int = Field(ge=1)
-    turn_limit_today: int = Field(ge=1)
+    turn_number_this_week: int = Field(ge=1)
+    turn_limit_this_week: int = Field(ge=1)
     wake_signals: tuple[WakeSignal, ...]
     observation: ObservationFacts
     observation_delta: ObservationDelta
@@ -232,8 +232,8 @@ class TurnTimelineItem(StrictModel):
     disposition_source: DecisionDispositionSource
     effects: tuple[DomainEvent, ...]
     state_changes: tuple[DecisionStateChange, ...] = ()
-    next_available_at: SimTime | None = None
-    review_at: SimTime | None = None
+    next_available_on: SimDay | None = None
+    review_on: SimDay | None = None
     replay_origin: TurnReplayOrigin | None = None
     traces: tuple[AgentTracePreview, ...] = ()
     protocol_error: str | None = None
@@ -260,7 +260,7 @@ class SystemTimelineItem(StrictModel):
 
     entry_type: Literal["system_step"] = "system_step"
     entry_id: Identifier
-    sim_time: SimTime
+    sim_day: SimDay
     kind: SystemEventKind
     journal_sequence: int | None = Field(default=None, ge=1)
     state_version_before: int | None = Field(default=None, ge=0)
@@ -291,7 +291,7 @@ class MarketPriceLevel(StrictModel):
 
 
 class MarketOrderBook(StrictModel):
-    """Observer-only end-of-minute Bid and Ask book for one product."""
+    """Observer-only end-of-day Bid and Ask book for one product."""
 
     product: ProductId
     bids: tuple[MarketPriceLevel, ...] = ()
@@ -456,7 +456,7 @@ type MarketOrderFlowItem = Annotated[
 
 
 class TimelineTrade(StrictModel):
-    """One persisted trade displayed in the minute that applied it."""
+    """One persisted trade displayed on the day that applied it."""
 
     apply_sequence: int = Field(ge=1)
     trade_id: Identifier
@@ -467,7 +467,7 @@ class TimelineTrade(StrictModel):
     buyer_id: CompanyId
     quantity: PositiveQuantity
     unit_price: PositiveMoney
-    arrives_at: SimTime
+    arrives_on: SimDay
 
 
 class MarketFrame(StrictModel):
@@ -532,22 +532,22 @@ type TimelineItem = Annotated[
 ]
 
 
-class TimelineMoment(StrictModel):
-    """Every system step and concurrent decision at one simulated minute."""
+class TimelineDayFrame(StrictModel):
+    """Every system step and company decision on one simulated day."""
 
-    sim_time: SimTime
+    sim_day: SimDay
     system_steps: tuple[SystemTimelineItem, ...] = ()
     turns: tuple[TurnTimelineItem, ...] = ()
     market: MarketFrame
 
 
-class TimelineDay(StrictModel):
-    """One day of the operations timeline plus run-wide day summaries."""
+class TimelineWeek(StrictModel):
+    """One seven-day operations timeline plus run-wide week summaries."""
 
     context: TimelineRunContext
-    selected_day: int = Field(ge=1)
-    day_summaries: tuple[DayTimelineSummary, ...]
-    moments: tuple[TimelineMoment, ...]
+    selected_week: int = Field(ge=1)
+    week_summaries: tuple[WeekTimelineSummary, ...]
+    days: tuple[TimelineDayFrame, ...] = Field(min_length=7, max_length=7)
 
 
 class AgentTraceDetail(StrictModel):

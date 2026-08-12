@@ -11,6 +11,7 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "stopped";
+export type RunStopReason = "user_requested" | "quota_exhausted";
 
 declare const decimalTextBrand: unique symbol;
 export type DecimalText = string & { readonly [decimalTextBrand]: true };
@@ -84,8 +85,8 @@ export interface CompanyResultView {
   readonly growth: DecimalText;
 }
 
-export interface DailySnapshotView {
-  readonly day: number;
+export interface WeeklySnapshotView {
+  readonly week: number;
   readonly companyId: string;
   readonly cash: DecimalText;
   readonly inventoryValue: DecimalText;
@@ -98,12 +99,12 @@ export interface EpisodeView {
   readonly runId: string;
   readonly scenarioId: string;
   readonly seed: number;
-  readonly days: number;
+  readonly weeks: number;
   readonly score: ScoreView;
   readonly quality: EpisodeQualityView;
   readonly agentUsage: AgentUsageSummaryView | null;
   readonly companies: readonly CompanyResultView[];
-  readonly snapshots: readonly DailySnapshotView[];
+  readonly snapshots: readonly WeeklySnapshotView[];
 }
 
 export interface PolicyProfileView {
@@ -120,8 +121,8 @@ export interface PolicyProfileView {
 export interface RunProgressView {
   readonly runId: string;
   readonly status: RunStatus;
-  readonly currentDay: number;
-  readonly totalDays: number;
+  readonly currentAbsoluteDay: number;
+  readonly totalWeeks: number;
   readonly errorMessage: string | null;
 }
 
@@ -135,6 +136,7 @@ export interface RunJobView extends RunProgressView {
   readonly submittedAt: string;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
+  readonly stopReason: RunStopReason | null;
   readonly quality: EpisodeQualityView | null;
 }
 
@@ -145,14 +147,14 @@ export interface ReplaySourceView {
 }
 
 export interface RunDiagnosticsView {
-  readonly completedDays: number;
+  readonly completedWeeks: number;
   readonly benchmarkEligible: boolean | null;
   readonly protocolInvalidTurns: number;
   readonly economicRejections: number;
   readonly attentionRejections: number;
   readonly tradeCount: number;
-  readonly lastTradeDay: number | null;
-  readonly zeroTradeDayStreak: number;
+  readonly lastTradeWeek: number | null;
+  readonly zeroTradeWeekStreak: number;
   readonly consumerDemand: DecimalText;
   readonly consumerSales: DecimalText;
   readonly consumerFillRate: DecimalText;
@@ -164,7 +166,7 @@ export interface TimelineContextView {
   readonly currentRunId: string;
   readonly scenarioId: string;
   readonly scenarioVersion: number;
-  readonly totalDays: number;
+  readonly totalWeeks: number;
   readonly status: RunStatus;
   readonly mode: string;
   readonly isReplay: boolean;
@@ -174,13 +176,13 @@ export interface TimelineContextView {
   readonly sourceModelCallCount: number;
   readonly currentUsage: TokenUsageView;
   readonly sourceUsage: TokenUsageView;
-  readonly checkpointMinute: number | null;
+  readonly checkpointDay: SimDayView | null;
   readonly checkpointStateVersion: number | null;
   readonly diagnostics: RunDiagnosticsView;
 }
 
-export interface TimelineDaySummaryView {
-  readonly day: number;
+export interface TimelineWeekSummaryView {
+  readonly week: number;
   readonly turnCount: number;
   readonly acceptedCount: number;
   readonly rejectedCount: number;
@@ -283,7 +285,7 @@ export type EconomicActionView =
     };
 
 export interface AttentionPlanView {
-  readonly reviewAfterMinutes: number | null;
+  readonly reviewAfterDays: number | null;
   readonly alerts: readonly QuoteAlertView[];
 }
 
@@ -348,7 +350,7 @@ export interface OpenOrderView {
   readonly product: string;
   readonly remainingQuantity: DecimalText;
   readonly limitPrice: DecimalText;
-  readonly placedAtMinute: number;
+  readonly placedOn: SimDayView;
   readonly prioritySequence: number;
   readonly queueAheadQuantity: DecimalText;
 }
@@ -383,12 +385,12 @@ export interface OrderBookView {
   readonly bids: readonly PriceLevelView[];
   readonly asks: readonly PriceLevelView[];
   readonly lastTradePrice: DecimalText | null;
-  readonly dailyVolume: DecimalText;
+  readonly weeklyVolume: DecimalText;
 }
 
 export interface InventoryExpiryBucketView {
   readonly product: string;
-  readonly expiresEndOfDay: number;
+  readonly expiresEndOfWeek: number;
   readonly availableQuantity: DecimalText;
   readonly reservedQuantity: DecimalText;
 }
@@ -464,7 +466,7 @@ export interface TimelineTradeView {
   readonly buyerId: string;
   readonly quantity: DecimalText;
   readonly unitPrice: DecimalText;
-  readonly arrivesAtMinute: number;
+  readonly arrivesOn: SimDayView;
 }
 
 export interface MarketFrameView {
@@ -478,19 +480,19 @@ export interface IncomingDeliveryView {
   readonly tradeId: string;
   readonly product: string;
   readonly quantity: DecimalText;
-  readonly arrivesAtMinute: number;
+  readonly arrivesOn: SimDayView;
   readonly expiryBuckets: readonly DeliveryExpiryBucketView[];
 }
 
 export interface DeliveryExpiryBucketView {
   readonly quantity: DecimalText;
-  readonly expiresEndOfDay: number;
+  readonly expiresEndOfWeek: number;
 }
 
 export interface OperationJobView {
   readonly jobId: string;
   readonly kind: "production" | "transformation";
-  readonly completesAtMinute: number;
+  readonly completesOn: SimDayView;
   readonly outputProduct: string;
   readonly outputQuantity: DecimalText;
 }
@@ -537,10 +539,12 @@ export interface TurnTimelineItemView {
   readonly companyId: string;
   readonly companyName: string;
   readonly role: CompanyRole;
-  readonly simMinute: number;
+  readonly simDay: SimDayView;
   readonly stateVersion: number;
   readonly applySequence: number;
   readonly journalSequence: number | null;
+  readonly turnNumberThisWeek: number;
+  readonly turnLimitThisWeek: number;
   readonly wakeSignals: readonly WakeSignalView[];
   readonly observation: ObservationFactsView;
   readonly observationDelta: ObservationDeltaView;
@@ -553,8 +557,8 @@ export interface TurnTimelineItemView {
   readonly outcomeJobId: string | null;
   readonly effects: readonly EconomicEffectView[];
   readonly stateChanges: readonly DecisionStateChangeView[];
-  readonly nextAvailableMinute: number | null;
-  readonly reviewMinute: number | null;
+  readonly nextAvailableOn: SimDayView | null;
+  readonly reviewOn: SimDayView | null;
   readonly sourceRunId: string | null;
   readonly sourceTurnId: string | null;
   readonly traces: readonly TracePreviewView[];
@@ -566,7 +570,7 @@ export interface TurnTimelineItemView {
 export interface SystemTimelineItemView {
   readonly entryType: "system";
   readonly entryId: string;
-  readonly simMinute: number;
+  readonly simDay: SimDayView;
   readonly kind: string;
   readonly journalSequence: number | null;
   readonly stateVersionBefore: number | null;
@@ -578,19 +582,22 @@ export interface SystemTimelineItemView {
   readonly summary: string;
 }
 
-export interface TimelineMomentView {
-  readonly simMinute: number;
-  readonly totalTurnCount: number;
+export interface SimDayView {
+  readonly absoluteDay: number;
+}
+
+export interface TimelineDayFrameView {
+  readonly simDay: SimDayView;
   readonly systemSteps: readonly SystemTimelineItemView[];
   readonly turns: readonly TurnTimelineItemView[];
   readonly market: MarketFrameView;
 }
 
-export interface TimelineDayView {
+export interface TimelineWeekView {
   readonly context: TimelineContextView;
-  readonly selectedDay: number;
-  readonly daySummaries: readonly TimelineDaySummaryView[];
-  readonly moments: readonly TimelineMomentView[];
+  readonly selectedWeek: number;
+  readonly weekSummaries: readonly TimelineWeekSummaryView[];
+  readonly days: readonly TimelineDayFrameView[];
 }
 
 export interface AgentTraceView {

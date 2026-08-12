@@ -16,7 +16,6 @@ import { isAbortError, requestErrorMessage } from "../../shared/requestErrors";
 import {
   DECISION_PROCESSING_ORDER_LABEL,
   attentionFallbackSummary,
-  clockTime,
   decisionSummary,
   economicStateTransitionSummary,
   effectSummary,
@@ -28,6 +27,7 @@ import {
   systemLabel,
   wakeLabel,
 } from "../../shared/timelineFormatters";
+import { simulationDayLabel } from "../../shared/simulationCalendar";
 import type {
   AttentionPlanView,
   DecisionStateChangeView,
@@ -119,7 +119,7 @@ function TurnDetail({
   return (
     <div className="drawer-body">
       <dl className="detail-metadata decision-metadata">
-        <Meta label="Simulation time" value={clockTime(turn.simMinute)} />
+        <Meta label="Simulation day" value={simulationDayLabel(turn.simDay)} />
         <Meta
           label="Observation source"
           value={`Economic state v${turn.stateVersion}`}
@@ -193,15 +193,15 @@ function TurnDetail({
         <AttentionPlan
           accepted={turn.accepted}
           attention={turn.decision.attention}
-          reviewMinute={turn.reviewMinute}
+          reviewOn={turn.reviewOn}
         />
         {turn.effects.length === 0 && turn.stateChanges.length === 0 && (
           <p className="inline-empty">No immediate economic change.</p>
         )}
         <p className="next-action">
-          {turn.nextAvailableMinute === null
+          {turn.nextAvailableOn === null
             ? "No economic action cooldown is active."
-            : `Economic action cooldown ended at ${clockTime(turn.nextAvailableMinute)}; it did not itself schedule a new turn.`}
+            : `Economic action cooldown ends on ${simulationDayLabel(turn.nextAvailableOn)}; it does not itself schedule a new turn.`}
         </p>
       </DrawerSection>
 
@@ -220,11 +220,11 @@ function TurnDetail({
 function AttentionPlan({
   accepted,
   attention,
-  reviewMinute,
+  reviewOn,
 }: {
   readonly accepted: boolean;
   readonly attention: AttentionPlanView;
-  readonly reviewMinute: number | null;
+  readonly reviewOn: TurnTimelineItemView["reviewOn"];
 }) {
   return (
     <div className="observed-facts">
@@ -248,10 +248,10 @@ function AttentionPlan({
       </p>
       {!accepted ? (
         <p>The attention plan was not armed because the decision was rejected.</p>
-      ) : reviewMinute === null ? (
-        <p>No same-day fallback wake was scheduled.</p>
+      ) : reviewOn === null ? (
+        <p>No fallback wake was scheduled.</p>
       ) : (
-        <p>Effective fallback: {clockTime(reviewMinute)}.</p>
+        <p>Effective fallback: {simulationDayLabel(reviewOn)}.</p>
       )}
     </div>
   );
@@ -269,7 +269,7 @@ function SystemDetail({
       <DrawerSection number="SYSTEM" title={systemLabel(step.kind)}>
         <p>{step.summary}</p>
         <dl className="detail-metadata">
-          <Meta label="Simulation time" value={clockTime(step.simMinute)} />
+          <Meta label="Simulation day" value={simulationDayLabel(step.simDay)} />
           <Meta
             label="Economic state transition"
             value={economicStateTransitionSummary(
@@ -381,7 +381,7 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
         {turn.observation.visibleEventCount} visible economic{" "}
         {plural(turn.observation.visibleEventCount, "event")} at this turn.
         {turn.observation.remainingOperationCapacity !== null &&
-          ` Remaining daily operation capacity: ${formatExactDecimal(turn.observation.remainingOperationCapacity)}.`}
+          ` Remaining weekly operation capacity: ${formatExactDecimal(turn.observation.remainingOperationCapacity)}.`}
       </p>
       {turn.observation.openOrders.length > 0 && (
         <div className="observed-facts">
@@ -407,9 +407,9 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
           <h4>Inventory expiry</h4>
           <ul className="effect-list">
             {turn.observation.inventoryExpiry.map((bucket) => (
-              <li key={`${bucket.product}-${bucket.expiresEndOfDay}`}>
+              <li key={`${bucket.product}-${bucket.expiresEndOfWeek}`}>
                 <span>
-                  {productLabel(bucket.product)} · end of D{bucket.expiresEndOfDay}
+                  {productLabel(bucket.product)} · end of Week {bucket.expiresEndOfWeek}
                 </span>
                 <strong>
                   {formatExactDecimal(bucket.availableQuantity)} available;{" "}
@@ -432,7 +432,7 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
                   {" "}Last trade: {book.lastTradePrice === null
                     ? "none"
                     : formatExactDecimal(book.lastTradePrice)};{" "}
-                  {formatExactDecimal(book.dailyVolume)} traded.
+                  {formatExactDecimal(book.weeklyVolume)} traded this week.
                 </strong>
               </li>
             ))}
@@ -445,14 +445,14 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
           <ul className="effect-list">
             {turn.observation.pendingDeliveries.map((delivery) => (
               <li key={delivery.tradeId}>
-                <span>{clockTime(delivery.arrivesAtMinute)}</span>
+                <span>{simulationDayLabel(delivery.arrivesOn)}</span>
                 <strong>
                   {formatExactDecimal(delivery.quantity)} {productLabel(delivery.product)}
                   {"; expiry "}
                   {delivery.expiryBuckets
                     .map(
                       (bucket) =>
-                        `D${bucket.expiresEndOfDay}: ${formatExactDecimal(bucket.quantity)}`,
+                        `W${bucket.expiresEndOfWeek}: ${formatExactDecimal(bucket.quantity)}`,
                     )
                     .join(", ")}
                 </strong>
@@ -466,7 +466,7 @@ function ObservationDelta({ turn }: { readonly turn: TurnTimelineItemView }) {
           <h4>Active operation</h4>
           <p>
             {humanizeIdentifier(turn.observation.activeOperation.kind)} completes at{" "}
-            {clockTime(turn.observation.activeOperation.completesAtMinute)}, yielding{" "}
+            {simulationDayLabel(turn.observation.activeOperation.completesOn)}, yielding{" "}
             {formatExactDecimal(turn.observation.activeOperation.outputQuantity)}{" "}
             {productLabel(turn.observation.activeOperation.outputProduct)}.
           </p>
@@ -681,6 +681,6 @@ function Meta({ label, value }: { readonly label: string; readonly value: string
 
 function detailTitle(detail: TimelineDetailView): string {
   return detail.entry.entryType === "turn"
-    ? `${detail.entry.companyName} · ${clockTime(detail.entry.simMinute)}`
-    : `${systemLabel(detail.entry.kind)} · ${clockTime(detail.entry.simMinute)}`;
+    ? `${detail.entry.companyName} · ${simulationDayLabel(detail.entry.simDay)}`
+    : `${systemLabel(detail.entry.kind)} · ${simulationDayLabel(detail.entry.simDay)}`;
 }

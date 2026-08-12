@@ -13,13 +13,13 @@ from company_bench.agents.memory import AgentCheckpoint
 from company_bench.domain.models import (
     CompanyId,
     CompanyObservation,
-    DaySnapshot,
     EpisodeQuality,
     EventRecord,
     Identifier,
     PolicyDescriptor,
     PolicyKind,
     StrictModel,
+    WeekSnapshot,
 )
 from company_bench.economy.engine import EconomyState
 from company_bench.runtime.attention import AgentAttention, ArmedAttention, AttentionRejected
@@ -27,7 +27,7 @@ from company_bench.runtime.models import (
     CompanyDecision,
     DecisionOutcome,
     JournalEntryKind,
-    SimTime,
+    SimDay,
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
@@ -57,6 +57,13 @@ class RunStatus(StrEnum):
         return self in {self.INTERRUPTED, self.STOPPED}
 
 
+class RunStopReason(StrEnum):
+    """Typed reason why a resumable run entered the stopped state."""
+
+    USER_REQUESTED = "user_requested"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+
+
 class RunJob(StrictModel):
     """Progress record returned immediately by the run API."""
 
@@ -68,25 +75,33 @@ class RunJob(StrictModel):
     seed: int
     source_run_id: Identifier | None = None
     scenario_id: Identifier
-    current_day: int = Field(default=0, ge=0)
-    total_days: int = Field(ge=1)
+    current_absolute_day: int = Field(default=0, ge=0)
+    total_weeks: int = Field(ge=1)
     submitted_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error_message: str | None = Field(default=None, max_length=500)
+    stop_reason: RunStopReason | None = None
     quality: EpisodeQuality | None = None
 
     @model_validator(mode="after")
     def validate_progress(self) -> RunJob:
         """Keep reported progress inside the scenario duration."""
-        if self.current_day > self.total_days:
-            raise ValueError("current_day must not exceed total_days")
+        if self.current_absolute_day > self.total_weeks * 7:
+            raise ValueError("current_absolute_day exceeds the scenario calendar")
         if self.mode is PolicyKind.MODEL and self.model is None:
             raise ValueError("Model Agent jobs require a model")
         if self.mode is not PolicyKind.MODEL and self.model is not None:
             raise ValueError("model is only valid for Model Agent jobs")
         if (self.status is RunStatus.COMPLETED) != (self.quality is not None):
             raise ValueError("only completed runs require quality metadata")
+        if self.status is not RunStatus.STOPPED and self.stop_reason is not None:
+            raise ValueError("stop_reason is only valid for stopped runs")
+        if (
+            self.stop_reason is RunStopReason.QUOTA_EXHAUSTED
+            and self.error_message is None
+        ):
+            raise ValueError("quota-exhausted runs require the provider diagnostic")
         return self
 
     def mark_running(self, started_at: datetime) -> Self:
@@ -98,15 +113,17 @@ class RunJob(StrictModel):
             error_message=None,
         )
 
-    def report_progress(self, day: int) -> Self:
-        """Record one newly completed simulation day."""
-        return self._advance(current_day=day)
+    def report_week_completed(self, week: int) -> Self:
+        """Record one newly completed trading week."""
+        if not 1 <= week <= self.total_weeks:
+            raise ValueError("completed week must belong to the run")
+        return self._advance(current_absolute_day=week * 7)
 
     def mark_completed(self, finished_at: datetime, quality: EpisodeQuality) -> Self:
         """Finish the full horizon without an error."""
         return self._advance(
             status=RunStatus.COMPLETED,
-            current_day=self.total_days,
+            current_absolute_day=self.total_weeks * 7,
             finished_at=finished_at,
             error_message=None,
             quality=quality,
@@ -134,6 +151,16 @@ class RunJob(StrictModel):
             status=RunStatus.STOPPED,
             finished_at=finished_at,
             error_message=None,
+            stop_reason=RunStopReason.USER_REQUESTED,
+        )
+
+    def mark_quota_exhausted(self, finished_at: datetime, reason: str) -> Self:
+        """Pause for exhausted provider quota while retaining its diagnostic."""
+        return self._advance(
+            status=RunStatus.STOPPED,
+            finished_at=finished_at,
+            error_message=reason,
+            stop_reason=RunStopReason.QUOTA_EXHAUSTED,
         )
 
     def queue_for_resume(self) -> Self:
@@ -148,6 +175,8 @@ class RunJob(StrictModel):
 
     def _advance(self, **changes: object) -> Self:
         """Apply one validated lifecycle transition."""
+        if changes.get("status", self.status) is not RunStatus.STOPPED:
+            changes.setdefault("stop_reason", None)
         candidate = self.model_copy(
             update={**changes, "revision": self.revision + 1},
         )
@@ -168,14 +197,14 @@ class CompanyRuntimeCursor(StrictModel):
     company_id: CompanyId
     next_turn_sequence: int = Field(ge=1)
     last_visible_event_sequence: int = Field(default=0, ge=0)
-    available_at: SimTime | None = None
+    available_on: SimDay | None = None
     active_attention: ArmedAttention | None = None
 
 
 class RunCheckpoint(StrictModel):
-    """Current mutable state needed to resume one V4 episode."""
+    """Current mutable state needed to resume one V6 episode."""
 
-    schema_version: Literal[9] = 9
+    schema_version: Literal[10] = 10
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -183,7 +212,7 @@ class RunCheckpoint(StrictModel):
     policies: tuple[PolicyDescriptor, ...]
     agent_states: tuple[AgentCheckpoint, ...]
     events: tuple[EventRecord, ...] = ()
-    snapshots: tuple[DaySnapshot, ...] = ()
+    snapshots: tuple[WeekSnapshot, ...] = ()
     cursors: tuple[CompanyRuntimeCursor, ...] = ()
 
     @model_validator(mode="after")
@@ -216,13 +245,13 @@ class RunCheckpoint(StrictModel):
         ):
             raise ValueError("checkpoint event sequences must be contiguous")
         _require_unique(
-            (snapshot.day for snapshot in self.snapshots),
-            "checkpoint snapshot days",
+            (snapshot.week for snapshot in self.snapshots),
+            "checkpoint snapshot weeks",
         )
-        if tuple(snapshot.day for snapshot in self.snapshots) != tuple(
+        if tuple(snapshot.week for snapshot in self.snapshots) != tuple(
             range(1, len(self.snapshots) + 1)
         ):
-            raise ValueError("checkpoint snapshot days must be contiguous")
+            raise ValueError("checkpoint snapshot weeks must be contiguous")
 
         cursor_ids = [cursor.company_id for cursor in self.cursors]
         _require_unique(cursor_ids, "runtime cursor company_ids")
@@ -395,12 +424,12 @@ class ProviderCallAudit(StrictModel):
 
 
 class PolicyInvocation(ProviderCallAudit):
-    """Auditable provider call for one V4 atomic company turn."""
+    """Auditable provider call for one V6 atomic company turn."""
 
     invocation_id: Identifier
     run_id: Identifier
     company_id: CompanyId
-    day: int = Field(ge=1)
+    week: int = Field(ge=1)
     observation: CompanyObservation
     provider: str
     model: str
@@ -410,7 +439,7 @@ class PolicyInvocation(ProviderCallAudit):
     finished_at: datetime
     outcome: InvocationOutcome
     domain_turn_id: Identifier | None = None
-    sim_minute: int | None = Field(default=None, ge=0)
+    absolute_day: int | None = Field(default=None, ge=1)
     state_version: int | None = Field(default=None, ge=0)
     apply_sequence: int | None = Field(default=None, ge=1)
     decision: CompanyDecision | None = None
@@ -424,7 +453,7 @@ class PolicyInvocation(ProviderCallAudit):
     def validate_event_turn(self) -> PolicyInvocation:
         """Keep optional event-driven audit fields complete and consistent."""
         if self.domain_turn_id is not None and (
-            self.sim_minute is None
+            self.absolute_day is None
             or self.state_version is None
             or (self.outcome is InvocationOutcome.SUCCESS and self.decision is None)
         ):
@@ -462,14 +491,14 @@ def _validate_runtime_commitments(checkpoint: RunCheckpoint) -> None:
                 (
                     event.reference_ids[0],
                     event.company_id,
-                    event.at.absolute_minute,
+                    event.scheduled_for.absolute_day,
                 )
             )
         _require_unique(keys, f"{kind.value} commitments")
         return tuple(keys)
 
     expected_jobs = {
-        (job.job_id, job.company_id, job.completes_at.absolute_minute)
+        (job.job_id, job.company_id, job.completes_on.absolute_day)
         for job in checkpoint.economy.jobs
     }
     if set(completion_keys(SystemEventKind.OPERATION_COMPLETED)) != expected_jobs:
@@ -479,20 +508,23 @@ def _validate_runtime_commitments(checkpoint: RunCheckpoint) -> None:
         (
             delivery.delivery_id,
             delivery.buyer_id,
-            delivery.arrives_at.absolute_minute,
+            delivery.arrives_on.absolute_day,
         )
         for delivery in checkpoint.economy.deliveries
     }
     if set(completion_keys(SystemEventKind.DELIVERY_COMPLETED)) != expected_deliveries:
         raise ValueError("deliveries and completion events must match")
 
-    runtime = checkpoint.economy.scenario.runtime
+    calendar = checkpoint.economy.scenario.calendar
     if any(
         event.kind is SystemEventKind.COMPANY_WAKE
-        and not runtime.open_minute <= event.at.minute_of_day < runtime.close_minute
+        and (
+            not calendar.contains(event.scheduled_for)
+            or not event.scheduled_for.is_decision_day
+        )
         for event in pending
     ):
-        raise ValueError("company wakes must remain inside business hours")
+        raise ValueError("company wakes must remain on Monday-Saturday")
 
 
 def _validate_attention_commitments(
@@ -517,7 +549,7 @@ def _validate_attention_commitments(
             or source.turn.company_id != cursor.company_id
             or latest_by_company.get(cursor.company_id) != source
             or not source.outcome.accepted
-            or source.turn.turn_number_today >= source.turn.turn_limit_today
+            or source.turn.turn_number_this_week >= source.turn.turn_limit_this_week
         ):
             raise ValueError("active attention must reference the latest accepted decision")
         try:
@@ -526,9 +558,9 @@ def _validate_attention_commitments(
             raise ValueError("attention source no longer forms a valid plan") from error
         if derived != plan:
             raise ValueError("active attention must match its source Turn")
-        if plan.review_at is not None:
+        if plan.review_on is not None:
             expected.append(
-                (cursor.company_id, plan.review_at.absolute_minute, plan.source_turn_id)
+                (cursor.company_id, plan.review_on.absolute_day, plan.source_turn_id)
             )
 
     actual: list[tuple[CompanyId, int, Identifier]] = []
@@ -540,7 +572,13 @@ def _validate_attention_commitments(
                 continue
             if signal.source is None or signal.source.entry_type is not JournalEntryKind.TURN:
                 raise ValueError("review wakes require a source Turn")
-            actual.append((event.company_id, event.at.absolute_minute, signal.source.entry_id))
+            actual.append(
+                (
+                    event.company_id,
+                    event.scheduled_for.absolute_day,
+                    signal.source.entry_id,
+                )
+            )
     _require_unique(actual, "review commitments")
     if set(actual) != set(expected):
         raise ValueError("armed attention and review wakes must match")
@@ -556,7 +594,7 @@ def _require_unique(values: Iterable[Hashable], label: str) -> None:
 def _checkpoint_turn_order(record: TurnRecord) -> tuple[int, int, str]:
     """Return the canonical order stored by a recovery checkpoint."""
     return (
-        record.turn.sim_time.absolute_minute,
+        record.turn.sim_day.absolute_day,
         record.outcome.apply_sequence,
         record.turn.turn_id,
     )
@@ -565,7 +603,7 @@ def _checkpoint_turn_order(record: TurnRecord) -> tuple[int, int, str]:
 def _system_step_order(record: SystemStepRecord) -> tuple[int, int, str]:
     """Return the canonical order of one durable system journal entry."""
     return (
-        record.occurred_at.absolute_minute,
+        record.occurred_on.absolute_day,
         record.journal_sequence,
         record.entry_id,
     )

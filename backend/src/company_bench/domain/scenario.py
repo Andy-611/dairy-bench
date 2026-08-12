@@ -58,7 +58,7 @@ def _build_companies() -> tuple[CompanySpec, ...]:
                 ),
                 cost=CostFunction(
                     normal_unit_cost=_money("1.00"),
-                    daily_volatility=_money("0.10"),
+                    weekly_volatility=_money("0.10"),
                     curvature=_money("0.35"),
                 ),
             ),
@@ -75,7 +75,7 @@ def _build_companies() -> tuple[CompanySpec, ...]:
                 ),
                 cost=CostFunction(
                     normal_unit_cost=_money("0.40"),
-                    daily_volatility=_money("0.15"),
+                    weekly_volatility=_money("0.15"),
                     curvature=_money("0.65"),
                 ),
                 yield_rate=_money("0.8"),
@@ -91,20 +91,20 @@ def _build_companies() -> tuple[CompanySpec, ...]:
 def _build_dairy_scenario() -> ScenarioSpec:
     """Build the canonical event-driven Dairy Bench scenario."""
     return ScenarioSpec(
-        scenario_id="flow.dairy.base.s9.v5",
-        version=5,
-        days=30,
+        scenario_id="flow.dairy.base.s9.v6",
+        version=6,
+        weeks=52,
         products=(
             ProductSpec(
                 product=ProductId.RAW_MILK,
                 name="原奶",
-                shelf_life_days=2,
+                shelf_life_weeks=2,
                 reference_value=_money("1.00"),
             ),
             ProductSpec(
                 product=ProductId.BOTTLED_MILK,
                 name="盒装奶",
-                shelf_life_days=4,
+                shelf_life_weeks=4,
                 reference_value=_money("1.75"),
             ),
         ),

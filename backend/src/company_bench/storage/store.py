@@ -22,8 +22,8 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 12
-_PAYLOAD_SCHEMA_VERSION = 6
+_DATABASE_SCHEMA_VERSION = 13
+_PAYLOAD_SCHEMA_VERSION = 7
 _AUTO_RESUME_STATUSES = (
     RunStatus.QUEUED,
     RunStatus.RUNNING,
@@ -463,7 +463,7 @@ class SQLiteRunStore:
                 SELECT schema_version, payload_json
                 FROM run_turns
                 WHERE run_id = ?
-                ORDER BY sim_minute ASC, apply_sequence ASC, turn_id ASC
+                ORDER BY absolute_day ASC, apply_sequence ASC, turn_id ASC
                 """,
                 (run_id,),
             ).fetchall()
@@ -482,7 +482,7 @@ class SQLiteRunStore:
                 SELECT schema_version, payload_json
                 FROM run_system_steps
                 WHERE run_id = ?
-                ORDER BY sim_minute ASC, journal_sequence ASC, entry_id ASC
+                ORDER BY absolute_day ASC, journal_sequence ASC, entry_id ASC
                 """,
                 (run_id,),
             ).fetchall()
@@ -544,7 +544,7 @@ class SQLiteRunStore:
         self._connection.execute(
             """
             INSERT INTO run_turns (
-                run_id, turn_id, company_id, sim_minute, state_version,
+                run_id, turn_id, company_id, absolute_day, state_version,
                 apply_sequence, schema_version, payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, turn_id) DO NOTHING
@@ -553,7 +553,7 @@ class SQLiteRunStore:
                 record.run_id,
                 record.turn.turn_id,
                 record.turn.company_id,
-                record.turn.sim_time.absolute_minute,
+                record.turn.sim_day.absolute_day,
                 record.turn.state_version,
                 record.outcome.apply_sequence,
                 _PAYLOAD_SCHEMA_VERSION,
@@ -598,7 +598,7 @@ class SQLiteRunStore:
         self._connection.execute(
             """
             INSERT INTO run_system_steps (
-                run_id, entry_id, sim_minute, journal_sequence, kind,
+                run_id, entry_id, absolute_day, journal_sequence, kind,
                 schema_version, payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, entry_id) DO NOTHING
@@ -606,7 +606,7 @@ class SQLiteRunStore:
             (
                 record.run_id,
                 record.entry_id,
-                record.occurred_at.absolute_minute,
+                record.occurred_on.absolute_day,
                 record.journal_sequence,
                 record.kind.value,
                 _PAYLOAD_SCHEMA_VERSION,
@@ -633,16 +633,16 @@ class SQLiteRunStore:
         self._connection.execute(
             """
             INSERT INTO run_checkpoints (
-                run_id, current_day, updated_at, payload_json
+                run_id, current_week, updated_at, payload_json
             ) VALUES (?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
-                current_day = excluded.current_day,
+                current_week = excluded.current_week,
                 updated_at = excluded.updated_at,
                 payload_json = excluded.payload_json
             """,
             (
                 checkpoint.run_id,
-                checkpoint.economy.day,
+                checkpoint.economy.week,
                 datetime.now(UTC).isoformat(),
                 checkpoint.model_dump_json(),
             ),
@@ -664,7 +664,7 @@ class SQLiteRunStore:
             )
 
     def _create_schema(self) -> None:
-        """Create the current V4 schema for a fresh benchmark database."""
+        """Create the current V6 schema for a fresh benchmark database."""
         current_version = self._connection.execute("PRAGMA user_version").fetchone()[0]
         if current_version not in (0, _DATABASE_SCHEMA_VERSION):
             raise RuntimeError(f"unsupported database schema version: {current_version}")
@@ -691,8 +691,8 @@ class SQLiteRunStore:
             seed INTEGER NOT NULL,
             source_run_id TEXT,
             scenario_id TEXT NOT NULL,
-            current_day INTEGER NOT NULL,
-            total_days INTEGER NOT NULL,
+            current_absolute_day INTEGER NOT NULL,
+            total_weeks INTEGER NOT NULL,
             submitted_at TEXT NOT NULL,
             started_at TEXT,
             finished_at TEXT,
@@ -704,7 +704,7 @@ class SQLiteRunStore:
             invocation_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
             company_id TEXT NOT NULL,
-            day INTEGER NOT NULL,
+            week INTEGER NOT NULL,
             outcome TEXT NOT NULL,
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
@@ -716,7 +716,7 @@ class SQLiteRunStore:
 
         CREATE TABLE IF NOT EXISTS run_checkpoints (
             run_id TEXT PRIMARY KEY,
-            current_day INTEGER NOT NULL,
+            current_week INTEGER NOT NULL,
             updated_at TEXT NOT NULL,
             payload_json TEXT NOT NULL
         );
@@ -725,7 +725,7 @@ class SQLiteRunStore:
             run_id TEXT NOT NULL,
             turn_id TEXT NOT NULL,
             company_id TEXT NOT NULL,
-            sim_minute INTEGER NOT NULL,
+            absolute_day INTEGER NOT NULL,
             state_version INTEGER NOT NULL,
             apply_sequence INTEGER NOT NULL,
             schema_version INTEGER NOT NULL,
@@ -736,7 +736,7 @@ class SQLiteRunStore:
         CREATE TABLE IF NOT EXISTS run_system_steps (
             run_id TEXT NOT NULL,
             entry_id TEXT NOT NULL,
-            sim_minute INTEGER NOT NULL,
+            absolute_day INTEGER NOT NULL,
             journal_sequence INTEGER NOT NULL,
             kind TEXT NOT NULL,
             schema_version INTEGER NOT NULL,
@@ -746,12 +746,12 @@ class SQLiteRunStore:
 
         CREATE INDEX IF NOT EXISTS ix_run_jobs_status_submitted
             ON run_jobs(status, submitted_at);
-        CREATE INDEX IF NOT EXISTS ix_invocations_run_day_company
-            ON policy_invocations(run_id, day, company_id);
+        CREATE INDEX IF NOT EXISTS ix_invocations_run_week_company
+            ON policy_invocations(run_id, week, company_id);
         CREATE INDEX IF NOT EXISTS ix_run_turns_order
-            ON run_turns(run_id, sim_minute, apply_sequence, turn_id);
+            ON run_turns(run_id, absolute_day, apply_sequence, turn_id);
         CREATE INDEX IF NOT EXISTS ix_run_system_steps_order
-            ON run_system_steps(run_id, sim_minute, journal_sequence, entry_id);
+            ON run_system_steps(run_id, absolute_day, journal_sequence, entry_id);
         """
         with self._lock, self._connection:
             self._connection.executescript(schema)
@@ -763,7 +763,7 @@ class SQLiteRunStore:
             """
             INSERT INTO run_jobs (
                 run_id, mode, status, seed, source_run_id, scenario_id,
-                current_day, total_days, submitted_at, started_at, finished_at,
+                current_absolute_day, total_weeks, submitted_at, started_at, finished_at,
                 error_message, payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
@@ -772,8 +772,8 @@ class SQLiteRunStore:
                 seed = excluded.seed,
                 source_run_id = excluded.source_run_id,
                 scenario_id = excluded.scenario_id,
-                current_day = excluded.current_day,
-                total_days = excluded.total_days,
+                current_absolute_day = excluded.current_absolute_day,
+                total_weeks = excluded.total_weeks,
                 submitted_at = excluded.submitted_at,
                 started_at = excluded.started_at,
                 finished_at = excluded.finished_at,
@@ -787,8 +787,8 @@ class SQLiteRunStore:
                 job.seed,
                 job.source_run_id,
                 job.scenario_id,
-                job.current_day,
-                job.total_days,
+                job.current_absolute_day,
+                job.total_weeks,
                 job.submitted_at.isoformat(),
                 _isoformat(job.started_at),
                 _isoformat(job.finished_at),
@@ -802,13 +802,13 @@ class SQLiteRunStore:
         self._connection.execute(
             """
             INSERT INTO policy_invocations (
-                invocation_id, run_id, company_id, day, outcome, provider,
+                invocation_id, run_id, company_id, week, outcome, provider,
                 model, prompt_version, started_at, finished_at, payload_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(invocation_id) DO UPDATE SET
                 run_id = excluded.run_id,
                 company_id = excluded.company_id,
-                day = excluded.day,
+                week = excluded.week,
                 outcome = excluded.outcome,
                 provider = excluded.provider,
                 model = excluded.model,
@@ -821,7 +821,7 @@ class SQLiteRunStore:
                 invocation.invocation_id,
                 invocation.run_id,
                 invocation.company_id,
-                invocation.day,
+                invocation.week,
                 invocation.outcome.value,
                 invocation.provider,
                 invocation.model,
@@ -867,7 +867,7 @@ def _validate_completion(
         raise ValueError("complete_job requires status=completed")
     if (
         completed_job.scenario_id != result.scenario.scenario_id
-        or completed_job.total_days != result.scenario.days
+        or completed_job.total_weeks != result.scenario.weeks
         or completed_job.seed != result.seed
     ):
         raise ValueError("result and completed job must describe the same episode")
@@ -878,7 +878,7 @@ def _validate_completion(
 def _turn_order(record: TurnRecord) -> tuple[int, int, str]:
     """Return the stable chronological journal key."""
     return (
-        record.turn.sim_time.absolute_minute,
+        record.turn.sim_day.absolute_day,
         record.outcome.apply_sequence,
         record.turn.turn_id,
     )
@@ -887,7 +887,7 @@ def _turn_order(record: TurnRecord) -> tuple[int, int, str]:
 def _system_step_order(record: SystemStepRecord) -> tuple[int, int, str]:
     """Return the stable chronological system-journal key."""
     return (
-        record.occurred_at.absolute_minute,
+        record.occurred_on.absolute_day,
         record.journal_sequence,
         record.entry_id,
     )
@@ -896,10 +896,10 @@ def _system_step_order(record: SystemStepRecord) -> tuple[int, int, str]:
 def _invocation_order(
     invocation: PolicyInvocation,
 ) -> tuple[int, int, bool, int, str, str]:
-    """Order daily calls by company and event-driven calls by time and application."""
+    """Order opening calls by company and event-driven calls by day and application."""
     return (
-        invocation.day,
-        invocation.sim_minute if invocation.sim_minute is not None else -1,
+        invocation.week,
+        invocation.absolute_day if invocation.absolute_day is not None else -1,
         invocation.apply_sequence is None,
         invocation.apply_sequence or 0,
         invocation.company_id,

@@ -25,7 +25,7 @@ from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import TurnRecord
 from company_bench.settings import MAX_PARALLELISM, ExecutionLimits, RuntimePaths
 from company_bench.storage.store import RunStore, SQLiteRunStore
-from company_bench.timeline.models import TimelineDay, TimelineDetail
+from company_bench.timeline.models import TimelineDetail, TimelineWeek
 from company_bench.timeline.projector import RunTimelineProjector
 
 
@@ -159,8 +159,8 @@ class BenchmarkApplication:
     def turns(self, run_id: str) -> tuple[TurnRecord, ...]:
         return self._store.list_turns(run_id)
 
-    def timeline_day(self, run_id: str, day: int) -> TimelineDay:
-        return self._timeline.read_day(run_id, day)
+    def timeline_week(self, run_id: str, week: int) -> TimelineWeek:
+        return self._timeline.read_week(run_id, week)
 
     def timeline_detail(self, run_id: str, entry_id: str) -> TimelineDetail:
         return self._timeline.read_detail(run_id, entry_id)

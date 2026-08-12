@@ -10,10 +10,10 @@ import {
 import {
   DECISION_PROCESSING_ORDER_LABEL,
   ORDER_BOOK_PRIORITY_LABEL,
-  clockTime,
   decisionProcessingOrderSummary,
   plural,
 } from "../../shared/timelineFormatters";
+import { simulationDayLabel } from "../../shared/simulationCalendar";
 import type {
   MarketFrameView,
   MarketOrderFlowItemView,
@@ -24,8 +24,8 @@ import type {
 import { DetailDrawer } from "../../shared/ui/DetailDrawer";
 
 interface MarketDisplayProps {
+  readonly absoluteDay: number;
   readonly frame: MarketFrameView;
-  readonly minute: number;
 }
 
 type BookSide = "ask" | "bid";
@@ -41,7 +41,7 @@ type MarketSelection =
       readonly side: BookSide;
     };
 
-export function MarketDisplay({ frame, minute }: MarketDisplayProps) {
+export function MarketDisplay({ absoluteDay, frame }: MarketDisplayProps) {
   const [selectedProduct, setSelectedProduct] = useState(
     frame.closingOrderBooks[0]?.product ?? "",
   );
@@ -56,24 +56,24 @@ export function MarketDisplay({ frame, minute }: MarketDisplayProps) {
 
   return (
     <aside
-      aria-label={`End-of-minute market state at ${clockTime(minute)}`}
+      aria-label={`End-of-day market state on ${simulationDayLabel(absoluteDay)}`}
       className="market-display"
-      data-minute={minute}
+      data-day={absoluteDay}
     >
       <header className="market-display-header">
         <strong>Market display</strong>
-        <small>End-of-minute state · v{frame.stateVersion}</small>
+        <small>End-of-day state · v{frame.stateVersion}</small>
       </header>
       <OrderFlow
         items={frame.orderFlow}
         onSelect={(flow) => setSelection({ flow, kind: "flow" })}
         selected={selection?.kind === "flow" ? selection.flow : null}
       />
-      <TradeTape frame={frame} minute={minute} />
-      <EndOfMinuteOrderBook
+      <TradeTape absoluteDay={absoluteDay} frame={frame} />
+      <EndOfDayOrderBook
+        absoluteDay={absoluteDay}
         book={book}
         books={frame.closingOrderBooks}
-        minute={minute}
         onSelectLevel={(level, side) =>
           setSelection({ kind: "level", level, product: book.product, side })
         }
@@ -85,7 +85,7 @@ export function MarketDisplay({ frame, minute }: MarketDisplayProps) {
       />
       {selection !== null && (
         <MarketDetailDrawer
-          minute={minute}
+          absoluteDay={absoluteDay}
           onClose={() => setSelection(null)}
           selection={selection}
         />
@@ -114,7 +114,7 @@ function OrderFlow({
       {items.length === 0 ? (
         <p>
           No quote-ladder reconciliation changed or preserved an order during
-          this minute.
+          this day.
         </p>
       ) : (
         <ol>
@@ -160,20 +160,20 @@ function OrderFlow({
 }
 
 function TradeTape({
+  absoluteDay,
   frame,
-  minute,
 }: {
+  readonly absoluteDay: number;
   readonly frame: MarketFrameView;
-  readonly minute: number;
 }) {
   return (
     <section className="trade-tape">
       <header>
         <span>TRADE TAPE</span>
-        <strong>Trades during {clockTime(minute)} · this minute only</strong>
+        <strong>Trades on {simulationDayLabel(absoluteDay)} · this day only</strong>
       </header>
       {frame.trades.length === 0 ? (
-        <p>No trades during this minute</p>
+        <p>No trades during this day</p>
       ) : (
         <ol>
           {frame.trades.map((trade) => (
@@ -192,9 +192,9 @@ function TradeTape({
               </span>
               <span className="trade-route">
                 <strong>
-                  {companyLabel(trade.sellerId)} {"→"} {companyLabel(trade.buyerId)}
+                  {companyLabel(trade.sellerId)} → {companyLabel(trade.buyerId)}
                 </strong>
-                <span>Arrives {clockTime(trade.arrivesAtMinute)}</span>
+                <span>Arrives {simulationDayLabel(trade.arrivesOn)}</span>
               </span>
             </li>
           ))}
@@ -204,17 +204,17 @@ function TradeTape({
   );
 }
 
-function EndOfMinuteOrderBook({
+function EndOfDayOrderBook({
+  absoluteDay,
   book,
   books,
-  minute,
   onSelectLevel,
   onSelectProduct,
   selection,
 }: {
+  readonly absoluteDay: number;
   readonly book: ObserverOrderBookView;
   readonly books: readonly ObserverOrderBookView[];
-  readonly minute: number;
   readonly onSelectLevel: (level: MarketPriceLevelView, side: BookSide) => void;
   readonly onSelectProduct: (product: string) => void;
   readonly selection: MarketSelection | null;
@@ -224,7 +224,7 @@ function EndOfMinuteOrderBook({
       <header className="market-book-header">
         <div>
           <span>ACTIVE ORDER BOOK</span>
-          <strong>End-of-minute order book · {clockTime(minute)}</strong>
+          <strong>End-of-day order book · {simulationDayLabel(absoluteDay)}</strong>
         </div>
         <div className="market-product-tabs" role="tablist" aria-label="Market product">
           {books.map((candidate) => (
@@ -368,32 +368,40 @@ function PriceLevel({
 }
 
 function MarketDetailDrawer({
-  minute,
+  absoluteDay,
   onClose,
   selection,
 }: {
-  readonly minute: number;
+  readonly absoluteDay: number;
   readonly onClose: () => void;
   readonly selection: MarketSelection;
 }) {
   return selection.kind === "flow" ? (
-    <OrderFlowDetail flow={selection.flow} minute={minute} onClose={onClose} />
+    <OrderFlowDetail
+      absoluteDay={absoluteDay}
+      flow={selection.flow}
+      onClose={onClose}
+    />
   ) : (
-    <PriceLevelDetail minute={minute} onClose={onClose} selection={selection} />
+    <PriceLevelDetail
+      absoluteDay={absoluteDay}
+      onClose={onClose}
+      selection={selection}
+    />
   );
 }
 
 function OrderFlowDetail({
+  absoluteDay,
   flow,
-  minute,
   onClose,
 }: {
+  readonly absoluteDay: number;
   readonly flow: MarketOrderFlowItemView;
-  readonly minute: number;
   readonly onClose: () => void;
 }) {
   const order = flowOrder(flow);
-  const title = `${flow.action.toUpperCase()} ${bookSide(order.side).toUpperCase()} · ${clockTime(minute)}`;
+  const title = `${flow.action.toUpperCase()} ${bookSide(order.side).toUpperCase()} · ${simulationDayLabel(absoluteDay)}`;
   return (
     <DetailDrawer
       ariaLabel={`Market order ${order.orderId} detail`}
@@ -442,10 +450,10 @@ function OrderFlowDetail({
             </p>
           </MarketDrawerSection>
         ) : flow.action === "cancel" ? (
-          <MarketDrawerSection label="2" title="End-of-minute result">
+          <MarketDrawerSection label="2" title="End-of-day result">
             <p className="market-result-copy">
               The active order was removed and does not appear in the
-              end-of-minute order book.
+              end-of-day order book.
             </p>
           </MarketDrawerSection>
         ) : (
@@ -521,11 +529,11 @@ function OrderFlowDetail({
 }
 
 function PriceLevelDetail({
-  minute,
+  absoluteDay,
   onClose,
   selection,
 }: {
-  readonly minute: number;
+  readonly absoluteDay: number;
   readonly onClose: () => void;
   readonly selection: Extract<MarketSelection, { readonly kind: "level" }>;
 }) {
@@ -533,15 +541,15 @@ function PriceLevelDetail({
   const orderCount = level.orders.length;
   return (
     <DetailDrawer
-      ariaLabel={`${side} end-of-minute order book price level detail`}
-      eyebrow="END-OF-MINUTE ORDER BOOK"
+      ariaLabel={`${side} end-of-day order book price level detail`}
+      eyebrow="END-OF-DAY ORDER BOOK"
       onClose={onClose}
       title={`${side.toUpperCase()} ${formatMarketPrice(level.unitPrice)} · ${productLabel(product)}`}
     >
       <div className="drawer-body market-drawer-body">
         <MarketDrawerSection
           label="BOOK"
-          title={`End-of-minute order book · ${clockTime(minute)}`}
+          title={`End-of-day order book · ${simulationDayLabel(absoluteDay)}`}
         >
           <dl className="market-detail-grid compact">
             <MarketMeta label="Side" value={side.toUpperCase()} />

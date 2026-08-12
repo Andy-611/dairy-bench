@@ -24,12 +24,12 @@ from company_bench.agents.contracts import (
     ModelOutputError,
     PolicyExecutionError,
     PolicyInfrastructureError,
+    PolicyRecoverableError,
     PolicyTerminalError,
 )
 from company_bench.domain.models import (
     CompanyEvent,
     CompanyId,
-    DaySnapshot,
     DomainEvent,
     EpisodeQuality,
     EpisodeResult,
@@ -40,6 +40,7 @@ from company_bench.domain.models import (
     ProtocolReport,
     ScenarioSpec,
     TradeExecutedEvent,
+    WeekSnapshot,
 )
 from company_bench.economy.engine import EconomyEngine, EconomyState
 from company_bench.economy.scoring import Evaluator
@@ -67,7 +68,7 @@ from company_bench.runtime.models import (
     JournalEntryKind,
     JournalEntryReference,
     RejectionCategory,
-    SimTime,
+    SimDay,
     SystemEventKind,
     SystemStepRecord,
     TurnRecord,
@@ -79,7 +80,7 @@ from company_bench.runtime.models import (
 from company_bench.runtime.scheduler import ScheduledEvent, Scheduler
 
 _DECISION_ADAPTER = TypeAdapter(CompanyDecision)
-type DayCallback = Callable[[int], Awaitable[None]]
+type WeekCallback = Callable[[int], Awaitable[None]]
 type TurnCallback = Callable[[TurnRecord], Awaitable[None]]
 
 
@@ -108,7 +109,7 @@ class EpisodeExecution:
 class _Cursor:
     next_turn_sequence: int = 1
     last_visible_event_sequence: int = 0
-    available_at: SimTime | None = None
+    available_on: SimDay | None = None
     active_attention: ArmedAttention | None = None
 
 
@@ -128,7 +129,7 @@ class _PendingTurn:
 
 
 class EpisodeRuntime:
-    """Run one V4 episode with deterministic scheduling and atomic decisions."""
+    """Run one V6 episode with deterministic daily scheduling and atomic decisions."""
 
     def __init__(
         self,
@@ -154,7 +155,7 @@ class EpisodeRuntime:
         *,
         run_id: str,
         started_at: datetime | None = None,
-        on_day_completed: DayCallback | None = None,
+        on_week_completed: WeekCallback | None = None,
         on_turn_completed: TurnCallback | None = None,
         store: RuntimeStore | None = None,
         recovery: RunRecovery | None = None,
@@ -177,17 +178,17 @@ class EpisodeRuntime:
             raise ValueError("started_at does not match the checkpoint")
         initial_state = self._engine.initial_state(self.scenario, seed)
         if recovery is None:
-            economy = self._engine.open_day(initial_state)
+            economy = self._engine.open_week(initial_state)
             scheduler = Scheduler()
-            self._schedule_day(scheduler, economy.day)
+            self._schedule_week(scheduler, economy.week)
             turns: list[TurnRecord] = []
             system_steps: list[SystemStepRecord] = []
             event_records: list[EventRecord] = []
-            snapshots: list[DaySnapshot] = []
+            snapshots: list[WeekSnapshot] = []
             cursors = {company.company_id: _Cursor() for company in self.scenario.companies}
         else:
+            economy = self._restore_economy(checkpoint.economy)
             self._validate_recovery(recovery, run_id, seed, agents)
-            economy = checkpoint.economy
             scheduler = Scheduler.restore(checkpoint.scheduler)
             turns = list(recovery.turns)
             system_steps = list(recovery.system_steps)
@@ -220,7 +221,7 @@ class EpisodeRuntime:
         previous_outcomes = self._previous_outcomes(turns)
         turn_counts = self._turn_counts(turns)
         turn_limit_audits: set[tuple[int, CompanyId]] = {
-            (step.occurred_at.day + 1, step.company_id)
+            (step.occurred_on.week, step.company_id)
             for step in system_steps
             if step.kind is SystemEventKind.TURN_LIMIT_REACHED and step.company_id is not None
         }
@@ -239,13 +240,13 @@ class EpisodeRuntime:
         )
 
         while scheduler:
-            bucket = scheduler.pop_bucket()
+            bucket = scheduler.pop_day()
             (
                 economy,
                 completed,
                 new_steps,
                 next_journal_sequence,
-                completed_days,
+                completed_weeks,
             ) = await self._apply_system_events(
                 run_id,
                 economy,
@@ -258,7 +259,7 @@ class EpisodeRuntime:
             )
             self._expire_attention(bucket, cursors)
             pending_system_steps = list(new_steps)
-            pending_completed_days = list(completed_days)
+            pending_completed_weeks = list(completed_weeks)
             if completed:
                 self._save_progress(
                     store,
@@ -275,37 +276,37 @@ class EpisodeRuntime:
                     snapshots,
                     cursors,
                 )
-                if on_day_completed is not None:
-                    for completed_day in pending_completed_days:
-                        await on_day_completed(completed_day)
+                if on_week_completed is not None:
+                    for completed_week in pending_completed_weeks:
+                        await on_week_completed(completed_week)
                 break
 
             wake_events = [event for event in bucket if event.kind is SystemEventKind.COMPANY_WAKE]
-            while scheduler.peek_time() == scheduler.now:
-                same_time = scheduler.pop_bucket()
+            while scheduler.peek_day() == scheduler.today:
+                same_day = scheduler.pop_day()
                 (
                     economy,
                     completed,
                     step_delta,
                     next_journal_sequence,
-                    day_delta,
+                    week_delta,
                 ) = await self._apply_system_events(
                     run_id,
                     economy,
                     scheduler,
-                    same_time,
+                    same_day,
                     system_steps,
                     event_records,
                     snapshots,
                     next_journal_sequence,
                 )
-                self._expire_attention(same_time, cursors)
+                self._expire_attention(same_day, cursors)
                 pending_system_steps.extend(step_delta)
-                pending_completed_days.extend(day_delta)
+                pending_completed_weeks.extend(week_delta)
                 if completed:
                     break
                 wake_events.extend(
-                    event for event in same_time if event.kind is SystemEventKind.COMPANY_WAKE
+                    event for event in same_day if event.kind is SystemEventKind.COMPANY_WAKE
                 )
             if completed:
                 self._save_progress(
@@ -323,9 +324,9 @@ class EpisodeRuntime:
                     snapshots,
                     cursors,
                 )
-                if on_day_completed is not None:
-                    for completed_day in pending_completed_days:
-                        await on_day_completed(completed_day)
+                if on_week_completed is not None:
+                    for completed_week in pending_completed_weeks:
+                        await on_week_completed(completed_week)
                 break
             merged_wakes = self._merge_wakes(tuple(wake_events))
             ready_wakes = self._defer_busy_wakes(
@@ -349,9 +350,9 @@ class EpisodeRuntime:
                     snapshots,
                     cursors,
                 )
-                if on_day_completed is not None:
-                    for completed_day in pending_completed_days:
-                        await on_day_completed(completed_day)
+                if on_week_completed is not None:
+                    for completed_week in pending_completed_weeks:
+                        await on_week_completed(completed_week)
                 continue
             (
                 eligible,
@@ -385,9 +386,9 @@ class EpisodeRuntime:
                     snapshots,
                     cursors,
                 )
-                if on_day_completed is not None:
-                    for completed_day in pending_completed_days:
-                        await on_day_completed(completed_day)
+                if on_week_completed is not None:
+                    for completed_week in pending_completed_weeks:
+                        await on_week_completed(completed_week)
                 continue
 
             for event in eligible:
@@ -406,14 +407,14 @@ class EpisodeRuntime:
             )
             ordered = tuple(
                 self._prepare_attention(item)
-                for item in self._application_order(pending, seed, scheduler.now)
+                for item in self._application_order(pending, seed, scheduler.today)
             )
             envelopes = tuple(
                 DecisionEnvelope(
                     turn_id=item.turn.turn_id,
                     decision_id=f"{item.turn.turn_id}.decision",
                     company_id=item.turn.company_id,
-                    issued_at=item.turn.sim_time,
+                    issued_on=item.turn.sim_day,
                     state_version=item.turn.state_version,
                     decision=item.decision,
                 )
@@ -475,11 +476,11 @@ class EpisodeRuntime:
                 turns.append(record)
                 new_records.append(record)
                 company_id = item.turn.company_id
-                turn_counts[(economy.day, company_id)] = (
-                    turn_counts.get((economy.day, company_id), 0) + 1
+                turn_counts[(economy.week, company_id)] = (
+                    turn_counts.get((economy.week, company_id), 0) + 1
                 )
                 previous_outcomes[company_id] = outcome
-                cursors[company_id].available_at = self._available_after(record)
+                cursors[company_id].available_on = self._available_after(record)
                 agent = agents[company_id]
                 if isinstance(agent, TurnMemory):
                     agent.remember(record)
@@ -488,22 +489,23 @@ class EpisodeRuntime:
                 self._schedule_rejection_retry(
                     scheduler,
                     record,
-                    turn_counts[(economy.day, company_id)],
+                    turn_counts[(economy.week, company_id)],
                 )
                 self._install_attention(
                     scheduler,
                     cursors[company_id],
                     record,
                     item.attention_plan,
-                    turn_counts[(economy.day, company_id)],
+                    turn_counts[(economy.week, company_id)],
                 )
                 self._schedule_trade_wakes(scheduler, record)
             self._schedule_price_alerts(scheduler, economy, cursors)
             for record in new_records:
                 company_id = record.turn.company_id
-                audit_key = (economy.day, company_id)
+                audit_key = (economy.week, company_id)
                 if (
-                    turn_counts[audit_key] != self.scenario.runtime.max_turns_per_company_day
+                    turn_counts[audit_key]
+                    != self.scenario.runtime.max_turns_per_company_week
                     or audit_key in turn_limit_audits
                 ):
                     continue
@@ -511,7 +513,7 @@ class EpisodeRuntime:
                 step = self._turn_limit_step(
                     run_id,
                     economy,
-                    record.turn.sim_time,
+                    record.turn.sim_day,
                     company_id,
                     next_journal_sequence,
                 )
@@ -534,12 +536,12 @@ class EpisodeRuntime:
                 snapshots,
                 cursors,
             )
-            if on_day_completed is not None:
-                for completed_day in pending_completed_days:
-                    await on_day_completed(completed_day)
+            if on_week_completed is not None:
+                for completed_week in pending_completed_weeks:
+                    await on_week_completed(completed_week)
 
         final_state = economy.base_state
-        if final_state.day != self.scenario.days:
+        if final_state.completed_weeks != self.scenario.weeks:
             raise RuntimeError("scheduler ended before the scenario completed")
         for agent in agents.values():
             if isinstance(agent, EpisodeCompletionGuard):
@@ -585,7 +587,7 @@ class EpisodeRuntime:
     def _merge_wakes(
         wake_events: tuple[ScheduledEvent, ...],
     ) -> tuple[ScheduledEvent, ...]:
-        """Coalesce wakes added while same-minute system events execute."""
+        """Coalesce wakes added while same-day system events execute."""
         merged: dict[str, ScheduledEvent] = {}
         for event in sorted(wake_events, key=lambda item: item.sequence):
             company_id = event.company_id
@@ -616,11 +618,14 @@ class EpisodeRuntime:
             company_id = event.company_id
             if company_id is None:
                 raise ValueError("wake event is missing company_id")
-            available_at = cursors[company_id].available_at
-            if available_at is None or event.at.absolute_minute >= available_at.absolute_minute:
+            available_on = cursors[company_id].available_on
+            if (
+                available_on is None
+                or event.scheduled_for.absolute_day >= available_on.absolute_day
+            ):
                 ready.append(event)
                 continue
-            target = self._next_business_time(available_at)
+            target = self._next_decision_day(available_on)
             if target is None:
                 continue
             for signal in event.wake_signals:
@@ -633,26 +638,17 @@ class EpisodeRuntime:
                 )
         return tuple(ready)
 
-    def _next_business_time(self, at: SimTime) -> SimTime | None:
-        """Move a cooldown boundary into the next valid business window."""
-        runtime = self.scenario.runtime
-        day = at.day
-        minute = at.minute_of_day
-        if minute < runtime.open_minute:
-            minute = runtime.open_minute
-        elif minute >= runtime.close_minute:
-            day += 1
-            minute = runtime.open_minute
-        if day >= self.scenario.days:
-            return None
-        return SimTime(absolute_minute=day * 24 * 60 + minute)
+    def _next_decision_day(self, day: SimDay) -> SimDay | None:
+        """Move a causal wake onto the first valid Monday-Saturday."""
+        calendar = self.scenario.calendar
+        if calendar.contains(day) and day.is_decision_day:
+            return day
+        return calendar.next_decision_day(day)
 
     @staticmethod
-    def _available_after(record: TurnRecord) -> SimTime | None:
-        """Return the cooldown boundary; idling does not occupy a company."""
-        if isinstance(record.envelope.decision, IdleDecision) and record.outcome.accepted:
-            return None
-        return record.outcome.next_available_at
+    def _available_after(record: TurnRecord) -> SimDay | None:
+        """Return the next-day cooldown boundary for every submitted decision."""
+        return record.outcome.next_available_on
 
     async def _apply_system_events(
         self,
@@ -662,7 +658,7 @@ class EpisodeRuntime:
         bucket: tuple[ScheduledEvent, ...],
         system_steps: list[SystemStepRecord],
         event_records: list[EventRecord],
-        snapshots: list[DaySnapshot],
+        snapshots: list[WeekSnapshot],
         next_journal_sequence: int,
     ) -> tuple[
         EconomyState,
@@ -672,26 +668,28 @@ class EpisodeRuntime:
         tuple[int, ...],
     ]:
         new_steps: list[SystemStepRecord] = []
-        completed_days: list[int] = []
+        completed_weeks: list[int] = []
         completed = False
         for event in bucket:
             if event.kind is SystemEventKind.COMPANY_WAKE:
                 continue
             before_version = economy.state_version
             before_event_count = len(event_records)
-            snapshot_day: int | None = None
+            snapshot_week: int | None = None
             entry_id = system_step_id(run_id, event.event_id)
-            if event.kind is SystemEventKind.DAY_OPEN:
+            if event.kind is SystemEventKind.WEEK_OPEN:
                 for company in self.scenario.companies:
                     scheduler.schedule_wake(
                         company.company_id,
-                        event.at,
-                        WakeReason.DAY_OPEN,
+                        event.scheduled_for,
+                        WakeReason.WEEK_OPEN,
                         source=JournalEntryReference(
                             entry_id=entry_id,
                             entry_type=JournalEntryKind.SYSTEM_STEP,
                         ),
                     )
+            elif event.kind is SystemEventKind.DAY_STARTED:
+                pass
             elif event.kind in {
                 SystemEventKind.OPERATION_COMPLETED,
                 SystemEventKind.DELIVERY_COMPLETED,
@@ -699,17 +697,26 @@ class EpisodeRuntime:
                 reference_id = self._completion_reference(event)
                 before = len(economy.events)
                 economy = (
-                    self._engine.complete_operation(economy, reference_id, event.at)
+                    self._engine.complete_operation(
+                        economy,
+                        reference_id,
+                        event.scheduled_for,
+                    )
                     if event.kind is SystemEventKind.OPERATION_COMPLETED
-                    else self._engine.complete_delivery(economy, reference_id, event.at)
+                    else self._engine.complete_delivery(
+                        economy,
+                        reference_id,
+                        event.scheduled_for,
+                    )
                 )
                 self._append_events(event_records, economy.events[before:])
-                if event.at.minute_of_day < self.scenario.runtime.close_minute:
-                    if event.company_id is None:
-                        raise ValueError("completion event is missing company_id")
+                if event.company_id is None:
+                    raise ValueError("completion event is missing company_id")
+                wake_on = self.scenario.calendar.next_decision_day(event.scheduled_for)
+                if wake_on is not None:
                     scheduler.schedule_wake(
                         event.company_id,
-                        event.at,
+                        wake_on,
                         (
                             WakeReason.OPERATION_COMPLETED
                             if event.kind is SystemEventKind.OPERATION_COMPLETED
@@ -722,21 +729,24 @@ class EpisodeRuntime:
                         reference_ids=(reference_id,),
                     )
             elif event.kind is SystemEventKind.MARKET_CLOSE:
-                economy = self._engine.close_markets(economy, event.at)
+                economy = self._engine.close_markets(economy, event.scheduled_for)
             elif event.kind is SystemEventKind.CONSUMER_SALES:
                 before = len(economy.events)
-                economy = self._engine.settle_consumer_sales(economy, event.at)
+                economy = self._engine.settle_consumer_sales(
+                    economy,
+                    event.scheduled_for,
+                )
                 self._append_events(event_records, economy.events[before:])
-            elif event.kind is SystemEventKind.DAY_CLOSE:
-                result = self._engine.close_day(economy, event.at)
+            elif event.kind is SystemEventKind.WEEK_CLOSE:
+                result = self._engine.close_week(economy, event.scheduled_for)
                 self._append_events(
                     event_records,
                     result.events[len(economy.events) :],
                 )
                 snapshots.append(result.snapshot)
-                snapshot_day = result.snapshot.day
-                completed_days.append(result.state.day)
-                if result.state.day == self.scenario.days:
+                snapshot_week = result.snapshot.week
+                completed_weeks.append(result.state.completed_weeks)
+                if result.state.completed_weeks == self.scenario.weeks:
                     economy = economy.model_copy(
                         update={
                             "base_state": result.state,
@@ -747,11 +757,11 @@ class EpisodeRuntime:
                     )
                     completed = True
                 else:
-                    economy = self._engine.open_day(
+                    economy = self._engine.open_week(
                         result.state,
                         state_version=economy.state_version + 1,
                     )
-                    self._schedule_day(scheduler, economy.day)
+                    self._schedule_week(scheduler, economy.week)
             else:
                 raise RuntimeError(f"unsupported system event: {event.kind.value}")
             effects = tuple(event_records[before_event_count:])
@@ -760,13 +770,13 @@ class EpisodeRuntime:
                 entry_id=entry_id,
                 journal_sequence=next_journal_sequence,
                 scheduled_event_id=event.event_id,
-                occurred_at=event.at,
+                occurred_on=event.scheduled_for,
                 kind=event.kind,
                 reference_ids=event.reference_ids,
                 state_version_before=before_version,
                 state_version_after=economy.state_version,
                 effects=effects,
-                snapshot_day=snapshot_day,
+                snapshot_week=snapshot_week,
             )
             system_steps.append(step)
             new_steps.append(step)
@@ -778,7 +788,7 @@ class EpisodeRuntime:
             completed,
             tuple(new_steps),
             next_journal_sequence,
-            tuple(completed_days),
+            tuple(completed_weeks),
         )
 
     @staticmethod
@@ -807,7 +817,7 @@ class EpisodeRuntime:
                 event_records,
                 cursors[event.company_id],
                 previous_outcomes.get(event.company_id),
-                turn_counts.get((economy.day, event.company_id), 0) + 1,
+                turn_counts.get((economy.week, event.company_id), 0) + 1,
             )
             for event in sorted(wake_events, key=lambda item: item.company_id or "")
             if event.company_id is not None
@@ -831,7 +841,7 @@ class EpisodeRuntime:
         event_records: list[EventRecord],
         cursor: _Cursor,
         previous_outcome: DecisionOutcome | None,
-        turn_number_today: int,
+        turn_number_this_week: int,
     ) -> AgentTurn:
         company_id = wake_event.company_id
         if company_id is None:
@@ -844,15 +854,19 @@ class EpisodeRuntime:
             if self._event_is_visible(record.event, company_id)
         )
         cursor.last_visible_event_sequence = len(event_records)
-        observation = self._engine.observe_active(economy, company_id)
+        observation = self._engine.observe_active(
+            economy,
+            company_id,
+            wake_event.scheduled_for,
+        )
         order_books = self._engine.order_books(economy, company_id)
         return AgentTurn(
             turn_id=f"{run_id}.{company_id}.t{sequence}",
             company_id=company_id,
-            sim_time=wake_event.at,
+            sim_day=wake_event.scheduled_for,
             state_version=economy.state_version,
-            turn_number_today=turn_number_today,
-            turn_limit_today=self.scenario.runtime.max_turns_per_company_day,
+            turn_number_this_week=turn_number_this_week,
+            turn_limit_this_week=self.scenario.runtime.max_turns_per_company_week,
             wake_reasons=wake_event.wake_reasons,
             wake_signals=wake_event.wake_signals,
             observation=observation,
@@ -909,7 +923,7 @@ class EpisodeRuntime:
                 turn=turn,
                 decision=_DECISION_ADAPTER.validate_python(decision),
             )
-        except (PolicyInfrastructureError, PolicyTerminalError, ReplayDriftError):
+        except (PolicyRecoverableError, PolicyTerminalError, ReplayDriftError):
             raise
         except TimeoutError as error:
             raise PolicyInfrastructureError(
@@ -961,13 +975,15 @@ class EpisodeRuntime:
     def _application_order(
         pending: tuple[_PendingTurn, ...],
         seed: int,
-        at: SimTime,
+        on: SimDay,
     ) -> tuple[_PendingTurn, ...]:
-        """Create a full seed-derived arrival permutation for one minute."""
+        """Create a full seed-derived arrival permutation for one day."""
 
         def priority(item: _PendingTurn) -> tuple[bytes, str]:
             company_id = item.turn.company_id
-            digest = hashlib.sha256(f"{seed}|{at.absolute_minute}|{company_id}".encode()).digest()
+            digest = hashlib.sha256(
+                f"{seed}|{on.absolute_day}|{company_id}".encode()
+            ).digest()
             return digest, company_id
 
         return tuple(sorted(pending, key=priority))
@@ -1000,7 +1016,7 @@ class EpisodeRuntime:
                     turn_id=envelope.turn_id,
                     decision_id=envelope.decision_id,
                     company_id=envelope.company_id,
-                    occurred_at=envelope.issued_at,
+                    occurred_on=envelope.issued_on,
                     status=DecisionStatus.REJECTED,
                     accepted=False,
                     rejection_category=(
@@ -1011,8 +1027,8 @@ class EpisodeRuntime:
                     reason=reason,
                     resulting_state_version=state_version,
                     apply_sequence=first_apply_sequence + offset,
-                    next_available_at=envelope.issued_at.plus(
-                        item.turn.observation.runtime.decision_interval_minutes
+                    next_available_on=envelope.issued_on.plus_days(
+                        item.turn.observation.runtime.decision_interval_days
                     ),
                 )
             )
@@ -1022,22 +1038,19 @@ class EpisodeRuntime:
         self,
         scheduler: Scheduler,
         record: TurnRecord,
-        turns_today: int,
+        turns_this_week: int,
     ) -> None:
         if (
             record.outcome.accepted
-            or turns_today >= self.scenario.runtime.max_turns_per_company_day
+            or turns_this_week >= self.scenario.runtime.max_turns_per_company_week
         ):
             return
-        available = record.outcome.next_available_at
-        if (
-            available is not None
-            and available.day == record.turn.sim_time.day
-            and available.minute_of_day < self.scenario.runtime.close_minute
-        ):
+        available = record.outcome.next_available_on
+        retry_on = None if available is None else self._next_decision_day(available)
+        if retry_on is not None:
             scheduler.schedule_wake(
                 record.turn.company_id,
-                available,
+                retry_on,
                 WakeReason.DECISION_REJECTED,
                 source=JournalEntryReference(
                     entry_id=record.turn.turn_id,
@@ -1045,28 +1058,35 @@ class EpisodeRuntime:
                 ),
             )
 
-    def _schedule_day(self, scheduler: Scheduler, day: int) -> None:
-        day_index = day - 1
-        runtime = self.scenario.runtime
+    def _schedule_week(self, scheduler: Scheduler, week: int) -> None:
+        days = self.scenario.calendar.days_of_week(week)
+        monday, *later_days = days
         scheduler.schedule_system(
-            SystemEventKind.DAY_OPEN,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.open_minute),
-            event_id=f"d{day}.open",
+            SystemEventKind.WEEK_OPEN,
+            monday,
+            event_id=f"w{week}.open",
         )
+        for day in later_days:
+            scheduler.schedule_system(
+                SystemEventKind.DAY_STARTED,
+                day,
+                event_id=f"w{week}.{day.weekday.value}.started",
+            )
+        sunday = days[-1]
         scheduler.schedule_system(
             SystemEventKind.MARKET_CLOSE,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.close_minute),
-            event_id=f"d{day}.market_close",
+            sunday,
+            event_id=f"w{week}.market_close",
         )
         scheduler.schedule_system(
             SystemEventKind.CONSUMER_SALES,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.close_minute),
-            event_id=f"d{day}.consumer_sales",
+            sunday,
+            event_id=f"w{week}.consumer_sales",
         )
         scheduler.schedule_system(
-            SystemEventKind.DAY_CLOSE,
-            SimTime(absolute_minute=day_index * 24 * 60 + runtime.day_close_minute),
-            event_id=f"d{day}.close",
+            SystemEventKind.WEEK_CLOSE,
+            sunday,
+            event_id=f"w{week}.close",
         )
 
     @staticmethod
@@ -1079,7 +1099,7 @@ class EpisodeRuntime:
             for completion in outcome.scheduled_completions:
                 scheduler.schedule_system(
                     completion.kind,
-                    completion.at,
+                    completion.scheduled_for,
                     event_id=completion.event_id,
                     company_id=completion.company_id,
                     reference_ids=(completion.reference_id,),
@@ -1091,21 +1111,21 @@ class EpisodeRuntime:
         cursor: _Cursor,
         record: TurnRecord,
         plan: ArmedAttention | None,
-        turns_today: int,
+        turns_this_week: int,
     ) -> None:
         """Persist accepted attention and schedule only its fallback review."""
         if not record.outcome.accepted:
             return
         if plan is None:
             raise RuntimeError("accepted decision is missing its attention plan")
-        if turns_today >= self.scenario.runtime.max_turns_per_company_day:
+        if turns_this_week >= self.scenario.runtime.max_turns_per_company_week:
             return
         cursor.active_attention = plan
-        if plan.review_at is None:
+        if plan.review_on is None:
             return
         scheduler.schedule_wake(
             record.turn.company_id,
-            plan.review_at,
+            plan.review_on,
             WakeReason.REVIEW_DUE,
             source=self._turn_reference(record.turn.turn_id),
         )
@@ -1119,8 +1139,8 @@ class EpisodeRuntime:
         trades = tuple(
             event for event in record.outcome.events if isinstance(event, TradeExecutedEvent)
         )
-        at = record.turn.sim_time.plus(self.scenario.runtime.decision_interval_minutes)
-        if not trades or not self._can_wake_on_day(at, record.turn.sim_time.day):
+        wake_on = self.scenario.calendar.next_decision_day(record.turn.sim_day)
+        if not trades or wake_on is None:
             return
         trade_ids_by_company: dict[CompanyId, list[str]] = {}
         for trade in trades:
@@ -1129,7 +1149,7 @@ class EpisodeRuntime:
         for company_id, trade_ids in sorted(trade_ids_by_company.items()):
             scheduler.schedule_wake(
                 company_id,
-                at,
+                wake_on,
                 WakeReason.TRADE_EXECUTED,
                 source=(
                     self._turn_reference(record.turn.turn_id)
@@ -1145,8 +1165,8 @@ class EpisodeRuntime:
         economy: EconomyState,
         cursors: Mapping[str, _Cursor],
     ) -> None:
-        """Evaluate every plan once against the committed minute-end books."""
-        wake_at = scheduler.now.plus(self.scenario.runtime.decision_interval_minutes)
+        """Evaluate every plan once against the committed day-end books."""
+        wake_on = self.scenario.calendar.next_decision_day(scheduler.today)
         for company_id, cursor in sorted(cursors.items()):
             plan = cursor.active_attention
             if plan is None:
@@ -1157,26 +1177,22 @@ class EpisodeRuntime:
             )
             if match is None:
                 continue
-            if plan.review_at is not None:
+            if plan.review_on is not None:
                 scheduler.cancel_wake(
                     company_id,
-                    plan.review_at,
+                    plan.review_on,
                     WakeReason.REVIEW_DUE,
                 )
             cursor.active_attention = None
-            if not self._can_wake_on_day(wake_at, scheduler.now.day):
+            if wake_on is None:
                 continue
             scheduler.schedule_wake(
                 company_id,
-                wake_at,
+                wake_on,
                 WakeReason.PRICE_ALERT,
                 source=self._turn_reference(plan.source_turn_id),
                 reference_ids=self._alert_reference_ids(match),
             )
-
-    def _can_wake_on_day(self, at: SimTime, day: int) -> bool:
-        """Return whether Agents may still act on this simulation day."""
-        return at.day == day and at.minute_of_day < self.scenario.runtime.close_minute
 
     @staticmethod
     def _turn_reference(turn_id: str) -> JournalEntryReference:
@@ -1211,12 +1227,12 @@ class EpisodeRuntime:
         """Admit bounded turns and backfill any missing limit audit."""
         eligible: list[ScheduledEvent] = []
         steps: list[SystemStepRecord] = []
-        limit = self.scenario.runtime.max_turns_per_company_day
+        limit = self.scenario.runtime.max_turns_per_company_week
         for wake in wakes:
             company_id = wake.company_id
             if company_id is None:
                 raise ValueError("wake event is missing company_id")
-            key = (economy.day, company_id)
+            key = (economy.week, company_id)
             if counts.get(key, 0) < limit:
                 eligible.append(wake)
                 continue
@@ -1226,7 +1242,7 @@ class EpisodeRuntime:
                     self._turn_limit_step(
                         run_id,
                         economy,
-                        wake.at,
+                        wake.scheduled_for,
                         company_id,
                         next_journal_sequence,
                     )
@@ -1247,16 +1263,16 @@ class EpisodeRuntime:
     def _turn_limit_step(
         run_id: str,
         economy: EconomyState,
-        at: SimTime,
+        on: SimDay,
         company_id: CompanyId,
         journal_sequence: int,
     ) -> SystemStepRecord:
-        """Create one state-neutral audit marker for a daily hard cap."""
-        event_id = f"d{economy.day}.turn_limit.{company_id}"
+        """Create one state-neutral audit marker for a weekly hard cap."""
+        event_id = f"w{economy.week}.turn_limit.{company_id}"
         return EpisodeRuntime._agent_audit_step(
             run_id,
             economy,
-            at,
+            on,
             company_id,
             event_id,
             kind=SystemEventKind.TURN_LIMIT_REACHED,
@@ -1270,14 +1286,14 @@ class EpisodeRuntime:
         wake: ScheduledEvent,
         journal_sequence: int,
     ) -> SystemStepRecord:
-        """Persist one causal Wake rejected by the daily Agent limit."""
+        """Persist one causal Wake rejected by the weekly Agent limit."""
         if wake.company_id is None:
             raise ValueError("wake event is missing company_id")
-        event_id = f"d{economy.day}.wake_suppressed.{wake.company_id}.{wake.event_id}"
+        event_id = f"w{economy.week}.wake_suppressed.{wake.company_id}.{wake.event_id}"
         return EpisodeRuntime._agent_audit_step(
             run_id,
             economy,
-            wake.at,
+            wake.scheduled_for,
             wake.company_id,
             event_id,
             kind=SystemEventKind.AGENT_WAKE_SUPPRESSED,
@@ -1289,7 +1305,7 @@ class EpisodeRuntime:
     def _agent_audit_step(
         run_id: str,
         economy: EconomyState,
-        at: SimTime,
+        on: SimDay,
         company_id: CompanyId,
         event_id: str,
         *,
@@ -1303,7 +1319,7 @@ class EpisodeRuntime:
             entry_id=system_step_id(run_id, event_id),
             journal_sequence=journal_sequence,
             scheduled_event_id=event_id,
-            occurred_at=at,
+            occurred_on=on,
             kind=kind,
             company_id=company_id,
             suppressed_wake_signals=signals,
@@ -1316,7 +1332,7 @@ class EpisodeRuntime:
         events: tuple[ScheduledEvent, ...],
         cursors: Mapping[str, _Cursor],
     ) -> None:
-        """Discard same-day plans when the continuous markets close."""
+        """Discard weekly attention plans when the continuous markets close."""
         if not any(event.kind is SystemEventKind.MARKET_CLOSE for event in events):
             return
         for cursor in cursors.values():
@@ -1332,7 +1348,7 @@ class EpisodeRuntime:
             _Cursor(
                 next_turn_sequence=cursor.next_turn_sequence,
                 last_visible_event_sequence=cursor.last_visible_event_sequence,
-                available_at=cursor.available_at,
+                available_on=cursor.available_on,
                 active_attention=cursor.active_attention,
             )
             if cursor is not None
@@ -1354,7 +1370,7 @@ class EpisodeRuntime:
     ) -> dict[tuple[int, str], int]:
         counts: dict[tuple[int, str], int] = {}
         for record in turns:
-            key = (record.turn.observation.day, record.turn.company_id)
+            key = (record.turn.sim_day.week, record.turn.company_id)
             counts[key] = counts.get(key, 0) + 1
         return counts
 
@@ -1371,7 +1387,7 @@ class EpisodeRuntime:
         turns: list[TurnRecord],
         system_steps: list[SystemStepRecord],
         events: list[EventRecord],
-        snapshots: list[DaySnapshot],
+        snapshots: list[WeekSnapshot],
         cursors: Mapping[str, _Cursor],
     ) -> None:
         if store is None:
@@ -1395,7 +1411,7 @@ class EpisodeRuntime:
                     company_id=company_id,
                     next_turn_sequence=cursor.next_turn_sequence,
                     last_visible_event_sequence=cursor.last_visible_event_sequence,
-                    available_at=cursor.available_at,
+                    available_on=cursor.available_on,
                     active_attention=cursor.active_attention,
                 )
                 for company_id, cursor in sorted(cursors.items())
@@ -1413,8 +1429,6 @@ class EpisodeRuntime:
         checkpoint = recovery.checkpoint
         if checkpoint.run_id != run_id:
             raise ValueError("checkpoint belongs to another run")
-        if checkpoint.economy.scenario != self.scenario:
-            raise ValueError("checkpoint uses a different scenario")
         if checkpoint.economy.seed != seed:
             raise ValueError("checkpoint uses a different seed")
         if checkpoint.policies != _policy_descriptors(self.scenario, agents):
@@ -1423,6 +1437,18 @@ class EpisodeRuntime:
         actual = {cursor.company_id for cursor in checkpoint.cursors}
         if actual != expected:
             raise ValueError("checkpoint must contain one cursor per company")
+
+    def _restore_economy(self, economy: EconomyState) -> EconomyState:
+        """Rebind a scoring-only checkpoint upgrade to the active scenario."""
+        compatible_scenario = economy.scenario.model_copy(
+            update={"scoring": self.scenario.scoring}
+        )
+        if compatible_scenario != self.scenario:
+            raise ValueError("checkpoint uses a different economic scenario")
+        if economy.scenario == self.scenario:
+            return economy
+        base_state = economy.base_state.model_copy(update={"scenario": self.scenario})
+        return economy.model_copy(update={"base_state": base_state})
 
     @staticmethod
     def _append_events(

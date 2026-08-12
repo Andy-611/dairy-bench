@@ -20,9 +20,12 @@ from company_bench.runs.models import (
     ReplaySource,
     RunJob,
     RunStatus,
+    RunStopReason,
 )
 from company_bench.storage.store import InMemoryRunStore
 from company_bench.web.app import create_app
+
+TEST_SCENARIO = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
 
 
 class _TrackedOwnedRepository(InMemoryRunStore):
@@ -39,7 +42,7 @@ class _TrackedOwnedRepository(InMemoryRunStore):
 
 def _app(repository: InMemoryRunStore) -> FastAPI:
     """Create an app with deterministic server-side policy availability."""
-    factory = AgentFactory(DAIRY_S9_SCENARIO, repository)
+    factory = AgentFactory(TEST_SCENARIO, repository)
     return create_app(BenchmarkApplication.create(repository, factory))
 
 
@@ -76,7 +79,8 @@ def test_run_list_and_detail_http_flow() -> None:
         completed = _wait_for_terminal_job(client, submitted.run_id)
         assert completed.status is RunStatus.COMPLETED
         assert completed.revision > submitted.revision
-        assert completed.current_day == completed.total_days == 30
+        assert completed.current_absolute_day == 7
+        assert completed.total_weeks == 1
 
         detail = client.get(f"/api/runs/{submitted.run_id}")
         assert detail.status_code == 200
@@ -97,11 +101,11 @@ def test_run_list_and_detail_http_flow() -> None:
         }
         result = EpisodeResult.model_validate(detail_payload)
         assert result.seed == 42
-        assert result.scenario == DAIRY_S9_SCENARIO
+        assert result.scenario == TEST_SCENARIO
         assert len(result.scenario.companies) == 9
-        assert len(result.snapshots) == 30
+        assert len(result.snapshots) == 1
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
-        assert len(turns) > (DAIRY_S9_SCENARIO.days * len(DAIRY_S9_SCENARIO.companies))
+        assert len(turns) == 6 * len(TEST_SCENARIO.companies)
         assert turns[0]["turn"]["state_version"] == 0
         decision = turns[0]["envelope"]["decision"]
         assert decision["kind"] == "action"
@@ -111,6 +115,25 @@ def test_run_list_and_detail_http_flow() -> None:
             "set_retail_price",
         }
         assert "attention" in decision
+
+        timeline_response = client.get(
+            f"/api/runs/{submitted.run_id}/timeline",
+            params={"week": 1},
+        )
+        assert timeline_response.status_code == 200
+        timeline = timeline_response.json()
+        assert timeline["selected_week"] == 1
+        assert len(timeline["week_summaries"]) == 1
+        assert [day["sim_day"]["absolute_day"] for day in timeline["days"]] == list(
+            range(1, 8)
+        )
+        assert (
+            client.get(
+                f"/api/runs/{submitted.run_id}/timeline",
+                params={"week": 2},
+            ).status_code
+            == 422
+        )
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
@@ -160,7 +183,7 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
                 status=status,
                 seed=sequence,
                 scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-                total_days=DAIRY_S9_SCENARIO.days,
+                total_weeks=DAIRY_S9_SCENARIO.weeks,
                 submitted_at=submitted_at + timedelta(minutes=sequence),
                 quality=_clean_quality() if status is RunStatus.COMPLETED else None,
             )
@@ -195,7 +218,7 @@ def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
         status=RunStatus.STOPPED,
         seed=42,
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-        total_days=DAIRY_S9_SCENARIO.days,
+        total_weeks=DAIRY_S9_SCENARIO.weeks,
         submitted_at=datetime(2026, 1, 1, tzinfo=UTC),
         finished_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
@@ -219,9 +242,10 @@ def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> No
         status=RunStatus.STOPPED,
         seed=42,
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-        total_days=DAIRY_S9_SCENARIO.days,
+        total_weeks=DAIRY_S9_SCENARIO.weeks,
         submitted_at=submitted_at,
         finished_at=submitted_at,
+        stop_reason=RunStopReason.USER_REQUESTED,
     )
     failed = stopped.model_copy(update={"run_id": "http_resume_failed", "status": RunStatus.FAILED})
     completed = stopped.model_copy(
@@ -244,6 +268,7 @@ def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> No
     assert resumed_response.status_code == 202
     assert resumed.run_id == stopped.run_id
     assert resumed.status is RunStatus.QUEUED
+    assert resumed.stop_reason is None
     assert failed_response.status_code == 409
     assert completed_response.status_code == 409
     assert missing_response.status_code == 404
@@ -259,7 +284,7 @@ def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
             status=RunStatus.COMPLETED,
             seed=sequence,
             scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-            total_days=DAIRY_S9_SCENARIO.days,
+            total_weeks=DAIRY_S9_SCENARIO.weeks,
             submitted_at=submitted_at + timedelta(minutes=sequence),
             quality=_clean_quality(),
         )
@@ -375,7 +400,7 @@ def test_default_repository_uses_configured_database(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    database = tmp_path / "data" / "runs.sqlite3"
+    database = tmp_path / "data" / "runs-v6.sqlite3"
     monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
@@ -387,7 +412,7 @@ def test_default_repository_uses_configured_database(
     assert database.is_file()
 
 
-def test_default_app_runs_the_v4_scenario(monkeypatch: MonkeyPatch) -> None:
+def test_default_app_runs_the_v6_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
@@ -406,7 +431,7 @@ def test_default_app_runs_the_v4_scenario(monkeypatch: MonkeyPatch) -> None:
 
     assert completed.status is RunStatus.COMPLETED
     assert result.scenario == DAIRY_S9_SCENARIO
-    assert len(turns) > (DAIRY_S9_SCENARIO.days * len(DAIRY_S9_SCENARIO.companies))
+    assert len(turns) > (DAIRY_S9_SCENARIO.weeks * len(DAIRY_S9_SCENARIO.companies))
 
 
 def test_model_profile_exposes_the_full_newapi_catalog_without_credentials(

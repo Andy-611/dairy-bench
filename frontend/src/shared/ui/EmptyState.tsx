@@ -11,8 +11,8 @@ export function EmptyState() {
       <span className="eyebrow">READY TO SIMULATE</span>
       <h2>Start with a random seed</h2>
       <p>
-        Run a 30-day simulation across production, procurement, processing,
-        retail, and perishable inventory settlement.
+        Run a 52-week simulation across production, procurement, processing,
+        retail, and Sunday settlement of perishable inventory.
       </p>
       <ul>
         <li>3 farms</li>

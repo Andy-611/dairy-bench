@@ -42,7 +42,6 @@ from company_bench.runtime.models import (
     QuoteLevel,
     SetQuoteLadder,
     SetRetailPrice,
-    SimTime,
     Transform,
     TurnRecord,
     WakeReason,
@@ -59,7 +58,7 @@ def _llm_agent(
     repository: InMemoryRunStore | None = None,
     memory_token_budget: int = 12_288,
 ) -> tuple[LlmCompanyAgent, ScriptedDecisionGateway, InMemoryRunStore]:
-    """Create one isolated scripted V4 Agent and its audit repository."""
+    """Create one isolated scripted V6 Agent and its audit repository."""
     audit_repository = repository if repository is not None else InMemoryRunStore()
     gateway = ScriptedDecisionGateway(lambda _: decision)
     agent = LlmCompanyAgent(
@@ -71,7 +70,7 @@ def _llm_agent(
             name="bounded-agent",
             kind=PolicyKind.MODEL,
             provider="scripted",
-            model="scripted-v4",
+            model="scripted-v6",
             prompt_version=DECISION_PROMPT_VERSION,
         ),
         memory_token_budget=memory_token_budget,
@@ -83,20 +82,20 @@ def _turn(
     run_id: str,
     observation: CompanyObservation,
     *,
-    wake_reason: WakeReason = WakeReason.DAY_OPEN,
+    wake_reason: WakeReason = WakeReason.WEEK_OPEN,
     open_orders: tuple[OpenOrderView, ...] = (),
     order_books: tuple[OrderBookView, ...] = (),
     pending_deliveries: tuple[IncomingDeliveryView, ...] = (),
     active_operation: OperationJobView | None = None,
 ) -> AgentTurn:
-    """Create one runtime-owned V4 company turn."""
+    """Create one runtime-owned V6 company turn."""
     return AgentTurn(
         turn_id=f"{run_id}.{observation.company_id}.t1",
         company_id=observation.company_id,
-        sim_time=SimTime(absolute_minute=540),
+        sim_day=observation.sim_day,
         state_version=0,
-        turn_number_today=1,
-        turn_limit_today=observation.runtime.max_turns_per_company_day,
+        turn_number_this_week=1,
+        turn_limit_this_week=observation.runtime.max_turns_per_company_week,
         wake_reasons=(wake_reason,),
         observation=observation,
         available_cash=observation.cash,
@@ -109,7 +108,7 @@ def _turn(
 
 
 def _observation(company_id: str) -> CompanyObservation:
-    """Read one company's initial V4 observation."""
+    """Read one company's initial V6 observation."""
     engine = EconomyEngine()
     world = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return next(
@@ -141,7 +140,7 @@ def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decima
     return first, second, quantity - first - second
 
 
-def test_quote_ladder_uses_the_strict_v4_action_schema() -> None:
+def test_quote_ladder_uses_the_strict_v6_action_schema() -> None:
     adapter = TypeAdapter(EconomicCommand)
     command = adapter.validate_json(
         '{"kind":"set_quote_ladder","product":"raw_milk",'
@@ -223,7 +222,7 @@ def test_quote_ladder_enforces_depth_order_and_exact_quantities() -> None:
         ),
     ),
 )
-async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
+async def test_llm_agent_exposes_v6_commands_and_weekly_market_facts(
     company_id: str,
     allowed_tools: tuple[str, ...],
 ) -> None:
@@ -260,8 +259,8 @@ async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
     assert "Your sole objective is to maximize your own company's profit." in request.instructions
     assert "resting price" in request.instructions
     assert "C(u+q)-C(u)" in request.instructions
-    assert "decision_constraints.delivery_duration_minutes" in request.instructions
-    assert "decision_constraints.operation_duration_minutes" in request.instructions
+    assert "decision_constraints.delivery_duration_days" in request.instructions
+    assert "decision_constraints.operation_duration_days" in request.instructions
     assert "set_quote_ladder" in request.instructions
     assert "zero to three unique" in request.instructions
     assert "use [] to cancel" in request.instructions
@@ -278,50 +277,50 @@ async def test_llm_agent_exposes_v4_commands_and_continuous_market_facts(
     assert "market_views" not in prompt_input["turn"]
     assert "remaining_operation_capacity" not in prompt_input["turn"]
     constraints = prompt_input["decision_constraints"]
-    assert constraints["market_open_minute"] == observation.runtime.open_minute
-    assert constraints["market_close_minute"] == observation.runtime.close_minute
-    assert constraints["operation_duration_minutes"] == (
-        observation.runtime.operation_duration_minutes
+    assert constraints["operation_duration_days"] == (
+        observation.runtime.operation_duration_days
     )
-    assert constraints["delivery_duration_minutes"] == (
-        observation.runtime.delivery_duration_minutes
+    assert constraints["delivery_duration_days"] == (
+        observation.runtime.delivery_duration_days
     )
-    assert constraints["decision_interval_minutes"] == (
-        observation.runtime.decision_interval_minutes
+    assert constraints["decision_interval_days"] == (
+        observation.runtime.decision_interval_days
     )
-    assert constraints["max_review_minutes"] == observation.runtime.max_review_minutes
+    assert constraints["default_review_days"] == observation.runtime.default_review_days
+    assert constraints["max_review_days"] == observation.runtime.max_review_days
+    assert constraints["days_until_settlement"] == observation.sim_day.days_until_settlement
     observed_payload = prompt_input["turn"]["observation"]
-    if observation.daily_operation is None:
-        assert "daily_operation" not in observed_payload
+    if observation.weekly_operation is None:
+        assert "weekly_operation" not in observed_payload
         assert "used_operation_capacity" not in constraints
         assert "remaining_operation_capacity" not in constraints
     else:
-        daily_operation = observed_payload["daily_operation"]
-        assert daily_operation["company_id"] == observation.company_id
-        assert "daily_base_unit_cost" in daily_operation
+        weekly_operation = observed_payload["weekly_operation"]
+        assert weekly_operation["company_id"] == observation.company_id
+        assert "weekly_base_unit_cost" in weekly_operation
         assert constraints["used_operation_capacity"] == str(
-            observation.daily_operation.used_capacity
+            observation.weekly_operation.used_capacity
         )
         assert constraints["remaining_operation_capacity"] == str(
-            observation.daily_operation.remaining_capacity
+            observation.weekly_operation.remaining_capacity
         )
     assert agent.metadata.prompt_version == DECISION_PROMPT_VERSION
 
 
 def test_decision_constraints_derive_current_remaining_capacity() -> None:
     observation = _observation("farm_a")
-    operation = observation.daily_operation
+    operation = observation.weekly_operation
     assert operation is not None
     used_capacity = Decimal("10.1234")
     observation = observation.model_copy(
-        update={"daily_operation": operation.model_copy(update={"used_capacity": used_capacity})}
+        update={"weekly_operation": operation.model_copy(update={"used_capacity": used_capacity})}
     )
     turn = _turn("capacity_projection", observation)
 
     constraints = AgentDecisionConstraints.from_turn(turn)
 
     assert constraints.used_operation_capacity == used_capacity
-    assert constraints.remaining_operation_capacity == operation.daily_capacity - used_capacity
+    assert constraints.remaining_operation_capacity == operation.weekly_capacity - used_capacity
     assert "remaining_operation_capacity" not in turn.model_dump()
 
 
@@ -332,7 +331,6 @@ async def test_baseline_farm_produces_then_offers_completed_inventory() -> None:
 
     assert await agent.act(_turn("farm_open", observation)) == company_decision(
         Produce(product=ProductId.RAW_MILK, quantity=Decimal("50")),
-        review_after_minutes=30,
     )
 
     stocked = _with_inventory(observation, raw_milk=Decimal("50"))
@@ -352,7 +350,6 @@ async def test_baseline_farm_produces_then_offers_completed_inventory() -> None:
                 QuoteLevel(quantity=Decimal("10"), limit_price=Decimal("1.60")),
             ),
         ),
-        review_after_minutes=30,
     )
 
 
@@ -405,8 +402,8 @@ async def test_llm_agent_accepts_a_schema_valid_quote_ladder_for_engine_audit() 
 async def test_baseline_processor_procures_transforms_and_trades_while_busy() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
-    assert observation.daily_operation is not None
-    capacity = min(observation.daily_operation.daily_capacity, Decimal("50"))
+    assert observation.weekly_operation is not None
+    capacity = min(observation.weekly_operation.weekly_capacity, Decimal("50"))
     first, second, third = _three_level_quantities(capacity)
 
     assert await agent.act(_turn("processor_procure", observation)) == company_decision(
@@ -419,7 +416,6 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
                 QuoteLevel(quantity=third, limit_price=Decimal("1.40")),
             ),
         ),
-        review_after_minutes=30,
     )
 
     raw_stock = _with_inventory(observation, raw_milk=Decimal("50"))
@@ -435,14 +431,13 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
             output_product=ProductId.BOTTLED_MILK,
             input_quantity=capacity,
         ),
-        review_after_minutes=30,
     )
 
     bottled_stock = _with_inventory(observation, bottled_milk=Decimal("20"))
     active_operation = OperationJobView(
         job_id="job_1",
         kind="transformation",
-        completes_at=SimTime(absolute_minute=570),
+        completes_on=observation.sim_day.plus_days(1),
         output_product=ProductId.BOTTLED_MILK,
         output_quantity=Decimal("40"),
     )
@@ -463,7 +458,6 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
                 QuoteLevel(quantity=Decimal("4"), limit_price=Decimal("2.80")),
             ),
         ),
-        review_after_minutes=30,
     )
 
 
@@ -477,7 +471,6 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
             product=ProductId.BOTTLED_MILK,
             unit_price=Decimal("3.50"),
         ),
-        review_after_minutes=1,
     )
 
     priced = observation.model_copy(update={"retail_price": Decimal("3.50")})
@@ -485,11 +478,11 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
         trade_id="trade_1",
         product=ProductId.BOTTLED_MILK,
         quantity=Decimal("15"),
-        arrives_at=SimTime(absolute_minute=570),
+        arrives_on=observation.sim_day.plus_days(1),
         expiry_buckets=(
             DeliveryExpiryBucket(
                 quantity=Decimal("15"),
-                expires_end_of_day=4,
+                expires_end_of_week=4,
             ),
         ),
     )
@@ -510,7 +503,6 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
                 QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("2.50")),
             ),
         ),
-        review_after_minutes=30,
     )
 
 
@@ -518,8 +510,8 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
 async def test_baseline_does_not_duplicate_a_resting_order() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("processor_a")
-    assert observation.daily_operation is not None
-    capacity = min(observation.daily_operation.remaining_capacity, Decimal("50"))
+    assert observation.weekly_operation is not None
+    capacity = min(observation.weekly_operation.remaining_capacity, Decimal("50"))
     quantities = _three_level_quantities(capacity)
     orders = tuple(
         OpenOrderView(
@@ -529,7 +521,7 @@ async def test_baseline_does_not_duplicate_a_resting_order() -> None:
             product=ProductId.RAW_MILK,
             remaining_quantity=quantity,
             limit_price=price,
-            placed_at=SimTime(absolute_minute=540),
+            placed_on=observation.sim_day,
             priority_sequence=index,
             queue_ahead_quantity=Decimal(),
         )
@@ -586,7 +578,7 @@ async def test_llm_agent_audits_and_remembers_one_complete_turn(
         turn_id=turn.turn_id,
         decision_id=f"{turn.turn_id}.decision",
         company_id=turn.company_id,
-        issued_at=turn.sim_time,
+        issued_on=turn.sim_day,
         state_version=turn.state_version,
         decision=decision,
     )
@@ -594,12 +586,12 @@ async def test_llm_agent_audits_and_remembers_one_complete_turn(
         turn_id=turn.turn_id,
         decision_id=envelope.decision_id,
         company_id=turn.company_id,
-        occurred_at=turn.sim_time,
+        occurred_on=turn.sim_day,
         status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=1,
         apply_sequence=1,
-        next_available_at=turn.sim_time.plus(1),
+        next_available_on=turn.sim_day.plus_days(1),
     )
     record = TurnRecord(
         run_id=run_id,
@@ -651,7 +643,7 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
 
 @pytest.mark.asyncio
 async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     run_id = "llm_runtime_cycle"
     repository = InMemoryRunStore()
     agents: dict[str, LlmCompanyAgent] = {}

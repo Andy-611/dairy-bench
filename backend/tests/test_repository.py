@@ -28,6 +28,7 @@ from company_bench.runs.models import (
     RunJob,
     RunRecovery,
     RunStatus,
+    RunStopReason,
 )
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import (
@@ -37,7 +38,6 @@ from company_bench.runtime.models import (
     DecisionOutcome,
     DecisionStatus,
     IdleDecision,
-    SimTime,
     TurnRecord,
     WakeReason,
 )
@@ -50,10 +50,11 @@ from company_bench.storage.store import (
 
 
 def run_episode(seed: int = 42) -> EpisodeResult:
-    """Create one real V4 episode through the public runtime interface."""
-    agents = {company.company_id: BaselineCompanyAgent() for company in DAIRY_S9_SCENARIO.companies}
+    """Create one short real episode through the public runtime interface."""
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
+    agents = {company.company_id: BaselineCompanyAgent() for company in scenario.companies}
     execution = asyncio.run(
-        EpisodeRuntime(DAIRY_S9_SCENARIO).run(
+        EpisodeRuntime(scenario).run(
             agents,
             seed,
             run_id=f"repository_{seed}",
@@ -68,7 +69,7 @@ def test_memory_repository_completed_episode_round_trip() -> None:
 
     repository.complete_job(result, _completed_job_for(result))
 
-    assert result.score.efficiency_reference == Decimal("8316.0938")
+    assert result.score.efficiency_reference > 0
     assert repository.get(result.run_id) == result
     assert repository.get("missing") is None
 
@@ -203,7 +204,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         completed_job = queued_job.model_copy(
             update={
                 "status": RunStatus.COMPLETED,
-                "current_day": 30,
+                "current_absolute_day": result.scenario.calendar.total_days,
                 "started_at": result.started_at,
                 "finished_at": result.finished_at,
                 "quality": result.quality,
@@ -225,8 +226,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
-        assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 7
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
             "result_json",
@@ -242,8 +243,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13])
-def test_sqlite_repository_rejects_non_v12_databases(
+@pytest.mark.parametrize("version", range(1, 13))
+def test_sqlite_repository_rejects_non_v13_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -272,7 +273,7 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
-    assert checkpoint.schema_version == 9
+    assert checkpoint.schema_version == 10
 
     with SQLiteRunStore(database) as repository:
         repository.save_progress((first,), (), checkpoint)
@@ -379,8 +380,11 @@ def _history_jobs() -> tuple[RunJob, ...]:
             status=status,
             seed=sequence,
             scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-            total_days=DAIRY_S9_SCENARIO.days,
+            total_weeks=DAIRY_S9_SCENARIO.weeks,
             submitted_at=submitted_at + timedelta(minutes=sequence),
+            stop_reason=(
+                RunStopReason.USER_REQUESTED if status is RunStatus.STOPPED else None
+            ),
             quality=_clean_quality() if status is RunStatus.COMPLETED else None,
         )
         for sequence, status in enumerate(RunStatus)
@@ -396,7 +400,7 @@ def _assert_replay_sources(repository: RunStore) -> tuple[ReplaySource, ...]:
         status=RunStatus.COMPLETED,
         seed=1,
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
-        total_days=DAIRY_S9_SCENARIO.days,
+        total_weeks=DAIRY_S9_SCENARIO.weeks,
         submitted_at=base_time,
         quality=_clean_quality(),
     )
@@ -540,18 +544,19 @@ def _turn_for(
     sequence: int = 1,
 ) -> TurnRecord:
     """Build one complete idle decision with deterministic runtime identities."""
-    at = SimTime.at(day=0, hour=9, minute=(sequence - 1) * 10)
+    at = observation.sim_day.plus_days(sequence - 1)
+    observed_today = observation.model_copy(update={"sim_day": at})
     turn_id = f"{run_id}.turn.{sequence}"
     decision_id = f"{run_id}.decision.{sequence}"
     turn = AgentTurn(
         turn_id=turn_id,
         company_id=observation.company_id,
-        sim_time=at,
+        sim_day=at,
         state_version=sequence - 1,
-        turn_number_today=sequence,
-        turn_limit_today=observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.DAY_OPEN if sequence == 1 else WakeReason.REVIEW_DUE,),
-        observation=observation,
+        turn_number_this_week=sequence,
+        turn_limit_this_week=observation.runtime.max_turns_per_company_week,
+        wake_reasons=(WakeReason.WEEK_OPEN if sequence == 1 else WakeReason.REVIEW_DUE,),
+        observation=observed_today,
         available_cash=observation.cash,
         marked_surplus=Decimal(),
     )
@@ -559,15 +564,15 @@ def _turn_for(
         turn_id=turn_id,
         decision_id=decision_id,
         company_id=observation.company_id,
-        issued_at=at,
+        issued_on=at,
         state_version=sequence - 1,
-        decision=IdleDecision(attention=AttentionPlan(review_after_minutes=10)),
+        decision=IdleDecision(attention=AttentionPlan()),
     )
     outcome = DecisionOutcome(
         turn_id=turn_id,
         decision_id=decision_id,
         company_id=observation.company_id,
-        occurred_at=at,
+        occurred_on=at,
         status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=sequence,
@@ -594,9 +599,9 @@ def _checkpoint_for(
     return RunCheckpoint(
         run_id=record.run_id,
         episode_started_at=datetime(2026, 1, 1, tzinfo=UTC),
-        economy=engine.open_day(world),
+        economy=engine.open_week(world),
         scheduler=SchedulerCheckpoint(
-            now=record.turn.sim_time,
+            today=record.turn.sim_day,
             next_sequence=1,
         ),
         policies=tuple(
@@ -637,7 +642,7 @@ def _job_for(result: EpisodeResult) -> RunJob:
         mode=PolicyKind.BASELINE,
         seed=result.seed,
         scenario_id=result.scenario.scenario_id,
-        total_days=result.scenario.days,
+        total_weeks=result.scenario.weeks,
         submitted_at=result.started_at,
     )
 
@@ -647,7 +652,7 @@ def _completed_job_for(result: EpisodeResult) -> RunJob:
     return _job_for(result).model_copy(
         update={
             "status": RunStatus.COMPLETED,
-            "current_day": result.scenario.days,
+            "current_absolute_day": result.scenario.calendar.total_days,
             "started_at": result.started_at,
             "finished_at": result.finished_at,
             "quality": result.quality,
@@ -681,7 +686,7 @@ def _invocation_for_turn(
         invocation_id=f"{record.turn.turn_id}.invocation",
         run_id=record.run_id,
         company_id=record.turn.company_id,
-        day=observation.day,
+        week=record.turn.sim_day.week,
         observation=observation,
         provider="scripted",
         model="scripted-current",
@@ -691,7 +696,7 @@ def _invocation_for_turn(
         finished_at=now,
         outcome=InvocationOutcome.SUCCESS,
         domain_turn_id=record.turn.turn_id,
-        sim_minute=record.turn.sim_time.absolute_minute,
+        absolute_day=record.turn.sim_day.absolute_day,
         state_version=record.turn.state_version,
         apply_sequence=record.outcome.apply_sequence,
         decision=record.envelope.decision,

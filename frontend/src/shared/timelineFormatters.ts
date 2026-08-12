@@ -9,6 +9,7 @@ import type {
 } from "./api/types";
 import { formatExactDecimal } from "./format";
 import { companyLabel, humanizeIdentifier, productLabel } from "./labels";
+import { simulationDayLabel } from "./simulationCalendar";
 
 export const ACCEPTED_BY_ENGINE_LABEL = "Accepted by Engine";
 export const DECISION_PROCESSING_ORDER_LABEL = "Decision Processing Order";
@@ -25,7 +26,7 @@ const DECISION_LABELS: Readonly<Record<DecisionKind, string>> = {
 };
 
 const WAKE_LABELS: Readonly<Record<string, string>> = {
-  day_open: "Market day opened",
+  decision_day_started: "Decision day started",
   decision_rejected: "Previous decision was rejected",
   delivery_completed: "Delivery arrived",
   external_event: "Relevant external event",
@@ -33,17 +34,18 @@ const WAKE_LABELS: Readonly<Record<string, string>> = {
   price_alert: "Watched price reached",
   review_due: "Fallback review became due",
   trade_executed: "Own order executed",
-  turn_limit_reached: "Daily turn limit reached",
+  week_open: "Trading week opened",
 };
 
 const SYSTEM_LABELS: Readonly<Record<string, string>> = {
   consumer_sales: "Consumer sales",
-  day_close: "Day close",
-  day_open: "Day open",
+  day_started: "Simulation day started",
   delivery_completed: "Delivery completed",
   market_close: "Continuous-market close",
   operation_completed: "Operation completed",
-  turn_limit_reached: "Daily turn limit reached",
+  turn_limit_reached: "Weekly turn limit reached",
+  week_close: "Trading week close",
+  week_open: "Trading week open",
 };
 
 export function decisionKind(decision: TimelineDecisionView): DecisionKind {
@@ -89,13 +91,13 @@ export function decisionProcessingResult(turn: TurnTimelineItemView): string {
 
 export function nextDecisionTiming(turn: TurnTimelineItemView): string {
   const alerts = turn.decision.attention.alerts;
-  const review = turn.reviewMinute;
+  const review = turn.reviewOn;
   if (review === null) {
     return alerts.length > 0
-      ? "On a matching price alert or the next market day"
-      : "At the next market day";
+      ? "On a matching price alert or the next decision day"
+      : "At the next decision day";
   }
-  const at = clockTime(review);
+  const at = simulationDayLabel(review);
   return alerts.length > 0
     ? `On a matching price alert, or fallback review at ${at}`
     : `Fallback review at ${at}`;
@@ -207,9 +209,9 @@ export function quoteAlertSummary(alert: QuoteAlertView): string {
 }
 
 export function attentionFallbackSummary(attention: AttentionPlanView): string {
-  return attention.reviewAfterMinutes === null
+  return attention.reviewAfterDays === null
     ? "use the runtime's bounded fallback review"
-    : `review after ${attention.reviewAfterMinutes} minutes`;
+    : `review after ${attention.reviewAfterDays} ${plural(attention.reviewAfterDays, "day")}`;
 }
 
 export function attentionSummary(attention: AttentionPlanView): string {
@@ -254,13 +256,6 @@ export function stateChangeKey(change: DecisionStateChangeView): string {
   return change.changeType === "retail_price_changed"
     ? `${change.changeType}-${change.product}`
     : `${change.changeType}-${change.orderId}`;
-}
-
-export function clockTime(absoluteMinute: number): string {
-  const minuteOfDay = absoluteMinute % (24 * 60);
-  const hour = Math.floor(minuteOfDay / 60);
-  const minute = minuteOfDay % 60;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 export function shortId(value: string): string {

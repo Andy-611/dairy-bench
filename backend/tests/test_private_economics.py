@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 
+from company_bench.domain.calendar import SimDay
 from company_bench.domain.models import (
     InventoryExpiredEvent,
     MilkProcessedEvent,
@@ -17,8 +18,8 @@ from company_bench.runtime.models import OrderBookView, PriceLevelView
 
 def test_processor_private_economics_combines_ledger_and_executable_prices() -> None:
     engine = EconomyEngine()
-    economy = engine.open_day(engine.initial_state(DAIRY_S9_SCENARIO, seed=42))
-    observation = engine.observe_active(economy, "processor_a")
+    economy = engine.open_week(engine.initial_state(DAIRY_S9_SCENARIO, seed=42))
+    observation = engine.observe_active(economy, "processor_a", SimDay.at(week=1))
     books = (
         OrderBookView(
             product=ProductId.RAW_MILK,
@@ -33,7 +34,7 @@ def test_processor_private_economics_combines_ledger_and_executable_prices() -> 
         _trade("raw", ProductId.RAW_MILK, "farm_a", "processor_a", "14"),
         _trade("bottled", ProductId.BOTTLED_MILK, "processor_a", "retailer_a", "25"),
         MilkProcessedEvent(
-            day=1,
+            occurred_on=SimDay.at(week=1),
             company_id="processor_a",
             requested_input="10",
             actual_input="10",
@@ -41,7 +42,7 @@ def test_processor_private_economics_combines_ledger_and_executable_prices() -> 
             cash_cost="4",
         ),
         InventoryExpiredEvent(
-            day=1,
+            occurred_on=SimDay.at(week=1),
             company_id="processor_a",
             lot_id="expired",
             product=ProductId.BOTTLED_MILK,
@@ -77,11 +78,11 @@ def test_processor_private_economics_combines_ledger_and_executable_prices() -> 
 
 def test_farm_and_retailer_unit_economics_use_only_executable_prices() -> None:
     engine = EconomyEngine()
-    economy = engine.open_day(engine.initial_state(DAIRY_S9_SCENARIO, seed=42))
+    economy = engine.open_week(engine.initial_state(DAIRY_S9_SCENARIO, seed=42))
     projector = PrivateEconomicsProjector()
     farm = projector.project(
         "farm_a",
-        engine.observe_active(economy, "farm_a"),
+        engine.observe_active(economy, "farm_a", SimDay.at(week=1)),
         (
             OrderBookView(
                 product=ProductId.RAW_MILK,
@@ -90,7 +91,11 @@ def test_farm_and_retailer_unit_economics_use_only_executable_prices() -> None:
         ),
         (),
     ).unit_economics
-    retailer_observation = engine.observe_active(economy, "retailer_a").model_copy(
+    retailer_observation = engine.observe_active(
+        economy,
+        "retailer_a",
+        SimDay.at(week=1),
+    ).model_copy(
         update={"retail_price": Decimal("3.00")}
     )
     retailer = projector.project(
@@ -126,7 +131,7 @@ def _trade(
 ) -> TradeExecutedEvent:
     """Build one compact trade fixture."""
     return TradeExecutedEvent(
-        day=1,
+        occurred_on=SimDay.at(week=1),
         trade_id=f"trade_{suffix}",
         maker_order_id=f"maker_{suffix}",
         taker_order_id=f"taker_{suffix}",

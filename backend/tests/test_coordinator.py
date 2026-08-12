@@ -8,7 +8,7 @@ from company_bench.agents.factory import AgentBundle, AgentFactory
 from company_bench.domain.models import EpisodeQuality, PolicyKind, ProtocolReport
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
-from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus
+from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus, RunStopReason
 from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import AgentTurn, CompanyDecision, SystemStepRecord, TurnRecord
 from company_bench.storage.store import InMemoryRunStore
@@ -72,7 +72,7 @@ class _QueueingRuntime(EpisodeRuntime):
     """Hold the active slot so a second run remains queued."""
 
     def __init__(self) -> None:
-        super().__init__(DAIRY_S9_SCENARIO.model_copy(update={"days": 1}))
+        super().__init__(DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1}))
         self.started = asyncio.Event()
         self.started_run_ids: list[str] = []
 
@@ -99,7 +99,7 @@ class _StopTestAgentFactory(AgentFactory):
     ) -> None:
         self._blocker = blocker
         self._gateway = gateway
-        super().__init__(DAIRY_S9_SCENARIO.model_copy(update={"days": 1}), repository)
+        super().__init__(DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1}), repository)
 
     def create_agents(self, **_: object) -> AgentBundle:
         """Return fresh baseline actors except for one blocking actor."""
@@ -135,7 +135,7 @@ async def _start_blocked_run(
 def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
     repository = InMemoryRunStore()
     factory = AgentFactory(DAIRY_S9_SCENARIO, repository)
-    runtime = EpisodeRuntime(DAIRY_S9_SCENARIO.model_copy(update={"days": 1}))
+    runtime = EpisodeRuntime(DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1}))
 
     with pytest.raises(ValueError, match="factory scenarios must match"):
         RunCoordinator(repository, factory, runtime)
@@ -155,6 +155,7 @@ async def test_stop_preserves_resumable_partial_audit_state() -> None:
     assert stopped.revision > submitted.revision
     assert stopped.finished_at is not None
     assert stopped.error_message is None
+    assert stopped.stop_reason is RunStopReason.USER_REQUESTED
     assert repository.get(submitted.run_id) is None
     assert repository.list_turns(submitted.run_id) == turns
     assert repository.get_checkpoint(submitted.run_id) == checkpoint
@@ -176,11 +177,12 @@ async def test_stop_before_first_decision_keeps_a_readable_empty_timeline() -> N
     assert repository.list_turns(submitted.run_id) == ()
 
     stopped = await coordinator.stop(submitted.run_id)
-    timeline = RunTimelineProjector(repository).read_day(submitted.run_id, 1)
+    timeline = RunTimelineProjector(repository).read_week(submitted.run_id, 1)
 
     assert stopped.status is RunStatus.STOPPED
-    assert timeline.context.checkpoint_at == checkpoint.scheduler.now
-    assert timeline.moments == ()
+    assert timeline.context.checkpoint_on == checkpoint.scheduler.today
+    assert len(timeline.days) == 7
+    assert all(not day.turns and not day.system_steps for day in timeline.days)
     await coordinator.close()
 
 
@@ -295,7 +297,7 @@ async def test_stop_queued_run_never_enters_the_runtime() -> None:
 
 @pytest.mark.asyncio
 async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -311,8 +313,8 @@ async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
             status=RunStatus.COMPLETED,
             seed=source.episode.seed,
             scenario_id=source.episode.scenario.scenario_id,
-            current_day=source.episode.scenario.days,
-            total_days=source.episode.scenario.days,
+            current_absolute_day=source.episode.scenario.weeks,
+            total_weeks=source.episode.scenario.weeks,
             submitted_at=source.episode.started_at,
             started_at=source.episode.started_at,
             finished_at=source.episode.finished_at,
@@ -386,8 +388,8 @@ async def _save_checkpointed_job(
         status=status,
         seed=seed,
         scenario_id=scenario.scenario_id,
-        current_day=len(checkpoint.snapshots),
-        total_days=scenario.days,
+        current_absolute_day=len(checkpoint.snapshots),
+        total_weeks=scenario.weeks,
         submitted_at=checkpoint.episode_started_at,
         started_at=checkpoint.episode_started_at,
         finished_at=checkpoint.episode_started_at,
@@ -399,7 +401,7 @@ async def _save_checkpointed_job(
 
 @pytest.mark.asyncio
 async def test_start_resumes_a_checkpoint_to_completion() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     runtime = EpisodeRuntime(scenario)
     seed = 18
     run_id = "restart_resume"
@@ -444,7 +446,7 @@ async def test_start_resumes_a_checkpoint_to_completion() -> None:
 async def test_explicit_resume_continues_the_same_checkpointed_run(
     status: RunStatus,
 ) -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     runtime = EpisodeRuntime(scenario)
     repository = InMemoryRunStore()
     run_id = f"explicit_resume_{status.value}"
@@ -475,9 +477,10 @@ async def test_explicit_resume_continues_the_same_checkpointed_run(
     result = repository.get(run_id)
     assert queued.run_id == suspended.run_id
     assert queued.status is RunStatus.QUEUED
-    assert queued.current_day == suspended.current_day
+    assert queued.current_absolute_day == suspended.current_absolute_day
     assert queued.finished_at is None
     assert queued.error_message is None
+    assert queued.stop_reason is None
     assert completed.status is RunStatus.COMPLETED
     assert result is not None
     assert repository.list_turns(run_id) == expected.turns
@@ -487,7 +490,7 @@ async def test_explicit_resume_continues_the_same_checkpointed_run(
 
 @pytest.mark.asyncio
 async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     job = RunJob(
         run_id="resume_from_start",
@@ -495,7 +498,7 @@ async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> No
         status=RunStatus.STOPPED,
         seed=20,
         scenario_id=scenario.scenario_id,
-        total_days=scenario.days,
+        total_weeks=scenario.weeks,
         submitted_at=datetime.now(UTC),
         finished_at=datetime.now(UTC),
     )
@@ -519,7 +522,7 @@ async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> No
 
 @pytest.mark.asyncio
 async def test_resume_rejects_irrecoverable_or_completed_runs() -> None:
-    scenario = DAIRY_S9_SCENARIO.model_copy(update={"days": 1})
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     repository = InMemoryRunStore()
     base = RunJob(
         run_id="resume_rejected",
@@ -527,7 +530,7 @@ async def test_resume_rejects_irrecoverable_or_completed_runs() -> None:
         status=RunStatus.FAILED,
         seed=21,
         scenario_id=scenario.scenario_id,
-        total_days=scenario.days,
+        total_weeks=scenario.weeks,
         submitted_at=datetime.now(UTC),
     )
     repository.save_job(base)

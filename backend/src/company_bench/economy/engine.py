@@ -1,4 +1,4 @@
-"""Deterministic V4 economy engine for continuous dairy-market episodes."""
+"""Deterministic V6 economy engine for weekly dairy-market episodes."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import Field, model_validator
 
+from company_bench.domain.calendar import SimDay
 from company_bench.domain.models import (
     MAX_SEED,
     ZERO,
@@ -19,9 +20,6 @@ from company_bench.domain.models import (
     CompanyState,
     ConsumerSaleEvent,
     CostFunction,
-    DailyOperationState,
-    DayResult,
-    DaySnapshot,
     DeliveryCompletedEvent,
     DomainEvent,
     FarmOperation,
@@ -43,6 +41,9 @@ from company_bench.domain.models import (
     ScenarioSpec,
     StrictModel,
     TradeExecutedEvent,
+    WeeklyOperationState,
+    WeekResult,
+    WeekSnapshot,
     WorldState,
 )
 from company_bench.domain.precision import EconomicDecimal, EconomicPrecision
@@ -76,7 +77,6 @@ from company_bench.runtime.models import (
     ScheduledCompletion,
     SetQuoteLadder,
     SetRetailPrice,
-    SimTime,
     SystemEventKind,
     Transform,
 )
@@ -99,8 +99,8 @@ class ProductionJob(StrictModel):
     kind: Literal["production"] = "production"
     job_id: Identifier
     company_id: CompanyId
-    started_at: SimTime
-    completes_at: SimTime
+    started_on: SimDay
+    completes_on: SimDay
     product: ProductId
     quantity: PositiveQuantity
     unit_cost: PositiveMoney
@@ -108,8 +108,8 @@ class ProductionJob(StrictModel):
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
-        """Require exact average cost and a same-day future completion."""
-        _validate_job_time(self.started_at, self.completes_at)
+        """Require exact average cost and a future completion this week."""
+        _validate_job_time(self.started_on, self.completes_on)
         if self.unit_cost != EconomicPrecision.round(self.cash_cost / self.quantity):
             raise ValueError("production unit cost must equal its rounded batch average")
         return self
@@ -121,8 +121,8 @@ class TransformationJob(StrictModel):
     kind: Literal["transformation"] = "transformation"
     job_id: Identifier
     company_id: CompanyId
-    started_at: SimTime
-    completes_at: SimTime
+    started_on: SimDay
+    completes_on: SimDay
     input_product: ProductId
     output_product: ProductId
     input_quantity: PositiveQuantity
@@ -133,7 +133,7 @@ class TransformationJob(StrictModel):
     @model_validator(mode="after")
     def validate_job(self) -> Self:
         """Require exact average cost, different products, and a future completion."""
-        _validate_job_time(self.started_at, self.completes_at)
+        _validate_job_time(self.started_on, self.completes_on)
         if self.input_product is self.output_product:
             raise ValueError("transformation input and output products must differ")
         if self.processing_cost_per_input != EconomicPrecision.round(
@@ -155,7 +155,7 @@ class PendingDelivery(StrictModel):
     delivery_id: Identifier
     trade_id: Identifier
     buyer_id: CompanyId
-    arrives_at: SimTime
+    arrives_on: SimDay
     lots: tuple[InventoryLot, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -181,29 +181,33 @@ class PendingDelivery(StrictModel):
 
     def view(self) -> IncomingDeliveryView:
         """Project exact arrival and expiry buckets for the buyer."""
-        expiry_days = sorted({lot.expires_end_of_day for lot in self.lots})
+        expiry_weeks = sorted({lot.expires_end_of_week for lot in self.lots})
         return IncomingDeliveryView(
             trade_id=self.trade_id,
             product=self.product,
             quantity=self.quantity,
-            arrives_at=self.arrives_at,
+            arrives_on=self.arrives_on,
             expiry_buckets=tuple(
                 DeliveryExpiryBucket(
                     quantity=sum(
-                        (lot.quantity for lot in self.lots if lot.expires_end_of_day == expiry_day),
+                        (
+                            lot.quantity
+                            for lot in self.lots
+                            if lot.expires_end_of_week == expiry_week
+                        ),
                         start=ZERO,
                     ),
-                    expires_end_of_day=expiry_day,
+                    expires_end_of_week=expiry_week,
                 )
-                for expiry_day in expiry_days
+                for expiry_week in expiry_weeks
             ),
         )
 
 
 class ConsumerSettlement(StrictModel):
-    """The immutable 19:00 consumer-market totals for one business day."""
+    """The immutable Sunday consumer-market totals for one trading week."""
 
-    day: int = Field(ge=1)
+    week: int = Field(ge=1)
     potential_demand: Quantity
     demand: Quantity
     sold_quantity: Quantity
@@ -218,17 +222,17 @@ class RetailPriceState(StrictModel):
 
 
 class EconomyState(StrictModel):
-    """Complete checkpointable state of one active V4 business day."""
+    """Complete checkpointable state of one active trading week."""
 
     base_state: WorldState
-    day: int = Field(ge=1)
+    week: int = Field(ge=1)
     state_version: int = Field(ge=0)
     companies: tuple[CompanyState, ...]
     markets: tuple[MarketState, ...]
     jobs: tuple[OperationJob, ...] = ()
     deliveries: tuple[PendingDelivery, ...] = ()
     retail_prices: tuple[RetailPriceState, ...] = ()
-    operation_states: tuple[DailyOperationState, ...]
+    operation_states: tuple[WeeklyOperationState, ...]
     consumer_settlement: ConsumerSettlement | None = None
     events: tuple[DomainEvent, ...] = ()
     next_lot_sequence: int = Field(default=1, ge=1)
@@ -238,19 +242,20 @@ class EconomyState(StrictModel):
     next_trade_sequence: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
-    def validate_active_day(self) -> Self:
+    def validate_active_week(self) -> Self:
         """Protect identities, ownership, and one-resource-per-company invariants."""
-        active = self.day == self.base_state.day + 1
+        active = self.week == self.base_state.completed_weeks + 1
         terminal = (
-            self.base_state.day == self.base_state.scenario.days and self.day == self.base_state.day
+            self.base_state.completed_weeks == self.base_state.scenario.weeks
+            and self.week == self.base_state.completed_weeks
         )
         if not (active or terminal):
-            raise ValueError("economy day must be active or terminal")
+            raise ValueError("economy week must be active or terminal")
         if active:
             expected_operations = OperatingEconomics(
                 self.scenario,
                 self.seed,
-            ).open_day(self.day, self.base_state.operation_states)
+            ).open_week(self.week, self.base_state.operation_states)
             reset_operations = tuple(
                 state.model_copy(update={"used_capacity": ZERO}) for state in self.operation_states
             )
@@ -305,15 +310,14 @@ class EconomyState(StrictModel):
             raise ValueError("retail price belongs to an unknown company")
         if len({market.is_open for market in self.markets}) != 1:
             raise ValueError("product markets must open and close together")
-        simulation_day = self.day - 1
-        if any(job.completes_at.day != simulation_day for job in self.jobs):
-            raise ValueError("operation job must complete on the active day")
-        if any(delivery.arrives_at.day != simulation_day for delivery in self.deliveries):
-            raise ValueError("delivery must arrive on the active day")
-        if any(event.day != self.day for event in self.events):
-            raise ValueError("active economy events must belong to its day")
-        if self.consumer_settlement is not None and self.consumer_settlement.day != self.day:
-            raise ValueError("consumer settlement must belong to the active day")
+        if any(job.completes_on.week != self.week for job in self.jobs):
+            raise ValueError("operation job must complete in the active week")
+        if any(delivery.arrives_on.week != self.week for delivery in self.deliveries):
+            raise ValueError("delivery must arrive in the active week")
+        if any(event.occurred_on.week != self.week for event in self.events):
+            raise ValueError("active economy events must belong to its week")
+        if self.consumer_settlement is not None and self.consumer_settlement.week != self.week:
+            raise ValueError("consumer settlement must belong to the active week")
         if self.consumer_settlement is not None and any(market.is_open for market in self.markets):
             raise ValueError("consumer settlement requires closed markets")
         return self
@@ -416,17 +420,17 @@ class _TradeEffects:
 
 
 class EconomyEngine:
-    """Own every V4 cash, inventory, market, operation, and delivery transition."""
+    """Own every V6 cash, inventory, market, operation, and delivery transition."""
 
     def initial_state(self, scenario: ScenarioSpec, seed: int) -> WorldState:
-        """Create an empty-inventory V4 world."""
+        """Create an empty-inventory V6 world."""
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
             raise ValueError(f"seed must be an integer from 0 to {MAX_SEED}")
         economics = OperatingEconomics(scenario, seed)
         return WorldState(
             scenario=scenario,
             seed=seed,
-            day=0,
+            completed_weeks=0,
             companies=tuple(
                 CompanyState(company_id=company.company_id, cash=company.initial_cash)
                 for company in scenario.companies
@@ -434,18 +438,18 @@ class EconomyEngine:
             operation_states=economics.initial_states(),
         )
 
-    def open_day(self, state: WorldState, *, state_version: int = 0) -> EconomyState:
-        """Open fresh product books and daily operating resources."""
-        if state.day >= state.scenario.days:
+    def open_week(self, state: WorldState, *, state_version: int = 0) -> EconomyState:
+        """Open fresh product books and weekly operating resources."""
+        if state.completed_weeks >= state.scenario.weeks:
             raise ValueError("the episode is already complete")
         assets = AssetLedger.from_world(
             state,
             next_lot_sequence=state.next_lot_sequence,
         )
-        day = state.day + 1
+        week = state.completed_weeks + 1
         return EconomyState(
             base_state=state,
-            day=day,
+            week=week,
             state_version=state_version,
             companies=state.companies,
             markets=tuple(
@@ -455,25 +459,26 @@ class EconomyEngine:
             operation_states=OperatingEconomics(
                 state.scenario,
                 state.seed,
-            ).open_day(day, state.operation_states),
+            ).open_week(week, state.operation_states),
             next_lot_sequence=state.next_lot_sequence,
         )
 
     def observe(self, state: WorldState) -> tuple[CompanyObservation, ...]:
-        """Project next-day morning facts without opening mutable runtime state."""
-        if state.day >= state.scenario.days:
+        """Project next-week Monday facts without opening mutable runtime state."""
+        if state.completed_weeks >= state.scenario.weeks:
             return ()
         operation_states = OperatingEconomics(
             state.scenario,
             state.seed,
-        ).open_day(state.day + 1, state.operation_states)
+        ).open_week(state.completed_weeks + 1, state.operation_states)
+        sim_day = SimDay.at(week=state.completed_weeks + 1)
         return tuple(
             self._observation(
                 state=state,
-                day=state.day + 1,
+                sim_day=sim_day,
                 company_id=company.company_id,
                 company_state=_company_state(state.companies, company.company_id),
-                daily_operation=_optional_operation_state(
+                weekly_operation=_optional_operation_state(
                     operation_states,
                     company.company_id,
                 ),
@@ -486,18 +491,23 @@ class EconomyEngine:
         self,
         economy: EconomyState,
         company_id: CompanyId,
+        sim_day: SimDay,
     ) -> CompanyObservation:
         """Project only currently available assets for one active company."""
+        if sim_day.week != economy.week:
+            raise ValueError("observation day must belong to the current active week")
+        if not sim_day.is_decision_day:
+            raise ValueError("company observations require a Monday-Saturday decision day")
         price = next(
             (item.unit_price for item in economy.retail_prices if item.company_id == company_id),
             None,
         )
         return self._observation(
             state=economy.base_state,
-            day=economy.day,
+            sim_day=sim_day,
             company_id=company_id,
             company_state=_company_state(economy.companies, company_id),
-            daily_operation=_optional_operation_state(
+            weekly_operation=_optional_operation_state(
                 economy.operation_states,
                 company_id,
             ),
@@ -580,11 +590,11 @@ class EconomyEngine:
         return tuple(
             InventoryExpiryBucket(
                 product=product,
-                expires_end_of_day=expiry_day,
-                available_quantity=available.get((product, expiry_day), ZERO),
-                reserved_quantity=reserved.get((product, expiry_day), ZERO),
+                expires_end_of_week=expiry_week,
+                available_quantity=available.get((product, expiry_week), ZERO),
+                reserved_quantity=reserved.get((product, expiry_week), ZERO),
             )
-            for product, expiry_day in keys
+            for product, expiry_week in keys
         )
 
     @staticmethod
@@ -615,7 +625,7 @@ class EconomyEngine:
         return OperationJobView(
             job_id=job.job_id,
             kind=job.kind,
-            completes_at=job.completes_at,
+            completes_on=job.completes_on,
             output_product=product,
             output_quantity=quantity,
         )
@@ -625,7 +635,7 @@ class EconomyEngine:
         economy: EconomyState,
         company_id: CompanyId,
     ) -> Quantity | None:
-        """Return today's unused production input capacity for an operator."""
+        """Return this week's unused production input capacity for an operator."""
         state = _optional_operation_state(economy.operation_states, company_id)
         return None if state is None else state.remaining_capacity
 
@@ -637,7 +647,7 @@ class EconomyEngine:
         first_apply_sequence: int,
         apply_sequences: tuple[int, ...] | None = None,
     ) -> tuple[EconomyState, tuple[DecisionOutcome, ...]]:
-        """Apply one deterministic same-minute decision batch serially."""
+        """Apply one deterministic same-day decision batch serially."""
         if first_apply_sequence < 1:
             raise ValueError("first_apply_sequence must be positive")
         companies = [envelope.company_id for envelope in envelopes]
@@ -645,9 +655,9 @@ class EconomyEngine:
             raise ValueError("a company may submit at most one decision per batch")
         if any(envelope.state_version != economy.state_version for envelope in envelopes):
             raise ValueError("every batch decision must target the shared state version")
-        issued_minutes = {envelope.issued_at.absolute_minute for envelope in envelopes}
-        if len(issued_minutes) > 1:
-            raise ValueError("one decision batch must share a virtual minute")
+        issued_days = {envelope.issued_on.absolute_day for envelope in envelopes}
+        if len(issued_days) > 1:
+            raise ValueError("one decision batch must share a simulation day")
         sequences = (
             tuple(range(first_apply_sequence, first_apply_sequence + len(envelopes)))
             if apply_sequences is None
@@ -671,15 +681,15 @@ class EconomyEngine:
         self,
         economy: EconomyState,
         job_id: Identifier,
-        at: SimTime,
+        on: SimDay,
     ) -> EconomyState:
         """Complete one scheduled physical operation exactly once."""
         job = next((candidate for candidate in economy.jobs if candidate.job_id == job_id), None)
         if job is None:
             raise ValueError("operation job does not exist")
-        if at != job.completes_at:
-            raise ValueError("operation must complete at its scheduled time")
-        self._validate_system_time(economy, at)
+        if on != job.completes_on:
+            raise ValueError("operation must complete on its scheduled day")
+        self._validate_system_day(economy, on)
 
         session = _MarketSession.from_economy(economy)
         next_lot_sequence = economy.next_lot_sequence + 1
@@ -692,18 +702,21 @@ class EconomyEngine:
             quantity = job.output_quantity
             source = "transform"
         lot = InventoryLot(
-            lot_id=f"d{economy.day}.{source}.{job.company_id}.l{economy.next_lot_sequence}",
+            lot_id=(
+                f"w{economy.week}.d{on.day_of_week}.{source}."
+                f"{job.company_id}.l{economy.next_lot_sequence}"
+            ),
             product=product,
             quantity=quantity,
-            produced_day=economy.day,
-            expires_end_of_day=(
-                economy.day + economy.scenario.product(product).shelf_life_days - 1
+            produced_week=economy.week,
+            expires_end_of_week=(
+                economy.week + economy.scenario.product(product).shelf_life_weeks - 1
             ),
         )
         session.assets.restore_inventory(job.company_id, (lot,))
         event: DomainEvent = (
             MilkProducedEvent(
-                day=economy.day,
+                occurred_on=on,
                 company_id=job.company_id,
                 requested_quantity=job.quantity,
                 actual_quantity=job.quantity,
@@ -713,7 +726,7 @@ class EconomyEngine:
             )
             if isinstance(job, ProductionJob)
             else MilkProcessedEvent(
-                day=economy.day,
+                occurred_on=on,
                 company_id=job.company_id,
                 requested_input=job.input_quantity,
                 actual_input=job.input_quantity,
@@ -737,7 +750,7 @@ class EconomyEngine:
         self,
         economy: EconomyState,
         delivery_id: Identifier,
-        at: SimTime,
+        on: SimDay,
     ) -> EconomyState:
         """Move one guaranteed delivery into the buyer's available inventory."""
         delivery = next(
@@ -746,13 +759,13 @@ class EconomyEngine:
         )
         if delivery is None:
             raise ValueError("pending delivery does not exist")
-        if at != delivery.arrives_at:
-            raise ValueError("delivery must complete at its scheduled time")
-        self._validate_system_time(economy, at)
+        if on != delivery.arrives_on:
+            raise ValueError("delivery must complete on its scheduled day")
+        self._validate_system_day(economy, on)
         session = _MarketSession.from_economy(economy)
         session.assets.restore_inventory(delivery.buyer_id, delivery.lots)
         event = DeliveryCompletedEvent(
-            day=economy.day,
+            occurred_on=on,
             company_id=delivery.buyer_id,
             trade_id=delivery.trade_id,
             product=delivery.product,
@@ -769,9 +782,9 @@ class EconomyEngine:
             }
         )
 
-    def close_markets(self, economy: EconomyState, at: SimTime) -> EconomyState:
-        """Expire every DAY order and release its remaining collateral."""
-        self._require_clock_event(economy, at, economy.scenario.runtime.close_minute)
+    def close_markets(self, economy: EconomyState, on: SimDay) -> EconomyState:
+        """Expire every weekly order and release its remaining collateral."""
+        self._require_settlement_day(economy, on)
         if not all(market.is_open for market in economy.markets):
             raise ValueError("markets are already closed")
         session = _MarketSession.from_economy(economy)
@@ -779,9 +792,9 @@ class EconomyEngine:
             market.close()
         return economy._with_market_session(session.freeze())
 
-    def settle_consumer_sales(self, economy: EconomyState, at: SimTime) -> EconomyState:
-        """Execute the sole 19:00 consumer purchase event."""
-        self._require_clock_event(economy, at, economy.scenario.runtime.close_minute)
+    def settle_consumer_sales(self, economy: EconomyState, on: SimDay) -> EconomyState:
+        """Execute the sole Sunday consumer purchase event."""
+        self._require_settlement_day(economy, on)
         if economy.consumer_settlement is not None:
             raise ValueError("consumer sales are already settled")
         if any(market.is_open for market in economy.markets):
@@ -800,7 +813,7 @@ class EconomyEngine:
             operation = company.operation
             if not isinstance(operation, RetailerOperation):
                 continue
-            potential = demand_curve.potential(economy.seed, economy.day, company.company_id)
+            potential = demand_curve.potential(economy.seed, economy.week, company.company_id)
             price = prices.get((company.company_id, operation.input_product))
             if price is None:
                 demand = potential
@@ -823,7 +836,7 @@ class EconomyEngine:
                     session.assets.credit_cash(company.company_id, revenue)
             events.append(
                 ConsumerSaleEvent(
-                    day=economy.day,
+                    occurred_on=on,
                     company_id=company.company_id,
                     potential_demand_quantity=potential,
                     demand_quantity=demand,
@@ -839,7 +852,7 @@ class EconomyEngine:
         return economy._with_market_session(session.freeze()).model_copy(
             update={
                 "consumer_settlement": ConsumerSettlement(
-                    day=economy.day,
+                    week=economy.week,
                     potential_demand=potential_total,
                     demand=demand_total,
                     sold_quantity=sold_total,
@@ -848,32 +861,32 @@ class EconomyEngine:
             }
         )
 
-    def close_day(self, economy: EconomyState, at: SimTime) -> DayResult:
-        """Assert a drained runtime, expire inventory, and freeze the daily result."""
-        self._require_clock_event(economy, at, economy.scenario.runtime.day_close_minute)
+    def close_week(self, economy: EconomyState, on: SimDay) -> WeekResult:
+        """Assert a drained runtime, expire inventory, and freeze the weekly result."""
+        self._require_settlement_day(economy, on)
         if any(market.is_open or market.orders for market in economy.markets):
-            raise ValueError("day close requires closed empty markets")
+            raise ValueError("week close requires closed empty markets")
         if economy.jobs:
-            raise ValueError("day close requires every operation to complete")
+            raise ValueError("week close requires every operation to complete")
         if economy.deliveries:
-            raise ValueError("day close requires every delivery to complete")
+            raise ValueError("week close requires every delivery to complete")
         if economy.consumer_settlement is None:
             raise ValueError("consumer sales must settle before day close")
 
-        companies, expiry_events = self._expire_inventory(economy)
+        companies, expiry_events = self._expire_inventory(economy, on)
         events = (*economy.events, *expiry_events)
         markets = tuple(_market_summary(market) for market in economy.markets)
         state = WorldState(
             scenario=economy.scenario,
             seed=economy.seed,
-            day=economy.day,
+            completed_weeks=economy.week,
             companies=companies,
             operation_states=economy.operation_states,
             previous_markets=markets,
             next_lot_sequence=economy.next_lot_sequence,
         )
         settlement = economy.consumer_settlement
-        return DayResult(
+        return WeekResult(
             state=state,
             events=events,
             snapshot=self._snapshot(
@@ -971,11 +984,14 @@ class EconomyEngine:
         session.assets.debit_cash(company.company_id, cost)
         sequence = economy.next_job_sequence
         job = ProductionJob(
-            job_id=f"d{economy.day}.job{sequence}.{company.company_id}",
+            job_id=(
+                f"w{economy.week}.d{envelope.issued_on.day_of_week}."
+                f"job{sequence}.{company.company_id}"
+            ),
             company_id=company.company_id,
-            started_at=envelope.issued_at,
-            completes_at=envelope.issued_at.plus(
-                economy.scenario.runtime.operation_duration_minutes
+            started_on=envelope.issued_on,
+            completes_on=envelope.issued_on.plus_days(
+                economy.scenario.runtime.operation_duration_days
             ),
             product=action.product,
             quantity=action.quantity,
@@ -1047,11 +1063,14 @@ class EconomyEngine:
         session.assets.debit_cash(company.company_id, cost)
         sequence = economy.next_job_sequence
         job = TransformationJob(
-            job_id=f"d{economy.day}.job{sequence}.{company.company_id}",
+            job_id=(
+                f"w{economy.week}.d{envelope.issued_on.day_of_week}."
+                f"job{sequence}.{company.company_id}"
+            ),
             company_id=company.company_id,
-            started_at=envelope.issued_at,
-            completes_at=envelope.issued_at.plus(
-                economy.scenario.runtime.operation_duration_minutes
+            started_on=envelope.issued_on,
+            completes_on=envelope.issued_on.plus_days(
+                economy.scenario.runtime.operation_duration_days
             ),
             input_product=action.input_product,
             output_product=action.output_product,
@@ -1090,9 +1109,12 @@ class EconomyEngine:
         execution = session.market(action.product).set_quote_ladder(
             owner_id=company.company_id,
             ladder=action,
-            placed_at=envelope.issued_at,
+            placed_on=envelope.issued_on,
             order_identity_factory=lambda offset: OrderIdentity(
-                order_id=f"d{economy.day}.o{sequence + offset - 1}.{company.company_id}",
+                order_id=(
+                    f"w{economy.week}.d{envelope.issued_on.day_of_week}."
+                    f"o{sequence + offset - 1}.{company.company_id}"
+                ),
                 priority_sequence=sequence + offset - 1,
             ),
             trade_id_factory=self._trade_id_factory(economy),
@@ -1103,7 +1125,7 @@ class EconomyEngine:
         return self._commit_quote_ladder(
             economy,
             session,
-            envelope.issued_at,
+            envelope.issued_on,
             execution.result,
             execution.fills,
             sequence + created,
@@ -1144,7 +1166,7 @@ class EconomyEngine:
         self,
         economy: EconomyState,
         session: _MarketSession,
-        at: SimTime,
+        on: SimDay,
         result: QuoteLadderResult,
         fills: tuple[TradeFill, ...],
         next_order_sequence: int,
@@ -1154,7 +1176,7 @@ class EconomyEngine:
         )
         if not changed:
             return _DecisionEffect(economy=economy, quote_ladder_result=result)
-        trade_effects = self._trade_effects(economy, fills, at)
+        trade_effects = self._trade_effects(economy, fills, on)
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
                 "deliveries": (*economy.deliveries, *trade_effects.deliveries),
@@ -1175,25 +1197,25 @@ class EconomyEngine:
         self,
         economy: EconomyState,
         fills: tuple[TradeFill, ...],
-        at: SimTime,
+        on: SimDay,
     ) -> _TradeEffects:
         events: list[TradeExecutedEvent] = []
         deliveries: list[PendingDelivery] = []
         completions: list[ScheduledCompletion] = []
         for offset, fill in enumerate(fills):
             delivery_sequence = economy.next_delivery_sequence + offset
-            delivery_id = f"d{economy.day}.delivery{delivery_sequence}"
+            delivery_id = f"w{economy.week}.delivery{delivery_sequence}"
             delivery = PendingDelivery(
                 delivery_id=delivery_id,
                 trade_id=fill.trade_id,
                 buyer_id=fill.buyer_id,
-                arrives_at=at.plus(economy.scenario.runtime.delivery_duration_minutes),
+                arrives_on=on.plus_days(economy.scenario.runtime.delivery_duration_days),
                 lots=fill.delivery_lots,
             )
             deliveries.append(delivery)
             events.append(
                 TradeExecutedEvent(
-                    day=economy.day,
+                    occurred_on=on,
                     trade_id=fill.trade_id,
                     maker_order_id=fill.maker_order_id,
                     taker_order_id=fill.taker_order_id,
@@ -1211,7 +1233,7 @@ class EconomyEngine:
                 ScheduledCompletion(
                     event_id=f"{delivery_id}.complete",
                     kind=SystemEventKind.DELIVERY_COMPLETED,
-                    at=delivery.arrives_at,
+                    scheduled_for=delivery.arrives_on,
                     reference_id=delivery.delivery_id,
                     company_id=delivery.buyer_id,
                 )
@@ -1229,7 +1251,7 @@ class EconomyEngine:
         economy: EconomyState,
     ) -> Callable[[int], Identifier]:
         """Return a deterministic per-decision trade identity factory."""
-        return lambda offset: f"d{economy.day}.trade{economy.next_trade_sequence + offset - 1}"
+        return lambda offset: f"w{economy.week}.trade{economy.next_trade_sequence + offset - 1}"
 
     def _outcome(
         self,
@@ -1244,12 +1266,14 @@ class EconomyEngine:
         events: tuple[DomainEvent, ...] = (),
         completions: tuple[ScheduledCompletion, ...] = (),
     ) -> DecisionOutcome:
-        next_available = envelope.issued_at.plus(economy.scenario.runtime.decision_interval_minutes)
+        next_available = envelope.issued_on.plus_days(
+            economy.scenario.runtime.decision_interval_days
+        )
         return DecisionOutcome(
             turn_id=envelope.turn_id,
             decision_id=envelope.decision_id,
             company_id=envelope.company_id,
-            occurred_at=envelope.issued_at,
+            occurred_on=envelope.issued_on,
             status=DecisionStatus.ACCEPTED if accepted else DecisionStatus.REJECTED,
             accepted=accepted,
             rejection_category=None if accepted else RejectionCategory.ECONOMIC,
@@ -1260,31 +1284,30 @@ class EconomyEngine:
             job_id=job_id,
             events=events,
             scheduled_completions=completions,
-            next_available_at=next_available,
+            next_available_on=next_available,
         )
 
     @staticmethod
     def _validate_decision_time(economy: EconomyState, envelope: DecisionEnvelope) -> None:
-        runtime = economy.scenario.runtime
-        if envelope.issued_at.day != economy.day - 1:
-            raise _DecisionRejected("decision targets a different business day")
-        if not runtime.open_minute <= envelope.issued_at.minute_of_day < runtime.close_minute:
-            raise _DecisionRejected("decision is outside business hours")
+        day = envelope.issued_on
+        if day.week != economy.week:
+            raise _DecisionRejected("decision targets a different trading week")
+        if not economy.scenario.calendar.contains(day) or not day.is_decision_day:
+            raise _DecisionRejected("decision must occur on Monday-Saturday")
 
     @staticmethod
-    def _validate_system_time(economy: EconomyState, at: SimTime) -> None:
-        if at.day != economy.day - 1:
-            raise ValueError("system event targets a different business day")
+    def _validate_system_day(economy: EconomyState, day: SimDay) -> None:
+        if day.week != economy.week or not economy.scenario.calendar.contains(day):
+            raise ValueError("system event targets a different trading week")
 
-    def _require_clock_event(
+    def _require_settlement_day(
         self,
         economy: EconomyState,
-        at: SimTime,
-        minute_of_day: int,
+        day: SimDay,
     ) -> None:
-        self._validate_system_time(economy, at)
-        if at.minute_of_day != minute_of_day:
-            raise ValueError("system event occurred at the wrong configured minute")
+        self._validate_system_day(economy, day)
+        if not day.is_settlement_day:
+            raise ValueError("weekly settlement must occur on Sunday")
 
     @staticmethod
     def _require_idle(economy: EconomyState, company_id: CompanyId) -> None:
@@ -1295,22 +1318,24 @@ class EconomyEngine:
         self,
         *,
         state: WorldState,
-        day: int,
+        sim_day: SimDay,
         company_id: CompanyId,
         company_state: CompanyState,
-        daily_operation: DailyOperationState | None,
+        weekly_operation: WeeklyOperationState | None,
         retail_price: Money | None,
     ) -> CompanyObservation:
         scenario = state.scenario
         company = scenario.company(company_id)
         return CompanyObservation(
-            observation_id=f"{scenario.scenario_id}|{day}|{company_id}",
+            observation_id=(
+                f"{scenario.scenario_id}|d{sim_day.absolute_day}|{company_id}"
+            ),
             scenario_id=scenario.scenario_id,
-            scenario_days=scenario.days,
-            day=day,
+            scenario_weeks=scenario.weeks,
+            sim_day=sim_day,
             company_id=company_id,
             operation=company.operation,
-            daily_operation=daily_operation,
+            weekly_operation=weekly_operation,
             products=scenario.products,
             demand=scenario.demand,
             scoring=scenario.scoring,
@@ -1338,16 +1363,17 @@ class EconomyEngine:
     def _expire_inventory(
         self,
         economy: EconomyState,
+        on: SimDay,
     ) -> tuple[tuple[CompanyState, ...], tuple[InventoryExpiredEvent, ...]]:
         companies: list[CompanyState] = []
         events: list[InventoryExpiredEvent] = []
         for company in economy.companies:
             retained: list[InventoryLot] = []
             for lot in company.inventory:
-                if lot.expires_end_of_day <= economy.day:
+                if lot.expires_end_of_week <= economy.week:
                     events.append(
                         InventoryExpiredEvent(
-                            day=economy.day,
+                            occurred_on=on,
                             company_id=company.company_id,
                             lot_id=lot.lot_id,
                             product=lot.product,
@@ -1370,14 +1396,14 @@ class EconomyEngine:
         consumer_demand: Quantity,
         consumer_sales: Quantity,
         expired_quantity: Quantity,
-    ) -> DaySnapshot:
-        daily_sales = {company.company_id: ZERO for company in state.scenario.companies}
-        daily_expired = dict(daily_sales)
+    ) -> WeekSnapshot:
+        weekly_sales = {company.company_id: ZERO for company in state.scenario.companies}
+        weekly_expired = dict(weekly_sales)
         for event in events:
             if isinstance(event, ConsumerSaleEvent):
-                daily_sales[event.company_id] += event.sold_quantity
+                weekly_sales[event.company_id] += event.sold_quantity
             elif isinstance(event, InventoryExpiredEvent):
-                daily_expired[event.company_id] += event.quantity
+                weekly_expired[event.company_id] += event.quantity
         states = {company.company_id: company for company in state.companies}
         companies: list[CompanySnapshot] = []
         for company in state.scenario.companies:
@@ -1386,7 +1412,7 @@ class EconomyEngine:
             net_worth = current.cash + inventory_value
             companies.append(
                 CompanySnapshot(
-                    day=state.day,
+                    week=state.completed_weeks,
                     company_id=company.company_id,
                     tier=company.tier,
                     cash=current.cash,
@@ -1398,12 +1424,12 @@ class EconomyEngine:
                     inventory_value=inventory_value,
                     net_worth=net_worth,
                     surplus=net_worth - company.initial_cash,
-                    daily_consumer_sales=daily_sales[company.company_id],
-                    daily_expired_quantity=daily_expired[company.company_id],
+                    weekly_consumer_sales=weekly_sales[company.company_id],
+                    weekly_expired_quantity=weekly_expired[company.company_id],
                 )
             )
-        return DaySnapshot(
-            day=state.day,
+        return WeekSnapshot(
+            week=state.completed_weeks,
             companies=tuple(companies),
             markets=markets,
             consumer_demand=consumer_demand,
@@ -1412,11 +1438,11 @@ class EconomyEngine:
         )
 
 
-def _validate_job_time(started_at: SimTime, completes_at: SimTime) -> None:
-    if completes_at.absolute_minute <= started_at.absolute_minute:
+def _validate_job_time(started_on: SimDay, completes_on: SimDay) -> None:
+    if completes_on.absolute_day <= started_on.absolute_day:
         raise ValueError("operation completion must follow its start")
-    if completes_at.day != started_at.day:
-        raise ValueError("operation must complete within its business day")
+    if completes_on.week != started_on.week:
+        raise ValueError("operation must complete within its trading week")
 
 
 def _reserved_lots(
@@ -1439,7 +1465,7 @@ def _expiry_quantities(
     """Aggregate lots without exposing their private identities."""
     quantities: dict[tuple[ProductId, int], Quantity] = {}
     for lot in lots:
-        key = (lot.product, lot.expires_end_of_day)
+        key = (lot.product, lot.expires_end_of_week)
         quantities[key] = quantities.get(key, ZERO) + lot.quantity
     return quantities
 
@@ -1494,16 +1520,16 @@ def _inventory_quantity(state: CompanyState, product: ProductId) -> Quantity:
 
 
 def _optional_operation_state(
-    states: tuple[DailyOperationState, ...],
+    states: tuple[WeeklyOperationState, ...],
     company_id: CompanyId,
-) -> DailyOperationState | None:
+) -> WeeklyOperationState | None:
     return next((state for state in states if state.company_id == company_id), None)
 
 
 def _operation_state(
-    states: tuple[DailyOperationState, ...],
+    states: tuple[WeeklyOperationState, ...],
     company_id: CompanyId,
-) -> DailyOperationState:
+) -> WeeklyOperationState:
     state = _optional_operation_state(states, company_id)
     if state is None:
         raise ValueError(f"company has no productive operation: {company_id}")
@@ -1511,9 +1537,9 @@ def _operation_state(
 
 
 def _replace_operation_state(
-    states: tuple[DailyOperationState, ...],
-    replacement: DailyOperationState,
-) -> tuple[DailyOperationState, ...]:
+    states: tuple[WeeklyOperationState, ...],
+    replacement: WeeklyOperationState,
+) -> tuple[WeeklyOperationState, ...]:
     return tuple(
         replacement if state.company_id == replacement.company_id else state for state in states
     )
@@ -1525,7 +1551,7 @@ def _price_operation(
     quantity: Decimal,
     cost_function: CostFunction,
     label: str,
-) -> tuple[DailyOperationState, Money]:
+) -> tuple[WeeklyOperationState, Money]:
     state = _operation_state(economy.operation_states, company_id)
     if quantity > state.remaining_capacity:
         raise _DecisionRejected(
@@ -1534,10 +1560,10 @@ def _price_operation(
         )
     try:
         cost = cost_function.incremental_cost(
-            daily_capacity=state.daily_capacity,
+            weekly_capacity=state.weekly_capacity,
             used_capacity=state.used_capacity,
             quantity=quantity,
-            daily_base_unit_cost=state.daily_base_unit_cost,
+            weekly_base_unit_cost=state.weekly_base_unit_cost,
         )
         if cost <= ZERO:
             raise ValueError(f"{label} cost rounds to zero")
@@ -1550,7 +1576,7 @@ def _operation_completion(job: OperationJob) -> ScheduledCompletion:
     return ScheduledCompletion(
         event_id=f"{job.job_id}.complete",
         kind=SystemEventKind.OPERATION_COMPLETED,
-        at=job.completes_at,
+        scheduled_for=job.completes_on,
         reference_id=job.job_id,
         company_id=job.company_id,
     )

@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from company_bench.domain.calendar import SimDay, TradingCalendar
 from company_bench.domain.precision import (
     ECONOMIC_NORMALIZER,
     ECONOMIC_QUANTUM,
@@ -61,7 +62,7 @@ type BenchmarkScore = Annotated[
     economic_field(ge=ZERO, le=Decimal("100")),
     ECONOMIC_NORMALIZER,
 ]
-type ScoreVersion = Literal["s9-enterprise-v2"]
+type ScoreVersion = Literal["s9-enterprise-v3", "s9-enterprise-v4"]
 
 
 class InvalidOrderQuantity(ValueError):
@@ -150,19 +151,19 @@ class ProductSpec(StrictModel):
 
     product: ProductId
     name: str = Field(min_length=1, max_length=80)
-    shelf_life_days: int = Field(ge=1)
+    shelf_life_weeks: int = Field(ge=1)
     reference_value: PositiveMoney
 
 
-class DailyCapacity(StrictModel):
-    """One realized daily capacity and its persistent availability state."""
+class WeeklyCapacity(StrictModel):
+    """One realized weekly capacity and its persistent availability state."""
 
     availability: PositiveQuantity
     quantity: PositiveQuantity
 
 
 class CapacityFunction(StrictModel):
-    """Generate bounded, persistent daily capacity from one private innovation."""
+    """Generate bounded, persistent weekly capacity from one private innovation."""
 
     normal_capacity: PositiveQuantity
     persistence: Persistence
@@ -182,11 +183,11 @@ class CapacityFunction(StrictModel):
             raise ValueError("minimum realized capacity must survive quantity precision")
         return self
 
-    def daily_capacity(
+    def weekly_capacity(
         self,
         previous_availability: Decimal,
         innovation: Decimal,
-    ) -> DailyCapacity:
+    ) -> WeeklyCapacity:
         """Advance the AR(1) availability state and return its bounded capacity."""
         _require_finite_between(
             previous_availability,
@@ -205,7 +206,7 @@ class CapacityFunction(StrictModel):
             ),
         )
         availability = EconomicPrecision.round(availability)
-        return DailyCapacity(
+        return WeeklyCapacity(
             availability=availability,
             quantity=EconomicPrecision.round(self.normal_capacity * availability),
         )
@@ -215,60 +216,63 @@ class CostFunction(StrictModel):
     """Realize private base cost and price cumulative capacity use convexly."""
 
     normal_unit_cost: PositiveMoney
-    daily_volatility: OpenUnitInterval = ZERO
+    weekly_volatility: OpenUnitInterval = ZERO
     curvature: PositiveQuantity
 
     @model_validator(mode="after")
     def validate_minimum_cost(self) -> Self:
         """Require the smallest supported batch to retain a positive cash cost."""
-        minimum_unit_cost = self.normal_unit_cost * (ONE - self.daily_volatility)
+        minimum_unit_cost = self.normal_unit_cost * (ONE - self.weekly_volatility)
         if EconomicPrecision.round(minimum_unit_cost) <= ZERO:
-            raise ValueError("minimum daily unit cost must survive cost precision")
+            raise ValueError("minimum weekly unit cost must survive cost precision")
         return self
 
-    def daily_base_unit_cost(self, innovation: Decimal) -> PositiveMoney:
-        """Return today's positive private base cost from a symmetric innovation."""
+    def weekly_base_unit_cost(self, innovation: Decimal) -> PositiveMoney:
+        """Return this week's positive private base cost."""
         _require_finite_between(innovation, -ONE, ONE, "cost innovation")
         return EconomicPrecision.round(
-            self.normal_unit_cost * (ONE + self.daily_volatility * innovation)
+            self.normal_unit_cost * (ONE + self.weekly_volatility * innovation)
         )
 
     def incremental_cost(
         self,
         *,
-        daily_capacity: Decimal,
+        weekly_capacity: Decimal,
         used_capacity: Decimal,
         quantity: Decimal,
-        daily_base_unit_cost: Decimal,
+        weekly_base_unit_cost: Decimal,
     ) -> Money:
         """Charge the rounded cumulative-cost difference for one new batch."""
-        if not daily_capacity.is_finite() or daily_capacity <= ZERO:
-            raise ValueError("daily capacity must be positive and finite")
+        if not weekly_capacity.is_finite() or weekly_capacity <= ZERO:
+            raise ValueError("weekly capacity must be positive and finite")
         if not used_capacity.is_finite() or used_capacity < ZERO:
             raise ValueError("used capacity must be nonnegative and finite")
         _validate_operation_quantity(quantity)
-        if not daily_base_unit_cost.is_finite() or daily_base_unit_cost <= ZERO:
-            raise ValueError("daily base unit cost must be positive and finite")
-        if used_capacity + quantity > daily_capacity:
-            raise ValueError("production quantity exceeds remaining daily capacity")
+        if not weekly_base_unit_cost.is_finite() or weekly_base_unit_cost <= ZERO:
+            raise ValueError("weekly base unit cost must be positive and finite")
+        if used_capacity + quantity > weekly_capacity:
+            raise ValueError("production quantity exceeds remaining weekly capacity")
         return self._total_cost(
             used_capacity + quantity,
-            daily_capacity,
-            daily_base_unit_cost,
+            weekly_capacity,
+            weekly_base_unit_cost,
         ) - self._total_cost(
             used_capacity,
-            daily_capacity,
-            daily_base_unit_cost,
+            weekly_capacity,
+            weekly_base_unit_cost,
         )
 
     def _total_cost(
         self,
         quantity: Decimal,
-        daily_capacity: Decimal,
-        daily_base_unit_cost: Decimal,
+        weekly_capacity: Decimal,
+        weekly_base_unit_cost: Decimal,
     ) -> Money:
-        total = daily_base_unit_cost * quantity + (
-            self.curvature * daily_base_unit_cost * quantity**2 / (Decimal("2") * daily_capacity)
+        total = weekly_base_unit_cost * quantity + (
+            self.curvature
+            * weekly_base_unit_cost
+            * quantity**2
+            / (Decimal("2") * weekly_capacity)
         )
         return EconomicPrecision.round(total)
 
@@ -323,32 +327,32 @@ class CompanySpec(StrictModel):
         return CompanyTier(self.operation.kind)
 
 
-class DailyOperationState(StrictModel):
-    """One operator's private daily economics and consumed capacity."""
+class WeeklyOperationState(StrictModel):
+    """One operator's private weekly economics and consumed capacity."""
 
     company_id: CompanyId
     availability: PositiveQuantity
-    daily_capacity: PositiveQuantity
-    daily_base_unit_cost: PositiveMoney
+    weekly_capacity: PositiveQuantity
+    weekly_base_unit_cost: PositiveMoney
     used_capacity: Quantity = ZERO
 
     @model_validator(mode="after")
     def validate_usage(self) -> Self:
-        """Keep consumed capacity inside today's realized limit."""
-        if self.used_capacity > self.daily_capacity:
-            raise ValueError("used capacity cannot exceed daily capacity")
+        """Keep consumed capacity inside this week's realized limit."""
+        if self.used_capacity > self.weekly_capacity:
+            raise ValueError("used capacity cannot exceed weekly capacity")
         return self
 
     @property
     def remaining_capacity(self) -> Quantity:
-        """Return capacity that remains available today."""
-        return self.daily_capacity - self.used_capacity
+        """Return capacity that remains available this week."""
+        return self.weekly_capacity - self.used_capacity
 
-    def consume(self, quantity: Decimal) -> DailyOperationState:
+    def consume(self, quantity: Decimal) -> WeeklyOperationState:
         """Return the state after reserving capacity for one accepted batch."""
         quantity = _validate_operation_quantity(quantity)
         if quantity > self.remaining_capacity:
-            raise ValueError("consumed capacity exceeds the daily remainder")
+            raise ValueError("consumed capacity exceeds the weekly remainder")
         return self.model_copy(update={"used_capacity": self.used_capacity + quantity})
 
 
@@ -372,38 +376,25 @@ class DemandSpec(StrictModel):
 class ScoringSpec(StrictModel):
     """Immutable identity of the active benchmark scoring contract."""
 
-    score_version: ScoreVersion = "s9-enterprise-v2"
+    score_version: ScoreVersion = "s9-enterprise-v4"
 
 
 class RuntimeSpec(StrictModel):
-    """Event-time and memory budgets for one benchmark scenario."""
+    """Day-granularity scheduling and memory budgets for one scenario."""
 
-    open_minute: int = Field(default=9 * 60, ge=0, lt=24 * 60)
-    close_minute: int = Field(default=19 * 60, ge=0, lt=24 * 60)
-    day_close_minute: int = Field(default=19 * 60 + 30, ge=0, lt=24 * 60)
-    operation_duration_minutes: int = Field(default=30, ge=1)
-    delivery_duration_minutes: int = Field(default=30, ge=1)
-    decision_interval_minutes: int = Field(default=1, ge=1)
-    max_review_minutes: int = Field(default=120, ge=1)
-    max_turns_per_company_day: int = Field(default=25, ge=1)
+    operation_duration_days: int = Field(default=1, ge=1, le=1)
+    delivery_duration_days: int = Field(default=1, ge=1, le=1)
+    decision_interval_days: int = Field(default=1, ge=1, le=1)
+    default_review_days: int = Field(default=1, ge=1)
+    max_review_days: int = Field(default=2, ge=1)
+    max_turns_per_company_week: int = Field(default=6, ge=1, le=6)
     compaction_trigger_tokens: int = Field(default=12_288, ge=512)
 
     @model_validator(mode="after")
     def validate_schedule(self) -> Self:
-        """Require ordered market boundaries."""
-        boundaries = (self.open_minute, self.close_minute, self.day_close_minute)
-        if boundaries != tuple(sorted(set(boundaries))):
-            raise ValueError("runtime boundaries must be strictly increasing")
-        latest_completion = (
-            self.close_minute
-            - 1
-            + max(
-                self.operation_duration_minutes,
-                self.delivery_duration_minutes,
-            )
-        )
-        if latest_completion >= self.day_close_minute:
-            raise ValueError("day close must follow every possible completion")
+        """Keep default attention inside its explicit review ceiling."""
+        if self.default_review_days > self.max_review_days:
+            raise ValueError("default review days cannot exceed max review days")
         return self
 
 
@@ -412,12 +403,17 @@ class ScenarioSpec(StrictModel):
 
     scenario_id: Identifier
     version: int = Field(ge=1)
-    days: int = Field(ge=1)
+    weeks: int = Field(ge=1)
     products: tuple[ProductSpec, ...] = Field(min_length=1)
     companies: tuple[CompanySpec, ...] = Field(min_length=1)
     demand: DemandSpec
     scoring: ScoringSpec
     runtime: RuntimeSpec = RuntimeSpec()
+
+    @property
+    def calendar(self) -> TradingCalendar:
+        """Return the canonical calendar for this scenario."""
+        return TradingCalendar(weeks=self.weeks)
 
     @model_validator(mode="after")
     def validate_unique_references(self) -> Self:
@@ -479,13 +475,13 @@ class InventoryLot(StrictModel):
     lot_id: Identifier
     product: ProductId
     quantity: PositiveQuantity
-    produced_day: int = Field(ge=1)
-    expires_end_of_day: int = Field(ge=1)
+    produced_week: int = Field(ge=1)
+    expires_end_of_week: int = Field(ge=1)
 
     @model_validator(mode="after")
     def validate_lifetime(self) -> Self:
         """Disallow a batch that expires before it is produced."""
-        if self.expires_end_of_day < self.produced_day:
+        if self.expires_end_of_week < self.produced_week:
             raise ValueError("inventory cannot expire before production")
         return self
 
@@ -516,13 +512,13 @@ class MarketSummary(StrictModel):
 
 
 class WorldState(StrictModel):
-    """Immutable state after the latest completed day."""
+    """Immutable state after the latest completed week."""
 
     scenario: ScenarioSpec
     seed: int
-    day: int = Field(ge=0)
+    completed_weeks: int = Field(ge=0)
     companies: tuple[CompanyState, ...]
-    operation_states: tuple[DailyOperationState, ...]
+    operation_states: tuple[WeeklyOperationState, ...]
     previous_markets: tuple[MarketSummary, ...] = ()
     next_lot_sequence: int = Field(default=1, ge=1)
 
@@ -533,7 +529,7 @@ class WorldState(StrictModel):
         actual = [company.company_id for company in self.companies]
         if len(actual) != len(set(actual)) or set(actual) != configured:
             raise ValueError("world state must match the scenario company set")
-        if self.day > self.scenario.days:
+        if self.completed_weeks > self.scenario.weeks:
             raise ValueError("world state exceeds the scenario duration")
         expected_operators = tuple(
             company.company_id for company in self.scenario.productive_companies
@@ -563,11 +559,11 @@ class CompanyObservation(StrictModel):
 
     observation_id: Identifier
     scenario_id: Identifier
-    scenario_days: int = Field(ge=1)
-    day: int = Field(ge=1)
+    scenario_weeks: int = Field(ge=1)
+    sim_day: SimDay
     company_id: CompanyId
     operation: CompanyOperation
-    daily_operation: DailyOperationState | None = None
+    weekly_operation: WeeklyOperationState | None = None
     products: tuple[ProductSpec, ...]
     demand: DemandSpec
     scoring: ScoringSpec
@@ -579,15 +575,15 @@ class CompanyObservation(StrictModel):
     retail_price: Money | None = None
 
     @model_validator(mode="after")
-    def validate_daily_operation(self) -> Self:
-        """Expose daily economics exactly to productive companies themselves."""
+    def validate_weekly_operation(self) -> Self:
+        """Expose weekly economics exactly to productive companies themselves."""
         productive = isinstance(self.operation, ProductiveOperation)
-        if productive != (self.daily_operation is not None):
-            raise ValueError("daily operation must match the company's productive role")
-        if self.daily_operation is not None and (
-            self.daily_operation.company_id != self.company_id
+        if productive != (self.weekly_operation is not None):
+            raise ValueError("weekly operation must match the company's productive role")
+        if self.weekly_operation is not None and (
+            self.weekly_operation.company_id != self.company_id
         ):
-            raise ValueError("daily operation must belong to the observed company")
+            raise ValueError("weekly operation must belong to the observed company")
         return self
 
     def quantity(self, product: ProductId) -> Decimal:
@@ -598,13 +594,13 @@ class CompanyObservation(StrictModel):
         )
 
 
-class DayEvent(StrictModel):
-    """Shared fields for every fact emitted during a simulated day."""
+class WeekEvent(StrictModel):
+    """Shared fields for every fact emitted during a simulated week."""
 
-    day: int = Field(ge=1)
+    occurred_on: SimDay
 
 
-class CompanyEvent(DayEvent):
+class CompanyEvent(WeekEvent):
     """Shared fields for an event owned by one company."""
 
     company_id: CompanyId
@@ -621,7 +617,7 @@ class MilkProducedEvent(CompanyEvent):
     lot_id: Identifier | None = None
 
 
-class TradeExecutedEvent(DayEvent):
+class TradeExecutedEvent(WeekEvent):
     """One actual spot-market transfer of money and inventory."""
 
     event_type: Literal["trade_executed"] = "trade_executed"
@@ -670,7 +666,7 @@ class ConsumerSaleEvent(CompanyEvent):
 
 
 class InventoryExpiredEvent(CompanyEvent):
-    """One expired lot removed at the end of a day."""
+    """One expired lot removed at the end of a week."""
 
     event_type: Literal["inventory_expired"] = "inventory_expired"
     lot_id: Identifier
@@ -698,9 +694,9 @@ class EventRecord(StrictModel):
 
 
 class CompanySnapshot(StrictModel):
-    """One company's auditable end-of-day accounting view."""
+    """One company's auditable end-of-week accounting view."""
 
-    day: int = Field(ge=1)
+    week: int = Field(ge=1)
     company_id: CompanyId
     tier: CompanyTier
     cash: Money
@@ -709,14 +705,14 @@ class CompanySnapshot(StrictModel):
     inventory_value: Money
     net_worth: Money
     surplus: EconomicDecimal
-    daily_consumer_sales: Quantity
-    daily_expired_quantity: Quantity
+    weekly_consumer_sales: Quantity
+    weekly_expired_quantity: Quantity
 
 
-class DaySnapshot(StrictModel):
-    """System-wide facts captured after a day is settled."""
+class WeekSnapshot(StrictModel):
+    """System-wide facts captured after a week is settled."""
 
-    day: int = Field(ge=1)
+    week: int = Field(ge=1)
     companies: tuple[CompanySnapshot, ...]
     markets: tuple[MarketSummary, ...]
     consumer_demand: Quantity
@@ -724,12 +720,12 @@ class DaySnapshot(StrictModel):
     expired_quantity: Quantity
 
 
-class DayResult(StrictModel):
+class WeekResult(StrictModel):
     """The only public state transition returned by the engine."""
 
     state: WorldState
     events: tuple[DomainEvent, ...]
-    snapshot: DaySnapshot
+    snapshot: WeekSnapshot
 
 
 class CompanyScore(StrictModel):
@@ -876,7 +872,7 @@ class EpisodeResult(StrictModel):
     finished_at: datetime
     policies: tuple[PolicyDescriptor, ...]
     events: tuple[EventRecord, ...]
-    snapshots: tuple[DaySnapshot, ...]
+    snapshots: tuple[WeekSnapshot, ...]
     score: ScoreCard
     quality: EpisodeQuality
 

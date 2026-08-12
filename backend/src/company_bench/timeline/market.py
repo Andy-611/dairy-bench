@@ -1,4 +1,4 @@
-"""Observer-only reconstruction of each minute's continuous market state."""
+"""Observer-only reconstruction of each day's continuous market state."""
 
 from __future__ import annotations
 
@@ -61,15 +61,15 @@ class _MarketReplay:
     last_trade_price: dict[ProductId, PositiveMoney] = field(default_factory=dict)
     state_version: int = 0
 
-    def reset_day(self) -> None:
-        """Open a new empty DAY book and reset daily market statistics."""
+    def reset_week(self) -> None:
+        """Open a new empty weekly book and reset market statistics."""
         self.orders.clear()
         self.last_trade_price.clear()
 
     def apply_system_step(self, step: SystemStepRecord) -> None:
         """Apply the only system transitions that mutate the order book."""
-        if step.kind is SystemEventKind.DAY_OPEN:
-            self.reset_day()
+        if step.kind is SystemEventKind.WEEK_OPEN:
+            self.reset_week()
         elif step.kind is SystemEventKind.MARKET_CLOSE:
             self.orders.clear()
         self.state_version = step.state_version_after
@@ -157,7 +157,9 @@ class _MarketReplay:
         if events_by_order:
             raise MarketProjectionError("trade event references an unknown ladder order")
 
-        arrives_at = record.envelope.issued_at.plus(self.scenario.runtime.delivery_duration_minutes)
+        arrives_on = record.envelope.issued_on.plus_days(
+            self.scenario.runtime.delivery_duration_days
+        )
         trades = tuple(
             TimelineTrade(
                 apply_sequence=record.outcome.apply_sequence,
@@ -169,7 +171,7 @@ class _MarketReplay:
                 buyer_id=event.buyer_id,
                 quantity=event.quantity,
                 unit_price=event.unit_price,
-                arrives_at=arrives_at,
+                arrives_on=arrives_on,
             )
             for event in events
         )
@@ -207,7 +209,7 @@ class _MarketReplay:
             product=action.product,
             remaining_quantity=result.level.quantity,
             limit_price=result.level.limit_price,
-            placed_at=record.envelope.issued_at,
+            placed_on=record.envelope.issued_on,
             priority_sequence=result.priority_sequence,
             queue_ahead_quantity=Decimal(),
         )
@@ -379,51 +381,51 @@ class _MarketReplay:
 
 
 class MarketTimelineProjector:
-    """Project one day's journal behind a single typed read interface."""
+    """Project one week's journal behind a single typed read interface."""
 
-    def project_day(
+    def project_week(
         self,
         scenario: ScenarioSpec,
-        day: int,
+        week: int,
         turns: tuple[TurnRecord, ...],
         system_steps: tuple[SystemStepRecord, ...],
-        minutes: tuple[int, ...],
+        absolute_days: tuple[int, ...],
     ) -> dict[int, MarketFrame]:
-        """Return exact end-state market frames for requested simulation minutes."""
+        """Return exact end-state market frames for requested simulation days."""
         replay = _MarketReplay(scenario)
         entries: tuple[TurnRecord | SystemStepRecord, ...] = (
-            *(record for record in system_steps if record.occurred_at.day + 1 == day),
-            *(record for record in turns if record.turn.sim_time.day + 1 == day),
+            *(record for record in system_steps if record.occurred_on.week == week),
+            *(record for record in turns if record.turn.sim_day.week == week),
         )
-        by_minute: dict[int, list[TurnRecord | SystemStepRecord]] = defaultdict(list)
+        by_day: dict[int, list[TurnRecord | SystemStepRecord]] = defaultdict(list)
         for record in sorted(entries, key=_journal_key):
-            by_minute[_journal_key(record)[0]].append(record)
+            by_day[_journal_key(record)[0]].append(record)
 
-        requested_minutes = frozenset(minutes)
+        requested_days = frozenset(absolute_days)
         frames: dict[int, MarketFrame] = {}
-        for minute in sorted(requested_minutes | by_minute.keys()):
+        for absolute_day in sorted(requested_days | by_day.keys()):
             order_flow: list[MarketOrderFlowItem] = []
             trades: list[TimelineTrade] = []
-            for record in by_minute.get(minute, ()):
+            for record in by_day.get(absolute_day, ()):
                 if isinstance(record, TurnRecord):
                     projection = replay.apply_turn(record)
                     order_flow.extend(projection.flows)
                     trades.extend(projection.trades)
                 else:
                     replay.apply_system_step(record)
-            if minute in requested_minutes:
-                frames[minute] = replay.frame(tuple(order_flow), tuple(trades))
+            if absolute_day in requested_days:
+                frames[absolute_day] = replay.frame(tuple(order_flow), tuple(trades))
         return frames
 
 
 def _journal_key(record: TurnRecord | SystemStepRecord) -> tuple[int, int, int]:
     if isinstance(record, TurnRecord):
         return (
-            record.turn.sim_time.absolute_minute,
+            record.turn.sim_day.absolute_day,
             record.journal_sequence or record.outcome.apply_sequence,
             record.outcome.apply_sequence,
         )
-    return (record.occurred_at.absolute_minute, record.journal_sequence, 0)
+    return (record.occurred_on.absolute_day, record.journal_sequence, 0)
 
 
 def _settled_remainder(

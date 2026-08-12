@@ -35,7 +35,7 @@ from company_bench.runtime.models import (
     QuoteLevel,
     QuoteLevelAction,
     QuoteLevelResult,
-    SimTime,
+    SimDay,
 )
 
 __all__ = [
@@ -74,7 +74,7 @@ class _QueueOrder(Protocol):
     side: MarketSide
     remaining_quantity: PositiveQuantity
     limit_price: PositiveMoney
-    placed_at: SimTime
+    placed_on: SimDay
     priority_sequence: int
 
 
@@ -88,7 +88,7 @@ class PriceTimeQueue:
     def priority(order: _QueueOrder) -> tuple[int, int, str]:
         """Return one order's time-priority key within a price level."""
         return (
-            order.placed_at.absolute_minute,
+            order.placed_on.absolute_day,
             order.priority_sequence,
             order.order_id,
         )
@@ -359,7 +359,7 @@ class _BaseOrder(StrictModel):
     product: ProductId
     remaining_quantity: PositiveQuantity
     limit_price: PositiveMoney
-    placed_at: SimTime
+    placed_on: SimDay
     priority_sequence: int = Field(ge=1)
 
 
@@ -512,7 +512,7 @@ class MarketState(StrictModel):
             bids=_price_levels(self.orders, MarketSide.BUY),
             asks=_price_levels(self.orders, MarketSide.SELL),
             last_trade_price=self.last_trade_price,
-            daily_volume=self.volume,
+            weekly_volume=self.volume,
         )
 
     def company_order_views(self, company_id: CompanyId) -> tuple[OpenOrderView, ...]:
@@ -552,7 +552,7 @@ class ContinuousSpotMarket:
         *,
         owner_id: CompanyId,
         ladder: QuoteLadder,
-        placed_at: SimTime,
+        placed_on: SimDay,
         order_identity_factory: OrderIdentityFactory,
         trade_id_factory: TradeIdFactory,
     ) -> QuoteLadderExecution:
@@ -602,7 +602,7 @@ class ContinuousSpotMarket:
                     side=ladder.side,
                     quantity=target.level.quantity,
                     limit_price=target.level.limit_price,
-                    placed_at=placed_at,
+                    placed_on=placed_on,
                     priority_sequence=identity.priority_sequence,
                     trade_id_factory=lambda offset, base=fill_offset: trade_id_factory(
                         base + offset
@@ -648,7 +648,7 @@ class ContinuousSpotMarket:
         side: MarketSide,
         quantity: OrderQuantity,
         limit_price: PositiveMoney,
-        placed_at: SimTime,
+        placed_on: SimDay,
         priority_sequence: int,
         trade_id_factory: TradeIdFactory,
     ) -> tuple[TradeFill, ...]:
@@ -662,7 +662,7 @@ class ContinuousSpotMarket:
             side=side,
             quantity=quantity,
             limit_price=limit_price,
-            placed_at=placed_at,
+            placed_on=placed_on,
             priority_sequence=priority_sequence,
         )
         return self._match(order, trade_id_factory)
@@ -792,7 +792,7 @@ class ContinuousSpotMarket:
         side: MarketSide,
         quantity: OrderQuantity,
         limit_price: PositiveMoney,
-        placed_at: SimTime,
+        placed_on: SimDay,
         priority_sequence: int,
     ) -> LimitOrder:
         if quantity <= ZERO:
@@ -808,7 +808,7 @@ class ContinuousSpotMarket:
             "product": self._state.product,
             "remaining_quantity": quantity,
             "limit_price": limit_price,
-            "placed_at": placed_at,
+            "placed_on": placed_on,
             "priority_sequence": priority_sequence,
         }
         if side is MarketSide.BUY:
@@ -1063,7 +1063,7 @@ def _open_order_view(
         product=order.product,
         remaining_quantity=order.remaining_quantity,
         limit_price=order.limit_price,
-        placed_at=order.placed_at,
+        placed_on=order.placed_on,
         priority_sequence=order.priority_sequence,
         queue_ahead_quantity=PriceTimeQueue.quantity_ahead(order, candidates),
     )
@@ -1085,8 +1085,8 @@ def _cash_value(quantity: Decimal, unit_price: Decimal) -> Money:
 
 def _lot_priority(lot: InventoryLot) -> tuple[int, int, str, str]:
     return (
-        lot.expires_end_of_day,
-        lot.produced_day,
+        lot.expires_end_of_week,
+        lot.produced_week,
         lot.product.value,
         lot.lot_id,
     )

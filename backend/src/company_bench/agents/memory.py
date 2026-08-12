@@ -15,7 +15,7 @@ from company_bench.runtime.models import (
     TurnRecord,
 )
 
-_CHECKPOINT_SCHEMA_VERSION: Final = 7
+_CHECKPOINT_SCHEMA_VERSION: Final = 8
 _DEFAULT_MAX_TOKENS: Final = 16_384
 _DEFAULT_CHARS_PER_TOKEN: Final = 2
 _SUMMARY_OMISSION: Final = "[older memory omitted]"
@@ -27,7 +27,7 @@ class MemorySummary(StrictModel):
     run_id: Identifier
     company_id: CompanyId
     through_turn_id: Identifier
-    through_absolute_minute: int = Field(ge=0)
+    through_absolute_day: int = Field(ge=1)
     through_apply_sequence: int = Field(ge=1)
     exchange_count: int = Field(ge=1)
     source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -40,7 +40,7 @@ class MemoryExchange(StrictModel):
     run_id: Identifier
     company_id: CompanyId
     turn_id: Identifier
-    sim_minute: int = Field(ge=0)
+    absolute_day: int = Field(ge=1)
     apply_sequence: int = Field(ge=1)
     resulting_state_version: int = Field(ge=0)
     decision: CompanyDecision
@@ -69,7 +69,7 @@ class MemoryExchange(StrictModel):
             run_id=record.run_id,
             company_id=record.turn.company_id,
             turn_id=record.turn.turn_id,
-            sim_minute=record.turn.sim_time.absolute_minute,
+            absolute_day=record.turn.sim_day.absolute_day,
             apply_sequence=record.outcome.apply_sequence,
             resulting_state_version=record.outcome.resulting_state_version,
             decision=record.envelope.decision,
@@ -89,7 +89,7 @@ type MemorySummarizer = Callable[
 class AgentCheckpoint(StrictModel):
     """Portable state required to restore one company's memory exactly."""
 
-    schema_version: Literal[7] = _CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[8] = _CHECKPOINT_SCHEMA_VERSION
     run_id: Identifier
     company_id: CompanyId
     revision: int = Field(ge=0)
@@ -102,7 +102,7 @@ class AgentCheckpoint(StrictModel):
     def validate_history(self) -> Self:
         """Require one ordered, company-private, internally complete history."""
         compacted = 0
-        previous_minute = -1
+        previous_day = 0
         previous_apply_sequence = 0
         if self.summary is not None:
             if self.summary.run_id != self.run_id:
@@ -110,7 +110,7 @@ class AgentCheckpoint(StrictModel):
             if self.summary.company_id != self.company_id:
                 raise ValueError("summary company_id must match the checkpoint")
             compacted = self.summary.exchange_count
-            previous_minute = self.summary.through_absolute_minute
+            previous_day = self.summary.through_absolute_day
             previous_apply_sequence = self.summary.through_apply_sequence
 
         turn_ids: set[str] = set()
@@ -121,12 +121,12 @@ class AgentCheckpoint(StrictModel):
                 raise ValueError("exchange company_id must match the checkpoint")
             if exchange.turn_id in turn_ids:
                 raise ValueError("turn_id must be unique in active memory")
-            if exchange.sim_minute < previous_minute:
+            if exchange.absolute_day < previous_day:
                 raise ValueError("memory exchanges must be chronological")
             if exchange.apply_sequence <= previous_apply_sequence:
                 raise ValueError("memory apply_sequence must increase")
             turn_ids.add(exchange.turn_id)
-            previous_minute = exchange.sim_minute
+            previous_day = exchange.absolute_day
             previous_apply_sequence = exchange.apply_sequence
 
         if self.summary is not None and self.summary.through_turn_id in turn_ids:
@@ -277,7 +277,7 @@ class ConversationMemory:
             run_id=self._run_id,
             company_id=self._company_id,
             through_turn_id=latest.turn_id,
-            through_absolute_minute=latest.sim_minute,
+            through_absolute_day=latest.absolute_day,
             through_apply_sequence=latest.apply_sequence,
             exchange_count=(previous.exchange_count if previous else 0) + len(removed),
             source_hash=_source_hash(previous, removed),
@@ -355,7 +355,7 @@ def _exchange_line(exchange: MemoryExchange) -> str:
     detail = exchange.reason or "-"
     detail = " ".join(detail.split())
     return (
-        f"{exchange.turn_id}@{exchange.sim_minute}:"
+        f"{exchange.turn_id}@day{exchange.absolute_day}:"
         f"{exchange.decision.model_dump_json()}"
         f"=>{'accepted' if exchange.accepted else 'rejected'}"
         f"[state={exchange.resulting_state_version},"

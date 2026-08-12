@@ -6,7 +6,7 @@ import type {
   AttentionPlanView,
   CompanyResultView,
   CompanyRole,
-  DailySnapshotView,
+  WeeklySnapshotView,
   DecimalText,
   DecisionDispositionSource,
   DecisionStateChangeView,
@@ -25,15 +25,16 @@ import type {
   QuoteAlertView,
   RunJobView,
   RunRequest,
+  RunStopReason,
   RunStatus,
   ScoreView,
   SystemTimelineItemView,
   TimelineContextView,
   TimelineDecisionView,
-  TimelineDaySummaryView,
-  TimelineDayView,
+  TimelineDayFrameView,
   TimelineDetailView,
-  TimelineMomentView,
+  TimelineWeekSummaryView,
+  TimelineWeekView,
   TokenUsageView,
   TracePreviewView,
   TurnTimelineItemView,
@@ -147,16 +148,16 @@ export class DairyBenchApi {
     return parseEpisode(episode, parseInvocations(invocations));
   }
 
-  public async timelineDay(
+  public async timelineWeek(
     runId: string,
-    day: number,
+    week: number,
     signal?: AbortSignal,
-  ): Promise<TimelineDayView> {
+  ): Promise<TimelineWeekView> {
     const payload = await this.getJson(
-      `/api/runs/${encodeURIComponent(runId)}/timeline?day=${day}`,
+      `/api/runs/${encodeURIComponent(runId)}/timeline?week=${week}`,
       signal,
     );
-    return parseTimelineDay(payload);
+    return parseTimelineWeek(payload);
   }
 
   public async timelineDetail(
@@ -263,12 +264,16 @@ function parseRunJob(payload: unknown): RunJobView {
     seed: number(job.seed, "seed"),
     sourceRunId: nullableText(job.source_run_id, "source_run_id"),
     scenarioId: text(job.scenario_id, "scenario_id"),
-    currentDay: number(job.current_day, "current_day"),
-    totalDays: number(job.total_days, "total_days"),
+    currentAbsoluteDay: number(
+      job.current_absolute_day,
+      "current_absolute_day",
+    ),
+    totalWeeks: number(job.total_weeks, "total_weeks"),
     submittedAt: dateTime(job.submitted_at, "submitted_at"),
     startedAt: nullableDateTime(job.started_at, "started_at"),
     finishedAt: nullableDateTime(job.finished_at, "finished_at"),
     errorMessage: nullableText(job.error_message, "error_message"),
+    stopReason: nullableRunStopReason(job.stop_reason, "stop_reason"),
     quality:
       job.quality === null
         ? null
@@ -322,7 +327,7 @@ function parseEpisode(
     runId: text(episode.run_id, "run_id"),
     scenarioId: text(scenario.scenario_id, "scenario.scenario_id"),
     seed: number(episode.seed, "seed"),
-    days: number(scenario.days, "scenario.days"),
+    weeks: number(scenario.weeks, "scenario.weeks"),
     agentUsage: summarizeAgentUsage(invocations),
     score: parseScore(score),
     quality: parseEpisodeQuality(episode.quality, "quality"),
@@ -500,17 +505,18 @@ function parseCompany(
   };
 }
 
-function parseSnapshots(payload: unknown): readonly DailySnapshotView[] {
-  return array(payload, "snapshots").flatMap((item, dayIndex) => {
-    const day = record(item, `snapshots[${dayIndex}]`);
-    return array(day.companies, `snapshots[${dayIndex}].companies`).map(
+function parseSnapshots(payload: unknown): readonly WeeklySnapshotView[] {
+  return array(payload, "snapshots").flatMap((item, weekIndex) => {
+    const week = record(item, `snapshots[${weekIndex}]`);
+    const weekNumber = number(week.week, `snapshots[${weekIndex}].week`);
+    return array(week.companies, `snapshots[${weekIndex}].companies`).map(
       (company, companyIndex) => {
         const snapshot = record(
           company,
-          `snapshots[${dayIndex}].companies[${companyIndex}]`,
+          `snapshots[${weekIndex}].companies[${companyIndex}]`,
         );
         return {
-          day: number(snapshot.day, "snapshot.day"),
+          week: weekNumber,
           companyId: text(snapshot.company_id, "snapshot.company_id"),
           cash: decimalText(snapshot.cash, "snapshot.cash"),
           inventoryValue: decimalText(
@@ -519,12 +525,12 @@ function parseSnapshots(payload: unknown): readonly DailySnapshotView[] {
           ),
           cumulativeSurplus: decimalText(snapshot.surplus, "snapshot.surplus"),
           consumerSalesQuantity: decimalText(
-            snapshot.daily_consumer_sales,
-            "snapshot.daily_consumer_sales",
+            snapshot.weekly_consumer_sales,
+            "snapshot.weekly_consumer_sales",
           ),
           expiredQuantity: decimalText(
-            snapshot.daily_expired_quantity,
-            "snapshot.daily_expired_quantity",
+            snapshot.weekly_expired_quantity,
+            "snapshot.weekly_expired_quantity",
           ),
         };
       },
@@ -532,17 +538,17 @@ function parseSnapshots(payload: unknown): readonly DailySnapshotView[] {
   });
 }
 
-function parseTimelineDay(payload: unknown): TimelineDayView {
-  const timeline = record(payload, "TimelineDay");
+function parseTimelineWeek(payload: unknown): TimelineWeekView {
+  const timeline = record(payload, "TimelineWeek");
   return {
     context: parseTimelineContext(timeline.context, "context"),
-    selectedDay: number(timeline.selected_day, "selected_day"),
-    daySummaries: array(timeline.day_summaries, "day_summaries").map(
+    selectedWeek: number(timeline.selected_week, "selected_week"),
+    weekSummaries: array(timeline.week_summaries, "week_summaries").map(
       (item, index) =>
-        parseTimelineDaySummary(item, `day_summaries[${index}]`),
+        parseTimelineWeekSummary(item, `week_summaries[${index}]`),
     ),
-    moments: array(timeline.moments, "moments").map((item, index) =>
-      parseTimelineMoment(item, `moments[${index}]`),
+    days: array(timeline.days, "days").map((item, index) =>
+      parseTimelineDayFrame(item, `days[${index}]`),
     ),
   };
 }
@@ -589,7 +595,7 @@ function parseTimelineContext(
       context.scenario_version,
       `${path}.scenario_version`,
     ),
-    totalDays: number(context.total_days, `${path}.total_days`),
+    totalWeeks: number(context.total_weeks, `${path}.total_weeks`),
     status: runStatus(context.status, `${path}.status`),
     mode: text(context.mode, `${path}.mode`),
     sourceRunId: nullableText(context.source_run_id, `${path}.source_run_id`),
@@ -611,10 +617,10 @@ function parseTimelineContext(
       context.source_usage,
       `${path}.source_usage`,
     ),
-    checkpointMinute:
-      context.checkpoint_at === null
+    checkpointDay:
+      context.checkpoint_on === null
         ? null
-        : simMinute(context.checkpoint_at, `${path}.checkpoint_at`),
+        : simDay(context.checkpoint_on, `${path}.checkpoint_on`),
     checkpointStateVersion: nullableNumber(
       context.checkpoint_state_version,
       `${path}.checkpoint_state_version`,
@@ -629,7 +635,10 @@ function parseRunDiagnostics(
 ): RunDiagnosticsView {
   const diagnostics = record(payload, path);
   return {
-    completedDays: number(diagnostics.completed_days, `${path}.completed_days`),
+    completedWeeks: number(
+      diagnostics.completed_weeks,
+      `${path}.completed_weeks`,
+    ),
     benchmarkEligible: nullableBoolean(
       diagnostics.benchmark_eligible,
       `${path}.benchmark_eligible`,
@@ -647,10 +656,13 @@ function parseRunDiagnostics(
       `${path}.attention_rejections`,
     ),
     tradeCount: number(diagnostics.trade_count, `${path}.trade_count`),
-    lastTradeDay: nullableNumber(diagnostics.last_trade_day, `${path}.last_trade_day`),
-    zeroTradeDayStreak: number(
-      diagnostics.zero_trade_day_streak,
-      `${path}.zero_trade_day_streak`,
+    lastTradeWeek: nullableNumber(
+      diagnostics.last_trade_week,
+      `${path}.last_trade_week`,
+    ),
+    zeroTradeWeekStreak: number(
+      diagnostics.zero_trade_week_streak,
+      `${path}.zero_trade_week_streak`,
     ),
     consumerDemand: decimalText(diagnostics.consumer_demand, `${path}.consumer_demand`),
     consumerSales: decimalText(diagnostics.consumer_sales, `${path}.consumer_sales`),
@@ -671,13 +683,13 @@ function parseRunDiagnostics(
   };
 }
 
-function parseTimelineDaySummary(
+function parseTimelineWeekSummary(
   payload: unknown,
   path: string,
-): TimelineDaySummaryView {
+): TimelineWeekSummaryView {
   const summary = record(payload, path);
   return {
-    day: number(summary.day, `${path}.day`),
+    week: number(summary.week, `${path}.week`),
     turnCount: number(summary.turn_count, `${path}.turn_count`),
     acceptedCount: number(summary.accepted_count, `${path}.accepted_count`),
     rejectedCount: number(summary.rejected_count, `${path}.rejected_count`),
@@ -702,30 +714,28 @@ function parseTimelineDaySummary(
   };
 }
 
-function parseTimelineMoment(
+function parseTimelineDayFrame(
   payload: unknown,
   path: string,
-): TimelineMomentView {
-  const moment = record(payload, path);
-  const rawTurns = array(moment.turns, `${path}.turns`);
+): TimelineDayFrameView {
+  const day = record(payload, path);
   return {
-    simMinute: simMinute(moment.sim_time, `${path}.sim_time`),
-    totalTurnCount: rawTurns.length,
-    systemSteps: array(moment.system_steps, `${path}.system_steps`).map(
+    simDay: simDay(day.sim_day, `${path}.sim_day`),
+    systemSteps: array(day.system_steps, `${path}.system_steps`).map(
       (value, index) =>
         parseSystemTimelineItem(value, `${path}.system_steps[${index}]`),
     ),
-    turns: rawTurns.map((value, index) =>
+    turns: array(day.turns, `${path}.turns`).map((value, index) =>
       parseTurnTimelineItem(value, `${path}.turns[${index}]`),
     ),
-    market: parseMarketFrame(moment.market, `${path}.market`),
+    market: parseMarketFrame(day.market, `${path}.market`),
   };
 }
 
 function parseMarketFrame(
   payload: unknown,
   path: string,
-): TimelineMomentView["market"] {
+): TimelineDayFrameView["market"] {
   const frame = record(payload, path);
   return {
     stateVersion: number(frame.state_version, `${path}.state_version`),
@@ -747,7 +757,7 @@ function parseMarketFrame(
 function parseMarketOrderFlow(
   payload: unknown,
   path: string,
-): TimelineMomentView["market"]["orderFlow"][number] {
+): TimelineDayFrameView["market"]["orderFlow"][number] {
   const flow = record(payload, path);
   const action = text(flow.action, `${path}.action`);
   const applySequence = number(flow.apply_sequence, `${path}.apply_sequence`);
@@ -820,7 +830,7 @@ function parseMarketMatch(
 function parseTimelineTrade(
   payload: unknown,
   path: string,
-): TimelineMomentView["market"]["trades"][number] {
+): TimelineDayFrameView["market"]["trades"][number] {
   const trade = record(payload, path);
   return {
     applySequence: number(trade.apply_sequence, `${path}.apply_sequence`),
@@ -832,14 +842,14 @@ function parseTimelineTrade(
     buyerId: text(trade.buyer_id, `${path}.buyer_id`),
     quantity: decimalText(trade.quantity, `${path}.quantity`),
     unitPrice: decimalText(trade.unit_price, `${path}.unit_price`),
-    arrivesAtMinute: simMinute(trade.arrives_at, `${path}.arrives_at`),
+    arrivesOn: simDay(trade.arrives_on, `${path}.arrives_on`),
   };
 }
 
 function parseObserverOrderBook(
   payload: unknown,
   path: string,
-): TimelineMomentView["market"]["closingOrderBooks"][number] {
+): TimelineDayFrameView["market"]["closingOrderBooks"][number] {
   const book = record(payload, path);
   return {
     product: text(book.product, `${path}.product`),
@@ -862,7 +872,7 @@ function parseObserverOrderBook(
 function parseMarketPriceLevel(
   payload: unknown,
   path: string,
-): TimelineMomentView["market"]["closingOrderBooks"][number]["bids"][number] {
+): TimelineDayFrameView["market"]["closingOrderBooks"][number]["bids"][number] {
   const level = record(payload, path);
   return {
     unitPrice: decimalText(level.unit_price, `${path}.unit_price`),
@@ -906,12 +916,20 @@ function parseTurnTimelineItem(
     companyId,
     companyName: companyLabel(companyId, companyName),
     role: role(item.tier, `${path}.tier`),
-    simMinute: simMinute(item.sim_time, `${path}.sim_time`),
+    simDay: simDay(item.sim_day, `${path}.sim_day`),
     stateVersion: number(item.state_version, `${path}.state_version`),
     applySequence: number(item.apply_sequence, `${path}.apply_sequence`),
     journalSequence: nullableNumber(
       item.journal_sequence,
       `${path}.journal_sequence`,
+    ),
+    turnNumberThisWeek: number(
+      item.turn_number_this_week,
+      `${path}.turn_number_this_week`,
+    ),
+    turnLimitThisWeek: number(
+      item.turn_limit_this_week,
+      `${path}.turn_limit_this_week`,
     ),
     wakeSignals: array(item.wake_signals, `${path}.wake_signals`).map(
       (value, index) =>
@@ -946,14 +964,14 @@ function parseTurnTimelineItem(
       (value, index) =>
         parseDecisionStateChange(value, `${path}.state_changes[${index}]`),
     ),
-    nextAvailableMinute:
-      item.next_available_at === null
+    nextAvailableOn:
+      item.next_available_on === null
         ? null
-        : simMinute(item.next_available_at, `${path}.next_available_at`),
-    reviewMinute:
-      item.review_at === null
+        : simDay(item.next_available_on, `${path}.next_available_on`),
+    reviewOn:
+      item.review_on === null
         ? null
-        : simMinute(item.review_at, `${path}.review_at`),
+        : simDay(item.review_on, `${path}.review_on`),
     sourceRunId:
       replayOrigin === null
         ? null
@@ -988,7 +1006,7 @@ function parseSystemTimelineItem(
   return {
     entryType: "system",
     entryId: text(item.entry_id, `${path}.entry_id`),
-    simMinute: simMinute(item.sim_time, `${path}.sim_time`),
+    simDay: simDay(item.sim_day, `${path}.sim_day`),
     kind: text(item.kind, `${path}.kind`),
     journalSequence: nullableNumber(
       item.journal_sequence,
@@ -1125,7 +1143,7 @@ function parseOpenOrder(
       `${path}.remaining_quantity`,
     ),
     limitPrice: decimalText(order.limit_price, `${path}.limit_price`),
-    placedAtMinute: simMinute(order.placed_at, `${path}.placed_at`),
+    placedOn: simDay(order.placed_on, `${path}.placed_on`),
     prioritySequence: number(
       order.priority_sequence,
       `${path}.priority_sequence`,
@@ -1166,7 +1184,7 @@ function parseOrderBook(
       market.last_trade_price,
       `${path}.last_trade_price`,
     ),
-    dailyVolume: decimalText(market.daily_volume, `${path}.daily_volume`),
+    weeklyVolume: decimalText(market.weekly_volume, `${path}.weekly_volume`),
   };
 }
 
@@ -1194,9 +1212,9 @@ function parseInventoryExpiry(
     const bucket = record(value, itemPath);
     return {
       product: text(bucket.product, `${itemPath}.product`),
-      expiresEndOfDay: number(
-        bucket.expires_end_of_day,
-        `${itemPath}.expires_end_of_day`,
+      expiresEndOfWeek: number(
+        bucket.expires_end_of_week,
+        `${itemPath}.expires_end_of_week`,
       ),
       availableQuantity: decimalText(
         bucket.available_quantity,
@@ -1219,16 +1237,16 @@ function parseIncomingDelivery(
     tradeId: text(delivery.trade_id, `${path}.trade_id`),
     product: text(delivery.product, `${path}.product`),
     quantity: decimalText(delivery.quantity, `${path}.quantity`),
-    arrivesAtMinute: simMinute(delivery.arrives_at, `${path}.arrives_at`),
+    arrivesOn: simDay(delivery.arrives_on, `${path}.arrives_on`),
     expiryBuckets: array(delivery.expiry_buckets, `${path}.expiry_buckets`).map(
       (value, index) => {
         const bucketPath = `${path}.expiry_buckets[${index}]`;
         const bucket = record(value, bucketPath);
         return {
           quantity: decimalText(bucket.quantity, `${bucketPath}.quantity`),
-          expiresEndOfDay: number(
-            bucket.expires_end_of_day,
-            `${bucketPath}.expires_end_of_day`,
+          expiresEndOfWeek: number(
+            bucket.expires_end_of_week,
+            `${bucketPath}.expires_end_of_week`,
           ),
         };
       },
@@ -1248,7 +1266,7 @@ function parseOperationJob(
   return {
     jobId: text(operation.job_id, `${path}.job_id`),
     kind,
-    completesAtMinute: simMinute(operation.completes_at, `${path}.completes_at`),
+    completesOn: simDay(operation.completes_on, `${path}.completes_on`),
     outputProduct: text(operation.output_product, `${path}.output_product`),
     outputQuantity: decimalText(
       operation.output_quantity,
@@ -1426,9 +1444,9 @@ function parseTimelineDecision(
 function parseAttentionPlan(payload: unknown, path: string): AttentionPlanView {
   const attention = record(payload, path);
   return {
-    reviewAfterMinutes: nullableNumber(
-      attention.review_after_minutes,
-      `${path}.review_after_minutes`,
+    reviewAfterDays: nullableNumber(
+      attention.review_after_days,
+      `${path}.review_after_days`,
     ),
     alerts: array(attention.alerts, `${path}.alerts`).map((value, index) =>
       parseQuoteAlert(value, `${path}.alerts[${index}]`),
@@ -1634,9 +1652,9 @@ function parseAgentTrace(payload: unknown, path: string): AgentTraceView {
   return { preview: parseTracePreview(trace.preview, `${path}.preview`) };
 }
 
-function simMinute(payload: unknown, path: string): number {
-  const time = record(payload, path);
-  return number(time.absolute_minute, `${path}.absolute_minute`);
+function simDay(payload: unknown, path: string): { readonly absoluteDay: number } {
+  const day = record(payload, path);
+  return { absoluteDay: number(day.absolute_day, `${path}.absolute_day`) };
 }
 
 function jsonValue(value: unknown, path: string): JsonValue {
@@ -1765,6 +1783,19 @@ function invocationOutcome(value: unknown, path: string): InvocationOutcome {
     return value;
   }
   throw new Error(`Backend field ${path} is not a known invocation outcome.`);
+}
+
+function nullableRunStopReason(
+  value: unknown,
+  path: string,
+): RunStopReason | null {
+  if (value === null) {
+    return null;
+  }
+  if (value === "user_requested" || value === "quota_exhausted") {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known stop reason.`);
 }
 
 function protocolIssueKind(value: unknown, path: string): ProtocolIssueKind {

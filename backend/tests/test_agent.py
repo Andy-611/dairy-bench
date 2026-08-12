@@ -16,6 +16,7 @@ from company_bench.agents.contracts import (
     ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
+    ModelQuotaExhaustedError,
 )
 from company_bench.agents.factory import AgentFactory
 from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
@@ -28,7 +29,13 @@ from company_bench.domain.models import (
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
-from company_bench.runs.models import InvocationOutcome, RunJob, RunStatus, TokenUsage
+from company_bench.runs.models import (
+    InvocationOutcome,
+    RunJob,
+    RunStatus,
+    RunStopReason,
+    TokenUsage,
+)
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
@@ -39,7 +46,6 @@ from company_bench.runtime.models import (
     DecisionStatus,
     IdleDecision,
     RejectionCategory,
-    SimTime,
     TurnRecord,
     WakeReason,
 )
@@ -177,6 +183,17 @@ class _MisconfiguredGateway(_UnavailableGateway):
         raise ModelConfigurationError("credential rejected")
 
 
+class _QuotaExhaustedGateway(_UnavailableGateway):
+    """Reject a request whose paid provider balance is exhausted."""
+
+    async def generate_decision(
+        self,
+        request: DecisionModelRequest,
+    ) -> DecisionModelResult:
+        self.decision_requests.append(request)
+        raise ModelQuotaExhaustedError("paid quota exhausted")
+
+
 class _BrokenGateway(_UnavailableGateway):
     """Raise an unclassified implementation failure."""
 
@@ -215,11 +232,11 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
     turn = AgentTurn(
         turn_id="failed_run.farm_a.t1",
         company_id=first_observation.company_id,
-        sim_time=SimTime(absolute_minute=540),
+        sim_day=first_observation.sim_day,
         state_version=0,
-        turn_number_today=1,
-        turn_limit_today=first_observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.DAY_OPEN,),
+        turn_number_this_week=1,
+        turn_limit_this_week=first_observation.runtime.max_turns_per_company_week,
+        wake_reasons=(WakeReason.WEEK_OPEN,),
         observation=first_observation,
         available_cash=first_observation.cash,
         marked_surplus=Decimal(),
@@ -248,7 +265,7 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
     assert invocation.attempts == 2
     assert invocation.latency_ms == 123
     assert invocation.domain_turn_id == turn.turn_id
-    assert invocation.sim_minute == turn.sim_time.absolute_minute
+    assert invocation.absolute_day == turn.sim_day.absolute_day
     assert invocation.prompt_version == DECISION_PROMPT_VERSION
 
     protocol_error = "ModelOutputError: invalid output"
@@ -257,7 +274,7 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
         turn_id=turn.turn_id,
         decision_id="failed_decision",
         company_id=turn.company_id,
-        issued_at=turn.sim_time,
+        issued_on=turn.sim_day,
         state_version=turn.state_version,
         decision=decision,
     )
@@ -265,14 +282,14 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
         turn_id=turn.turn_id,
         decision_id=envelope.decision_id,
         company_id=turn.company_id,
-        occurred_at=turn.sim_time,
+        occurred_on=turn.sim_day,
         status=DecisionStatus.REJECTED,
         accepted=False,
         rejection_category=RejectionCategory.PROTOCOL,
         reason=f"{PROTOCOL_ERROR_PREFIX}{protocol_error}",
         resulting_state_version=turn.state_version,
         apply_sequence=1,
-        next_available_at=turn.sim_time.plus(1),
+        next_available_on=turn.sim_day.plus_days(1),
     )
     agent.remember(
         TurnRecord(
@@ -334,7 +351,7 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     interrupted = asyncio.run(_run_model_job_until(repository, factory, RunStatus.INTERRUPTED))
 
     assert interrupted.status is RunStatus.INTERRUPTED
-    assert interrupted.current_day == 0
+    assert interrupted.current_absolute_day == 0
     assert "PolicyInfrastructureError" in (interrupted.error_message or "")
     assert repository.get(interrupted.run_id) is None
     assert repository.get_checkpoint(interrupted.run_id) is not None
@@ -356,6 +373,28 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     assert {gateway.decision_requests[0].turn.company_id for gateway in gateways} == {
         company.company_id for company in DAIRY_S9_SCENARIO.companies
     }
+
+
+def test_quota_exhaustion_stops_job_with_checkpoint_for_explicit_resume() -> None:
+    repository = InMemoryRunStore()
+    factory = AgentFactory(
+        DAIRY_S9_SCENARIO,
+        repository,
+        newapi_config=_config(),
+        model_capabilities=_capabilities(),
+        gateway_factory=_RecordingGatewayFactory(_QuotaExhaustedGateway),
+    )
+
+    stopped = asyncio.run(_run_model_job_until(repository, factory, RunStatus.STOPPED))
+
+    assert stopped.stop_reason is RunStopReason.QUOTA_EXHAUSTED
+    assert "PolicyQuotaExhaustedError" in (stopped.error_message or "")
+    assert repository.get(stopped.run_id) is None
+    assert repository.get_checkpoint(stopped.run_id) is not None
+    assert all(
+        invocation.outcome is InvocationOutcome.INFRASTRUCTURE_ERROR
+        for invocation in repository.list_invocations(stopped.run_id)
+    )
 
 
 @pytest.mark.parametrize(

@@ -368,7 +368,9 @@ button:disabled {
 }
 
 .final-score-card {
+  container-type: inline-size;
   display: flex;
+  min-width: 0;
   min-height: 260px;
   padding: 25px;
   color: #fff;
@@ -390,16 +392,19 @@ button:disabled {
 .final-score-value {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  min-width: 0;
+  gap: 6px;
 }
 
 .final-score-value strong {
+  min-width: 0;
   font-family: Georgia, "Songti SC", serif;
-  font-size: clamp(66px, 7vw, 108px);
+  font-size: clamp(44px, 17cqi, 72px);
   font-variant-numeric: tabular-nums;
   font-weight: 500;
-  letter-spacing: -0.055em;
-  line-height: 0.82;
+  letter-spacing: -0.045em;
+  line-height: 0.9;
+  white-space: nowrap;
 }
 
 .final-score-value small {
@@ -484,12 +489,28 @@ button:disabled {
   flex-direction: column;
 }
 
-.evaluation-metric-list dt strong {
-  overflow: hidden;
+.math-symbol {
+  display: inline-flex;
+  align-items: baseline;
   color: var(--green-dark);
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 11px;
-  text-overflow: ellipsis;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.math-symbol var {
+  font-family: inherit;
+  font-style: italic;
+}
+
+.math-symbol sub {
+  margin-left: 1px;
+  font-size: 0.68em;
+  font-style: normal;
+  line-height: 0;
+  vertical-align: -0.36em;
 }
 
 .evaluation-metric-list dt small,
@@ -547,19 +568,20 @@ button:disabled {
 
 .formula-expression {
   display: grid;
-  gap: 4px;
-  overflow-x: auto;
+  align-content: start;
+  gap: 9px;
+  min-width: 0;
 }
 
-.formula-expression code {
-  overflow-x: auto;
-  padding-bottom: 2px;
+.math-formula {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 0;
   color: #173e33;
-  font-size: 11px;
-  font-weight: 800;
-  line-height: 1.5;
-  scrollbar-width: thin;
-  white-space: nowrap;
+  font-family: "Cambria Math", "STIX Two Math", "Times New Roman", serif;
+  font-size: clamp(14px, 1.05vw, 18px);
+  line-height: 1.35;
 }
 
 .formula-grid p,
@@ -572,6 +594,11 @@ button:disabled {
 
 .formula-note {
   margin-top: 12px;
+}
+
+.formula-note .math-symbol {
+  color: inherit;
+  font-size: 1.08em;
 }
 
 .token-heading {
@@ -1501,7 +1528,7 @@ footer {
   font-size: 12px;
 }
 
-.day-navigator {
+.week-navigator {
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr) 38px;
   align-items: center;
@@ -1509,7 +1536,7 @@ footer {
   padding: 0 28px 16px;
 }
 
-.day-navigator > button {
+.week-navigator > button {
   width: 38px;
   height: 38px;
   color: var(--green-dark);
@@ -1518,34 +1545,44 @@ footer {
   background: #fff;
 }
 
-.day-navigator > button:disabled {
+.week-navigator > button:disabled {
   cursor: default;
   opacity: 0.35;
 }
 
-.day-density-strip {
-  display: grid;
-  grid-template-columns: repeat(30, minmax(22px, 1fr));
-  gap: 3px;
+.week-density-strip {
+  display: flex;
+  min-width: 0;
+  gap: 4px;
   overflow-x: auto;
-  padding: 3px;
+  padding: 3px 4px;
+  scroll-behavior: smooth;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  touch-action: pan-x;
 }
 
-.day-density-strip button {
+.week-density-strip::-webkit-scrollbar {
+  display: none;
+}
+
+.week-density-strip button {
   position: relative;
-  min-width: 22px;
+  min-width: 44px;
+  flex: 0 0 clamp(44px, 5.5vw, 76px);
   height: 34px;
   overflow: hidden;
   padding: 0;
-  color: #557066;
+  color: #fff;
   border: 0;
   border-radius: 5px;
   background: rgb(23 108 87 / var(--activity));
   font-size: 9px;
   font-variant-numeric: tabular-nums;
+  scroll-snap-align: center;
 }
 
-.day-density-strip button.selected {
+.week-density-strip button.selected {
   color: #fff;
   outline: 2px solid var(--green-dark);
   outline-offset: 2px;
@@ -1592,22 +1629,22 @@ footer {
   padding: 26px 28px 32px;
 }
 
-.minute-bucket {
+.day-bucket {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr);
+  grid-template-columns: 116px minmax(0, 1fr);
   gap: 20px;
 }
 
-.minute-bucket + .minute-bucket {
+.day-bucket + .day-bucket {
   margin-top: 24px;
 }
 
-.minute-marker {
+.day-marker {
   position: relative;
   text-align: right;
 }
 
-.minute-marker::after {
+.day-marker::after {
   position: absolute;
   top: 7px;
   right: -27px;
@@ -1619,7 +1656,7 @@ footer {
   content: "";
 }
 
-.minute-marker time {
+.day-marker time {
   display: block;
   color: var(--green-dark);
   font-size: 18px;
@@ -1627,7 +1664,8 @@ footer {
   font-variant-numeric: tabular-nums;
 }
 
-.minute-marker span {
+.day-marker span,
+.day-marker small {
   display: block;
   margin-top: 4px;
   color: var(--muted);
@@ -1635,14 +1673,19 @@ footer {
   line-height: 1.4;
 }
 
-.minute-content {
+.day-marker small {
+  display: block;
+  margin-top: 5px;
+}
+
+.day-content {
   position: relative;
   min-width: 0;
   padding: 0 0 4px 20px;
   border-left: 1px solid #dfe7e2;
 }
 
-.minute-lanes {
+.day-lanes {
   display: grid;
   grid-template-columns: minmax(0, 1.55fr) minmax(430px, 1fr);
   align-items: start;
@@ -2888,7 +2931,7 @@ footer {
 }
 
 @media (max-width: 1280px) {
-  .minute-lanes {
+  .day-lanes {
     grid-template-columns: 1fr;
   }
 }
@@ -2907,7 +2950,7 @@ footer {
     grid-template-columns: 1fr;
   }
 
-  .day-navigator,
+  .week-navigator,
   .timeline-filters {
     padding-right: 18px;
     padding-left: 18px;
@@ -2917,29 +2960,29 @@ footer {
     padding: 21px 18px 27px;
   }
 
-  .minute-bucket {
+  .day-bucket {
     grid-template-columns: 1fr;
     gap: 8px;
   }
 
-  .minute-marker {
+  .day-marker {
     text-align: left;
   }
 
-  .minute-marker::after {
+  .day-marker::after {
     display: none;
   }
 
-  .minute-marker span {
+  .day-marker span {
     display: inline;
     margin-left: 8px;
   }
 
-  .minute-marker time {
+  .day-marker time {
     display: inline;
   }
 
-  .minute-content {
+  .day-content {
     padding-left: 0;
     border-left: 0;
   }

@@ -1,340 +1,185 @@
-# V4 Architecture and Invariants
+# V6 Architecture and Invariants
 
-## Purpose
+## 1. Simulation boundary
 
-V4 models nine independent companies operating a continuous dairy spot
-market. It adds credible intraday price discovery and physical lead times while
-keeping the benchmark deterministic, auditable, and small enough to reason
-about.
-
-The active scenario is `flow.dairy.base.s9.v5`:
-
-- three farms produce raw milk;
-- three processors buy raw milk, transform it, and sell bottled milk; and
-- three retailers buy bottled milk, set retail prices, and serve consumers.
-
-## Module boundaries
+The active scenario, `flow.dairy.base.s9.v6`, contains nine independent
+companies and 52 trading weeks. The authoritative clock is `SimDay`; an episode
+contains 364 days and no minute-level economic time.
 
 ```text
-CompanyAgent
-    | one typed CompanyDecision
-    v
-EpisodeRuntime ---- Scheduler
-    | deterministic batch order
-    v
-EconomyEngine ---- ContinuousSpotMarket ---- AssetLedger
-    | typed state and events
-    v
-RunStore ---- Journal + Checkpoint + SQLite
-    |
-    `---- Evaluator / Timeline / Replay
+TradingCalendar
+└── Week 1..52
+    ├── Monday..Saturday: decision days
+    └── Sunday: settlement day
 ```
 
-Responsibilities are deliberately narrow:
-
-- `CompanyAgent` chooses one authorized `CompanyDecision`; it cannot mutate state.
-- `EpisodeRuntime` owns virtual time, wakes, concurrent inference, seed-derived
-  application order, journal sequencing, and checkpoint boundaries.
-- `EconomyEngine` owns business authorization, operations, deliveries, consumer
-  settlement, inventory expiry, and typed projections.
-- `ContinuousSpotMarket` owns atomic target-ladder reconciliation, collateral
-  reservation, price-time matching, partial fills, and book close for one product.
-- `AssetLedger` is the transaction-local authority for available cash and FEFO
-  inventory. Both product markets share one ledger within an engine transaction.
-- `RunStore` atomically persists journal additions and the replacement
-  checkpoint; projections never become a second source of truth.
-
-The design uses immutable Pydantic boundary models. Mutable matching work is
-confined to a short transaction-local market session and frozen back into
-`EconomyState` before returning.
-
-## Daily event order
-
-The decision window is `[09:00, 19:00)`:
-
-| Time | Ordered behavior |
-|---|---|
-| 09:00 | Open both markets, then wake all companies |
-| 09:00-18:59 | Run event-driven decisions and continuous matching |
-| 19:00 | Complete due operations and deliveries; close both books; settle consumer sales |
-| 19:00-19:29 | Drain only operations and deliveries committed before close |
-| 19:30 | Require empty books, jobs, and deliveries; expire lots; write snapshot |
-
-The scheduler orders same-minute system events by explicit priority:
+The core boundary remains:
 
 ```text
-operation/delivery completion -> market close -> consumer sales -> day close
+AgentTurn -> CompanyDecision -> DecisionEnvelope -> EconomyEngine -> DecisionOutcome
 ```
 
-Thus a retailer receiving goods exactly at 19:00 may sell them to consumers.
-A trade at 18:59 arrives at 19:29 and cannot affect that day's 19:00 consumer
-sale, but it is fully delivered before the 19:30 snapshot. No new company
-decision is accepted at or after 19:00.
+Identity, simulation day, state version, and application sequence are assigned
+by the runtime. The Agent never supplies them.
 
-`RuntimeSpec` validates that the day-close boundary is late enough for the
-longest operation or delivery started in the last decision minute.
+## 2. Layer ownership
 
-## Continuous spot market
+- `domain/calendar.py` owns `SimDay`, weekdays, and episode bounds.
+- `domain/models.py` owns immutable scenario, observation, event, snapshot, and
+  score contracts.
+- `runtime/models.py` owns Agent decisions, wakes, scheduler events, and journal
+  records.
+- `economy/engine.py` is the only authority that mutates economic state.
+- `runtime/episode.py` schedules days, invokes policies, and commits results.
+- `runs/` owns independent job lifecycle and concurrency.
+- `storage/store.py` owns atomic journal/checkpoint persistence.
+- `timeline/` projects persisted state into 52 weekly views of seven days each.
+- `agents/providers/` is the sole model transport boundary through NewAPI.
 
-Each product has one `MarketState`; both books open and close together. Only
-plain DAY limit orders exist.
+The dependency direction points toward typed domain contracts. Storage, web,
+and UI projections never become economic authorities.
 
-### Reservation
+## 3. Weekly lifecycle
 
-- One `set_quote_ladder` command defines zero to three distinct target prices for
-  one product and side. Every level crosses the engine boundary only with a
-  positive `OrderQuantity` and `PositiveMoney` price, both exact multiples of
-  `0.0001`. Invalid raw commands are rejected before a market session exists;
-  they are never rounded.
-- A bid removes the four-place, half-even rounded
-  `remaining_quantity * limit_price` from available cash and stores it on
-  `BuyOrder`.
-- An ask removes exact FEFO lots from available inventory and stores them on
-  `SellOrder`.
-- Production output, inbound deliveries, and lots already held by another ask
-  are unavailable.
-- All mutable old levels and target levels are staged in one transaction. The
-  complete Bid notional or Ask quantity must be backed after reusable old holds
-  are released; otherwise the original ladder and every hold remain unchanged.
-  There is no per-level partial commit or settlement-time clipping.
+### Monday
 
-The private observation reports available and reserved assets separately. Total
-economic ownership is therefore visible without allowing the same asset to back
-two commitments.
+1. Open the trading week.
+2. Realize private productive capacity and base unit cost from the existing
+   seeded formulas.
+3. Reset weekly order books, retail prices, used capacity, and turn budgets.
+4. Wake all nine companies.
 
-### Matching
+### Tuesday-Saturday
 
-An incoming order repeatedly matches while `best_bid >= best_ask`:
+For each day:
 
-1. better price has priority;
-2. equal price uses the persisted `priority_sequence`;
-3. the execution price is the resting maker order's limit;
-4. execution quantity is the smaller remaining quantity; and
-5. any fully backed nonzero remainder stays on the book with its existing
-   priority; a rounding-dust or no-longer-fully-backed remainder is withdrawn.
+1. Start the day.
+2. Complete production/transformation jobs due that day.
+3. Complete deliveries due that day.
+4. Coalesce all same-company wakes into one Agent turn.
+5. Infer same-day decisions concurrently.
+6. Apply those decisions serially in deterministic order.
 
-Partial fill describes quantity interaction, not under-collateralization: every
-remaining unit is still fully backed. When a bid executes below its limit, the
-unused price difference returns to available cash immediately. With one shared
-four-place quantum, independently rounded fill and remainder amounts can differ
-by one quantum; in that boundary case the fill stands and only the remainder is
-released.
+Orders and retail prices persist through Saturday. Production, transformation,
+and delivery each take exactly one day and must complete within the same week.
 
-The ladder is a target state. Bid targets must arrive from highest to lowest and
-Ask targets from lowest to highest; invalid ordering is rejected. Reconciliation
-first keeps exact price-and-quantity matches, then replaces remaining same-price
-levels, pairs the remaining old and target levels in price-priority order as
-replacements, cancels unmatched old levels, and places unmatched targets. Empty
-`levels` cancels the complete product-side ladder. Exact matches retain their
-order ID, arrival time, and priority; every replacement or placement is an
-independent order with a new identity and priority. The market applies new levels from best
-to worst price so immediate matching is deterministic.
+### Sunday
 
-Because the command supplies no level identity, repricing and a cancel-plus-place
-intention are observationally indistinguishable and both lose old priority. The
-deterministic pairing defines the auditable result without requiring the Agent
-to micromanage order IDs. If any validation, self-cross, or reservation check
-fails, the complete staged transaction is discarded. At 19:00, book close
-releases all unfilled collateral.
+Sunday has no Agent calls. Its fixed economic order is:
 
-### Trade and delivery
+1. Complete due jobs and deliveries.
+2. Close both wholesale order books and release unused collateral.
+3. Settle each retailer's consumer demand once.
+4. Expire inventory whose `expires_end_of_week` is due.
+5. Commit one immutable `WeekSnapshot`.
+6. Advance to the next week.
 
-At a fill:
+This order allows Saturday commitments to arrive before Sunday sales while
+preventing post-settlement decisions.
+
+## 4. Formula frequency
+
+The migration changes time frequency, not the economic formula inputs.
+
+- `normal_capacity=60` for farms and `normal_capacity=50` for processors are
+  parameters of `CapacityFunction`, not realized fixed capacities.
+- Weekly capacity retains seeded persistence, volatility, and clipping.
+- `base_demand=40` is a parameter of `DemandSpec`, not a fixed sale quantity.
+- Potential demand retains the seeded shock and continuous price-demand curve.
+- Productive cost retains the convex cumulative cost function.
+
+Each capacity/cost realization occurs once per company-week. Each potential
+demand realization occurs once per retailer-week and is settled on Sunday.
+Initial cash, reference values, and formula parameters are not multiplied by
+seven.
+
+## 5. Inventory, markets, and physical commitments
+
+- Raw milk shelf life: 2 weekly settlements.
+- Bottled milk shelf life: 4 weekly settlements.
+- FEFO reservation and delivery preserve original lot expiry.
+- Orders are fully collateralized with cash or physical inventory.
+- A target quote ladder atomically keeps, places, replaces, or cancels up to
+  three levels.
+- Matching remains price-time priority at the resting maker price.
+- Cash transfers at trade time; inventory becomes usable after the one-day
+  delivery.
+- A company owns at most one active production resource.
+- All economic quantities use the `0.0001` quantum.
+
+## 6. Attention and bounded turns
+
+Every decision includes an `AttentionPlan`:
+
+- `review_after_days`: optional positive delay, maximum 2;
+- default review: 1 day when another Monday-Saturday remains;
+- up to three quote alerts;
+- no review may cross into Sunday or a later week.
+
+Event wakes, alerts, and reviews for the same company/day coalesce. One company
+can receive at most one Agent call per day and six calls per week. Reaching the
+limit writes an explicit audit step and suppresses later wakes. Sunday never
+consumes a turn.
+
+## 7. Deterministic concurrency
+
+All companies woken on one day observe the same pre-apply state. Provider calls
+may run concurrently, but economic application is serial:
 
 ```text
-buy reserve pays trade value
-seller available cash increases immediately
-price improvement returns to buyer
-seller lots become one PendingDelivery owned by the buyer
-30 minutes later those lots enter buyer available inventory
+sort_key = SHA256(seed | absolute_day | company_id)
 ```
 
-`PendingDelivery` is the minimum state needed to enforce lead time and exact
-replay. It is not a logistics aggregate: there is no manual dispatch, escrow,
-route, carrier, freight price, capacity, delay, loss, or failure transition. A
-scheduled completion either occurs exactly once at `arrives_at` or the runtime
-invariant fails.
+Each committed turn persists `apply_sequence`. Consequently network latency,
+completion order, and parallel run load cannot change the simulated economy.
 
-## Physical operations
+Different `RunJob`s own separate runtimes, schedulers, economy states,
+checkpoints, journals, and policy instances. The application shares only the
+NewAPI HTTP transport and its bounded request semaphore.
 
-`ProductionJob` and `TransformationJob` are typed asynchronous commitments.
-Starting either job:
+## 8. Persistence and replay
 
-- verifies role, daily capacity, idle resource, cash, and inputs;
-- consumes cash immediately and transformation input inventory immediately;
-- records one completion exactly 30 virtual minutes later; and
-- exposes no output until that completion creates a new expiring inventory lot.
+One atomic progress transaction stores:
 
-Each company has at most one active physical operation. The resource lock does
-not block quote-ladder updates, retail pricing, or idle decisions. Daily used capacity is
-tracked independently from the active job, so completing a job does not restore
-that day's capacity.
+- new immutable `TurnRecord`s;
+- new immutable `SystemStepRecord`s;
+- the complete current checkpoint;
+- run progress through the completed week.
 
-## Decisions and deterministic concurrency
+A completion transaction stores the final `EpisodeResult` and removes the
+checkpoint. Interrupted/stopped runs resume from the same run ID. Completed
+replay uses the source observations and decisions but recomputes every engine
+outcome; any journal, event, snapshot, score, or quality drift fails replay.
 
-Economic actions have zero modeled duration except for their physical consequences.
-The runtime prevents zero-time loops with a one-decision-per-company-per-minute
-throttle and a hard cap of 25 Agent turns per company per day. The current turn
-number and limit are part of every `AgentTurn`; reaching the limit produces one
-state-neutral, journaled `TURN_LIMIT_REACHED` step. Every later causal Wake is
-suppressed without a model call but remains auditable as an
-`AGENT_WAKE_SUPPRESSED` step with its typed signals.
+V6 intentionally uses a fresh `runs-v6.sqlite3` schema and does not read older
+runtime payloads.
 
-Agents woken in the same minute observe the same base `state_version`. Inference
-runs concurrently, but decisions apply in a full deterministic permutation:
+## 9. Scoring
+
+One valid episode produces one score after all 52 weekly snapshots exist:
 
 ```text
-sort_key = SHA256(seed | absolute_minute | company_id)
+E_raw = Σ_i [V_i(T) - V_i(0)]
+E_ref = seeded maximum net value across 52 retailer-week markets
+E = clip(E_raw / E_ref, 0, 1)
+F = 1 - mean(tier Gini) / (2/3)
+B = bankrupt companies / 9
+Score = 100 × E × sqrt(F × (1 - B))
 ```
 
-The resulting global `apply_sequence` is journaled as decision-processing order.
-When that decision is applied, each new or replaced ladder level receives its own
-persisted order priority sequence in best-to-worst target order; unchanged
-levels retain theirs. Real response latency, retries, and provider load are
-audited but never feed matching.
+`V_i` is cash plus reference-valued inventory. Under `s9-enterprise-v4`, a
+company is counted once as bankrupt when its net worth is at or below `1.0000`
+in any weekly snapshot. Protocol validity is independent: any invalid Agent
+turn makes the result diagnostic-only.
 
-Episode concurrency is a separate application concern. `RunCoordinator` admits
-up to 100 independent `RunJob`s into `EpisodeRuntime`; later jobs remain queued.
-Every episode owns its scheduler, economy state, agents, checkpoints, and
-journal, while immutable runtime services are shared. Model gateways share one
-application-owned `NewApiTransport`, whose connection pool and request semaphore
-allow at most 100 in-flight NewAPI calls across all runs. A permit covers only
-the HTTP request, never retry backoff. An application-owned
-`ModelCapabilityCatalog` single-flights pre-run output-limit calibration per
-model and atomically persists confirmed limits; gateways receive only fully
-resolved model configurations. These bounds do not change the
-same-minute inference and deterministic serial-application rule inside a run.
+## 10. Required invariants
 
-Sparse decisions are governed by the in-process `AgentAttention` module. Every
-`ActionDecision` and `IdleDecision` carries an `AttentionPlan` with up to three
-Agent-visible `best_bid`/`best_ask` threshold alerts, combined with OR semantics,
-plus an optional relative review delay. An explicit `review_after_minutes` must
-be at most 120 minutes and remain within the same business day. Omitting it
-schedules a 120-minute review when that still falls before market close;
-otherwise there is no same-day review. Duplicate, hidden, or already-true alerts
-reject the entire decision without changing economic state.
-
-Alerts are one-shot. They observe only the final committed order books after all
-seed-ordered decisions for a minute have applied, then wake the company on the
-following minute. An accepted decision never creates a routine next-minute wake.
-Own trades, operation completion, delivery completion, a matched alert, fallback
-review, and the next market open are the normal wakes. Only a rejected decision
-gets the bounded correction retry. Generic order-book mutations are not
-broadcast and resting orders do not receive an independent polling timer.
-
-## Agent projection and information boundary
-
-The engine builds a private `AgentTurn` rather than exposing `EconomyState`.
-Along with available assets and events, it contains:
-
-- `open_orders` owned by the company, each with current same-price FIFO quantity
-  ahead;
-- `order_books` with every anonymous aggregated price level, its quantity and
-  order count, plus last trade price and daily volume;
-- `reserved_cash`, `marked_surplus`, and `inventory_expiry`, whose buckets split
-  available from ask-reserved spot inventory;
-- `pending_deliveries` with exact arrival times and quantity-preserving expiry
-  buckets;
-- `active_operation` and the authoritative daily operation state; and
-- `private_economics`, derived from only the company's own cash-flow ledger and
-  current executable prices; and
-- the current daily turn number and hard limit.
-
-The provider adapter adds one typed `decision_constraints` projection with
-explicit runtime limits and derived used/remaining operation capacity. It is
-rebuilt from `AgentTurn` for every request and never owns economic state.
-
-`marked_surplus` values available cash, bid-reserved cash, available and
-ask-reserved inventory, pending deliveries, and guaranteed active-operation
-output at immutable product reference values, then subtracts the company's
-episode initial cash. Moving the same asset between available, reserved,
-in-transit, and completed states is therefore value-neutral. `inventory_expiry`
-covers spot inventory only; pending deliveries retain their own expiry buckets,
-and work in process enters an expiry bucket only when completed.
-
-Other companies' identities, holdings, orders, memories, and traces stay hidden.
-Natural-language reasoning is non-binding; only the validated structured decision
-can change the economy.
-
-## Memory, durability, and replay
-
-Every company has its own token-budgeted `ConversationMemory`. Recent compact
-decision records keep only time, wake, decision, disposition, and rejection
-category; older records compact into a deterministic summary. Full observations
-and outcomes remain in the journal instead of being duplicated into every model
-request. Memory has no seven-day cutoff and never replaces current authoritative
-facts.
-
-The immutable journal records company turns and ordered system steps. A
-`RunCheckpoint` captures all state needed to resume exactly, including books and
-collateral, jobs, deliveries, scheduler state, armed attention plans,
-per-company memory, sequence counters, events, and snapshots. Each armed plan is
-validated against its source decision and exact fallback wake. Journal additions
-and checkpoint replacement commit in one database transaction at a stable
-virtual-time boundary.
-
-Replay uses the same runtime and engine without model calls. Observation hashes,
-decisions or protocol rejections, outcomes, `apply_sequence`, system effects,
-events, snapshots, final score, and episode quality must match exactly.
-
-## Episode evaluation
-
-Each valid episode receives one seed-specific score. For each of the 30 days and
-three retailers, the evaluator derives potential demand `A` from the episode
-seed and uses the continuous net-value ceiling `(A + 14)^2 / 32`. Their sum is
-`E_ref`; it is never selected from participating models. Aggregate company value
-growth is `E_raw`, and `E = clip(E_raw / E_ref, 0, 1)`.
-
-The evaluator computes a raw growth Gini for each three-company tier. With a
-finite-sample maximum of `2/3`, normalized fairness is
-`F = 1 - (G_farm + G_processor + G_retailer) / 2`. A company is bankrupt when
-its day-end cash plus reference-valued inventory has reached zero on any day;
-with `D` bankrupt companies, `B = D / 9`. The final score is:
-
-```text
-Score = 100 * E * sqrt(F * (1 - B))
-```
-
-Under `s9-enterprise-v2`, these formulas retain full intermediate precision;
-each published `CompanyScore` and `ScoreCard` Decimal is normalized to four
-places only at its public boundary.
-
-Economic outcomes do not create eligibility gates. A completed episode always
-receives its diagnostic economic score. Protocol-invalid completion is marked
-`benchmark_eligible=false` and excluded from model comparison; an incomplete,
-technically failed, or replay-divergent episode still produces no final result.
-
-## Core invariants
-
-1. Only `EconomyEngine` changes economic state.
-2. One company submits at most one decision in a same-minute batch.
-3. Every resting order is fully backed by uniquely held cash or inventory.
-4. One company has at most three distinct active price levels per product and
-   side; one ladder action commits all of its changes or none of them.
-5. Every live order quantity is positive and aligned to the `0.0001` market
-   tick; raw journal decisions remain audit evidence, not executable state.
-6. Every active order has an independent persisted priority sequence; one
-   decision's `apply_sequence` is not reused as three order priorities.
-7. Available, reserved, and pending inventory lots have globally unique IDs.
-8. One company has at most one active operation; one trade has one pending
-   delivery until completion.
-9. Product markets share session state and always open or close together.
-10. No company decision is accepted outside `[09:00, 19:00)`.
-11. Books, jobs, and deliveries are empty before the 19:30 day snapshot.
-12. Provider completion order never changes economic application order.
-13. Journal plus checkpoint, not prompts or UI projections, is the replay
-    authority.
-14. Attention reads only the anonymous Agent market projection; observer UI
-    order-book data can never wake an Agent or change economic state.
-15. Every economic Decimal crossing a domain boundary is a canonical multiple
-    of `0.0001`. External over-precision is rejected; derived cash uses
-    half-even rounding, derived physical quantity rounds down, and zero-value
-    settlements are atomically rejected.
-
-## Deliberate non-goals
-
-V4 does not model credit, short selling, forward contracts, bilateral
-negotiation, natural-language settlement, shipping choices, transport risk,
-consumer agents, or complex exchange order types. These features should be
-added only when they create a measurable strategic choice; they must not weaken
-the structured settlement and replay invariants above.
+1. Exactly 52 weekly settlements and 52 snapshots complete an episode.
+2. Every projected week contains exactly seven ordered `TimelineDayFrame`s.
+3. Company decisions exist only Monday-Saturday and at most once per company/day.
+4. Sunday order is completions, market close, consumer sales, expiry, snapshot.
+5. Weekly capacity and demand are formula realizations, never hard-coded output.
+6. No job, delivery, review, or open order crosses a week boundary.
+7. Same-day concurrent inference always has deterministic serial application.
+8. Only the engine mutates economic state.
+9. Journal/checkpoint progress is atomic and replay drift is fatal.

@@ -1,44 +1,48 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 
-import { MarketDisplay } from "../market/MarketDisplay";
-import { companyLabel } from "../../shared/labels";
+import type {
+  SystemTimelineItemView,
+  TimelineContextView,
+  TimelineDayFrameView,
+  TimelineDetailView,
+  TimelineWeekView,
+  TurnTimelineItemView,
+} from "../../shared/api/types";
 import {
   formatExactDecimal,
   formatPercent,
   formatValue,
 } from "../../shared/format";
+import { companyLabel } from "../../shared/labels";
 import { isAbortError, requestErrorMessage } from "../../shared/requestErrors";
 import {
+  simulationDayLabel,
+  weekdayName,
+} from "../../shared/simulationCalendar";
+import {
   ACCEPTED_BY_ENGINE_LABEL,
-  clockTime,
+  decisionContextSummary,
   decisionDispositionLabel,
   decisionKind,
   decisionLabel,
   decisionProcessingResult,
   decisionSummary,
-  decisionContextSummary,
   nextDecisionTiming,
   plural,
   systemLabel,
   wakeLabel,
   type DecisionKind,
 } from "../../shared/timelineFormatters";
-import type {
-  SystemTimelineItemView,
-  TimelineContextView,
-  TimelineDayView,
-  TimelineDetailView,
-  TimelineMomentView,
-  TurnTimelineItemView,
-} from "../../shared/api/types";
+import { MarketDisplay } from "../market/MarketDisplay";
 import { DecisionDrawer } from "./DecisionDrawer";
 import { TimelineError, TimelineNotice } from "./TimelineFeedback";
 
 type TimelineLoader = (
   runId: string,
-  day: number,
+  week: number,
   signal?: AbortSignal,
-) => Promise<TimelineDayView>;
+) => Promise<TimelineWeekView>;
 type DetailLoader = (
   runId: string,
   entryId: string,
@@ -47,14 +51,14 @@ type DetailLoader = (
 type StatusFilter = "accepted" | "all" | "rejected";
 
 interface OperationsTimelineProps {
-  readonly day: number;
-  readonly days: number;
   readonly loadDetail: DetailLoader;
   readonly loadTimeline: TimelineLoader;
-  readonly onDayChange: (day: number) => void;
+  readonly onWeekChange: (week: number) => void;
   readonly revision: string;
   readonly runId: string;
   readonly timelinePending?: boolean;
+  readonly week: number;
+  readonly weeks: number;
 }
 
 interface CompanyOption {
@@ -63,37 +67,41 @@ interface CompanyOption {
 }
 
 interface TimelineFilters {
-  readonly decision: DecisionKind | typeof ALL;
   readonly company: string;
+  readonly decision: DecisionKind | typeof ALL;
   readonly status: StatusFilter;
+}
+
+interface DisplayDay extends TimelineDayFrameView {
+  readonly totalTurnCount: number;
 }
 
 const ALL = "all";
 const INITIAL_FILTERS: TimelineFilters = {
-  decision: ALL,
   company: ALL,
+  decision: ALL,
   status: "all",
 };
 
 export function OperationsTimeline({
-  day,
-  days,
   loadDetail,
   loadTimeline,
-  onDayChange,
+  onWeekChange,
   revision,
   runId,
   timelinePending = false,
+  week,
+  weeks,
 }: OperationsTimelineProps) {
-  const [timeline, setTimeline] = useState<TimelineDayView | null>(null);
+  const [timeline, setTimeline] = useState<TimelineWeekView | null>(null);
   const [filters, setFilters] = useState<TimelineFilters>(INITIAL_FILTERS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
-  const dayCache = useRef(new Map<string, TimelineDayView>());
+  const weekCache = useRef(new Map<string, TimelineWeekView>());
 
   useEffect(() => {
-    dayCache.current.clear();
+    weekCache.current.clear();
     setTimeline(null);
     setSelectedEntryId(null);
     setFilters(INITIAL_FILTERS);
@@ -107,8 +115,8 @@ export function OperationsTimeline({
       return;
     }
 
-    const cacheKey = `${revision}:${day}`;
-    const cached = dayCache.current.get(cacheKey);
+    const cacheKey = `${revision}:${week}`;
+    const cached = weekCache.current.get(cacheKey);
     if (cached) {
       setTimeline(cached);
       setLoading(false);
@@ -119,9 +127,9 @@ export function OperationsTimeline({
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    void loadTimeline(runId, day, controller.signal)
+    void loadTimeline(runId, week, controller.signal)
       .then((nextTimeline) => {
-        dayCache.current.set(cacheKey, nextTimeline);
+        weekCache.current.set(cacheKey, nextTimeline);
         setTimeline(nextTimeline);
       })
       .catch((reason: unknown) => {
@@ -140,22 +148,22 @@ export function OperationsTimeline({
         }
       });
     return () => controller.abort();
-  }, [day, loadTimeline, revision, runId, timelinePending]);
+  }, [loadTimeline, revision, runId, timelinePending, week]);
 
-  const companies = useMemo<readonly CompanyOption[]>(
-    () => timelineCompanies(timeline),
-    [timeline],
-  );
-
+  const companies = useMemo(() => timelineCompanies(timeline), [timeline]);
   const decisionKinds = useMemo<readonly DecisionKind[]>(
     () =>
-      [...new Set(timeline?.moments.flatMap((moment) =>
-        moment.turns.map((turn) => decisionKind(turn.decision)),
-      )) ?? []].sort(),
+      [
+        ...new Set(
+          timeline?.days.flatMap((day) =>
+            day.turns.map((turn) => decisionKind(turn.decision)),
+          ) ?? [],
+        ),
+      ].sort(),
     [timeline],
   );
-  const visibleMoments = useMemo(
-    () => filterMoments(timeline?.moments ?? [], filters),
+  const visibleDays = useMemo(
+    () => filterDays(timeline?.days ?? [], filters),
     [filters, timeline],
   );
 
@@ -163,22 +171,22 @@ export function OperationsTimeline({
     <section aria-labelledby="operations-title" className="panel operations-panel">
       <OperationsHeader
         context={timeline?.context ?? null}
-        day={day}
-        days={days}
+        week={week}
+        weeks={weeks}
       />
 
       {timeline && (
         <>
           <RunProvenanceBanner context={timeline.context} />
           <RunDiagnosticsPanel context={timeline.context} />
-          <DayNavigator
-            day={day}
-            onSelect={onDayChange}
-            summaries={timeline.daySummaries}
+          <WeekNavigator
+            onSelect={onWeekChange}
+            summaries={timeline.weekSummaries}
+            week={week}
           />
           <TimelineFilterBar
-            decisionKinds={decisionKinds}
             companies={companies}
+            decisionKinds={decisionKinds}
             filters={filters}
             onChange={setFilters}
           />
@@ -188,17 +196,15 @@ export function OperationsTimeline({
       {timelinePending ? (
         <TimelineNotice label="This run is queued and has not produced timeline data yet." />
       ) : loading ? (
-        <TimelineNotice label="Loading this simulation day…" />
+        <TimelineNotice label="Loading this simulation week…" />
       ) : error ? (
         <TimelineError message={error} />
-      ) : visibleMoments.length === 0 ? (
-        <TimelineNotice label="No timeline entries match these filters." />
       ) : (
         <div className="operations-stream">
-          {visibleMoments.map((moment) => (
-            <MinuteBucket
-              key={moment.simMinute}
-              moment={moment}
+          {visibleDays.map((day) => (
+            <DayBucket
+              day={day}
+              key={day.simDay.absoluteDay}
               onSelectEntry={setSelectedEntryId}
             />
           ))}
@@ -220,23 +226,21 @@ export function OperationsTimeline({
 
 function OperationsHeader({
   context,
-  day,
-  days,
+  week,
+  weeks,
 }: {
   readonly context: TimelineContextView | null;
-  readonly day: number;
-  readonly days: number;
+  readonly week: number;
+  readonly weeks: number;
 }) {
   return (
     <div className="section-heading operations-heading">
       <div>
         <span className="eyebrow">OPERATIONS TIMELINE</span>
-        <h2 id="operations-title">
-          Company decisions and economic activity, minute by minute
-        </h2>
+        <h2 id="operations-title">One trading week, Monday through Sunday</h2>
       </div>
       <p>
-        Day {day} of {context?.totalDays ?? days}
+        Week {week} of {context?.totalWeeks ?? weeks}
         {context ? checkpointSummary(context) : ""}
       </p>
     </div>
@@ -244,12 +248,10 @@ function OperationsHeader({
 }
 
 function checkpointSummary(context: TimelineContextView): string {
-  const minute = context.checkpointMinute;
-  if (minute === null) {
-    return "";
-  }
-  const day = Math.floor(minute / (24 * 60)) + 1;
-  return ` · last checkpoint Day ${day} ${clockTime(minute)} · state v${context.checkpointStateVersion}`;
+  const day = context.checkpointDay;
+  return day === null
+    ? ""
+    : ` · last checkpoint ${simulationDayLabel(day)} · state v${context.checkpointStateVersion}`;
 }
 
 function RunProvenanceBanner({ context }: { readonly context: TimelineContextView }) {
@@ -263,8 +265,8 @@ function RunProvenanceBanner({ context }: { readonly context: TimelineContextVie
         <div>
           <strong>{context.currentModelCallCount} model calls in this run</strong>
           <p>
-            Trace material and {formatValue(context.currentUsage.totalTokens)}{" "}
-            tokens belong to run <code>{context.currentRunId}</code>.
+            Trace material and {formatValue(context.currentUsage.totalTokens)} tokens
+            belong to run <code>{context.currentRunId}</code>.
           </p>
         </div>
       </div>
@@ -273,22 +275,17 @@ function RunProvenanceBanner({ context }: { readonly context: TimelineContextVie
 
   return (
     <div className="trace-provenance replay">
-      <span className="provenance-icon" aria-hidden="true">
-        REPLAY
-      </span>
+      <span className="provenance-icon" aria-hidden="true">REPLAY</span>
       <div>
         <strong>
           Zero-call replay · {context.currentModelCallCount} current model calls ·{" "}
           {formatValue(context.currentUsage.totalTokens)} current tokens
         </strong>
         <p>
-          Direct replay parent:{" "}
-          <code>{context.sourceRunId ?? "not recorded"}</code>. Ultimate trace
-          source:{" "}
-          <code>{context.traceRunId}</code>:{" "}
-          {context.sourceModelCallCount} calls and{" "}
-          {formatValue(context.sourceUsage.totalTokens)} tokens. Source usage is
-          never charged to this replay.
+          Direct replay parent: <code>{context.sourceRunId ?? "not recorded"}</code>.
+          Ultimate trace source: <code>{context.traceRunId}</code>: {context.sourceModelCallCount}{" "}
+          calls and {formatValue(context.sourceUsage.totalTokens)} tokens. Source usage
+          is never charged to this replay.
         </p>
       </div>
     </div>
@@ -298,7 +295,9 @@ function RunProvenanceBanner({ context }: { readonly context: TimelineContextVie
 function RunDiagnosticsPanel({ context }: { readonly context: TimelineContextView }) {
   const diagnostics = context.diagnostics;
   const lastTrade =
-    diagnostics.lastTradeDay === null ? "none" : `Day ${diagnostics.lastTradeDay}`;
+    diagnostics.lastTradeWeek === null
+      ? "none"
+      : `Week ${diagnostics.lastTradeWeek}`;
   return (
     <section aria-label="Run diagnostics" className="run-diagnostics">
       <header>
@@ -312,16 +311,8 @@ function RunDiagnosticsPanel({ context }: { readonly context: TimelineContextVie
         </strong>
       </header>
       <dl>
-        <div>
-          <dt>Protocol-invalid</dt>
-          <dd>{formatValue(diagnostics.protocolInvalidTurns)} turns</dd>
-        </div>
-        <div>
-          <dt>Trades</dt>
-          <dd>
-            {formatValue(diagnostics.tradeCount)} · last {lastTrade}
-          </dd>
-        </div>
+        <div><dt>Protocol-invalid</dt><dd>{formatValue(diagnostics.protocolInvalidTurns)} turns</dd></div>
+        <div><dt>Trades</dt><dd>{formatValue(diagnostics.tradeCount)} · last {lastTrade}</dd></div>
         <div>
           <dt>Consumer fill</dt>
           <dd>
@@ -330,10 +321,7 @@ function RunDiagnosticsPanel({ context }: { readonly context: TimelineContextVie
             {formatExactDecimal(diagnostics.consumerDemand)}
           </dd>
         </div>
-        <div>
-          <dt>Expired</dt>
-          <dd>{formatExactDecimal(diagnostics.expiredQuantity)}</dd>
-        </div>
+        <div><dt>Expired</dt><dd>{formatExactDecimal(diagnostics.expiredQuantity)}</dd></div>
         <div>
           <dt>Rejected decisions</dt>
           <dd>
@@ -352,73 +340,130 @@ function RunDiagnosticsPanel({ context }: { readonly context: TimelineContextVie
           </dd>
         </div>
       </dl>
-      {diagnostics.zeroTradeDayStreak > 0 && (
+      {diagnostics.zeroTradeWeekStreak > 0 && (
         <p>
-          No trades for the latest {formatValue(diagnostics.zeroTradeDayStreak)} completed{" "}
-          {plural(diagnostics.zeroTradeDayStreak, "day")}. The Trade Tape below
-          shows only the selected minute, while this card summarizes the full run.
+          No trades for the latest {formatValue(diagnostics.zeroTradeWeekStreak)} completed{" "}
+          {plural(diagnostics.zeroTradeWeekStreak, "week")}.
         </p>
       )}
     </section>
   );
 }
 
-function DayNavigator({
-  day,
+function WeekNavigator({
   onSelect,
   summaries,
+  week,
 }: {
-  readonly day: number;
-  readonly onSelect: (day: number) => void;
-  readonly summaries: TimelineDayView["daySummaries"];
+  readonly onSelect: (week: number) => void;
+  readonly summaries: TimelineWeekView["weekSummaries"];
+  readonly week: number;
 }) {
+  const stripRef = useRef<HTMLDivElement>(null);
+  const [scrollBounds, setScrollBounds] = useState({ backward: false, forward: false });
+
+  const updateScrollBounds = useCallback(() => {
+    const strip = stripRef.current;
+    if (!strip) {
+      return;
+    }
+    const maximum = Math.max(0, strip.scrollWidth - strip.clientWidth);
+    const nextBounds = {
+      backward: strip.scrollLeft > 1,
+      forward: strip.scrollLeft < maximum - 1,
+    };
+    setScrollBounds((current) =>
+      current.backward === nextBounds.backward && current.forward === nextBounds.forward
+        ? current
+        : nextBounds,
+    );
+  }, []);
+
+  useEffect(() => {
+    const strip = stripRef.current;
+    if (!strip) {
+      return;
+    }
+    const selected = strip.querySelector<HTMLElement>(`[data-week="${week}"]`);
+    if (selected) {
+      strip.scrollTo({
+        behavior: "smooth",
+        left: selected.offsetLeft - (strip.clientWidth - selected.offsetWidth) / 2,
+      });
+    }
+  }, [summaries, week]);
+
+  useEffect(() => {
+    const strip = stripRef.current;
+    if (!strip) {
+      return;
+    }
+    const observer = new ResizeObserver(updateScrollBounds);
+    observer.observe(strip);
+    updateScrollBounds();
+    return () => observer.disconnect();
+  }, [updateScrollBounds]);
+
+  const slide = (direction: -1 | 1) => {
+    const strip = stripRef.current;
+    strip?.scrollBy({
+      behavior: "smooth",
+      left: direction * strip.clientWidth * 0.85,
+    });
+  };
+
   return (
-    <nav aria-label="Simulation day" className="day-navigator">
+    <nav aria-label="Simulation week" className="week-navigator">
       <button
-        aria-label="Previous day"
-        disabled={day <= 1}
-        onClick={() => onSelect(day - 1)}
+        aria-label="Show earlier weeks"
+        disabled={!scrollBounds.backward}
+        onClick={() => slide(-1)}
         type="button"
       >
-        ←
+        <span aria-hidden="true">←</span>
       </button>
-      <div className="day-density-strip">
+      <div className="week-density-strip" onScroll={updateScrollBounds} ref={stripRef}>
         {summaries.map((summary) => (
           <button
-            aria-current={summary.day === day ? "page" : undefined}
-            className={summary.day === day ? "selected" : ""}
-            key={summary.day}
-            onClick={() => onSelect(summary.day)}
+            aria-current={summary.week === week ? "page" : undefined}
+            className={summary.week === week ? "selected" : ""}
+            data-week={summary.week}
+            key={summary.week}
+            onClick={() => onSelect(summary.week)}
             style={{
               "--activity": activityOpacity(summary.turnCount, summaries),
-            } as React.CSSProperties}
-            title={`Day ${summary.day}: ${summary.turnCount} turns, ${summary.rejectedCount} rejected, ${formatExactDecimal(summary.tradeQuantity)} traded`}
+            } as CSSProperties}
+            title={
+              `Week ${summary.week}: ${summary.turnCount} turns, ` +
+              `${summary.rejectedCount} rejected, ` +
+              `${formatExactDecimal(summary.tradeQuantity)} traded`
+            }
             type="button"
           >
-            <span>{summary.day}</span>
+            <span>{summary.week}</span>
           </button>
         ))}
       </div>
       <button
-        aria-label="Next day"
-        disabled={day >= summaries.length}
-        onClick={() => onSelect(day + 1)}
+        aria-label="Show later weeks"
+        disabled={!scrollBounds.forward}
+        onClick={() => slide(1)}
         type="button"
       >
-        →
+        <span aria-hidden="true">→</span>
       </button>
     </nav>
   );
 }
 
 function TimelineFilterBar({
-  decisionKinds,
   companies,
+  decisionKinds,
   filters,
   onChange,
 }: {
-  readonly decisionKinds: readonly DecisionKind[];
   readonly companies: readonly CompanyOption[];
+  readonly decisionKinds: readonly DecisionKind[];
   readonly filters: TimelineFilters;
   readonly onChange: (filters: TimelineFilters) => void;
 }) {
@@ -427,9 +472,7 @@ function TimelineFilterBar({
       <label>
         <span>Company</span>
         <select
-          onChange={(event) =>
-            onChange({ ...filters, company: event.target.value })
-          }
+          onChange={(event) => onChange({ ...filters, company: event.target.value })}
           value={filters.company}
         >
           <option value={ALL}>All companies</option>
@@ -444,10 +487,7 @@ function TimelineFilterBar({
         <span>Status</span>
         <select
           onChange={(event) =>
-            onChange({
-              ...filters,
-              status: event.target.value as StatusFilter,
-            })
+            onChange({ ...filters, status: event.target.value as StatusFilter })
           }
           value={filters.status}
         >
@@ -469,9 +509,7 @@ function TimelineFilterBar({
         >
           <option value={ALL}>All decisions</option>
           {decisionKinds.map((kind) => (
-            <option key={kind} value={kind}>
-              {decisionLabel(kind)}
-            </option>
+            <option key={kind} value={kind}>{decisionLabel(kind)}</option>
           ))}
         </select>
       </label>
@@ -479,53 +517,62 @@ function TimelineFilterBar({
   );
 }
 
-function MinuteBucket({
-  moment,
+function DayBucket({
+  day,
   onSelectEntry,
 }: {
-  readonly moment: TimelineMomentView;
+  readonly day: DisplayDay;
   readonly onSelectEntry: (entryId: string) => void;
 }) {
+  const absoluteDay = day.simDay.absoluteDay;
+  const sunday = weekdayName(day.simDay) === "Sunday";
   return (
-    <article className="minute-bucket">
-      <header className="minute-marker">
-        <time>{clockTime(moment.simMinute)}</time>
+    <article className="day-bucket">
+      <header className="day-marker">
+        <time>{weekdayName(day.simDay)}</time>
         <span>
-          {moment.totalTurnCount > 1
-            ? concurrencyLabel(moment)
-            : moment.turns.length === 1
-              ? "1 company turn"
-              : "System event"}
+          {sunday
+            ? "Weekly trading and consumer settlement"
+            : day.totalTurnCount > 1
+              ? concurrencyLabel(day)
+              : day.totalTurnCount === 1
+                ? "1 company turn"
+                : "No company turn"}
         </span>
+        <small>Simulation day {absoluteDay}</small>
       </header>
-      <div className="minute-content">
-        <div className="minute-lanes">
+      <div className="day-content">
+        <div className="day-lanes">
           <section className="company-activity-lane" aria-label="Company activity">
-            {moment.systemSteps.map((step) => (
+            {day.systemSteps.map((step) => (
               <SystemStepCard
                 key={step.entryId}
                 onSelect={() => onSelectEntry(step.entryId)}
                 step={step}
               />
             ))}
-            {moment.totalTurnCount > 1 && (
+            {day.totalTurnCount > 1 && day.turns.length > 0 && (
               <div className="concurrency-note">
                 <span>CONCURRENT OBSERVATION</span>
-                Agents saw the same pre-apply state. Cards below follow the persisted
-                seed-derived apply order.
+                Agents saw the same pre-apply state. Cards follow the persisted,
+                seed-derived application order.
               </div>
             )}
-            <div className="turn-card-grid">
-              {moment.turns.map((turn) => (
-                <TurnCard
-                  key={turn.entryId}
-                  onSelect={() => onSelectEntry(turn.entryId)}
-                  turn={turn}
-                />
-              ))}
-            </div>
+            {day.turns.length > 0 ? (
+              <div className="turn-card-grid">
+                {day.turns.map((turn) => (
+                  <TurnCard
+                    key={turn.entryId}
+                    onSelect={() => onSelectEntry(turn.entryId)}
+                    turn={turn}
+                  />
+                ))}
+              </div>
+            ) : day.systemSteps.length === 0 ? (
+              <TimelineNotice label="No activity matches the selected filters for this day." />
+            ) : null}
           </section>
-          <MarketDisplay frame={moment.market} minute={moment.simMinute} />
+          <MarketDisplay absoluteDay={absoluteDay} frame={day.market} />
         </div>
       </div>
     </article>
@@ -541,17 +588,14 @@ function SystemStepCard({
 }) {
   return (
     <button className="system-step-card" onClick={onSelect} type="button">
-      <span className="system-step-icon" aria-hidden="true">
-        SYSTEM
-      </span>
+      <span className="system-step-icon" aria-hidden="true">SYSTEM</span>
       <span>
         <small>{systemLabel(step.kind)}</small>
         <strong>{step.title}</strong>
         <span>{step.summary}</span>
       </span>
       <span className="system-step-meta">
-        {step.effects.length} {plural(step.effects.length, "effect")}
-        {" · "}
+        {step.effects.length} {plural(step.effects.length, "effect")} ·{" "}
         {step.affectedCompanyIds.length > 0
           ? step.affectedCompanyIds.map((id) => companyLabel(id)).join(", ")
           : "No direct economic impact"}
@@ -567,9 +611,10 @@ function TurnCard({
   readonly onSelect: () => void;
   readonly turn: TurnTimelineItemView;
 }) {
+  const dayLabel = simulationDayLabel(turn.simDay);
   return (
     <article
-      aria-label={`${turn.companyName} turn at ${clockTime(turn.simMinute)}`}
+      aria-label={`${turn.companyName} turn on ${dayLabel}`}
       className={`turn-card ${turn.accepted ? "accepted" : "rejected"}`}
     >
       <header>
@@ -585,29 +630,22 @@ function TurnCard({
       <ol className="decision-chain">
         <DecisionStage
           label="Decision Trigger"
-          value={turn.wakeSignals
-            .map((signal) => wakeLabel(signal.reason))
-            .join(" · ")}
+          value={turn.wakeSignals.map((signal) => wakeLabel(signal.reason)).join(" · ")}
         />
-        <DecisionStage
-          label="Company Decision"
-          value={decisionSummary(turn.decision)}
-        />
+        <DecisionStage label="Company Decision" value={decisionSummary(turn.decision)} />
         <DecisionStage
           label="Decision Processing Result"
           tone={turn.accepted ? "positive" : "negative"}
           value={decisionProcessingResult(turn)}
         />
-        <DecisionStage
-          label="Next Decision Timing"
-          value={nextDecisionTiming(turn)}
-        />
+        <DecisionStage label="Next Decision Timing" value={nextDecisionTiming(turn)} />
       </ol>
       <footer>
         <span>{turn.title}</span>
+        <span>Turn {turn.turnNumberThisWeek}/{turn.turnLimitThisWeek} this week</span>
         {turn.sourceTurnId && <span>Source turn linked</span>}
         <button
-          aria-label={`Open ${turn.companyName} turn detail at ${clockTime(turn.simMinute)}`}
+          aria-label={`Open ${turn.companyName} turn detail on ${dayLabel}`}
           className="turn-card-action"
           onClick={onSelect}
           type="button"
@@ -636,37 +674,34 @@ function DecisionStage({
   );
 }
 
-function filterMoments(
-  moments: readonly TimelineMomentView[],
+function filterDays(
+  days: readonly TimelineDayFrameView[],
   filters: TimelineFilters,
-): readonly TimelineMomentView[] {
-  return moments.flatMap((moment) => {
-    const systemSteps = moment.systemSteps.filter(
+): readonly DisplayDay[] {
+  return days.map((day) => ({
+    ...day,
+    totalTurnCount: day.turns.length,
+    systemSteps: day.systemSteps.filter(
       (step) => step.kind !== "agent_wake_suppressed",
-    );
-    const turns = moment.turns.filter((turn) => {
-      return (
+    ),
+    turns: day.turns.filter(
+      (turn) =>
         (filters.company === ALL || turn.companyId === filters.company) &&
         (filters.decision === ALL ||
           decisionKind(turn.decision) === filters.decision) &&
         (filters.status === "all" ||
           (filters.status === "accepted" && turn.accepted) ||
-          (filters.status === "rejected" && !turn.accepted))
-      );
-    });
-    if (turns.length === 0 && systemSteps.length === 0) {
-      return [];
-    }
-    return [{ ...moment, systemSteps, turns }];
-  });
+          (filters.status === "rejected" && !turn.accepted)),
+    ),
+  }));
 }
 
 function timelineCompanies(
-  timeline: TimelineDayView | null,
+  timeline: TimelineWeekView | null,
 ): readonly CompanyOption[] {
   const companies = new Map<string, CompanyOption>();
-  timeline?.moments.forEach((moment) =>
-    moment.turns.forEach((turn) =>
+  timeline?.days.forEach((day) =>
+    day.turns.forEach((turn) =>
       companies.set(turn.companyId, {
         companyId: turn.companyId,
         companyName: turn.companyName,
@@ -680,20 +715,16 @@ function timelineCompanies(
 
 function activityOpacity(
   count: number,
-  summaries: TimelineDayView["daySummaries"],
+  summaries: TimelineWeekView["weekSummaries"],
 ): string {
   const maximum = Math.max(1, ...summaries.map((summary) => summary.turnCount));
   return `${(18 + (count / maximum) * 82).toFixed(1)}%`;
 }
 
-function sharedStateVersion(moment: TimelineMomentView): string {
-  const versions = [...new Set(moment.turns.map((turn) => turn.stateVersion))];
-  return versions.length === 1 ? String(versions[0]) : versions.join("/");
-}
-
-function concurrencyLabel(moment: TimelineMomentView): string {
-  const state = `state v${sharedStateVersion(moment)}`;
-  return moment.turns.length === moment.totalTurnCount
-    ? `${moment.totalTurnCount} companies observed ${state} concurrently`
-    : `${moment.turns.length} of ${moment.totalTurnCount} concurrent turns shown · observed ${state}`;
+function concurrencyLabel(day: DisplayDay): string {
+  const versions = [...new Set(day.turns.map((turn) => turn.stateVersion))];
+  const state = `state v${versions.length === 1 ? versions[0] : versions.join("/")}`;
+  return day.turns.length === day.totalTurnCount
+    ? `${day.totalTurnCount} companies observed ${state} concurrently`
+    : `${day.turns.length} of ${day.totalTurnCount} concurrent turns shown · observed ${state}`;
 }

@@ -13,7 +13,7 @@ from company_bench.runtime.models import (
     MarketSide,
     OrderBookView,
     QuoteAlert,
-    SimTime,
+    SimDay,
 )
 
 __all__ = [
@@ -32,8 +32,8 @@ class ArmedAttention(StrictModel):
     """One validated, checkpoint-safe attention plan."""
 
     source_turn_id: Identifier
-    armed_at: SimTime
-    review_at: SimTime | None = None
+    armed_on: SimDay
+    review_on: SimDay | None = None
     alerts: tuple[QuoteAlert, ...] = Field(max_length=3)
 
     @model_validator(mode="after")
@@ -41,12 +41,14 @@ class ArmedAttention(StrictModel):
         """Keep one persisted plan chronological and free of duplicate alerts."""
         if len(self.alerts) != len(set(self.alerts)):
             raise ValueError("armed attention alerts must be unique")
-        if self.review_at is None:
+        if self.review_on is None:
             return self
-        if self.review_at.day != self.armed_at.day:
-            raise ValueError("review_at must be on the day attention was armed")
-        if self.review_at.absolute_minute <= self.armed_at.absolute_minute:
-            raise ValueError("review_at must be later than armed_at")
+        if self.review_on.week != self.armed_on.week:
+            raise ValueError("review_on must remain in the week attention was armed")
+        if self.review_on.absolute_day <= self.armed_on.absolute_day:
+            raise ValueError("review_on must be later than armed_on")
+        if not self.review_on.is_decision_day:
+            raise ValueError("review_on must be a company decision day")
         return self
 
 
@@ -65,8 +67,8 @@ class AgentAttention:
         self._validate_alerts(attention.alerts, turn.order_books)
         return ArmedAttention(
             source_turn_id=turn.turn_id,
-            armed_at=turn.sim_time,
-            review_at=self._review_at(attention.review_after_minutes, turn),
+            armed_on=turn.sim_day,
+            review_on=self._review_on(attention.review_after_days, turn),
             alerts=attention.alerts,
         )
 
@@ -88,23 +90,25 @@ class AgentAttention:
         )
 
     @staticmethod
-    def _review_at(
-        review_after_minutes: int | None,
+    def _review_on(
+        review_after_days: int | None,
         turn: AgentTurn,
-    ) -> SimTime | None:
+    ) -> SimDay | None:
         runtime = turn.observation.runtime
-        now = turn.sim_time
-        delay = review_after_minutes or runtime.max_review_minutes
-        if delay > runtime.max_review_minutes:
+        today = turn.sim_day
+        delay = review_after_days or runtime.default_review_days
+        if delay > runtime.max_review_days:
             raise AttentionRejected(
-                f"attention review delay cannot exceed {runtime.max_review_minutes} minutes"
+                f"attention review delay cannot exceed {runtime.max_review_days} days"
             )
-        review_at = now.plus(delay)
-        if review_at.day != now.day or review_at.minute_of_day >= runtime.close_minute:
-            if review_after_minutes is None:
+        review_on = today.plus_days(delay)
+        if review_on.week != today.week or not review_on.is_decision_day:
+            if review_after_days is None:
                 return None
-            raise AttentionRejected("attention review must remain inside the business day")
-        return review_at
+            raise AttentionRejected(
+                "attention review must remain on Monday-Saturday of the current week"
+            )
+        return review_on
 
     def _validate_alerts(
         self,

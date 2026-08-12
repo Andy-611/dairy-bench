@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from company_bench.domain.calendar import SimDay, Weekday
 from company_bench.domain.models import (
     CompanyObservation,
     InvalidOrderQuantity,
@@ -25,7 +26,6 @@ from company_bench.runtime.models import (
     QuoteLevel,
     SetQuoteLadder,
     SetRetailPrice,
-    SimTime,
     SystemEventKind,
     Transform,
     TurnRecord,
@@ -35,14 +35,14 @@ from company_bench.runtime.models import (
 from company_bench.runtime.scheduler import Scheduler, SchedulerCheckpoint
 
 
-def test_sim_time_is_absolute_and_immutable() -> None:
-    at = SimTime.at(day=2, hour=9, minute=15)
+def test_sim_day_is_absolute_and_immutable() -> None:
+    at = SimDay.at(week=3, weekday=Weekday.WEDNESDAY)
 
-    assert at.absolute_minute == 3_435
-    assert (at.day, at.hour, at.minute, at.minute_of_day) == (2, 9, 15, 555)
-    assert at.plus(30) == SimTime(absolute_minute=3_465)
+    assert at.absolute_day == 17
+    assert (at.week, at.weekday, at.day_of_week) == (3, Weekday.WEDNESDAY, 3)
+    assert at.plus_days(2) == SimDay.at(week=3, weekday=Weekday.FRIDAY)
     with pytest.raises(ValidationError):
-        SimTime(absolute_minute=-1)
+        SimDay(absolute_day=-1)
 
 
 def test_company_decision_is_discriminated_and_identity_free() -> None:
@@ -59,7 +59,7 @@ def test_company_decision_is_discriminated_and_identity_free() -> None:
                     {"quantity": "5", "limit_price": "4.00"},
                 ],
             },
-            "attention": {"review_after_minutes": 30},
+            "attention": {"review_after_days": 1},
         }
     )
 
@@ -72,7 +72,7 @@ def test_company_decision_is_discriminated_and_identity_free() -> None:
                 QuoteLevel(quantity=Decimal("5"), limit_price=Decimal("4.00")),
             ),
         ),
-        attention=AttentionPlan(review_after_minutes=30),
+        attention=AttentionPlan(review_after_days=1),
     )
     with pytest.raises(ValidationError):
         adapter.validate_python(
@@ -164,9 +164,9 @@ def test_every_economic_command_has_a_discriminated_variant(
 def test_company_decision_distinguishes_action_from_idle() -> None:
     action = ActionDecision(
         action=Produce(product="raw_milk", quantity="10"),
-        attention=AttentionPlan(review_after_minutes=30),
+        attention=AttentionPlan(review_after_days=1),
     )
-    idle = IdleDecision(attention=AttentionPlan(review_after_minutes=60))
+    idle = IdleDecision(attention=AttentionPlan(review_after_days=2))
 
     assert action.kind == "action"
     assert idle.kind == "idle"
@@ -175,28 +175,28 @@ def test_company_decision_distinguishes_action_from_idle() -> None:
 def test_turn_record_requires_runtime_identity_consistency(
     first_observation: CompanyObservation,
 ) -> None:
-    at = SimTime(absolute_minute=540)
+    at = first_observation.sim_day
     turn = AgentTurn(
         turn_id="turn_1",
         company_id="farm_a",
-        sim_time=at,
+        sim_day=at,
         state_version=0,
-        turn_number_today=1,
-        turn_limit_today=first_observation.runtime.max_turns_per_company_day,
-        wake_reasons=(WakeReason.DAY_OPEN,),
-        observation=first_observation.model_copy(update={"company_id": "farm_a"}),
+        turn_number_this_week=1,
+        turn_limit_this_week=first_observation.runtime.max_turns_per_company_week,
+        wake_reasons=(WakeReason.WEEK_OPEN,),
+        observation=first_observation,
         available_cash=first_observation.cash,
         marked_surplus=Decimal(),
     )
     decision = ActionDecision(
         action=Produce(product="raw_milk", quantity=Decimal("10")),
-        attention=AttentionPlan(review_after_minutes=30),
+        attention=AttentionPlan(review_after_days=1),
     )
     envelope = DecisionEnvelope(
         turn_id="turn_1",
         decision_id="decision_1",
         company_id="farm_a",
-        issued_at=at,
+        issued_on=at,
         state_version=0,
         decision=decision,
     )
@@ -204,12 +204,12 @@ def test_turn_record_requires_runtime_identity_consistency(
         turn_id="turn_1",
         decision_id="decision_1",
         company_id="farm_a",
-        occurred_at=at,
+        occurred_on=at,
         status=DecisionStatus.ACCEPTED,
         accepted=True,
         resulting_state_version=1,
         apply_sequence=1,
-        next_available_at=at.plus(30),
+        next_available_on=at.plus_days(1),
     )
 
     assert TurnRecord(
@@ -238,35 +238,35 @@ def test_turn_record_requires_runtime_identity_consistency(
 
 
 def test_scheduler_clamps_past_events_and_pops_a_stable_bucket() -> None:
-    scheduler = Scheduler(start_at=SimTime(absolute_minute=100))
+    scheduler = Scheduler(start_on=SimDay(absolute_day=3))
     first = scheduler.schedule_system(
-        SystemEventKind.DAY_OPEN,
-        SimTime(absolute_minute=50),
+        SystemEventKind.WEEK_OPEN,
+        SimDay(absolute_day=1),
         event_id="first",
     )
     second = scheduler.schedule_system(
         SystemEventKind.OPERATION_COMPLETED,
-        SimTime(absolute_minute=100),
+        SimDay(absolute_day=3),
         event_id="second",
     )
     later = scheduler.schedule_system(
-        SystemEventKind.DAY_CLOSE,
-        SimTime(absolute_minute=200),
+        SystemEventKind.WEEK_CLOSE,
+        SimDay(absolute_day=5),
         event_id="later",
     )
 
-    assert first.at == scheduler.now
-    assert scheduler.peek_time() == SimTime(absolute_minute=100)
-    assert scheduler.pop_bucket() == (first, second)
-    assert scheduler.now == SimTime(absolute_minute=100)
-    assert scheduler.pop_bucket() == (later,)
-    assert scheduler.now == SimTime(absolute_minute=200)
-    assert scheduler.pop_bucket() == ()
+    assert first.scheduled_for == scheduler.today
+    assert scheduler.peek_day() == SimDay(absolute_day=3)
+    assert scheduler.pop_day() == (first, second)
+    assert scheduler.today == SimDay(absolute_day=3)
+    assert scheduler.pop_day() == (later,)
+    assert scheduler.today == SimDay(absolute_day=5)
+    assert scheduler.pop_day() == ()
 
 
 def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> None:
     scheduler = Scheduler()
-    at = SimTime(absolute_minute=540)
+    at = SimDay.at(week=1, weekday=Weekday.WEDNESDAY)
     first = scheduler.schedule_wake(
         "processor_a",
         at,
@@ -278,7 +278,7 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
         SystemEventKind.OPERATION_COMPLETED,
         SystemEventKind.MARKET_CLOSE,
         SystemEventKind.CONSUMER_SALES,
-        SystemEventKind.DAY_CLOSE,
+        SystemEventKind.WEEK_CLOSE,
     )
     system_events = tuple(
         scheduler.schedule_system(kind, at, event_id=kind.value) for kind in system_kinds
@@ -289,7 +289,7 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
         WakeReason.EXTERNAL_EVENT,
         reference_ids=("message_1", "order_1"),
     )
-    other = scheduler.schedule_wake("processor_b", at, WakeReason.DAY_OPEN)
+    other = scheduler.schedule_wake("processor_b", at, WakeReason.WEEK_OPEN)
 
     assert len(scheduler) == 7
     assert merged.sequence == first.sequence
@@ -308,7 +308,7 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
         ),
     )
     assert merged.reference_ids == ()
-    bucket = scheduler.pop_bucket()
+    bucket = scheduler.pop_day()
     assert [event.sequence for event in bucket] == [
         *(event.sequence for event in system_events),
         first.sequence,
@@ -323,23 +323,23 @@ def test_scheduler_prioritizes_system_events_and_coalesces_company_wakes() -> No
 
 
 def test_checkpoint_json_round_trip_preserves_order_and_next_sequence() -> None:
-    scheduler = Scheduler(start_at=SimTime(absolute_minute=500))
+    scheduler = Scheduler(start_on=SimDay(absolute_day=1))
     scheduler.schedule_system(
-        SystemEventKind.DAY_OPEN,
-        SimTime(absolute_minute=540),
-        event_id="day_open",
+        SystemEventKind.WEEK_OPEN,
+        SimDay.at(week=1),
+        event_id="week_open",
     )
-    scheduler.schedule_wake("farm_a", SimTime(absolute_minute=540), WakeReason.DAY_OPEN)
-    for kind, minute in (
-        (SystemEventKind.OPERATION_COMPLETED, 600),
-        (SystemEventKind.DELIVERY_COMPLETED, 600),
-        (SystemEventKind.MARKET_CLOSE, 1_110),
-        (SystemEventKind.CONSUMER_SALES, 1_140),
-        (SystemEventKind.DAY_CLOSE, 1_170),
+    scheduler.schedule_wake("farm_a", SimDay.at(week=1), WakeReason.WEEK_OPEN)
+    for kind, absolute_day in (
+        (SystemEventKind.OPERATION_COMPLETED, 2),
+        (SystemEventKind.DELIVERY_COMPLETED, 2),
+        (SystemEventKind.MARKET_CLOSE, 7),
+        (SystemEventKind.CONSUMER_SALES, 7),
+        (SystemEventKind.WEEK_CLOSE, 7),
     ):
         scheduler.schedule_system(
             kind,
-            SimTime(absolute_minute=minute),
+            SimDay(absolute_day=absolute_day),
             event_id=kind.value,
         )
 
@@ -347,18 +347,18 @@ def test_checkpoint_json_round_trip_preserves_order_and_next_sequence() -> None:
     restored_checkpoint = SchedulerCheckpoint.model_validate_json(checkpoint.model_dump_json())
     restored = Scheduler.restore(restored_checkpoint)
 
-    assert restored.now == scheduler.now
+    assert restored.today == scheduler.today
     assert restored.checkpoint() == checkpoint
     restored_buckets = []
     original_buckets = []
     while restored:
-        restored_buckets.append(restored.pop_bucket())
+        restored_buckets.append(restored.pop_day())
     while scheduler:
-        original_buckets.append(scheduler.pop_bucket())
+        original_buckets.append(scheduler.pop_day())
     assert restored_buckets == original_buckets
     new_event = restored.schedule_system(
         SystemEventKind.DELIVERY_COMPLETED,
-        SimTime(absolute_minute=1_200),
+        SimDay(absolute_day=8),
     )
     assert new_event.sequence == checkpoint.next_sequence
 
@@ -367,17 +367,17 @@ def test_scheduler_cancels_superseded_company_wake_timers() -> None:
     scheduler = Scheduler()
     scheduler.schedule_wake(
         "farm_a",
-        SimTime(absolute_minute=600),
+        SimDay(absolute_day=2),
         WakeReason.REVIEW_DUE,
     )
     scheduler.schedule_wake(
         "farm_a",
-        SimTime(absolute_minute=630),
+        SimDay(absolute_day=3),
         WakeReason.DECISION_REJECTED,
     )
     retained = scheduler.schedule_wake(
         "farm_b",
-        SimTime(absolute_minute=620),
+        SimDay(absolute_day=2),
         WakeReason.DECISION_REJECTED,
     )
 
@@ -385,12 +385,12 @@ def test_scheduler_cancels_superseded_company_wake_timers() -> None:
     scheduler.cancel_company_wakes("farm_a")
 
     assert scheduler.checkpoint().pending_events == (retained,)
-    assert scheduler.pop_bucket() == (retained,)
+    assert scheduler.pop_day() == (retained,)
 
 
 def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
     scheduler = Scheduler()
-    at = SimTime(absolute_minute=600)
+    at = SimDay(absolute_day=2)
     scheduler.schedule_wake("farm_a", at, WakeReason.REVIEW_DUE)
     retained = scheduler.schedule_wake(
         "farm_a",
@@ -406,25 +406,25 @@ def test_scheduler_cancels_one_reason_without_losing_a_coalesced_wake() -> None:
     assert len(pending) == 1
     assert pending[0].event_id == retained.event_id
     assert pending[0].wake_reasons == (WakeReason.TRADE_EXECUTED,)
-    assert scheduler.pop_bucket() == pending
+    assert scheduler.pop_day() == pending
 
 
 def test_attention_can_target_time_but_cannot_spoof_runtime_fields() -> None:
-    decision = IdleDecision(attention=AttentionPlan(review_after_minutes=60))
+    decision = IdleDecision(attention=AttentionPlan(review_after_days=2))
     envelope = DecisionEnvelope(
         turn_id="turn_idle_1",
         decision_id="idle_1",
         company_id="retailer_a",
-        issued_at=SimTime(absolute_minute=900),
+        issued_on=SimDay(absolute_day=5),
         state_version=4,
         decision=decision,
     )
 
-    assert envelope.decision.attention.review_after_minutes == 60
+    assert envelope.decision.attention.review_after_days == 2
     with pytest.raises(ValidationError):
         AttentionPlan.model_validate(
             {
-                "until": {"absolute_minute": 1_140},
+                "until": {"absolute_day": 7},
                 "company_id": "retailer_b",
             }
         )

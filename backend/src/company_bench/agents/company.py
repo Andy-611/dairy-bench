@@ -17,10 +17,12 @@ from company_bench.agents.contracts import (
     ModelConfigurationError,
     ModelInfrastructureError,
     ModelOutputError,
+    ModelQuotaExhaustedError,
     PolicyCompatibilityError,
     PolicyConfigurationError,
     PolicyExecutionError,
     PolicyInfrastructureError,
+    PolicyQuotaExhaustedError,
 )
 from company_bench.agents.memory import (
     AgentCheckpoint,
@@ -65,7 +67,7 @@ from company_bench.runtime.models import (
     WakeReason,
 )
 
-DECISION_PROMPT_VERSION: Final = "dairy-company-v3.8"
+DECISION_PROMPT_VERSION: Final = "dairy-company-v6.0"
 
 
 class CompanyAgent(Protocol):
@@ -120,12 +122,12 @@ class EpisodeCompletionGuard(Protocol):
 class AgentDecisionConstraints(StrictModel):
     """Explicit decision limits derived from one authoritative turn."""
 
-    market_open_minute: int
-    market_close_minute: int
-    operation_duration_minutes: int
-    delivery_duration_minutes: int
-    decision_interval_minutes: int
-    max_review_minutes: int
+    operation_duration_days: int
+    delivery_duration_days: int
+    decision_interval_days: int
+    default_review_days: int
+    max_review_days: int
+    days_until_settlement: int
     used_operation_capacity: Quantity | None
     remaining_operation_capacity: Quantity | None
 
@@ -133,14 +135,14 @@ class AgentDecisionConstraints(StrictModel):
     def from_turn(cls, turn: AgentTurn) -> AgentDecisionConstraints:
         """Project runtime and operation limits without owning economic state."""
         runtime = turn.observation.runtime
-        operation = turn.observation.daily_operation
+        operation = turn.observation.weekly_operation
         return cls(
-            market_open_minute=runtime.open_minute,
-            market_close_minute=runtime.close_minute,
-            operation_duration_minutes=runtime.operation_duration_minutes,
-            delivery_duration_minutes=runtime.delivery_duration_minutes,
-            decision_interval_minutes=runtime.decision_interval_minutes,
-            max_review_minutes=runtime.max_review_minutes,
+            operation_duration_days=runtime.operation_duration_days,
+            delivery_duration_days=runtime.delivery_duration_days,
+            decision_interval_days=runtime.decision_interval_days,
+            default_review_days=runtime.default_review_days,
+            max_review_days=runtime.max_review_days,
+            days_until_settlement=turn.sim_day.days_until_settlement,
             used_operation_capacity=None if operation is None else operation.used_capacity,
             remaining_operation_capacity=turn.remaining_operation_capacity,
         )
@@ -168,7 +170,7 @@ class AgentDecisionInput(StrictModel):
 
 
 class LlmCompanyAgent:
-    """Use one isolated provider gateway and Agent-owned V4 memory."""
+    """Use one isolated provider gateway and Agent-owned V6 memory."""
 
     metadata: PolicyMetadata
 
@@ -222,6 +224,14 @@ class LlmCompanyAgent:
         started_at = datetime.now(UTC)
         try:
             result = await self._gateway.generate_decision(request)
+        except ModelQuotaExhaustedError as error:
+            self._record_failure(
+                request,
+                started_at,
+                InvocationOutcome.INFRASTRUCTURE_ERROR,
+                error,
+            )
+            raise PolicyQuotaExhaustedError(str(error)) from error
         except (ModelCompatibilityError, ModelConfigurationError) as error:
             self._record_failure(
                 request,
@@ -343,7 +353,7 @@ class LlmCompanyAgent:
             "invocation_id": request.invocation_id,
             "run_id": request.run_id,
             "company_id": turn.company_id,
-            "day": turn.observation.day,
+            "week": turn.sim_day.week,
             "observation": turn.observation,
             "provider": self.metadata.provider or "unknown",
             "model": self.metadata.model or "unknown",
@@ -353,13 +363,13 @@ class LlmCompanyAgent:
             ).hexdigest(),
             "started_at": started_at,
             "domain_turn_id": turn.turn_id,
-            "sim_minute": turn.sim_time.absolute_minute,
+            "absolute_day": turn.sim_day.absolute_day,
             "state_version": turn.state_version,
         }
 
 
 class BaselineCompanyAgent:
-    """Transparent V4 actor for the continuous dairy market."""
+    """Transparent V6 actor for the weekly dairy market."""
 
     metadata = PolicyMetadata(
         name="event-baseline",
@@ -377,13 +387,13 @@ class BaselineCompanyAgent:
             action = self._retailer_action(turn)
         else:
             raise TypeError(f"unsupported operation: {type(operation).__name__}")
-        return _baseline_decision(turn, action)
+        return _baseline_decision(action)
 
     @staticmethod
     def _farm_action(turn: AgentTurn) -> EconomicCommand | None:
         operation = turn.observation.operation
         assert isinstance(operation, FarmOperation)
-        if WakeReason.DAY_OPEN in turn.wake_reasons:
+        if WakeReason.WEEK_OPEN in turn.wake_reasons:
             capacity = _remaining_capacity(turn)
             if capacity <= 0:
                 return None
@@ -417,7 +427,7 @@ class BaselineCompanyAgent:
         sell_command = _sell_ladder(
             turn,
             operation.output_product,
-            Decimal("40"),
+            turn.observation.demand.base_demand,
             (Decimal("2.50"), Decimal("2.65"), Decimal("2.80")),
         )
         if sell_command is not None:
@@ -446,12 +456,12 @@ class BaselineCompanyAgent:
         if turn.observation.retail_price is None:
             return SetRetailPrice(
                 product=operation.input_product,
-                unit_price=Decimal("3.50"),
+                unit_price=turn.observation.demand.reference_price,
             )
         order_quantity = _floor_order_quantity(
             max(
                 Decimal("0"),
-                Decimal("40")
+                turn.observation.demand.base_demand
                 - turn.observation.quantity(operation.input_product)
                 - _pending_quantity(turn, operation.input_product),
             )
@@ -580,8 +590,8 @@ def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
         "Your sole objective is to maximize your own company's profit. "
         "Orders lock real cash or FEFO inventory, crossing quotes trade immediately at "
         "the resting price. Purchases arrive after decision_constraints."
-        "delivery_duration_minutes; production and transformation finish after "
-        "decision_constraints.operation_duration_minutes while market actions remain "
+        "delivery_duration_days; production and transformation finish after "
+        "decision_constraints.operation_duration_days while market actions remain "
         "available. Order books list every anonymous price level with aggregate quantity "
         "and order_count. queue_ahead_quantity is the same-price quantity ahead of your "
         "order. "
@@ -589,8 +599,8 @@ def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
         "quantities by expiry; in-transit lots remain in pending_deliveries. "
         "marked_surplus is guaranteed marked asset value minus initial cash, including "
         "reserved assets, pending deliveries, and active-operation output at reference "
-        "values. For productive companies, observation.daily_operation supplies "
-        "K=daily_capacity and c=daily_base_unit_cost; decision_constraints supplies "
+        "values. For productive companies, observation.weekly_operation supplies "
+        "K=weekly_capacity and c=weekly_base_unit_cost; decision_constraints supplies "
         "u=used_operation_capacity and remaining_operation_capacity, while "
         "observation.operation.cost.curvature supplies curvature; "
         "for a new quantity q, cash cost is C(u+q)-C(u), where "
@@ -607,33 +617,31 @@ def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
         "price-quantity levels keep their order identity and priority; every changed level "
         "loses its old priority. Total asks require real inventory and total bids require "
         "real cash collateral. Every tool input must include attention, which controls the "
-        "next review after this decision. Set review_after_minutes to null to "
-        "use the runtime's bounded fallback review when it remains before market close, or "
-        "select a positive delay no greater than decision_constraints.max_review_minutes; "
-        "the resulting review must remain before market close. Set alerts to [] when no price "
+        "next review after this decision. Set review_after_days to null to use the runtime's "
+        "one-day fallback when another Monday-Saturday remains this week, or select a "
+        "positive delay no greater than decision_constraints.max_review_days; the resulting "
+        "review must remain in the current trading week. Set alerts to [] when no price "
         "condition is needed; otherwise provide up to three OR price alerts over the "
         "best visible quote: bids[0].unit_price for best_bid or asks[0].unit_price for "
         "best_ask. Every alert must still be false when armed. "
-        "Background monitoring consumes no turn, but every model call counts against the "
-        "daily turn budget supplied in the turn. Use idle when no economic action is "
-        "justified. Do not poll for ordinary quote changes. "
+        "Sunday has no company decision: open orders close, consumer purchases settle once, "
+        "and expiring inventory is removed. Background monitoring consumes no turn, but "
+        "every model call counts against the six-turn weekly budget and a company can act "
+        "at most once per day. Use idle when no economic action is justified. Do not poll "
+        "for ordinary quote changes. "
         f"Authorized decision tools: {tools}."
     )
 
 
 def _baseline_decision(
-    turn: AgentTurn,
     action: EconomicCommand | None,
 ) -> CompanyDecision:
-    """Pair one baseline action with a bounded, non-polling review plan."""
+    """Pair one baseline decision with the next valid decision-day review."""
     if action is None:
         return IdleDecision(attention=AttentionPlan())
-    desired_delay = 1 if isinstance(action, SetRetailPrice) else 30
-    remaining = turn.observation.runtime.close_minute - turn.sim_time.minute_of_day - 1
-    review_after = min(desired_delay, remaining) if remaining > 0 else None
     return ActionDecision(
         action=action,
-        attention=AttentionPlan(review_after_minutes=review_after),
+        attention=AttentionPlan(),
     )
 
 
@@ -742,5 +750,5 @@ def _remaining_capacity(turn: AgentTurn) -> Decimal:
     """Return a productive company's private realized remaining capacity."""
     remaining = turn.remaining_operation_capacity
     if remaining is None:
-        raise TypeError("productive baseline turn requires daily operation state")
+        raise TypeError("productive baseline turn requires weekly operation state")
     return remaining

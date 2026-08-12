@@ -6,7 +6,10 @@ import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from company_bench.agents.contracts import PolicyInfrastructureError
+from company_bench.agents.contracts import (
+    PolicyInfrastructureError,
+    PolicyQuotaExhaustedError,
+)
 from company_bench.agents.factory import AgentFactory
 from company_bench.diagnostics import bounded_error
 from company_bench.domain.models import MAX_SEED, PolicyKind
@@ -87,7 +90,7 @@ class RunCoordinator:
             seed=active_seed,
             source_run_id=source_run_id,
             scenario_id=scenario.scenario_id,
-            total_days=scenario.days,
+            total_weeks=scenario.weeks,
             submitted_at=datetime.now(UTC),
         )
         self._repository.save_job(job)
@@ -169,16 +172,19 @@ class RunCoordinator:
         try:
             async with self._run_slots:
                 scenario = self._runtime.scenario
-                if job.scenario_id != scenario.scenario_id or job.total_days != scenario.days:
+                if (
+                    job.scenario_id != scenario.scenario_id
+                    or job.total_weeks != scenario.weeks
+                ):
                     raise ValueError("persisted job scenario does not match the active runtime")
                 await self._policy_factory.ensure_available(job.mode, job.model)
                 job = job.mark_running(datetime.now(UTC))
                 self._repository.save_job(job)
                 source = self._repository.get(job.source_run_id) if job.source_run_id else None
 
-                async def report_progress(day: int) -> None:
+                async def report_progress(week: int) -> None:
                     nonlocal job
-                    job = job.report_progress(day)
+                    job = job.report_week_completed(week)
                     self._repository.save_job(job)
 
                 recovery = self._repository.load_recovery(job.run_id)
@@ -201,7 +207,7 @@ class RunCoordinator:
                         job.seed,
                         run_id=job.run_id,
                         started_at=job.started_at,
-                        on_day_completed=report_progress,
+                        on_week_completed=report_progress,
                         store=self._repository,
                         recovery=recovery,
                         replay_source=source,
@@ -223,6 +229,15 @@ class RunCoordinator:
                     )
                 self._repository.save_job(current)
             raise
+        except PolicyQuotaExhaustedError as error:
+            current = self._repository.get_job(job.run_id) or job
+            if not current.status.terminal:
+                self._repository.save_job(
+                    current.mark_quota_exhausted(
+                        datetime.now(UTC),
+                        bounded_error(error),
+                    )
+                )
         except PolicyInfrastructureError as error:
             current = self._repository.get_job(job.run_id) or job
             if not current.status.terminal:
