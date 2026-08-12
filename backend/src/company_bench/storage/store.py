@@ -22,7 +22,7 @@ from company_bench.runs.models import (
 )
 from company_bench.runtime.models import SystemStepRecord, TurnRecord
 
-_DATABASE_SCHEMA_VERSION = 14
+_DATABASE_SCHEMA_VERSION = 15
 _PAYLOAD_SCHEMA_VERSION = 8
 _AUTO_RESUME_STATUSES = (
     RunStatus.QUEUED,

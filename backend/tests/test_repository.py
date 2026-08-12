@@ -227,7 +227,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 8
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
@@ -244,8 +244,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", range(1, 14))
-def test_sqlite_repository_rejects_non_v14_databases(
+@pytest.mark.parametrize("version", range(1, 15))
+def test_sqlite_repository_rejects_non_v15_databases(
     tmp_path: Path,
     version: int,
 ) -> None:

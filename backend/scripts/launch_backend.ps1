@@ -21,9 +21,10 @@ try {
             (Test-Path -LiteralPath $modelsPath)) {
             $credential = Import-Clixml -LiteralPath $credentialPath
             $plainKey = $credential.GetNetworkCredential().Password
+            $modelCatalog = Get-Content -LiteralPath $modelsPath -Raw |
+                ConvertFrom-Json
             $models = @(
-                Get-Content -LiteralPath $modelsPath -Raw |
-                    ConvertFrom-Json |
+                $modelCatalog |
                     ForEach-Object { [string]$_ } |
                     Where-Object { $_ }
             )

@@ -549,7 +549,7 @@ class _ChatCompletionsAdapter:
 
 class _ResponsesAdapter:
     protocol = NewApiWireProtocol.RESPONSES
-    adapter_version = "newapi-responses-v1"
+    adapter_version = "newapi-responses-v2"
 
     def request(
         self,
@@ -1146,6 +1146,7 @@ def _decision_tool(name: DecisionToolName) -> _Tool:
 def _responses_tool(name: DecisionToolName) -> _ResponsesTool:
     """Build one native Responses function from the canonical decision input."""
     model, schema = _decision_schema(name)
+    _require_all_object_properties(schema)
     return _ResponsesTool(
         name=name,
         description=model.__doc__ or f"Execute {name}.",
@@ -1174,6 +1175,24 @@ def _decision_schema(name: DecisionToolName) -> tuple[type[BaseModel], JsonObjec
     schema["additionalProperties"] = False
     require_numeric_economic_schema(schema)
     return model, _JSON_OBJECT_ADAPTER.validate_python(schema)
+
+
+def _require_all_object_properties(schema: JsonValue) -> None:
+    """Make every nested object compatible with strict Responses tools."""
+    if isinstance(schema, list):
+        for item in schema:
+            _require_all_object_properties(item)
+        return
+    if not isinstance(schema, dict):
+        return
+
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        schema["required"] = list(properties)
+    if schema.get("type") == "object":
+        schema["additionalProperties"] = False
+    for value in tuple(schema.values()):
+        _require_all_object_properties(value)
 
 
 def _parse_chat_completion(

@@ -47,6 +47,24 @@ from company_bench.runtime.models import (
 type ResponseHandler = Callable[[httpx.Request], httpx.Response]
 
 
+def _assert_strict_object_schemas(schema: object) -> None:
+    """Require every nested object to satisfy the Responses strict contract."""
+    if isinstance(schema, list):
+        for item in schema:
+            _assert_strict_object_schemas(item)
+        return
+    if not isinstance(schema, dict):
+        return
+
+    properties = schema.get("properties")
+    if schema.get("type") == "object":
+        assert schema.get("additionalProperties") is False
+    if isinstance(properties, dict):
+        assert schema.get("required") == list(properties)
+    for value in schema.values():
+        _assert_strict_object_schemas(value)
+
+
 def _config(
     *,
     max_attempts: int = 1,
@@ -506,7 +524,7 @@ def test_responses_gateway_uses_native_sse_and_parses_one_tool() -> None:
     assert result.usage.reasoning_tokens == 2
     assert result.usage.total_tokens == 14
     assert NewApiResponsesGateway.wire_protocol is NewApiWireProtocol.RESPONSES
-    assert NewApiResponsesGateway.adapter_version == "newapi-responses-v1"
+    assert NewApiResponsesGateway.adapter_version == "newapi-responses-v2"
 
     payload = requests[0]
     assert payload["instructions"] == "Call exactly one authorized tool."
@@ -521,6 +539,11 @@ def test_responses_gateway_uses_native_sse_and_parses_one_tool() -> None:
         "set_quote_ladder",
         "idle",
     }
+    for tool in payload["tools"]:
+        _assert_strict_object_schemas(tool["parameters"])
+    idle = next(tool for tool in payload["tools"] if tool["name"] == "idle")
+    attention = idle["parameters"]["$defs"]["AttentionPlan"]
+    assert attention["required"] == ["review_after_days", "alerts"]
 
 
 def test_anthropic_gateway_uses_messages_and_normalizes_cached_usage() -> None:
