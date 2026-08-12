@@ -134,8 +134,8 @@ Each committed turn persists `apply_sequence`. Consequently network latency,
 completion order, and parallel run load cannot change the simulated economy.
 
 Different `RunJob`s own separate runtimes, schedulers, economy states,
-checkpoints, journals, and policy instances. The application shares only the
-NewAPI HTTP transport and its bounded request semaphore.
+checkpoints, journals, and policy instances. Each credential profile owns one
+NewAPI HTTP connection pool; all profiles share one bounded request semaphore.
 
 ## 8. Persistence and replay
 

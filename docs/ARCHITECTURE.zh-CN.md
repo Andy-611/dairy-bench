@@ -106,7 +106,8 @@ sort_key = SHA256(seed | absolute_day | company_id)
 
 每个 Turn 持久化 `apply_sequence`，所以网络延迟、返回先后和其他并行 Run 的负载不会
 改变经济结果。不同 RunJob 各自拥有 Runtime、Scheduler、经济状态、Checkpoint、
-Journal 与策略实例；只共享 NewAPI HTTP Transport 和有界 Semaphore。
+Journal 与策略实例；每套凭据 Profile 拥有一个 NewAPI HTTP 连接池，所有 Profile 共享
+同一个有界 Semaphore。
 
 ## 8. 持久化与 Replay
 

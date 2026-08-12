@@ -8,12 +8,11 @@ import { TokenSummary } from "../features/evaluation/TokenSummary";
 import {
   RunForm,
   type RunControl,
-  type RunFormMode,
+  type RunFormSelection,
 } from "../features/runs/RunForm";
 import { OperationsTimeline } from "../features/timeline/OperationsTimeline";
 import { DairyBenchApi } from "../shared/api/client";
 import type {
-  PolicyMode,
   PolicyProfileView,
   RunJobView,
   RunRequest,
@@ -45,7 +44,8 @@ type RunSubmission = (signal: AbortSignal) => Promise<RunJobView>;
 
 export function App() {
   const workspace = useRunWorkspace(api);
-  const [mode, setMode] = useState<RunFormMode>("baseline");
+  const [profileId, setProfileId] =
+    useState<RunFormSelection>("baseline");
   const [profiles, setProfiles] = useState<readonly PolicyProfileView[]>([]);
   const [model, setModel] = useState("");
   const [seed, setSeed] = useState("42");
@@ -61,12 +61,11 @@ export function App() {
       .policyProfiles(controller.signal)
       .then((loadedProfiles) => {
         setProfiles(loadedProfiles);
-        const modelProfile = loadedProfiles.find(
-          (profile) => profile.mode === "model",
-        );
-        setModel(
-          (current) =>
-            current || modelProfile?.model || modelProfile?.models[0] || "",
+        setProfileId((current) =>
+          current === "all-runs" ||
+          loadedProfiles.some((profile) => profile.profileId === current)
+            ? current
+            : loadedProfiles[0]?.profileId ?? "all-runs",
         );
       })
       .catch((reason: unknown) => {
@@ -86,8 +85,23 @@ export function App() {
     };
   }, []);
 
+  const selectedProfile = profiles.find(
+    (profile) => profile.profileId === profileId,
+  );
+
   useEffect(() => {
-    if (mode !== "replay") {
+    if (selectedProfile?.kind !== "model") {
+      return;
+    }
+    setModel((current) =>
+      selectedProfile.models.includes(current)
+        ? current
+        : selectedProfile.model || selectedProfile.models[0] || "",
+    );
+  }, [selectedProfile]);
+
+  useEffect(() => {
+    if (selectedProfile?.kind !== "replay") {
       replaySourceActivated.current = false;
       return;
     }
@@ -102,7 +116,7 @@ export function App() {
       workspace.selectReplaySource(workspace.selectedReplaySourceId);
     }
   }, [
-    mode,
+    selectedProfile,
     workspace.selectReplaySource,
     workspace.selectedReplaySourceId,
     workspace.selectedRunId,
@@ -143,11 +157,11 @@ export function App() {
   }
 
   async function runBenchmark(): Promise<void> {
-    if (mode === "all-runs") {
+    if (profileId === "all-runs" || selectedProfile === undefined) {
       return;
     }
     const request = buildRunRequest(
-      mode,
+      selectedProfile,
       model,
       seed,
       workspace.selectedReplaySourceId,
@@ -203,7 +217,7 @@ export function App() {
 
   const { selectedJob, selectedWeek } = workspace;
   const replaySourceError =
-    mode === "replay" ? workspace.replaySourceError : null;
+    selectedProfile?.kind === "replay" ? workspace.replaySourceError : null;
   const selectedFailure =
     selectedJob?.status === "failed" ? selectedJob.errorMessage : null;
   const displayedError =
@@ -254,8 +268,8 @@ export function App() {
           jobs={workspace.jobs}
           model={model}
           control={runControl}
-          mode={mode}
-          onModeChange={setMode}
+          profileId={profileId}
+          onProfileChange={setProfileId}
           onLoadMoreRuns={workspace.loadMoreRuns}
           onModelChange={setModel}
           onRun={() => void runBenchmark()}
@@ -418,14 +432,14 @@ export function App() {
 }
 
 function buildRunRequest(
-  mode: PolicyMode,
+  profile: PolicyProfileView,
   model: string,
   seed: string,
   sourceRunId: string,
 ): RunRequest | string {
-  if (mode === "replay") {
+  if (profile.kind === "replay") {
     return sourceRunId
-      ? { policyMode: mode, sourceRunId }
+      ? { kind: profile.kind, profileId: profile.profileId, sourceRunId }
       : "Completed Run Replay requires a completed source run ID.";
   }
 
@@ -433,12 +447,17 @@ function buildRunRequest(
   if (!Number.isInteger(parsedSeed) || parsedSeed < 0 || parsedSeed > MAX_SEED) {
     return `The random seed must be an integer from 0 to ${MAX_SEED}.`;
   }
-  if (mode === "model") {
-    return model
-      ? { policyMode: mode, model, seed: parsedSeed }
-      : "Model mode requires a configured NewAPI model.";
+  if (profile.kind === "baseline") {
+    return { kind: profile.kind, profileId: profile.profileId, seed: parsedSeed };
   }
-  return { policyMode: mode, seed: parsedSeed };
+  return profile.models.includes(model)
+    ? {
+        kind: profile.kind,
+        profileId: profile.profileId,
+        model,
+        seed: parsedSeed,
+      }
+    : "Model mode requires a model configured for the selected policy.";
 }
 
 function transitionText(control: RunTransition): string {

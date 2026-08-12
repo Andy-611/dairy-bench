@@ -13,6 +13,7 @@ from company_bench.domain.models import (
     EpisodeQuality,
     EpisodeResult,
     PolicyKind,
+    PolicyProfileId,
     ProtocolReport,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
@@ -70,7 +71,7 @@ def test_run_list_and_detail_http_flow() -> None:
 
         created = client.post(
             "/api/runs",
-            json={"mode": "baseline", "seed": 42},
+            json={"profile_id": "baseline", "seed": 42},
         )
         assert created.status_code == 202
         submitted = RunJob.model_validate(created.json())
@@ -123,10 +124,9 @@ def test_run_list_and_detail_http_flow() -> None:
         assert timeline_response.status_code == 200
         timeline = timeline_response.json()
         assert timeline["selected_week"] == 1
+        assert timeline["context"]["profile_id"] == "baseline"
         assert len(timeline["week_summaries"]) == 1
-        assert [day["sim_day"]["absolute_day"] for day in timeline["days"]] == list(
-            range(1, 8)
-        )
+        assert [day["sim_day"]["absolute_day"] for day in timeline["days"]] == list(range(1, 8))
         assert (
             client.get(
                 f"/api/runs/{submitted.run_id}/timeline",
@@ -137,22 +137,18 @@ def test_run_list_and_detail_http_flow() -> None:
 
         assert client.get(f"/api/runs/{result.run_id}/invocations").json() == []
         profiles = client.get("/api/policy-profiles").json()
-        assert [profile["mode"] for profile in profiles] == [
+        assert [profile["profile_id"] for profile in profiles] == [
             "baseline",
-            "model",
             "replay",
         ]
         assert (
-            next(profile for profile in profiles if profile["mode"] == "model")["available"]
-            is False
-        )
-        assert next(profile for profile in profiles if profile["mode"] == "replay")["label"] == (
-            "Completed Run Replay"
+            next(profile for profile in profiles if profile["profile_id"] == "replay")["label"]
+            == "Completed Run Replay"
         )
 
         replayed = client.post(
             "/api/runs",
-            json={"mode": "replay", "source_run_id": result.run_id},
+            json={"profile_id": "replay", "source_run_id": result.run_id},
         )
         assert replayed.status_code == 202
         replay_job = _wait_for_terminal_job(
@@ -179,7 +175,8 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
         jobs = tuple(
             RunJob(
                 run_id=f"http_history_{status.value}",
-                mode=PolicyKind.BASELINE,
+                profile_id=PolicyProfileId.BASELINE,
+                kind=PolicyKind.BASELINE,
                 status=status,
                 seed=sequence,
                 scenario_id=DAIRY_S9_SCENARIO.scenario_id,
@@ -214,7 +211,8 @@ def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
     repository = InMemoryRunStore()
     stopped = RunJob(
         run_id="http_stopped",
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         status=RunStatus.STOPPED,
         seed=42,
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
@@ -238,7 +236,8 @@ def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> No
     submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
     stopped = RunJob(
         run_id="http_resume_stopped",
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         status=RunStatus.STOPPED,
         seed=42,
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
@@ -280,7 +279,8 @@ def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
     completed_jobs = tuple(
         RunJob(
             run_id=f"replay_source_{sequence}",
-            mode=PolicyKind.BASELINE,
+            profile_id=PolicyProfileId.BASELINE,
+            kind=PolicyKind.BASELINE,
             status=RunStatus.COMPLETED,
             seed=sequence,
             scenario_id=DAIRY_S9_SCENARIO.scenario_id,
@@ -348,37 +348,43 @@ def test_http_validation_and_localhost_cors() -> None:
         assert (
             client.post(
                 "/api/runs",
-                json={"mode": "replay"},
+                json={"profile_id": "replay"},
             ).status_code
             == 422
         )
         assert (
             client.post(
                 "/api/runs",
-                json={"mode": "replay", "seed": 42, "source_run_id": "missing"},
+                json={"profile_id": "replay", "seed": 42, "source_run_id": "missing"},
             ).status_code
             == 422
         )
         assert (
             client.post(
                 "/api/runs",
-                json={"mode": "replay", "source_run_id": "missing"},
+                json={"profile_id": "replay", "source_run_id": "missing"},
             ).status_code
             == 422
         )
-        for retired_mode in ("codex", "openai", "claude"):
+        for retired_profile in ("codex", "openai", "claude"):
             assert (
                 client.post(
                     "/api/runs",
-                    json={"mode": retired_mode, "seed": 42},
+                    json={"profile_id": retired_profile, "seed": 42},
                 ).status_code
                 == 422
             )
-        assert client.post("/api/runs", json={"mode": "model", "seed": 42}).status_code == 422
         assert (
             client.post(
                 "/api/runs",
-                json={"mode": "model", "model": "gpt-test", "seed": 42},
+                json={"profile_id": "newapi-model", "seed": 42},
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/api/runs",
+                json={"profile_id": "newapi-model", "model": "gpt-test", "seed": 42},
             ).status_code
             == 409
         )
@@ -422,7 +428,7 @@ def test_default_app_runs_the_v6_scenario(monkeypatch: MonkeyPatch) -> None:
         submitted = RunJob.model_validate(
             client.post(
                 "/api/runs",
-                json={"mode": "baseline", "seed": 42},
+                json={"profile_id": "baseline", "seed": 42},
             ).json()
         )
         completed = _wait_for_terminal_job(client, submitted.run_id)
@@ -437,10 +443,10 @@ def test_default_app_runs_the_v6_scenario(monkeypatch: MonkeyPatch) -> None:
 def test_model_profile_exposes_the_full_newapi_catalog_without_credentials(
     monkeypatch: MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NEWAPI_API_KEY", "secret-newapi-key")
-    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL", "gpt-default-model")
+    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL_API_KEY", "secret-newapi-key")
+    monkeypatch.setenv("DAIRY_BENCH_NEWAPI_MODEL_MODEL", "gpt-default-model")
     monkeypatch.setenv(
-        "DAIRY_BENCH_NEWAPI_MODELS",
+        "DAIRY_BENCH_NEWAPI_MODEL_MODELS",
         "gpt-default-model,claude-model,gemini-model,deepseek-model",
     )
     repository = InMemoryRunStore()
@@ -448,9 +454,17 @@ def test_model_profile_exposes_the_full_newapi_catalog_without_credentials(
     with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         profiles = client.get("/api/policy-profiles").json()
 
-    model = next(profile for profile in profiles if profile["mode"] == "model")
+    assert [profile["profile_id"] for profile in profiles] == [
+        "baseline",
+        "newapi-model",
+        "newapi-codex",
+        "newapi-claude-code",
+        "replay",
+    ]
+    model = next(profile for profile in profiles if profile["profile_id"] == "newapi-model")
     assert model == {
-        "mode": "model",
+        "profile_id": "newapi-model",
+        "kind": "model",
         "label": "Model agents via NewAPI",
         "available": True,
         "provider": "newapi",
@@ -483,5 +497,25 @@ def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(
         TestClient(create_app()),
     ):
         assert repository.close_calls == 0
+
+    assert repository.close_calls == 1
+
+
+def test_lifespan_reclaims_owned_resources_when_start_fails(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    repository = _TrackedOwnedRepository()
+
+    async def fail_start(_: object) -> None:
+        raise RuntimeError("coordinator start failed")
+
+    monkeypatch.setattr(application_module, "SQLiteRunStore", lambda _: repository)
+    monkeypatch.setattr(application_module.RunCoordinator, "start", fail_start)
+
+    with (
+        raises(RuntimeError, match="coordinator start failed"),
+        TestClient(create_app()),
+    ):
+        pass
 
     assert repository.close_calls == 1

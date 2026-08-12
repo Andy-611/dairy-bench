@@ -151,12 +151,8 @@ class RunTimelineProjector:
             days=tuple(
                 TimelineDayFrame(
                     sim_day=day,
-                    system_steps=tuple(
-                        item for item in selected_steps if item.sim_day == day
-                    ),
-                    turns=tuple(
-                        item for item in selected_turns if item.sim_day == day
-                    ),
+                    system_steps=tuple(item for item in selected_steps if item.sim_day == day),
+                    turns=tuple(item for item in selected_turns if item.sim_day == day),
                     market=market_by_day[day.absolute_day],
                 )
                 for day in days
@@ -249,7 +245,7 @@ class RunTimelineProjector:
             if invocation.domain_turn_id is not None:
                 trace_lists[invocation.domain_turn_id].append(invocation)
         mode = (
-            job.mode.value
+            job.kind.value
             if job is not None
             else next(
                 (policy.kind.value for policy in result.policies),
@@ -257,6 +253,13 @@ class RunTimelineProjector:
             )
             if result is not None
             else "unknown"
+        )
+        profile_id = (
+            job.profile_id
+            if job is not None
+            else next((policy.profile_id for policy in result.policies), None)
+            if result is not None
+            else None
         )
         snapshots = (
             result.snapshots
@@ -278,6 +281,7 @@ class RunTimelineProjector:
             scenario_version=scenario.version,
             total_weeks=scenario.weeks,
             status=job.status if job is not None else RunStatus.COMPLETED,
+            profile_id=profile_id,
             mode=mode,
             source_run_id=source_run_id,
             trace_run_id=trace_run_id,
@@ -420,8 +424,12 @@ class RunTimelineProjector:
                     trace_run_id=data.context.trace_run_id,
                     invocation_id=invocation.invocation_id,
                     source_trace=data.context.replay,
+                    profile_id=invocation.profile_id,
                     provider=invocation.provider,
                     model=invocation.model,
+                    wire_protocol=invocation.wire_protocol,
+                    adapter_version=invocation.adapter_version,
+                    config_fingerprint=invocation.config_fingerprint,
                     outcome=invocation.outcome,
                     usage=invocation.usage,
                     latency_ms=invocation.latency_ms,
@@ -620,9 +628,7 @@ def _week_summary(
         turn_count=len(week_turns),
         accepted_count=sum(item.outcome.accepted for item in week_turns),
         rejected_count=sum(not item.outcome.accepted for item in week_turns),
-        idle_count=sum(
-            isinstance(item.envelope.decision, IdleDecision) for item in week_turns
-        ),
+        idle_count=sum(isinstance(item.envelope.decision, IdleDecision) for item in week_turns),
         system_step_count=len(week_steps),
         event_count=len(week_events),
         trade_quantity=sum(
@@ -630,19 +636,11 @@ def _week_summary(
             Decimal(),
         ),
         consumer_sales=sum(
-            (
-                event.sold_quantity
-                for event in week_events
-                if isinstance(event, ConsumerSaleEvent)
-            ),
+            (event.sold_quantity for event in week_events if isinstance(event, ConsumerSaleEvent)),
             Decimal(),
         ),
         expired_quantity=sum(
-            (
-                event.quantity
-                for event in week_events
-                if isinstance(event, InventoryExpiredEvent)
-            ),
+            (event.quantity for event in week_events if isinstance(event, InventoryExpiredEvent)),
             Decimal(),
         ),
     )
@@ -699,9 +697,7 @@ def _run_diagnostics(
         trade_count=len(trade_weeks),
         last_trade_week=max(trade_weeks, default=None),
         zero_trade_week_streak=(
-            max(0, completed_weeks - max(trade_weeks))
-            if trade_weeks
-            else completed_weeks
+            max(0, completed_weeks - max(trade_weeks)) if trade_weeks else completed_weeks
         ),
         consumer_demand=demand,
         consumer_sales=sales,

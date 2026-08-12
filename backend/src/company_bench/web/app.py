@@ -16,6 +16,7 @@ from company_bench.domain.models import (
     MAX_SEED,
     EpisodeResult,
     PolicyKind,
+    PolicyProfileId,
 )
 from company_bench.runs.models import (
     PolicyInvocation,
@@ -36,7 +37,7 @@ class RunRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    mode: PolicyKind = PolicyKind.BASELINE
+    profile_id: PolicyProfileId
     model: str | None = Field(default=None, min_length=1, max_length=256)
     seed: int | None = Field(default=None, strict=True, ge=0, le=MAX_SEED)
     source_run_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -44,16 +45,17 @@ class RunRequest(BaseModel):
     @model_validator(mode="after")
     def validate_mode_fields(self) -> Self:
         """Keep replay identity separate from stochastic run inputs."""
-        if self.mode is PolicyKind.REPLAY:
+        kind = self.profile_id.kind
+        if kind is PolicyKind.REPLAY:
             if self.source_run_id is None:
                 raise ValueError("replay mode requires source_run_id")
             if self.seed is not None:
                 raise ValueError("replay mode inherits the source seed")
         elif self.source_run_id is not None:
             raise ValueError("source_run_id is only valid in replay mode")
-        if self.mode is PolicyKind.MODEL and self.model is None:
+        if kind is PolicyKind.MODEL and self.model is None:
             raise ValueError("Model Agent mode requires model")
-        if self.mode is not PolicyKind.MODEL and self.model is not None:
+        if kind is not PolicyKind.MODEL and self.model is not None:
             raise ValueError("model is only valid in Model Agent mode")
         return self
 
@@ -66,15 +68,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        await active_application.start()
         try:
+            await active_application.start()
             yield
         finally:
             await active_application.close()
 
     app = FastAPI(
         title="Dairy Bench API",
-        version="0.6.0",
+        version="0.7.0",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -106,7 +108,7 @@ def create_app(
     async def run_benchmark(request: RunRequest) -> RunJob:
         try:
             return await active_application.submit(
-                mode=request.mode,
+                profile_id=request.profile_id,
                 model=request.model,
                 seed=request.seed,
                 source_run_id=request.source_run_id,

@@ -1,4 +1,4 @@
-import type { RunJobView } from "../../shared/api/types";
+import type { PolicyProfileView, RunJobView } from "../../shared/api/types";
 import { isActiveRun, isResumableRun } from "../../shared/runStatus";
 import { completedWeeks } from "../../shared/simulationCalendar";
 
@@ -11,6 +11,7 @@ interface AllRunsProps {
   readonly onResume: (runId: string) => void;
   readonly onSelect: (runId: string) => void;
   readonly onStop: (runId: string) => void;
+  readonly profiles: readonly PolicyProfileView[];
   readonly resumingRunId: string | null;
   readonly selectedJob: RunJobView | null;
   readonly stoppingRunId: string | null;
@@ -25,6 +26,7 @@ export function AllRuns({
   onResume,
   onSelect,
   onStop,
+  profiles,
   resumingRunId,
   selectedJob,
   stoppingRunId,
@@ -47,7 +49,7 @@ export function AllRuns({
           ) : (
             jobs.map((job) => (
               <option key={job.runId} value={job.runId}>
-                {runLabel(job)}
+                {runLabel(job, profiles)}
               </option>
             ))
           )}
@@ -97,13 +99,14 @@ function confirmStop(runId: string, onStop: (runId: string) => void): void {
   }
 }
 
-function runLabel(job: RunJobView): string {
-  const policy =
-    job.mode === "model"
-      ? (job.model ?? "NewAPI model")
-      : job.mode === "replay"
-        ? "completed replay"
-        : "rule baseline";
+function runLabel(
+  job: RunJobView,
+  profiles: readonly PolicyProfileView[],
+): string {
+  const profile =
+    profiles.find((candidate) => candidate.profileId === job.profileId)?.label ??
+    job.profileId;
+  const policy = job.mode === "model" && job.model ? `${profile} / ${job.model}` : profile;
   const status = runStatusLabel(job);
   return `${status} · ${shortRunId(job.runId)} · ${policy} · week ${completedWeeks(job.currentAbsoluteDay)}/${job.totalWeeks}`;
 }

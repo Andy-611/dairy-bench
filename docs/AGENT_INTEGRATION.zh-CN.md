@@ -2,9 +2,12 @@
 
 ## 1. 模型边界
 
-模型公司只通过 NewAPI Chat Completions Transport 接入。每家公司拥有隔离的
-`LlmCompanyAgent`、Memory 和 Policy Metadata；不同 Run 只共享 HTTP 连接池与请求
-Semaphore。
+模型公司通过 NewAPI Chat Completions、Responses 或 Anthropic Messages Adapter
+接入统一的 `DecisionGateway`。每家公司拥有隔离的 `LlmCompanyAgent`、Memory 和
+Policy Metadata；不同 Profile 共享全局请求 Semaphore，每套凭据拥有自己的 HTTP 连接池。
+
+Codex 与 Claude Code 是协议 Profile 名称。Dairy Bench 始终是 Agent Runtime，不会启动
+本地编码 Agent 进程，也不会开放 Shell、文件系统、MCP、插件或工作区访问。
 
 Adapter 只接受恰好一个授权 Function Call，拒绝自由文本命令、多工具调用、未知工具，
 也不允许模型填写身份或时间。禁用并行 Tool Call；第一次无效响应可进行一次结构化修复，
@@ -115,8 +118,8 @@ SHA256(seed | absolute_day | company_id)
 ## 8. Memory、审计与 Replay
 
 应用后，公司私有 Memory 接收完整 Turn/Outcome；压缩过程确定且不会跨公司。每个物理调用
-记录模型、Provider、Token、延迟、尝试次数、Prompt 版本/Hash 和是否进入已提交 Turn；
-凭证不会写入 Journal。
+记录 Profile ID、Wire Protocol、Adapter 版本、配置指纹、模型、Provider、Token、延迟、
+尝试次数、Prompt 版本/Hash 和是否进入已提交 Turn；凭证不会写入 Journal。
 
 Replay Agent 不调用模型，必须精确匹配源公司的日期、Observation、Decision 和重新计算的
 Outcome。

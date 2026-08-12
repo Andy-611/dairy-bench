@@ -5,7 +5,12 @@ import pytest
 
 from company_bench.agents.company import BaselineCompanyAgent, CompanyAgent
 from company_bench.agents.factory import AgentBundle, AgentFactory
-from company_bench.domain.models import EpisodeQuality, PolicyKind, ProtocolReport
+from company_bench.domain.models import (
+    EpisodeQuality,
+    PolicyKind,
+    PolicyProfileId,
+    ProtocolReport,
+)
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
 from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus, RunStopReason
@@ -126,7 +131,7 @@ async def _start_blocked_run(
     active_gateway = gateway or _TrackedGateway()
     factory = _StopTestAgentFactory(repository, blocker, active_gateway)
     coordinator = RunCoordinator(repository, factory, EpisodeRuntime(factory.scenario))
-    submitted = await coordinator.submit(mode=PolicyKind.BASELINE, seed=42)
+    submitted = await coordinator.submit(profile_id=PolicyProfileId.BASELINE, seed=42)
     async with asyncio.timeout(2):
         await blocker.blocked.wait()
     return coordinator, repository, submitted, active_gateway
@@ -238,7 +243,7 @@ async def test_stop_newly_queued_run_before_its_task_starts() -> None:
         runtime,
         max_concurrent_runs=1,
     )
-    queued = await coordinator.submit(mode=PolicyKind.BASELINE, seed=2)
+    queued = await coordinator.submit(profile_id=PolicyProfileId.BASELINE, seed=2)
 
     stopped = await coordinator.stop(queued.run_id)
 
@@ -257,7 +262,10 @@ async def test_default_limit_starts_100_runs_and_queues_the_101st() -> None:
         AgentFactory(runtime.scenario, repository),
         runtime,
     )
-    jobs = [await coordinator.submit(mode=PolicyKind.BASELINE, seed=seed) for seed in range(101)]
+    jobs = [
+        await coordinator.submit(profile_id=PolicyProfileId.BASELINE, seed=seed)
+        for seed in range(101)
+    ]
 
     try:
         async with asyncio.timeout(2):
@@ -280,10 +288,10 @@ async def test_stop_queued_run_never_enters_the_runtime() -> None:
         runtime,
         max_concurrent_runs=1,
     )
-    active = await coordinator.submit(mode=PolicyKind.BASELINE, seed=1)
+    active = await coordinator.submit(profile_id=PolicyProfileId.BASELINE, seed=1)
     async with asyncio.timeout(2):
         await runtime.started.wait()
-    queued = await coordinator.submit(mode=PolicyKind.BASELINE, seed=2)
+    queued = await coordinator.submit(profile_id=PolicyProfileId.BASELINE, seed=2)
     await asyncio.sleep(0)
     assert repository.get_job(queued.run_id) == queued
 
@@ -309,7 +317,8 @@ async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
         source.episode,
         RunJob(
             run_id=source.episode.run_id,
-            mode=PolicyKind.BASELINE,
+            profile_id=PolicyProfileId.BASELINE,
+            kind=PolicyKind.BASELINE,
             status=RunStatus.COMPLETED,
             seed=source.episode.seed,
             scenario_id=source.episode.scenario.scenario_id,
@@ -333,7 +342,7 @@ async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
 
     try:
         submitted = await coordinator.submit(
-            mode=PolicyKind.REPLAY,
+            profile_id=PolicyProfileId.REPLAY,
             source_run_id=source.episode.run_id,
         )
         await _wait_for_terminal(repository, submitted.run_id)
@@ -384,7 +393,8 @@ async def _save_checkpointed_job(
     assert checkpoint is not None
     job = RunJob(
         run_id=run_id,
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         status=status,
         seed=seed,
         scenario_id=scenario.scenario_id,
@@ -494,7 +504,8 @@ async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> No
     repository = InMemoryRunStore()
     job = RunJob(
         run_id="resume_from_start",
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         status=RunStatus.STOPPED,
         seed=20,
         scenario_id=scenario.scenario_id,
@@ -526,7 +537,8 @@ async def test_resume_rejects_irrecoverable_or_completed_runs() -> None:
     repository = InMemoryRunStore()
     base = RunJob(
         run_id="resume_rejected",
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         status=RunStatus.FAILED,
         seed=21,
         scenario_id=scenario.scenario_id,

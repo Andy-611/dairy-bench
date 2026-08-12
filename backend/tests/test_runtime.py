@@ -24,6 +24,7 @@ from company_bench.domain.models import (
     MilkProducedEvent,
     PolicyKind,
     PolicyMetadata,
+    PolicyProfileId,
     ProductId,
     ProtocolIssueKind,
     ScenarioSpec,
@@ -65,6 +66,7 @@ class _ScriptedAgent:
     metadata: ClassVar[PolicyMetadata] = PolicyMetadata(
         name="runtime-test",
         kind=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
     )
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
@@ -221,8 +223,7 @@ def _apply_projection(
 
 def _assert_one_turn_per_company_day(execution: EpisodeExecution) -> None:
     keys = tuple(
-        (record.turn.company_id, record.turn.sim_day.absolute_day)
-        for record in execution.turns
+        (record.turn.company_id, record.turn.sim_day.absolute_day) for record in execution.turns
     )
     assert len(keys) == len(set(keys))
 
@@ -269,9 +270,7 @@ async def test_one_week_has_six_decision_days_and_no_sunday_agent_turn() -> None
     )
 
     assert len(execution.turns) == len(scenario.companies) * 6
-    assert {record.turn.sim_day.weekday for record in execution.turns} == set(
-        tuple(Weekday)[:-1]
-    )
+    assert {record.turn.sim_day.weekday for record in execution.turns} == set(tuple(Weekday)[:-1])
     assert all(record.turn.turn_limit_this_week == 6 for record in execution.turns)
     _assert_one_turn_per_company_day(execution)
 
@@ -286,9 +285,7 @@ async def test_canonical_horizon_has_52_weekly_snapshots_and_2808_baseline_turns
     )
 
     assert len(execution.episode.snapshots) == 52
-    assert tuple(snapshot.week for snapshot in execution.episode.snapshots) == tuple(
-        range(1, 53)
-    )
+    assert tuple(snapshot.week for snapshot in execution.episode.snapshots) == tuple(range(1, 53))
     assert len(execution.turns) == 52 * 6 * len(scenario.companies)
     assert all(record.turn.sim_day.is_decision_day for record in execution.turns)
 
@@ -324,9 +321,7 @@ async def test_a_different_seed_can_change_same_day_application_order() -> None:
     scenario = _scenario(max_turns=1)
     first_seed = 1
     first_order = _seed_order(scenario, first_seed)
-    second_seed = next(
-        seed for seed in range(2, 100) if _seed_order(scenario, seed) != first_order
-    )
+    second_seed = next(seed for seed in range(2, 100) if _seed_order(scenario, seed) != first_order)
     runtime = EpisodeRuntime(scenario)
 
     first = await runtime.run(_agents(scenario, _idle), first_seed, run_id="seed_one")
@@ -493,9 +488,7 @@ async def test_saturday_trade_delivery_precedes_sunday_consumer_settlement() -> 
         weekday = turn.sim_day.weekday
         if turn.company_id == "farm_a":
             if weekday is Weekday.MONDAY:
-                return company_decision(
-                    Produce(product=ProductId.BOTTLED_MILK, quantity=QUANTITY)
-                )
+                return company_decision(Produce(product=ProductId.BOTTLED_MILK, quantity=QUANTITY))
             if weekday is Weekday.SATURDAY:
                 return company_decision(
                     _quote(
@@ -536,8 +529,7 @@ async def test_saturday_trade_delivery_precedes_sunday_consumer_settlement() -> 
     sale = next(
         record.event
         for record in execution.episode.events
-        if isinstance(record.event, ConsumerSaleEvent)
-        and record.event.company_id == "retailer_a"
+        if isinstance(record.event, ConsumerSaleEvent) and record.event.company_id == "retailer_a"
     )
 
     assert sunday_kinds == (
@@ -645,9 +637,7 @@ async def test_checkpoint_resumes_each_commitment_exactly_once(
     assert resumed.episode.snapshots == expected.episode.snapshots
     assert resumed.episode.score == expected.episode.score
     completed_steps = tuple(
-        step
-        for step in repository.list_system_steps(run_id)
-        if step.kind is completion_kind
+        step for step in repository.list_system_steps(run_id) if step.kind is completion_kind
     )
     assert all(
         sum(commitment_id in step.reference_ids for step in completed_steps) == 1
@@ -731,9 +721,7 @@ async def test_checkpoint_accepts_a_scoring_only_contract_upgrade() -> None:
     scenario = _scenario(max_turns=3)
     legacy_scenario = scenario.model_copy(
         update={
-            "scoring": scenario.scoring.model_copy(
-                update={"score_version": "s9-enterprise-v3"}
-            )
+            "scoring": scenario.scoring.model_copy(update={"score_version": "s9-enterprise-v3"})
         }
     )
     run_id = "resume_scoring_upgrade"

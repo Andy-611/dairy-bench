@@ -13,7 +13,7 @@ from company_bench.agents.providers.capabilities import (
     ModelCapabilityCatalog,
     verified_capabilities,
 )
-from company_bench.domain.models import PolicyKind, PolicyMetadata
+from company_bench.domain.models import PolicyKind, PolicyMetadata, PolicyProfileId
 from company_bench.runtime.models import (
     ActionDecision,
     AgentTurn,
@@ -34,7 +34,11 @@ def model_capability_catalog(limits: dict[str, int]) -> ModelCapabilityCatalog:
 class FixedDecisionAgent:
     """Return decisions from one deterministic iterable."""
 
-    metadata = PolicyMetadata(name="fixed-decision", kind=PolicyKind.BASELINE)
+    metadata = PolicyMetadata(
+        name="fixed-decision",
+        kind=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+    )
 
     def __init__(self, decisions: Iterable[CompanyDecision]) -> None:
         self._decisions = iter(decisions)

@@ -15,7 +15,13 @@ from company_bench.agents.company import (
 )
 from company_bench.agents.contracts import DecisionModelRequest, DecisionModelResult
 from company_bench.domain.calendar import Weekday
-from company_bench.domain.models import PolicyKind, PolicyMetadata, ProductId, TradeExecutedEvent
+from company_bench.domain.models import (
+    PolicyKind,
+    PolicyMetadata,
+    PolicyProfileId,
+    ProductId,
+    TradeExecutedEvent,
+)
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
     InvocationOutcome,
@@ -58,12 +64,23 @@ def _complete(
     source_run_id: str | None = None,
 ) -> None:
     result = execution.episode
+    profile_id = {
+        PolicyKind.BASELINE: PolicyProfileId.BASELINE,
+        PolicyKind.MODEL: PolicyProfileId.NEWAPI_MODEL,
+        PolicyKind.REPLAY: PolicyProfileId.REPLAY,
+    }[mode]
     repository.complete_job(
         result,
         RunJob(
             run_id=result.run_id,
-            mode=mode,
+            profile_id=profile_id,
+            kind=mode,
+            provider="newapi" if mode is PolicyKind.MODEL else None,
             model="test-model" if mode is PolicyKind.MODEL else None,
+            wire_protocol=("chat_completions" if mode is PolicyKind.MODEL else None),
+            adapter_version=("newapi-chat-completions-v1" if mode is PolicyKind.MODEL else None),
+            prompt_version=(DECISION_PROMPT_VERSION if mode is PolicyKind.MODEL else None),
+            config_fingerprint="test-config" if mode is PolicyKind.MODEL else None,
             status=RunStatus.COMPLETED,
             seed=result.seed,
             source_run_id=source_run_id,
@@ -124,7 +141,11 @@ class _AuditedUnauthorizedGateway:
 class _MarketTimelineAgent:
     """Create multi-flow ladder changes for projection tests."""
 
-    metadata = PolicyMetadata(name="market-timeline", kind=PolicyKind.BASELINE)
+    metadata = PolicyMetadata(
+        name="market-timeline",
+        kind=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+    )
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
         """Return one deterministic decision from the current simulated day."""
@@ -195,7 +216,11 @@ class _TwoBidMarketTimelineAgent(_MarketTimelineAgent):
 class _ThreeFillMarketTimelineAgent:
     """Execute three target levels independently in one ladder command."""
 
-    metadata = PolicyMetadata(name="three-fill-timeline", kind=PolicyKind.BASELINE)
+    metadata = PolicyMetadata(
+        name="three-fill-timeline",
+        kind=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+    )
 
     async def act(self, turn: AgentTurn) -> CompanyDecision:
         if turn.company_id == "processor_a" and turn.sim_day.weekday is Weekday.MONDAY:
@@ -509,9 +534,7 @@ async def test_market_timeline_replays_three_independently_filled_ladder_levels(
     )
 
     page = RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
-    fill_frame = next(
-        day.market for day in page.days if day.sim_day.absolute_day == fill_day
-    )
+    fill_frame = next(day.market for day in page.days if day.sim_day.absolute_day == fill_day)
     assert len(fill_frame.order_flow) == 3
     assert all(isinstance(flow, MarketOrderPlaced) for flow in fill_frame.order_flow)
     assert {flow.apply_sequence for flow in fill_frame.order_flow} == {
@@ -579,14 +602,10 @@ async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> Non
         (1, 2),
     )
     raw_at_open = next(
-        book
-        for book in frames[1].closing_order_books
-        if book.product is ProductId.RAW_MILK
+        book for book in frames[1].closing_order_books if book.product is ProductId.RAW_MILK
     )
     raw_after_fill = next(
-        book
-        for book in frames[2].closing_order_books
-        if book.product is ProductId.RAW_MILK
+        book for book in frames[2].closing_order_books if book.product is ProductId.RAW_MILK
     )
     assert tuple(order.queue_ahead_quantity for order in raw_at_open.bids[0].orders) == (
         Decimal("0"),
@@ -654,8 +673,12 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
                 company_id=source_turn.turn.company_id,
                 week=source_turn.turn.sim_day.week,
                 observation=source_turn.turn.observation,
+                profile_id=PolicyProfileId.NEWAPI_MODEL,
                 provider="newapi",
                 model="test-model",
+                wire_protocol="chat_completions",
+                adapter_version="newapi-chat-completions-v1",
+                config_fingerprint="test-config",
                 prompt_version="current",
                 prompt_hash=f"hash_{index}",
                 started_at=started_at,
@@ -708,6 +731,7 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
     assert detail.item.replay_origin is not None
     assert detail.item.replay_origin.source_turn_id == source_turn.turn.turn_id
     assert len(detail.traces) == 2
+    assert {trace.preview.profile_id for trace in detail.traces} == {PolicyProfileId.NEWAPI_MODEL}
     assert sum(trace.preview.applied_to_committed_turn for trace in detail.traces) == 1
 
 
@@ -791,9 +815,13 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
         metadata=PolicyMetadata(
             name="audited-unauthorized-ladder",
             kind=PolicyKind.MODEL,
+            profile_id=PolicyProfileId.NEWAPI_MODEL,
             provider="scripted",
             model="rejection-model",
+            wire_protocol="scripted-tools",
+            adapter_version="scripted-v1",
             prompt_version=DECISION_PROMPT_VERSION,
+            config_fingerprint="scripted-config",
         ),
     )
 
@@ -809,8 +837,14 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
     repository.save_job(
         RunJob(
             run_id=run_id,
-            mode=PolicyKind.MODEL,
+            profile_id=PolicyProfileId.NEWAPI_MODEL,
+            kind=PolicyKind.MODEL,
+            provider="scripted",
             model="rejection-model",
+            wire_protocol="scripted-tools",
+            adapter_version="scripted-v1",
+            prompt_version=DECISION_PROMPT_VERSION,
+            config_fingerprint="scripted-config",
             status=RunStatus.FAILED,
             seed=17,
             scenario_id=scenario.scenario_id,
@@ -885,7 +919,8 @@ async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
     repository.save_job(
         RunJob(
             run_id="prefix_replay",
-            mode=PolicyKind.REPLAY,
+            profile_id=PolicyProfileId.REPLAY,
+            kind=PolicyKind.REPLAY,
             status=RunStatus.RUNNING,
             seed=7,
             source_run_id=source.episode.run_id,

@@ -14,6 +14,7 @@ from company_bench.domain.models import (
     EpisodeResult,
     PolicyDescriptor,
     PolicyKind,
+    PolicyProfileId,
     ProtocolIssueKind,
     ProtocolReport,
 )
@@ -226,7 +227,7 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         "run_system_steps": 0,
     }
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 13
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
         assert connection.execute("SELECT schema_version FROM run_turns").fetchone()[0] == 7
         assert tuple(row[1] for row in connection.execute("PRAGMA table_info(runs)")) == (
             "run_id",
@@ -243,8 +244,8 @@ def test_sqlite_repository_persists_complete_episode_and_projections(
         assert reopened.list_turns(result.run_id) == (completion_turn,)
 
 
-@pytest.mark.parametrize("version", range(1, 13))
-def test_sqlite_repository_rejects_non_v13_databases(
+@pytest.mark.parametrize("version", range(1, 14))
+def test_sqlite_repository_rejects_non_v14_databases(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -273,7 +274,7 @@ def test_sqlite_repository_turn_journal_and_checkpoint_survive_reopen(
     first = _turn_for("sqlite_run", first_observation, sequence=1)
     second = _turn_for("sqlite_run", first_observation, sequence=2)
     checkpoint = _checkpoint_for(first, first_observation)
-    assert checkpoint.schema_version == 10
+    assert checkpoint.schema_version == 11
 
     with SQLiteRunStore(database) as repository:
         repository.save_progress((first,), (), checkpoint)
@@ -376,15 +377,14 @@ def _history_jobs() -> tuple[RunJob, ...]:
     return tuple(
         RunJob(
             run_id=f"history_{status.value}",
-            mode=PolicyKind.BASELINE,
+            profile_id=PolicyProfileId.BASELINE,
+            kind=PolicyKind.BASELINE,
             status=status,
             seed=sequence,
             scenario_id=DAIRY_S9_SCENARIO.scenario_id,
             total_weeks=DAIRY_S9_SCENARIO.weeks,
             submitted_at=submitted_at + timedelta(minutes=sequence),
-            stop_reason=(
-                RunStopReason.USER_REQUESTED if status is RunStatus.STOPPED else None
-            ),
+            stop_reason=(RunStopReason.USER_REQUESTED if status is RunStatus.STOPPED else None),
             quality=_clean_quality() if status is RunStatus.COMPLETED else None,
         )
         for sequence, status in enumerate(RunStatus)
@@ -396,7 +396,8 @@ def _assert_replay_sources(repository: RunStore) -> tuple[ReplaySource, ...]:
     base_time = datetime(2026, 1, 1, tzinfo=UTC)
     older = RunJob(
         run_id="replay_older",
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         status=RunStatus.COMPLETED,
         seed=1,
         scenario_id=DAIRY_S9_SCENARIO.scenario_id,
@@ -613,6 +614,25 @@ def _checkpoint_for(
                     if company.company_id == observation.company_id
                     else PolicyKind.BASELINE
                 ),
+                profile_id=(
+                    PolicyProfileId.NEWAPI_MODEL
+                    if company.company_id == observation.company_id
+                    and policy_kind is PolicyKind.MODEL
+                    else PolicyProfileId.BASELINE
+                ),
+                **(
+                    {
+                        "provider": "scripted",
+                        "model": "scripted-current",
+                        "wire_protocol": "scripted-tools",
+                        "adapter_version": "scripted-v1",
+                        "prompt_version": "test-current",
+                        "config_fingerprint": "scripted-config",
+                    }
+                    if company.company_id == observation.company_id
+                    and policy_kind is PolicyKind.MODEL
+                    else {}
+                ),
             )
             for company in DAIRY_S9_SCENARIO.companies
         ),
@@ -639,7 +659,8 @@ def _job_for(result: EpisodeResult) -> RunJob:
     """Build a queued lifecycle record matching an episode identity."""
     return RunJob(
         run_id=result.run_id,
-        mode=PolicyKind.BASELINE,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
         seed=result.seed,
         scenario_id=result.scenario.scenario_id,
         total_weeks=result.scenario.weeks,
@@ -688,8 +709,12 @@ def _invocation_for_turn(
         company_id=record.turn.company_id,
         week=record.turn.sim_day.week,
         observation=observation,
+        profile_id=PolicyProfileId.NEWAPI_MODEL,
         provider="scripted",
         model="scripted-current",
+        wire_protocol="scripted-tools",
+        adapter_version="scripted-v1",
+        config_fingerprint="scripted-config",
         prompt_version="test-current",
         prompt_hash=f"hash-{record.turn.turn_id}",
         started_at=now,

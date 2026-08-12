@@ -18,6 +18,7 @@ import type {
   JsonValue,
   MarketMatchLegView,
   PolicyMode,
+  PolicyProfileId,
   PolicyProfileView,
   ProtocolIssueKind,
   ReplaySourceView,
@@ -220,15 +221,19 @@ async function readJsonBody(
 }
 
 function runRequestPayload(request: RunRequest): Readonly<Record<string, unknown>> {
-  if (request.policyMode === "replay") {
+  if (request.kind === "replay") {
     return {
-      mode: request.policyMode,
+      profile_id: request.profileId,
       source_run_id: request.sourceRunId,
     };
   }
-  return request.policyMode === "model"
-    ? { mode: request.policyMode, model: request.model, seed: request.seed }
-    : { mode: request.policyMode, seed: request.seed };
+  return request.kind === "model"
+    ? {
+        profile_id: request.profileId,
+        model: request.model,
+        seed: request.seed,
+      }
+    : { profile_id: request.profileId, seed: request.seed };
 }
 
 function parsePolicyProfile(
@@ -236,8 +241,8 @@ function parsePolicyProfile(
   path: string,
 ): PolicyProfileView {
   const profile = record(payload, path);
-  return {
-    mode: policyMode(profile.mode, `${path}.mode`),
+  const profileId = policyProfileId(profile.profile_id, `${path}.profile_id`);
+  const fields = {
     label: text(profile.label, `${path}.label`),
     available: boolean(profile.available, `${path}.available`),
     provider: nullableText(profile.provider, `${path}.provider`),
@@ -251,14 +256,33 @@ function parsePolicyProfile(
       `${path}.unavailable_reason`,
     ),
   };
+  if (profileId === "baseline") {
+    return {
+      ...fields,
+      profileId,
+      kind: expectedPolicyKind(profile.kind, `${path}.kind`, "baseline"),
+    };
+  }
+  if (profileId === "replay") {
+    return {
+      ...fields,
+      profileId,
+      kind: expectedPolicyKind(profile.kind, `${path}.kind`, "replay"),
+    };
+  }
+  return {
+    ...fields,
+    profileId,
+    kind: expectedPolicyKind(profile.kind, `${path}.kind`, "model"),
+  };
 }
 
 function parseRunJob(payload: unknown): RunJobView {
   const job = record(payload, "RunJob");
-  return {
+  const profileId = policyProfileId(job.profile_id, "profile_id");
+  const fields = {
     runId: text(job.run_id, "run_id"),
     revision: number(job.revision, "revision"),
-    mode: policyMode(job.mode, "mode"),
     model: nullableText(job.model, "model"),
     status: runStatus(job.status, "status"),
     seed: number(job.seed, "seed"),
@@ -278,6 +302,25 @@ function parseRunJob(payload: unknown): RunJobView {
       job.quality === null
         ? null
         : parseEpisodeQuality(job.quality, "quality"),
+  };
+  if (profileId === "baseline") {
+    return {
+      ...fields,
+      profileId,
+      mode: expectedPolicyKind(job.kind, "kind", "baseline"),
+    };
+  }
+  if (profileId === "replay") {
+    return {
+      ...fields,
+      profileId,
+      mode: expectedPolicyKind(job.kind, "kind", "replay"),
+    };
+  }
+  return {
+    ...fields,
+    profileId,
+    mode: expectedPolicyKind(job.kind, "kind", "model"),
   };
 }
 
@@ -597,6 +640,10 @@ function parseTimelineContext(
     ),
     totalWeeks: number(context.total_weeks, `${path}.total_weeks`),
     status: runStatus(context.status, `${path}.status`),
+    profileId:
+      context.profile_id === null
+        ? null
+        : policyProfileId(context.profile_id, `${path}.profile_id`),
     mode: text(context.mode, `${path}.mode`),
     sourceRunId: nullableText(context.source_run_id, `${path}.source_run_id`),
     traceRunId: text(context.trace_run_id, `${path}.trace_run_id`),
@@ -1582,8 +1629,15 @@ function parseTracePreview(
     traceRunId: text(preview.trace_run_id, `${path}.trace_run_id`),
     invocationId: text(preview.invocation_id, `${path}.invocation_id`),
     isSourceTrace: boolean(preview.source_trace, `${path}.source_trace`),
+    profileId: policyProfileId(preview.profile_id, `${path}.profile_id`),
     provider: text(preview.provider, `${path}.provider`),
     model: text(preview.model, `${path}.model`),
+    wireProtocol: text(preview.wire_protocol, `${path}.wire_protocol`),
+    adapterVersion: text(preview.adapter_version, `${path}.adapter_version`),
+    configFingerprint: text(
+      preview.config_fingerprint,
+      `${path}.config_fingerprint`,
+    ),
     outcome: invocationOutcome(preview.outcome, `${path}.outcome`),
     usage: parseTokenUsage(preview.usage, `${path}.usage`),
     latencyMs: number(preview.latency_ms, `${path}.latency_ms`),
@@ -1758,6 +1812,31 @@ function policyMode(value: unknown, path: string): PolicyMode {
     return value;
   }
   throw new Error(`Backend field ${path} is not a known run mode.`);
+}
+
+function policyProfileId(value: unknown, path: string): PolicyProfileId {
+  if (
+    value === "baseline" ||
+    value === "newapi-model" ||
+    value === "newapi-codex" ||
+    value === "newapi-claude-code" ||
+    value === "replay"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known policy profile ID.`);
+}
+
+function expectedPolicyKind<const Kind extends PolicyMode>(
+  value: unknown,
+  path: string,
+  expected: Kind,
+): Kind {
+  const kind = policyMode(value, path);
+  if (kind !== expected) {
+    throw new Error(`Backend field ${path} must be ${expected}, received ${kind}.`);
+  }
+  return expected;
 }
 
 function runStatus(value: unknown, path: string): RunStatus {

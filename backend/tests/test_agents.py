@@ -17,6 +17,7 @@ from company_bench.domain.models import (
     InventoryPosition,
     PolicyKind,
     PolicyMetadata,
+    PolicyProfileId,
     ProductId,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
@@ -69,8 +70,12 @@ def _llm_agent(
         metadata=PolicyMetadata(
             name="bounded-agent",
             kind=PolicyKind.MODEL,
+            profile_id=PolicyProfileId.NEWAPI_MODEL,
             provider="scripted",
             model="scripted-v6",
+            wire_protocol="scripted-tools",
+            adapter_version="scripted-v1",
+            config_fingerprint="scripted-config",
             prompt_version=DECISION_PROMPT_VERSION,
         ),
         memory_token_budget=memory_token_budget,
@@ -277,15 +282,9 @@ async def test_llm_agent_exposes_v6_commands_and_weekly_market_facts(
     assert "market_views" not in prompt_input["turn"]
     assert "remaining_operation_capacity" not in prompt_input["turn"]
     constraints = prompt_input["decision_constraints"]
-    assert constraints["operation_duration_days"] == (
-        observation.runtime.operation_duration_days
-    )
-    assert constraints["delivery_duration_days"] == (
-        observation.runtime.delivery_duration_days
-    )
-    assert constraints["decision_interval_days"] == (
-        observation.runtime.decision_interval_days
-    )
+    assert constraints["operation_duration_days"] == (observation.runtime.operation_duration_days)
+    assert constraints["delivery_duration_days"] == (observation.runtime.delivery_duration_days)
+    assert constraints["decision_interval_days"] == (observation.runtime.decision_interval_days)
     assert constraints["default_review_days"] == observation.runtime.default_review_days
     assert constraints["max_review_days"] == observation.runtime.max_review_days
     assert constraints["days_until_settlement"] == observation.sim_day.days_until_settlement
