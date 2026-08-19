@@ -16,12 +16,12 @@ from company_bench.runs.coordinator import RunCoordinator
 from company_bench.runs.models import RunCheckpoint, RunJob, RunStatus, RunStopReason
 from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import AgentTurn, CompanyDecision, SystemStepRecord, TurnRecord
-from company_bench.storage.store import InMemoryRunStore
+from company_bench.storage.memory import InMemoryRunRepository
 from company_bench.timeline.projector import RunTimelineProjector
 
 
 async def _wait_for_terminal(
-    repository: InMemoryRunStore,
+    repository: InMemoryRunRepository,
     run_id: str,
 ) -> RunJob:
     """Wait for one coordinator-owned job to reach a terminal state."""
@@ -31,6 +31,34 @@ async def _wait_for_terminal(
             if job is not None and job.status.terminal:
                 return job
             await asyncio.sleep(0)
+
+
+def _completed_job_for(execution: EpisodeExecution) -> RunJob:
+    """Build the lifecycle record paired with one completed baseline episode."""
+    result = execution.episode
+    return RunJob(
+        run_id=result.run_id,
+        profile_id=PolicyProfileId.BASELINE,
+        kind=PolicyKind.BASELINE,
+        status=RunStatus.COMPLETED,
+        seed=result.seed,
+        scenario_id=result.scenario.scenario_id,
+        current_absolute_day=result.scenario.calendar.total_days,
+        total_weeks=result.scenario.weeks,
+        submitted_at=result.started_at,
+        started_at=result.started_at,
+        finished_at=result.finished_at,
+        quality=result.quality,
+    )
+
+
+class _JobHidingRunRepository(InMemoryRunRepository):
+    """Hide one persisted source job to exercise replay fail-closed behavior."""
+
+    hidden_run_id: str | None = None
+
+    def get_job(self, run_id: str) -> RunJob | None:
+        return None if run_id == self.hidden_run_id else super().get_job(run_id)
 
 
 class _PausingAgent:
@@ -98,7 +126,7 @@ class _StopTestAgentFactory(AgentFactory):
 
     def __init__(
         self,
-        repository: InMemoryRunStore,
+        repository: InMemoryRunRepository,
         blocker: _PausingAgent,
         gateway: _TrackedGateway,
     ) -> None:
@@ -121,12 +149,12 @@ async def _start_blocked_run(
     gateway: _TrackedGateway | None = None,
 ) -> tuple[
     RunCoordinator,
-    InMemoryRunStore,
+    InMemoryRunRepository,
     RunJob,
     _TrackedGateway,
 ]:
     """Start a run paused at the requested decision boundary."""
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     blocker = _PausingAgent(passthrough_calls)
     active_gateway = gateway or _TrackedGateway()
     factory = _StopTestAgentFactory(repository, blocker, active_gateway)
@@ -138,7 +166,7 @@ async def _start_blocked_run(
 
 
 def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     factory = AgentFactory(DAIRY_S9_SCENARIO, repository)
     runtime = EpisodeRuntime(DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1}))
 
@@ -150,9 +178,9 @@ def test_coordinator_rejects_a_runtime_for_another_scenario() -> None:
 async def test_stop_preserves_resumable_partial_audit_state() -> None:
     coordinator, repository, submitted, gateway = await _start_blocked_run()
     turns = repository.list_turns(submitted.run_id)
-    checkpoint = repository.get_checkpoint(submitted.run_id)
+    recovery = repository.load_recovery(submitted.run_id)
     assert turns
-    assert checkpoint is not None
+    assert recovery is not None
 
     stopped = await coordinator.stop(submitted.run_id)
 
@@ -163,7 +191,7 @@ async def test_stop_preserves_resumable_partial_audit_state() -> None:
     assert stopped.stop_reason is RunStopReason.USER_REQUESTED
     assert repository.get(submitted.run_id) is None
     assert repository.list_turns(submitted.run_id) == turns
-    assert repository.get_checkpoint(submitted.run_id) == checkpoint
+    assert repository.load_recovery(submitted.run_id) == recovery
     assert repository.list_auto_resume_jobs() == ()
     assert gateway.close_calls == 1
     assert await coordinator.stop(submitted.run_id) == stopped
@@ -177,8 +205,9 @@ async def test_stop_before_first_decision_keeps_a_readable_empty_timeline() -> N
     coordinator, repository, submitted, _ = await _start_blocked_run(
         passthrough_calls=0,
     )
-    checkpoint = repository.get_checkpoint(submitted.run_id)
-    assert checkpoint is not None
+    recovery = repository.load_recovery(submitted.run_id)
+    assert recovery is not None
+    checkpoint = recovery.checkpoint
     assert repository.list_turns(submitted.run_id) == ()
 
     stopped = await coordinator.stop(submitted.run_id)
@@ -229,13 +258,13 @@ async def test_backend_close_remains_a_resumable_interruption() -> None:
     assert interrupted is not None
     assert interrupted.status is RunStatus.INTERRUPTED
     assert repository.list_auto_resume_jobs() == (interrupted,)
-    assert repository.get_checkpoint(submitted.run_id) is not None
+    assert repository.load_recovery(submitted.run_id) is not None
     assert gateway.close_calls == 1
 
 
 @pytest.mark.asyncio
 async def test_stop_newly_queued_run_before_its_task_starts() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     runtime = _QueueingRuntime()
     coordinator = RunCoordinator(
         repository,
@@ -255,7 +284,7 @@ async def test_stop_newly_queued_run_before_its_task_starts() -> None:
 
 @pytest.mark.asyncio
 async def test_default_limit_starts_100_runs_and_queues_the_101st() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     runtime = _QueueingRuntime()
     coordinator = RunCoordinator(
         repository,
@@ -280,7 +309,7 @@ async def test_default_limit_starts_100_runs_and_queues_the_101st() -> None:
 
 @pytest.mark.asyncio
 async def test_stop_queued_run_never_enters_the_runtime() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     runtime = _QueueingRuntime()
     coordinator = RunCoordinator(
         repository,
@@ -307,33 +336,17 @@ async def test_stop_queued_run_never_enters_the_runtime() -> None:
 async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     runtime = EpisodeRuntime(scenario)
+    repository = _TamperedJournalRepository()
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
         8,
         run_id="drift_source",
+        store=repository,
     )
-    repository = InMemoryRunStore()
     repository.complete_job(
         source.episode,
-        RunJob(
-            run_id=source.episode.run_id,
-            profile_id=PolicyProfileId.BASELINE,
-            kind=PolicyKind.BASELINE,
-            status=RunStatus.COMPLETED,
-            seed=source.episode.seed,
-            scenario_id=source.episode.scenario.scenario_id,
-            current_absolute_day=source.episode.scenario.weeks,
-            total_weeks=source.episode.scenario.weeks,
-            submitted_at=source.episode.started_at,
-            started_at=source.episode.started_at,
-            finished_at=source.episode.finished_at,
-            quality=source.episode.quality,
-        ),
+        _completed_job_for(source),
     )
-    for index, record in enumerate(source.turns):
-        repository.record_turn(
-            record.model_copy(update={"observation_hash": "tampered"}) if index == 0 else record
-        )
     coordinator = RunCoordinator(
         repository,
         AgentFactory(scenario, repository),
@@ -356,8 +369,37 @@ async def test_replay_drift_marks_the_job_failed_without_a_result() -> None:
     assert repository.get(submitted.run_id) is None
 
 
+@pytest.mark.asyncio
+async def test_replay_rejects_a_source_result_without_run_job() -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
+    runtime = EpisodeRuntime(scenario)
+    repository = _JobHidingRunRepository()
+    source = await runtime.run(
+        {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
+        9,
+        run_id="orphan_replay_source",
+        store=repository,
+    )
+    repository.complete_job(source.episode, _completed_job_for(source))
+    repository.hidden_run_id = source.episode.run_id
+    coordinator = RunCoordinator(
+        repository,
+        AgentFactory(scenario, repository),
+        runtime=runtime,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="replay source is missing its RunJob"):
+            await coordinator.submit(
+                profile_id=PolicyProfileId.REPLAY,
+                source_run_id=source.episode.run_id,
+            )
+    finally:
+        await coordinator.close()
+
+
 class _InterruptAfterCheckpoint:
-    def __init__(self, repository: InMemoryRunStore) -> None:
+    def __init__(self, repository: InMemoryRunRepository) -> None:
         self._repository = repository
 
     def save_progress(
@@ -370,8 +412,30 @@ class _InterruptAfterCheckpoint:
         raise RuntimeError("simulated process stop")
 
 
+class _TamperedJournalRepository(InMemoryRunRepository):
+    """Corrupt one durable source Turn without exposing non-atomic writes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._tampered = False
+
+    def save_progress(
+        self,
+        records: tuple[TurnRecord, ...],
+        system_steps: tuple[SystemStepRecord, ...],
+        checkpoint: RunCheckpoint,
+    ) -> None:
+        if records and not self._tampered:
+            records = (
+                records[0].model_copy(update={"observation_hash": "tampered"}),
+                *records[1:],
+            )
+            self._tampered = True
+        super().save_progress(records, system_steps, checkpoint)
+
+
 async def _save_checkpointed_job(
-    repository: InMemoryRunStore,
+    repository: InMemoryRunRepository,
     runtime: EpisodeRuntime,
     *,
     run_id: str,
@@ -389,8 +453,9 @@ async def _save_checkpointed_job(
             run_id=run_id,
             store=_InterruptAfterCheckpoint(repository),
         )
-    checkpoint = repository.get_checkpoint(run_id)
-    assert checkpoint is not None
+    recovery = repository.load_recovery(run_id)
+    assert recovery is not None
+    checkpoint = recovery.checkpoint
     job = RunJob(
         run_id=run_id,
         profile_id=PolicyProfileId.BASELINE,
@@ -415,7 +480,7 @@ async def test_start_resumes_a_checkpoint_to_completion() -> None:
     runtime = EpisodeRuntime(scenario)
     seed = 18
     run_id = "restart_resume"
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     expected, _ = await _save_checkpointed_job(
         repository,
         runtime,
@@ -445,7 +510,7 @@ async def test_start_resumes_a_checkpoint_to_completion() -> None:
     assert result.events == expected.episode.events
     assert result.snapshots == expected.episode.snapshots
     assert result.score == expected.episode.score
-    assert repository.get_checkpoint(run_id) is None
+    assert repository.load_recovery(run_id) is None
 
 
 @pytest.mark.asyncio
@@ -458,7 +523,7 @@ async def test_explicit_resume_continues_the_same_checkpointed_run(
 ) -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     runtime = EpisodeRuntime(scenario)
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     run_id = f"explicit_resume_{status.value}"
     expected, suspended = await _save_checkpointed_job(
         repository,
@@ -495,13 +560,13 @@ async def test_explicit_resume_continues_the_same_checkpointed_run(
     assert result is not None
     assert repository.list_turns(run_id) == expected.turns
     assert result.score == expected.episode.score
-    assert repository.get_checkpoint(run_id) is None
+    assert repository.load_recovery(run_id) is None
 
 
 @pytest.mark.asyncio
 async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     job = RunJob(
         run_id="resume_from_start",
         profile_id=PolicyProfileId.BASELINE,
@@ -534,7 +599,7 @@ async def test_stopped_run_without_checkpoint_resumes_from_the_beginning() -> No
 @pytest.mark.asyncio
 async def test_resume_rejects_irrecoverable_or_completed_runs() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     base = RunJob(
         run_id="resume_rejected",
         profile_id=PolicyProfileId.BASELINE,

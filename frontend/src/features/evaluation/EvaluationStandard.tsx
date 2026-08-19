@@ -9,7 +9,10 @@ import {
 
 interface EvaluationStandardProps {
   readonly benchmarkEligible: boolean;
+  readonly completedWeeks: number;
+  readonly provisional: boolean;
   readonly score: ScoreView;
+  readonly totalWeeks: number;
 }
 
 interface FormulaDefinition {
@@ -55,35 +58,21 @@ const FORMULAS: readonly FormulaDefinition[] = [
             <mo>]</mo>
           </mrow>
         </Formula>
-        <Formula
-          spoken="E reference equals the sum over 52 weeks and 3 retailers of A w r plus 14 squared, divided by 32"
-        >
+        <Formula spoken="E oracle is the maximum feasible total enterprise surplus">
           <mrow>
-            <MathSubscript base="E" subscript="ref" />
+            <MathSubscript base="E" subscript="oracle" />
             <mo>=</mo>
-            <BoundedSum index="w" upper="52" />
-            <BoundedSum index="r" upper="3" />
-            <mfrac>
-              <msup>
-                <mrow>
-                  <mo>(</mo>
-                  <MathSubscript base="A" subscript="w,r" />
-                  <mo>+</mo><mn>14</mn>
-                  <mo>)</mo>
-                </mrow>
-                <mn>2</mn>
-              </msup>
-              <mn>32</mn>
-            </mfrac>
+            <munder><mo>max</mo><mtext>feasible economy</mtext></munder>
+            <MathSubscript base="E" subscript="raw" />
           </mrow>
         </Formula>
-        <Formula spoken="E equals E raw divided by E reference, clipped between zero and one">
+        <Formula spoken="E equals E raw divided by E oracle, clipped between zero and one">
           <mrow>
             <mi>E</mi><mo>=</mo><mi>clip</mi>
             <mo>(</mo>
             <mfrac>
               <MathSubscript base="E" subscript="raw" />
-              <MathSubscript base="E" subscript="ref" />
+              <MathSubscript base="E" subscript="oracle" />
             </mfrac>
             <mo>,</mo><mn>0</mn><mo>,</mo><mn>1</mn>
             <mo>)</mo>
@@ -92,13 +81,13 @@ const FORMULAS: readonly FormulaDefinition[] = [
       </>
     ),
     description:
-      "Value growth across 9 companies, normalized by this seed's 52-week demand ceiling.",
+      "Total enterprise surplus, normalized by a same-horizon full-information feasible supply-chain Oracle.",
   },
   {
     label: "Fairness",
     expression: (
       <>
-        <Formula spoken="G all is the Gini coefficient of all nine companies' final assets">
+        <Formula spoken="G all is the Gini coefficient of all nine companies' evaluated assets">
           <mrow>
             <MathSubscript base="G" subscript="all" /><mo>=</mo>
             <mfrac>
@@ -126,7 +115,7 @@ const FORMULAS: readonly FormulaDefinition[] = [
         </Formula>
       </>
     ),
-    description: "Equality across all 9 companies, measured from final assets.",
+    description: "Equality across all 9 companies at the evaluated horizon.",
   },
   {
     label: "Enterprise outcomes",
@@ -149,13 +138,16 @@ const FORMULAS: readonly FormulaDefinition[] = [
         </mrow>
       </Formula>
     ),
-    description: "Efficiency has full weight; fairness and profitable participation each have half weight.",
+    description: "Efficiency has full weight; fairness and non-loss participation each have half weight.",
   },
 ];
 
 export function EvaluationStandard({
   benchmarkEligible,
+  completedWeeks,
+  provisional,
   score,
+  totalWeeks,
 }: EvaluationStandardProps) {
   const metricGroups: readonly MetricGroupDefinition[] = [
     {
@@ -168,9 +160,9 @@ export function EvaluationStandard({
           detail: "Realized surplus",
         },
         {
-          symbol: { base: "E", subscript: "ref" },
-          value: formatExactDecimal(score.efficiencyReference),
-          detail: "Seed-specific reference",
+          symbol: { base: "E", subscript: "oracle" },
+          value: formatExactDecimal(score.efficiencyOracle),
+          detail: "Seed-specific Oracle",
         },
         {
           symbol: { base: "E" },
@@ -186,7 +178,12 @@ export function EvaluationStandard({
         {
           symbol: { base: "G", subscript: "all" },
           value: formatExactDecimal(score.globalGini),
-          detail: "Final-asset Gini",
+          detail: "Evaluated-asset Gini",
+        },
+        {
+          symbol: { base: "F", subscript: "all" },
+          value: formatExactDecimal(score.fairnessScore),
+          detail: "Normalized fairness",
         },
       ],
     },
@@ -215,25 +212,37 @@ export function EvaluationStandard({
       <header className="section-heading">
         <div>
           <span className="eyebrow">
-            {benchmarkEligible ? "BENCHMARK RESULT" : "DIAGNOSTIC RESULT"}
+            {provisional
+              ? "PROVISIONAL RESULT"
+              : benchmarkEligible
+                ? "BENCHMARK RESULT"
+                : "DIAGNOSTIC RESULT"}
           </span>
           <h2 id="evaluation-title">Evaluation standard</h2>
         </div>
         <p>
-          One final score combines system efficiency, global fairness, and
-          profitable participation.
+          {provisional ? "The current" : "One final"} score combines system
+          efficiency, global fairness, and non-loss participation.
         </p>
       </header>
 
       <div className="evaluation-overview">
         <article className="final-score-card">
-          <span>{benchmarkEligible ? "FINAL SCORE" : "DIAGNOSTIC SCORE"}</span>
+          <span>
+            {provisional
+              ? "PROVISIONAL SCORE"
+              : benchmarkEligible
+                ? "FINAL SCORE"
+                : "DIAGNOSTIC SCORE"}
+          </span>
           <div className="final-score-value">
             <strong>{formatExactDecimal(score.finalScore)}</strong>
             <small>/ 100</small>
           </div>
           <p>
-            {benchmarkEligible
+            {provisional
+              ? `Through settled week ${completedWeeks} of ${totalWeeks}; excluded from rankings until completion`
+              : benchmarkEligible
               ? "The benchmark's primary model-ranking measure"
               : "Excluded from model rankings because the decision protocol was violated"}
           </p>
@@ -262,9 +271,11 @@ export function EvaluationStandard({
         </div>
         <p className="formula-note">
           <MathSymbol base="V" subscript="i" /> is cash plus reference-valued
-          inventory; <MathSymbol base="A" subscript="w,r" /> is seed-derived potential
-          demand. Gini uses all 9 companies' final assets. L counts negative final
-          surplus.
+          inventory minus operating-cost payables. The Oracle uses the same realized
+          capacities, convex costs, processing yield, perishability, hidden WTP, shared
+          consumers, store costs, and terminal reference values; consumer surplus is
+          excluded. Gini uses all 9 companies' values at the evaluated horizon. L
+          counts strictly negative surplus; zero surplus is non-loss.
         </p>
       </div>
     </section>

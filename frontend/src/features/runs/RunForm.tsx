@@ -6,6 +6,7 @@ import type {
   ReplaySourceView,
   RunJobView,
 } from "../../shared/api/types";
+import { shortRunId } from "../../shared/labels";
 import { AllRuns } from "./AllRuns";
 
 export type RunFormSelection = PolicyProfileId | "all-runs";
@@ -256,10 +257,6 @@ function RunActionButton({
 function replaySourceLabel(source: ReplaySourceView): string {
   const quality = source.benchmarkEligible ? "benchmark eligible" : "diagnostic only";
   return `${shortRunId(source.runId)} · ${quality} · ${formatDateTime(source.submittedAt)}`;
-}
-
-function shortRunId(runId: string): string {
-  return runId.length > 18 ? `${runId.slice(0, 18)}…` : runId;
 }
 
 function formatDateTime(value: string): string {

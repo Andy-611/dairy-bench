@@ -38,13 +38,14 @@ export type JsonValue =
 export interface ScoreView {
   readonly finalScore: DecimalText;
   readonly efficiencyRaw: DecimalText;
-  readonly efficiencyReference: DecimalText;
+  readonly efficiencyOracle: DecimalText;
   readonly efficiencyScore: DecimalText;
   readonly globalGini: DecimalText;
   readonly fairnessScore: DecimalText;
-  readonly profitParticipationScore: DecimalText;
+  readonly nonLossCompanyRatio: DecimalText;
   readonly bankruptCompanyCount: number;
   readonly lossMakingCompanyCount: number;
+  readonly lossMakingCompanyRate: DecimalText;
 }
 
 export interface TokenUsageView {
@@ -89,7 +90,7 @@ export interface CompanyResultView {
   readonly role: CompanyRole;
   readonly status: CompanyStatus;
   readonly policyName: string;
-  readonly initialCash: DecimalText;
+  readonly initialValue: DecimalText;
   readonly finalCash: DecimalText;
   readonly inventoryValue: DecimalText;
   readonly surplus: DecimalText;
@@ -106,11 +107,13 @@ export interface WeeklySnapshotView {
   readonly expiredQuantity: DecimalText;
 }
 
-export interface EpisodeView {
+export interface RunEvaluationView {
   readonly runId: string;
   readonly scenarioId: string;
   readonly seed: number;
-  readonly weeks: number;
+  readonly completedWeeks: number;
+  readonly totalWeeks: number;
+  readonly provisional: boolean;
   readonly score: ScoreView;
   readonly quality: EpisodeQualityView;
   readonly agentUsage: AgentUsageSummaryView | null;
@@ -269,18 +272,30 @@ export type EconomicEffectView =
   | {
       readonly kind: "consumer_sale";
       readonly companyId: string;
-      readonly potentialDemand: DecimalText;
-      readonly demandQuantity: DecimalText;
+      readonly saleableQuantity: DecimalText;
+      readonly saleableBookValue: DecimalText;
       readonly soldQuantity: DecimalText;
       readonly retailPrice: DecimalText | null;
       readonly revenue: DecimalText;
+      readonly costOfGoodsSold: DecimalText;
+      readonly grossProfit: DecimalText;
+      readonly soldOut: boolean;
+    }
+  | {
+      readonly kind: "retail_operating_cost_charged";
+      readonly companyId: string;
+      readonly openingPayable: DecimalText;
+      readonly costAccrued: DecimalText;
+      readonly cashPaid: DecimalText;
+      readonly closingPayable: DecimalText;
     }
   | {
       readonly kind: "inventory_expired";
       readonly companyId: string;
       readonly product: string;
       readonly quantity: DecimalText;
-      readonly valueLoss: DecimalText;
+      readonly referenceValueLoss: DecimalText;
+      readonly bookValueLoss: DecimalText;
     }
   | {
       readonly kind: "company_bankrupt";

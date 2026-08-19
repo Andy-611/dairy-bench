@@ -28,6 +28,7 @@ from company_bench.domain.models import (
     PolicyProfileId,
     ProductId,
     ProtocolIssueKind,
+    RetailerOperation,
     ScenarioSpec,
     TradeExecutedEvent,
 )
@@ -36,9 +37,11 @@ from company_bench.runs.models import RunCheckpoint, RunRecovery
 from company_bench.runtime.episode import EpisodeExecution, EpisodeRuntime
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
+    ActionDecision,
     AgentTurn,
     AttentionPlan,
     CompanyDecision,
+    DecisionPhase,
     IdleDecision,
     MarketSide,
     Produce,
@@ -51,7 +54,7 @@ from company_bench.runtime.models import (
     TurnRecord,
     WakeReason,
 )
-from company_bench.storage.store import InMemoryRunStore
+from company_bench.storage.memory import InMemoryRunRepository
 from tests.support.fakes import company_decision
 
 QUANTITY = Decimal("10")
@@ -74,12 +77,45 @@ class _ScriptedAgent:
         """Return one scripted decision after an optional real delay."""
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
+        if turn.phase is DecisionPhase.RETAIL_PRICING:
+            operation = turn.observation.operation
+            if not isinstance(operation, RetailerOperation):
+                raise TypeError("pricing turn requires a retailer")
+            return company_decision(
+                SetRetailPrice(
+                    product=operation.input_product,
+                    unit_price=Decimal("3.5000"),
+                )
+            )
         return self.decide(turn)
 
 
 @dataclass(slots=True)
+class _PricingProbeAgent:
+    """Capture a sealed pricing turn and optionally submit one retail price."""
+
+    price: Decimal | None
+    pricing_turns: list[AgentTurn]
+
+    metadata: ClassVar[PolicyMetadata] = _ScriptedAgent.metadata
+
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        if turn.phase is not DecisionPhase.RETAIL_PRICING:
+            return company_decision()
+        self.pricing_turns.append(turn)
+        if self.price is None:
+            return company_decision()
+        operation = turn.observation.operation
+        if not isinstance(operation, RetailerOperation):
+            raise TypeError("pricing turn requires a retailer")
+        return company_decision(
+            SetRetailPrice(product=operation.input_product, unit_price=self.price)
+        )
+
+
+@dataclass(slots=True)
 class _InterruptOnCommit:
-    repository: InMemoryRunStore
+    repository: InMemoryRunRepository
     kind: SystemEventKind
     interrupted: bool = False
 
@@ -103,7 +139,7 @@ class _InterruptOnCommit:
 
 @dataclass(slots=True)
 class _InterruptOnAttention:
-    repository: InMemoryRunStore
+    repository: InMemoryRunRepository
     interrupted: bool = False
 
     def save_progress(
@@ -232,7 +268,7 @@ def _assert_one_turn_per_company_day(execution: EpisodeExecution) -> None:
 @pytest.mark.asyncio
 async def test_runtime_orders_seven_days_and_sunday_settlement() -> None:
     scenario = _scenario(max_turns=1)
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     await EpisodeRuntime(scenario).run(
         _agents(scenario, _idle),
@@ -295,8 +331,9 @@ async def test_runtime_never_calls_an_agent_after_initial_bankruptcy() -> None:
         if isinstance(event.event, CompanyBankruptEvent)
     ) == ("farm_a",)
 
+
 @pytest.mark.asyncio
-async def test_one_week_has_six_decision_days_and_no_sunday_agent_turn() -> None:
+async def test_one_week_has_six_operating_days_and_one_retail_pricing_turn() -> None:
     scenario = _scenario()
     execution = await EpisodeRuntime(scenario).run(
         _agents(scenario, _idle),
@@ -304,14 +341,148 @@ async def test_one_week_has_six_decision_days_and_no_sunday_agent_turn() -> None
         run_id="weekly_turn_budget",
     )
 
-    assert len(execution.turns) == len(scenario.companies) * 6
-    assert {record.turn.sim_day.weekday for record in execution.turns} == set(tuple(Weekday)[:-1])
-    assert all(record.turn.turn_limit_this_week == 6 for record in execution.turns)
+    operating = tuple(
+        record for record in execution.turns if record.turn.phase is DecisionPhase.OPERATIONS
+    )
+    pricing = tuple(
+        record for record in execution.turns if record.turn.phase is DecisionPhase.RETAIL_PRICING
+    )
+    assert len(operating) == len(scenario.companies) * 6
+    assert {record.turn.sim_day.weekday for record in operating} == set(tuple(Weekday)[:-1])
+    assert all(record.turn.turn_limit_this_week == 6 for record in operating)
+    assert len(pricing) == 1
+    assert pricing[0].turn.company_id == "retailer_a"
+    assert pricing[0].turn.sim_day.weekday is Weekday.SUNDAY
+    assert pricing[0].turn.turn_limit_this_week == 1
     _assert_one_turn_per_company_day(execution)
 
 
 @pytest.mark.asyncio
-async def test_canonical_horizon_has_52_weekly_snapshots_and_2808_baseline_turns() -> None:
+async def test_retailers_make_sealed_sunday_prices_from_one_pre_price_state() -> None:
+    scenario = _scenario(
+        company_ids=(
+            "farm_a",
+            "processor_a",
+            "retailer_a",
+            "retailer_b",
+            "retailer_c",
+        )
+    )
+    pricing_turns: list[AgentTurn] = []
+    prices = {
+        "retailer_a": Decimal("3.0000"),
+        "retailer_b": Decimal("3.8000"),
+        "retailer_c": Decimal("5.0000"),
+    }
+    agents: dict[str, CompanyAgent] = {
+        company.company_id: (
+            _PricingProbeAgent(prices[company.company_id], pricing_turns)
+            if company.company_id in prices
+            else _ScriptedAgent(_idle)
+        )
+        for company in scenario.companies
+    }
+
+    execution = await EpisodeRuntime(scenario).run(agents, 42, run_id="sealed_prices")
+
+    assert len(pricing_turns) == 3
+    assert len({turn.state_version for turn in pricing_turns}) == 1
+    assert all(not turn.observation.public_retail_market_reports for turn in pricing_turns)
+    assert all(turn.retail_pricing_context is not None for turn in pricing_turns)
+    committed = {
+        event.event.company_id: event.event.retail_price
+        for event in execution.episode.events
+        if isinstance(event.event, ConsumerSaleEvent)
+    }
+    assert committed == prices
+
+
+@pytest.mark.asyncio
+async def test_invalid_pricing_response_keeps_prior_price_and_completes_week() -> None:
+    scenario = _scenario()
+    pricing_turns: list[AgentTurn] = []
+    agents: dict[str, CompanyAgent] = {
+        company.company_id: (
+            _PricingProbeAgent(None, pricing_turns)
+            if company.company_id == "retailer_a"
+            else _ScriptedAgent(_idle)
+        )
+        for company in scenario.companies
+    }
+
+    execution = await EpisodeRuntime(scenario).run(agents, 42, run_id="pricing_fallback")
+
+    pricing = next(
+        record for record in execution.turns if record.turn.phase is DecisionPhase.RETAIL_PRICING
+    )
+    assert pricing.outcome.accepted
+    assert pricing.protocol_issue_kind is ProtocolIssueKind.INVALID_RESPONSE
+    assert pricing.protocol_fallback_applied
+    decision = pricing.envelope.decision
+    assert isinstance(decision, ActionDecision)
+    assert isinstance(decision.action, SetRetailPrice)
+    assert decision.action.unit_price == Decimal("3.5000")
+    sale = next(
+        record.event
+        for record in execution.episode.events
+        if isinstance(record.event, ConsumerSaleEvent)
+    )
+    assert sale.retail_price == Decimal("3.5000")
+
+    replay = await EpisodeRuntime(scenario).run(
+        {
+            company.company_id: ReplayCompanyAgent(company.company_id, execution.turns)
+            for company in scenario.companies
+        },
+        42,
+        run_id="pricing_fallback_replay",
+        replay_source=execution.episode,
+    )
+    assert replay.episode.quality == execution.episode.quality
+    assert replay.episode.events == execution.episode.events
+
+
+@pytest.mark.asyncio
+async def test_week_two_observations_receive_private_and_public_weekly_reports() -> None:
+    scenario = _scenario(
+        weeks=2,
+        company_ids=(
+            "farm_a",
+            "processor_a",
+            "retailer_a",
+            "retailer_b",
+            "retailer_c",
+        ),
+    )
+    week_two_turns: dict[str, AgentTurn] = {}
+
+    def capture(turn: AgentTurn) -> CompanyDecision:
+        if turn.sim_day.week == 2 and turn.sim_day.weekday is Weekday.MONDAY:
+            week_two_turns[turn.company_id] = turn
+        return company_decision()
+
+    await EpisodeRuntime(scenario).run(
+        _agents(scenario, capture),
+        42,
+        run_id="weekly_reports",
+    )
+
+    assert set(week_two_turns) == {company.company_id for company in scenario.companies}
+    for company_id, turn in week_two_turns.items():
+        assert tuple(report.company_id for report in turn.observation.weekly_reports) == (
+            company_id,
+        )
+        public = turn.observation.public_retail_market_reports
+        assert tuple(report.week for report in public) == (1,)
+        assert tuple(item.company_id for item in public[0].retailers) == (
+            "retailer_a",
+            "retailer_b",
+            "retailer_c",
+        )
+
+
+@pytest.mark.asyncio
+async def test_canonical_horizon_has_52_snapshots_and_separate_pricing_turns() -> None:
     scenario = DAIRY_S9_SCENARIO
     execution = await EpisodeRuntime(scenario).run(
         _baseline_agents(scenario),
@@ -321,8 +492,16 @@ async def test_canonical_horizon_has_52_weekly_snapshots_and_2808_baseline_turns
 
     assert len(execution.episode.snapshots) == 52
     assert tuple(snapshot.week for snapshot in execution.episode.snapshots) == tuple(range(1, 53))
-    assert len(execution.turns) == 52 * 6 * len(scenario.companies)
-    assert all(record.turn.sim_day.is_decision_day for record in execution.turns)
+    operating = tuple(
+        record for record in execution.turns if record.turn.phase is DecisionPhase.OPERATIONS
+    )
+    pricing = tuple(
+        record for record in execution.turns if record.turn.phase is DecisionPhase.RETAIL_PRICING
+    )
+    assert len(operating) == 52 * 6 * len(scenario.companies)
+    assert len(pricing) == 52 * 3
+    assert all(record.turn.sim_day.is_decision_day for record in operating)
+    assert all(record.turn.sim_day.is_settlement_day for record in pricing)
 
 
 @pytest.mark.asyncio
@@ -469,7 +648,10 @@ async def test_protocol_rejection_retries_on_following_decision_days() -> None:
     assert execution.episode.quality.protocol.issues[0].kind is ProtocolIssueKind.INVALID_RESPONSE
     for company in scenario.companies:
         records = tuple(
-            record for record in observed if record.turn.company_id == company.company_id
+            record
+            for record in observed
+            if record.turn.company_id == company.company_id
+            and record.turn.phase is DecisionPhase.OPERATIONS
         )
         assert tuple(record.turn.sim_day.weekday for record in records) == (
             Weekday.MONDAY,
@@ -517,7 +699,7 @@ async def test_saturday_trade_delivery_precedes_sunday_consumer_settlement() -> 
         company_ids=("farm_a", "retailer_a"),
         bottled_farm=True,
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     def decide(turn: AgentTurn) -> CompanyDecision:
         weekday = turn.sim_day.weekday
@@ -580,7 +762,7 @@ async def test_saturday_trade_delivery_precedes_sunday_consumer_settlement() -> 
 @pytest.mark.asyncio
 async def test_turn_limit_audits_a_suppressed_completion_wake() -> None:
     scenario = _scenario(max_turns=1, company_ids=("farm_a",))
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     def produce(_: AgentTurn) -> CompanyDecision:
         return company_decision(
@@ -624,7 +806,7 @@ async def test_checkpoint_resumes_each_commitment_exactly_once(
         37,
         run_id=run_id,
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     store = _InterruptOnCommit(repository, completion_kind)
 
     with pytest.raises(RuntimeError, match="durable commitment"):
@@ -686,7 +868,7 @@ async def test_checkpoint_restores_attention_and_review_wake_exactly() -> None:
     run_id = "resume_attention"
     runtime = EpisodeRuntime(scenario)
     expected = await runtime.run(_agents(scenario, _idle), 39, run_id=run_id)
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     with pytest.raises(RuntimeError, match="durable attention plan"):
         await runtime.run(
@@ -754,11 +936,9 @@ async def test_checkpoint_restores_attention_and_review_wake_exactly() -> None:
 @pytest.mark.asyncio
 async def test_checkpoint_rejects_any_scenario_contract_change() -> None:
     scenario = _scenario(max_turns=3)
-    incompatible_scenario = scenario.model_copy(
-        update={"scenario_id": "test.runtime.incompatible"}
-    )
+    incompatible_scenario = scenario.model_copy(update={"scenario_id": "test.runtime.incompatible"})
     run_id = "reject_scenario_change"
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     with pytest.raises(RuntimeError, match="durable attention plan"):
         await EpisodeRuntime(incompatible_scenario).run(

@@ -24,7 +24,6 @@ class CapabilitySource(StrEnum):
     """Provenance for one model capability record."""
 
     GATEWAY = "gateway_validation"
-    MANUAL = "manual"
     OFFICIAL = "official_catalog"
 
 
@@ -87,15 +86,6 @@ class ModelCapabilityCatalog:
         """Open the production catalog with auditable built-in candidates."""
         return cls(path, probe, seeds=_BUILTIN_CAPABILITIES)
 
-    def require(self, model_id: str) -> ModelCapability:
-        """Return one confirmed capability or fail before creating Agents."""
-        capability = self._models.get(model_id)
-        if capability is None or not capability.verified:
-            raise ModelCapabilityError(
-                f"NewAPI model '{model_id}' has not completed output-token calibration"
-            )
-        return capability
-
     async def ensure(self, model_id: str) -> ModelCapability:
         """Calibrate one model at most once, even across concurrent submissions."""
         capability = self._models.get(model_id)
@@ -143,20 +133,6 @@ class ModelCapabilityCatalog:
             temporary = self._path.with_suffix(f"{self._path.suffix}.tmp")
             temporary.write_text(f"{document.model_dump_json(indent=2)}\n", encoding="utf-8")
             temporary.replace(self._path)
-
-
-def verified_capabilities(limits: dict[str, int]) -> tuple[ModelCapability, ...]:
-    """Build concise in-memory gateway-confirmed records for tests and adapters."""
-    verified_at = datetime.now(UTC)
-    return tuple(
-        ModelCapability(
-            model_id=model_id,
-            max_output_tokens=max_output_tokens,
-            source=CapabilitySource.GATEWAY,
-            verified_at=verified_at,
-        )
-        for model_id, max_output_tokens in limits.items()
-    )
 
 
 def _load_document(path: Path | None) -> dict[str, ModelCapability]:

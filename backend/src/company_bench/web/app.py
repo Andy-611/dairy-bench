@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from company_bench import __version__
 from company_bench.agents.factory import PolicyUnavailableError
 from company_bench.application import BenchmarkApplication
 from company_bench.domain.models import (
@@ -22,13 +23,14 @@ from company_bench.runs.models import (
     PolicyInvocation,
     PolicyProfileView,
     ReplaySource,
+    RunEvaluation,
     RunJob,
 )
 from company_bench.runtime.models import TurnRecord
+from company_bench.storage.sqlite import DATABASE_SCHEMA_VERSION, JOURNAL_PAYLOAD_VERSION
 from company_bench.timeline.models import TimelineDetail, TimelineWeek
 from company_bench.timeline.projector import (
     TimelineNotFoundError,
-    TimelineUnsupportedError,
 )
 
 
@@ -60,6 +62,19 @@ class RunRequest(BaseModel):
         return self
 
 
+class HealthView(BaseModel):
+    """Runtime identity used by launchers before reusing a backend process."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["ok"] = "ok"
+    api_version: str
+    scenario_id: str
+    score_version: str
+    database_schema: int
+    journal_payload_version: int
+
+
 def create_app(
     application: BenchmarkApplication | None = None,
 ) -> FastAPI:
@@ -76,7 +91,7 @@ def create_app(
 
     app = FastAPI(
         title="Dairy Bench API",
-        version="0.7.0",
+        version=__version__,
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -87,9 +102,16 @@ def create_app(
         allow_headers=("*",),
     )
 
-    @app.get("/api/health", tags=["system"])
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    @app.get("/api/health", response_model=HealthView, tags=["system"])
+    def health() -> HealthView:
+        scenario = active_application.scenario
+        return HealthView(
+            api_version=__version__,
+            scenario_id=scenario.scenario_id,
+            score_version=scenario.scoring.score_version,
+            database_schema=DATABASE_SCHEMA_VERSION,
+            journal_payload_version=JOURNAL_PAYLOAD_VERSION,
+        )
 
     @app.get(
         "/api/policy-profiles",
@@ -183,6 +205,17 @@ def create_app(
             ) from error
 
     @app.get(
+        "/api/runs/{run_id}/evaluation",
+        response_model=RunEvaluation,
+        tags=["runs"],
+    )
+    def get_evaluation(run_id: str) -> RunEvaluation:
+        evaluation = active_application.evaluation(run_id)
+        if evaluation is None:
+            raise _not_found("Settled run evaluation", run_id)
+        return evaluation
+
+    @app.get(
         "/api/runs/{run_id}/invocations",
         response_model=tuple[PolicyInvocation, ...],
         tags=["runs"],
@@ -213,7 +246,7 @@ def create_app(
     ) -> TimelineWeek:
         try:
             return active_application.timeline_week(run_id, week)
-        except (TimelineNotFoundError, TimelineUnsupportedError, ValueError) as error:
+        except (TimelineNotFoundError, ValueError) as error:
             raise _timeline_http_error(error) from error
 
     @app.get(
@@ -224,7 +257,7 @@ def create_app(
     def read_timeline_detail(run_id: str, entry_id: str) -> TimelineDetail:
         try:
             return active_application.timeline_detail(run_id, entry_id)
-        except (TimelineNotFoundError, TimelineUnsupportedError, ValueError) as error:
+        except (TimelineNotFoundError, ValueError) as error:
             raise _timeline_http_error(error) from error
 
     @app.get(
@@ -253,6 +286,4 @@ def _timeline_http_error(error: ValueError | LookupError) -> HTTPException:
     """Map timeline domain failures consistently across both read Interfaces."""
     if isinstance(error, TimelineNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error))
-    if isinstance(error, TimelineUnsupportedError):
-        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
     return HTTPException(status_code=422, detail=str(error))

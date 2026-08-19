@@ -89,9 +89,7 @@ class _MarketReplay:
             event for event in record.outcome.events if isinstance(event, TradeExecutedEvent)
         )
         bankruptcies = tuple(
-            event
-            for event in record.outcome.events
-            if isinstance(event, CompanyBankruptEvent)
+            event for event in record.outcome.events if isinstance(event, CompanyBankruptEvent)
         )
         if not isinstance(action, SetQuoteLadder):
             if events or record.outcome.quote_ladder_result is not None:

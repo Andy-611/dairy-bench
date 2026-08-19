@@ -57,7 +57,12 @@ class RuntimePaths:
     @property
     def database(self) -> Path:
         """Return the current weekly-runtime SQLite database path."""
-        return self.root / "data" / "runs-v7.sqlite3"
+        return self.root / "data" / "runs-v9.sqlite3"
+
+    @property
+    def oracle_cache(self) -> Path:
+        """Return the versioned enterprise-Oracle cache directory."""
+        return self.root / "data" / "oracle-v2"
 
     def model_capabilities(self, profile_id: PolicyProfileId) -> Path:
         """Return one profile's versioned NewAPI capability catalog path."""

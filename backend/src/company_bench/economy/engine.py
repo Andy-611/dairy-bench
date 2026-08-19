@@ -1,4 +1,4 @@
-"""Deterministic V7 economy engine for weekly dairy-market episodes."""
+"""Deterministic V9 economy engine for weekly dairy-market episodes."""
 
 from __future__ import annotations
 
@@ -35,10 +35,13 @@ from company_bench.domain.models import (
     PositiveMoney,
     PositiveQuantity,
     ProcessorOperation,
+    ProductFlowSummary,
     ProductId,
     PublicCompany,
     Quantity,
     RetailerOperation,
+    RetailOperatingCostChargedEvent,
+    RetailPrice,
     ScenarioSpec,
     StrictModel,
     TradeExecutedEvent,
@@ -48,7 +51,7 @@ from company_bench.domain.models import (
     WorldState,
 )
 from company_bench.domain.precision import EconomicDecimal, EconomicPrecision
-from company_bench.economy.demand import ConsumerDemandCurve
+from company_bench.economy.consumer import RetailOffer, SharedConsumerMarket
 from company_bench.economy.market import (
     AssetLedger,
     BuyOrder,
@@ -60,6 +63,7 @@ from company_bench.economy.market import (
     TradeFill,
 )
 from company_bench.economy.operations import OperatingEconomics
+from company_bench.economy.reports import WeeklyReportBook
 from company_bench.economy.valuation import EnterpriseValuation
 from company_bench.runtime.models import (
     DecisionEnvelope,
@@ -76,6 +80,7 @@ from company_bench.runtime.models import (
     QuoteLadderResult,
     QuoteLevelAction,
     RejectionCategory,
+    RetailPricingContext,
     ScheduledCompletion,
     SetQuoteLadder,
     SetRetailPrice,
@@ -90,7 +95,6 @@ __all__ = [
     "OperationJob",
     "PendingDelivery",
     "ProductionJob",
-    "RetailPriceState",
     "TransformationJob",
 ]
 
@@ -141,6 +145,7 @@ class TransformationJob(StrictModel):
     output_quantity: PositiveQuantity
     processing_cost_per_input: PositiveMoney
     cash_cost: PositiveMoney
+    input_book_value: Money
 
     @model_validator(mode="after")
     def validate_job(self) -> Self:
@@ -220,17 +225,8 @@ class ConsumerSettlement(StrictModel):
     """The immutable Sunday consumer-market totals for one trading week."""
 
     week: int = Field(ge=1)
-    potential_demand: Quantity
-    demand: Quantity
+    market_quantity: Quantity
     sold_quantity: Quantity
-
-
-class RetailPriceState(StrictModel):
-    """One retailer's active consumer price."""
-
-    company_id: CompanyId
-    product: ProductId
-    unit_price: PositiveMoney
 
 
 class EconomyState(StrictModel):
@@ -243,7 +239,7 @@ class EconomyState(StrictModel):
     markets: tuple[MarketState, ...]
     jobs: tuple[OperationJob, ...] = ()
     deliveries: tuple[PendingDelivery, ...] = ()
-    retail_prices: tuple[RetailPriceState, ...] = ()
+    retail_prices: tuple[RetailPrice, ...] = ()
     operation_states: tuple[WeeklyOperationState, ...]
     consumer_settlement: ConsumerSettlement | None = None
     events: tuple[DomainEvent, ...] = ()
@@ -320,9 +316,7 @@ class EconomyState(StrictModel):
             raise ValueError("pending delivery belongs to an unknown buyer")
         if any(price.company_id not in known for price in self.retail_prices):
             raise ValueError("retail price belongs to an unknown company")
-        bankrupt = {
-            company.company_id for company in self.companies if not company.is_active
-        }
+        bankrupt = {company.company_id for company in self.companies if not company.is_active}
         if any(order.owner_id in bankrupt for order in orders):
             raise ValueError("bankrupt companies cannot retain market orders")
         if any(price.company_id in bankrupt for price in self.retail_prices):
@@ -475,16 +469,12 @@ class BankruptcyManager:
         return economy.model_copy(
             update={
                 "companies": tuple(
-                    company.declare_bankrupt(on)
-                    if company.company_id in bankrupt_ids
-                    else company
+                    company.declare_bankrupt(on) if company.company_id in bankrupt_ids else company
                     for company in snapshot.companies
                 ),
                 "markets": snapshot.markets,
                 "retail_prices": tuple(
-                    price
-                    for price in economy.retail_prices
-                    if price.company_id not in bankrupt_ids
+                    price for price in economy.retail_prices if price.company_id not in bankrupt_ids
                 ),
                 "next_lot_sequence": snapshot.next_lot_sequence,
                 "events": (*economy.events, *events),
@@ -514,14 +504,15 @@ class _TradeEffects:
 
 
 class EconomyEngine:
-    """Own every V7 cash, inventory, market, operation, delivery, and exit transition."""
+    """Own every V9 cash, inventory, market, operation, delivery, and exit transition."""
 
     def __init__(self, valuation: EnterpriseValuation | None = None) -> None:
         self._valuation = valuation or EnterpriseValuation()
         self._bankruptcies = BankruptcyManager(self._valuation)
+        self._reports = WeeklyReportBook()
 
     def initial_state(self, scenario: ScenarioSpec, seed: int) -> WorldState:
-        """Create an empty-inventory V7 world."""
+        """Create an empty-inventory V9 world."""
         if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= MAX_SEED:
             raise ValueError(f"seed must be an integer from 0 to {MAX_SEED}")
         economics = OperatingEconomics(scenario, seed)
@@ -558,6 +549,7 @@ class EconomyEngine:
                 state.scenario,
                 state.seed,
             ).open_week(week, state.operation_states),
+            retail_prices=state.retail_prices,
             next_lot_sequence=state.next_lot_sequence,
         )
         return self._bankruptcies.settle(economy, SimDay.at(week=week))
@@ -581,7 +573,14 @@ class EconomyEngine:
                     operation_states,
                     company.company_id,
                 ),
-                retail_price=None,
+                retail_price=next(
+                    (
+                        price.unit_price
+                        for price in state.retail_prices
+                        if price.company_id == company.company_id
+                    ),
+                    None,
+                ),
             )
             for company in state.companies
             if company.is_active
@@ -592,11 +591,14 @@ class EconomyEngine:
         economy: EconomyState,
         company_id: CompanyId,
         sim_day: SimDay,
+        *,
+        allow_settlement_day: bool = False,
     ) -> CompanyObservation:
         """Project only currently available assets for one active company."""
         if sim_day.week != economy.week:
             raise ValueError("observation day must belong to the current active week")
-        if not sim_day.is_decision_day:
+        valid_day = sim_day.is_decision_day or (allow_settlement_day and sim_day.is_settlement_day)
+        if not valid_day:
             raise ValueError("company observations require a Monday-Saturday decision day")
         company_state = _company_state(economy.companies, company_id)
         if not company_state.is_active:
@@ -720,13 +722,59 @@ class EconomyEngine:
         )
 
     @staticmethod
-    def remaining_operation_capacity(
+    def retail_pricing_context(
         economy: EconomyState,
         company_id: CompanyId,
-    ) -> Quantity | None:
-        """Return this week's unused production input capacity for an operator."""
-        state = _optional_operation_state(economy.operation_states, company_id)
-        return None if state is None else state.remaining_capacity
+    ) -> RetailPricingContext:
+        """Project private post-procurement inventory and cost facts for pricing."""
+        if any(market.is_open for market in economy.markets):
+            raise ValueError("retail pricing context requires closed wholesale markets")
+        if economy.jobs or economy.deliveries:
+            raise ValueError("retail pricing context requires drained operations and deliveries")
+        company = economy.scenario.company(company_id)
+        operation = company.operation
+        if not isinstance(operation, RetailerOperation):
+            raise ValueError("retail pricing context is only available to retailers")
+        state = _company_state(economy.companies, company_id)
+        quantity = state.inventory_quantity(operation.input_product)
+        book_value = state.inventory_book_value(operation.input_product)
+        purchases = tuple(
+            event
+            for event in economy.events
+            if isinstance(event, TradeExecutedEvent)
+            and event.buyer_id == company_id
+            and event.product is operation.input_product
+        )
+        purchased_quantity = sum((event.quantity for event in purchases), start=ZERO)
+        purchase_spend = sum((event.total_value for event in purchases), start=ZERO)
+        previous_price = next(
+            (
+                price.unit_price
+                for price in economy.retail_prices
+                if price.company_id == company_id and price.product is operation.input_product
+            ),
+            None,
+        )
+        return RetailPricingContext(
+            current_cash=state.cash,
+            saleable_quantity=quantity,
+            saleable_book_value=book_value,
+            weighted_unit_cost=(
+                EconomicPrecision.round(book_value / quantity) if quantity > ZERO else None
+            ),
+            current_week_procurement=ProductFlowSummary(
+                product=operation.input_product,
+                quantity=purchased_quantity,
+                value=purchase_spend,
+                volume_weighted_unit_price=(
+                    EconomicPrecision.round(purchase_spend / purchased_quantity)
+                    if purchased_quantity > ZERO
+                    else None
+                ),
+            ),
+            inventory_by_expiry=state.inventory_positions(operation.input_product),
+            previous_retail_price=previous_price,
+        )
 
     def apply_batch(
         self,
@@ -797,6 +845,13 @@ class EconomyEngine:
             ),
             product=product,
             quantity=quantity,
+            unit_book_cost=(
+                job.unit_cost
+                if isinstance(job, ProductionJob)
+                else EconomicPrecision.round(
+                    (job.input_book_value + job.cash_cost) / job.output_quantity
+                )
+            ),
             produced_week=economy.week,
             expires_end_of_week=(
                 economy.week + economy.scenario.product(product).shelf_life_weeks - 1
@@ -834,7 +889,7 @@ class EconomyEngine:
                 "events": (*economy.events, event),
             }
         )
-        return self._bankruptcies.settle(updated, on)
+        return updated
 
     def complete_delivery(
         self,
@@ -887,7 +942,7 @@ class EconomyEngine:
         )
 
     def settle_consumer_sales(self, economy: EconomyState, on: SimDay) -> EconomyState:
-        """Execute the sole Sunday consumer purchase event."""
+        """Settle one finite shared Sunday consumer market across retailers."""
         self._require_settlement_day(economy, on)
         if economy.consumer_settlement is not None:
             raise ValueError("consumer sales are already settled")
@@ -895,61 +950,119 @@ class EconomyEngine:
             raise ValueError("markets must close before consumer sales")
 
         session = _MarketSession.from_economy(economy)
-        demand_curve = ConsumerDemandCurve(spec=economy.scenario.demand)
-        events: list[ConsumerSaleEvent] = []
-        potential_total = ZERO
-        demand_total = ZERO
-        sold_total = ZERO
+        retailers = tuple(
+            company
+            for company in economy.scenario.companies
+            if isinstance(company.operation, RetailerOperation)
+        )
         prices = {
             (price.company_id, price.product): price.unit_price for price in economy.retail_prices
         }
-        for company in economy.scenario.companies:
+        offers = tuple(
+            RetailOffer(
+                company_id=company.company_id,
+                unit_price=prices.get((company.company_id, company.operation.input_product)),
+                available_quantity=(
+                    session.assets.quantity(
+                        company.company_id,
+                        company.operation.input_product,
+                    )
+                    if economy.is_active(company.company_id)
+                    else ZERO
+                ),
+            )
+            for company in retailers
+            if isinstance(company.operation, RetailerOperation)
+        )
+        settlement = SharedConsumerMarket(economy.scenario.consumer_market).settle(
+            economy.seed,
+            economy.week,
+            offers,
+        )
+        sold_by_company = {sale.company_id: sale.sold_quantity for sale in settlement.sales}
+        offer_by_company = {offer.company_id: offer for offer in offers}
+        events: list[DomainEvent] = []
+        total_sold = ZERO
+        for company in retailers:
             operation = company.operation
             if not isinstance(operation, RetailerOperation):
-                continue
-            potential = demand_curve.potential(economy.seed, economy.week, company.company_id)
-            price = prices.get((company.company_id, operation.input_product))
-            if price is None:
-                demand = potential
-                sold = ZERO
-                revenue = ZERO
-            else:
-                demand = demand_curve.quantity(potential, price)
-                candidate_sale = min(
-                    demand,
-                    session.assets.quantity(company.company_id, operation.input_product),
+                raise TypeError("retailer roster contains a non-retailer operation")
+            offer = offer_by_company[company.company_id]
+            sold = sold_by_company[company.company_id]
+            price = offer.unit_price
+            revenue = (
+                EconomicPrecision.round(sold * price) if sold > ZERO and price is not None else ZERO
+            )
+            saleable_lots = tuple(
+                lot
+                for lot in _company_state(
+                    economy.companies,
+                    company.company_id,
+                ).inventory
+                if lot.product is operation.input_product
+            )
+            saleable_book_value = sum(
+                (lot.book_value for lot in saleable_lots),
+                start=ZERO,
+            )
+            sold_lots = (
+                session.assets.reserve_inventory(
+                    company.company_id,
+                    operation.input_product,
+                    sold,
                 )
-                revenue = EconomicPrecision.round(candidate_sale * price)
-                sold = candidate_sale if revenue > ZERO else ZERO
-                if sold > ZERO:
-                    session.assets.reserve_inventory(
-                        company.company_id,
-                        operation.input_product,
-                        sold,
-                    )
-                    session.assets.credit_cash(company.company_id, revenue)
+                if sold > ZERO
+                else ()
+            )
+            cost_of_goods_sold = sum(
+                (lot.book_value for lot in sold_lots),
+                start=ZERO,
+            )
+            if revenue > ZERO:
+                session.assets.credit_cash(company.company_id, revenue)
             events.append(
                 ConsumerSaleEvent(
                     occurred_on=on,
                     company_id=company.company_id,
-                    potential_demand_quantity=potential,
-                    demand_quantity=demand,
+                    saleable_quantity=offer.available_quantity,
+                    saleable_book_value=saleable_book_value,
                     sold_quantity=sold,
                     retail_price=price,
                     revenue=revenue,
+                    cost_of_goods_sold=cost_of_goods_sold,
+                    gross_profit=revenue - cost_of_goods_sold,
+                    sold_out=(offer.available_quantity > ZERO and sold == offer.available_quantity),
                 )
             )
-            potential_total += potential
-            demand_total += demand
-            sold_total += sold
+            total_sold += sold
+
+        for company in retailers:
+            if not economy.is_active(company.company_id):
+                continue
+            operation = company.operation
+            if not isinstance(operation, RetailerOperation):
+                raise TypeError("retailer roster contains a non-retailer operation")
+            charge = session.assets.settle_operating_cost(
+                company.company_id,
+                operation.weekly_operating_cost,
+            )
+            events.append(
+                RetailOperatingCostChargedEvent(
+                    occurred_on=on,
+                    company_id=company.company_id,
+                    opening_payable=charge.opening_payable,
+                    cost_accrued=charge.cost_accrued,
+                    cash_paid=charge.cash_paid,
+                    closing_payable=charge.closing_payable,
+                )
+            )
 
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
                 "consumer_settlement": ConsumerSettlement(
                     week=economy.week,
-                    potential_demand=potential_total,
-                    demand=demand_total,
-                    sold_quantity=sold_total,
+                    market_quantity=settlement.population.quantity,
+                    sold_quantity=total_sold,
                 ),
                 "events": (*economy.events, *events),
             }
@@ -987,7 +1100,31 @@ class EconomyEngine:
             companies=settled.companies,
             operation_states=economy.operation_states,
             previous_markets=markets,
+            retail_prices=settled.retail_prices,
+            company_weekly_reports=economy.base_state.company_weekly_reports,
+            public_retail_market_reports=(economy.base_state.public_retail_market_reports),
             next_lot_sequence=economy.next_lot_sequence,
+        )
+        company_reports, public_retail_report = self._reports.build(
+            scenario=economy.scenario,
+            week=economy.week,
+            opening=economy.base_state,
+            closing_companies=state.companies,
+            operation_states=economy.operation_states,
+            retail_prices=state.retail_prices,
+            events=events,
+        )
+        state = state.model_copy(
+            update={
+                "company_weekly_reports": (
+                    *economy.base_state.company_weekly_reports,
+                    *company_reports,
+                ),
+                "public_retail_market_reports": (
+                    *economy.base_state.public_retail_market_reports,
+                    public_retail_report,
+                ),
+            }
         )
         settlement = economy.consumer_settlement
         return WeekResult(
@@ -997,7 +1134,7 @@ class EconomyEngine:
                 state,
                 events,
                 markets,
-                settlement.potential_demand,
+                settlement.market_quantity,
                 settlement.sold_quantity,
                 sum((event.quantity for event in expiry_events), start=ZERO),
             ),
@@ -1160,7 +1297,7 @@ class EconomyEngine:
                 f"insufficient cash: required {cost}, "
                 f"available {session.assets.cash(company.company_id)}"
             )
-        session.assets.reserve_inventory(
+        input_lots = session.assets.reserve_inventory(
             company.company_id,
             action.input_product,
             action.input_quantity,
@@ -1183,6 +1320,7 @@ class EconomyEngine:
             output_quantity=output_quantity,
             processing_cost_per_input=EconomicPrecision.round(cost / action.input_quantity),
             cash_cost=cost,
+            input_book_value=sum((lot.book_value for lot in input_lots), start=ZERO),
         )
         updated = economy._with_market_session(session.freeze()).model_copy(
             update={
@@ -1248,12 +1386,18 @@ class EconomyEngine:
             raise _DecisionRejected("set_retail_price is only available to retailers")
         if action.product is not operation.input_product:
             raise _DecisionRejected("retailer cannot price the requested product")
+        if not envelope.issued_on.is_settlement_day:
+            raise _DecisionRejected("retail prices can only be committed on Sunday")
+        if any(market.is_open for market in economy.markets):
+            raise _DecisionRejected("retail pricing requires closed wholesale markets")
+        if economy.consumer_settlement is not None:
+            raise _DecisionRejected("retail pricing must precede consumer settlement")
         prices = tuple(
             price
             for price in economy.retail_prices
             if (price.company_id, price.product) != (company.company_id, action.product)
         )
-        price = RetailPriceState(
+        price = RetailPrice(
             company_id=company.company_id,
             product=action.product,
             unit_price=action.unit_price,
@@ -1398,8 +1542,13 @@ class EconomyEngine:
         day = envelope.issued_on
         if day.week != economy.week:
             raise _DecisionRejected("decision targets a different trading week")
-        if not economy.scenario.calendar.contains(day) or not day.is_decision_day:
-            raise _DecisionRejected("decision must occur on Monday-Saturday")
+        if not economy.scenario.calendar.contains(day):
+            raise _DecisionRejected("decision lies outside the scenario calendar")
+        action = envelope.action
+        retail_pricing = isinstance(action, SetRetailPrice)
+        if retail_pricing != day.is_settlement_day:
+            expected = "Sunday" if retail_pricing else "Monday-Saturday"
+            raise _DecisionRejected(f"decision must occur on {expected}")
 
     @staticmethod
     def _validate_system_day(economy: EconomyState, day: SimDay) -> None:
@@ -1433,13 +1582,9 @@ class EconomyEngine:
         scenario = state.scenario
         company = scenario.company(company_id)
         company_state = _company_state(company_states, company_id)
-        status_by_company = {
-            candidate.company_id: candidate.status for candidate in company_states
-        }
+        status_by_company = {candidate.company_id: candidate.status for candidate in company_states}
         return CompanyObservation(
-            observation_id=(
-                f"{scenario.scenario_id}|d{sim_day.absolute_day}|{company_id}"
-            ),
+            observation_id=(f"{scenario.scenario_id}|d{sim_day.absolute_day}|{company_id}"),
             scenario_id=scenario.scenario_id,
             scenario_weeks=scenario.weeks,
             sim_day=sim_day,
@@ -1447,13 +1592,14 @@ class EconomyEngine:
             operation=company.operation,
             weekly_operation=weekly_operation,
             products=scenario.products,
-            demand=scenario.demand,
+            consumer_market_rules=scenario.consumer_market.public_rules(),
             scoring=scenario.scoring,
             cash=company_state.cash,
+            operating_cost_payable=company_state.operating_cost_payable,
             inventory=tuple(
                 InventoryPosition(
                     product=product.product,
-                    quantity=_inventory_quantity(company_state, product.product),
+                    quantity=company_state.inventory_quantity(product.product),
                 )
                 for product in scenario.products
             ),
@@ -1467,6 +1613,10 @@ class EconomyEngine:
                 for public in scenario.companies
             ),
             previous_markets=state.previous_markets,
+            weekly_reports=tuple(
+                report for report in state.company_weekly_reports if report.company_id == company_id
+            )[-8:],
+            public_retail_market_reports=state.public_retail_market_reports[-8:],
             runtime=scenario.runtime,
             retail_price=retail_price,
         )
@@ -1492,6 +1642,7 @@ class EconomyEngine:
                             reference_value_loss=EconomicPrecision.round(
                                 lot.quantity * economy.scenario.product(lot.product).reference_value
                             ),
+                            book_value_loss=lot.book_value,
                         )
                     )
                 else:
@@ -1520,7 +1671,7 @@ class EconomyEngine:
         for company in state.scenario.companies:
             current = states[company.company_id]
             inventory_value = state.scenario.inventory_value(current.inventory)
-            net_worth = current.cash + inventory_value
+            net_worth = EnterpriseValuation.settled_value(state.scenario, current)
             companies.append(
                 CompanySnapshot(
                     week=state.completed_weeks,
@@ -1528,11 +1679,9 @@ class EconomyEngine:
                     tier=company.tier,
                     status=current.status,
                     cash=current.cash,
-                    raw_milk_quantity=_inventory_quantity(current, ProductId.RAW_MILK),
-                    bottled_milk_quantity=_inventory_quantity(
-                        current,
-                        ProductId.BOTTLED_MILK,
-                    ),
+                    operating_cost_payable=current.operating_cost_payable,
+                    raw_milk_quantity=current.inventory_quantity(ProductId.RAW_MILK),
+                    bottled_milk_quantity=current.inventory_quantity(ProductId.BOTTLED_MILK),
                     inventory_value=inventory_value,
                     net_worth=net_worth,
                     surplus=net_worth - company.initial_cash,
@@ -1608,13 +1757,6 @@ def _company_state(
         return next(company for company in companies if company.company_id == company_id)
     except StopIteration as error:
         raise ValueError(f"unknown company: {company_id}") from error
-
-
-def _inventory_quantity(state: CompanyState, product: ProductId) -> Quantity:
-    return sum(
-        (lot.quantity for lot in state.inventory if lot.product is product),
-        start=ZERO,
-    )
 
 
 def _optional_operation_state(

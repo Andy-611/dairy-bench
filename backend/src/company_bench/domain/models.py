@@ -62,7 +62,7 @@ type BenchmarkScore = Annotated[
     economic_field(ge=ZERO, le=Decimal("100")),
     ECONOMIC_NORMALIZER,
 ]
-type ScoreVersion = Literal["s9-enterprise-v5"]
+type ScoreVersion = Literal["s9-enterprise-v9"]
 
 
 class InvalidOrderQuantity(ValueError):
@@ -328,6 +328,7 @@ class RetailerOperation(StrictModel):
 
     kind: Literal["retailer"] = "retailer"
     input_product: ProductId = ProductId.BOTTLED_MILK
+    weekly_operating_cost: PositiveMoney
 
 
 type CompanyOperation = Annotated[
@@ -379,27 +380,151 @@ class WeeklyOperationState(StrictModel):
         return self.model_copy(update={"used_capacity": self.used_capacity + quantity})
 
 
-class DemandSpec(StrictModel):
-    """Public deterministic demand curve and private shock range."""
+class ConsumerGroup(StrEnum):
+    """Hidden willingness-to-pay cohort identity."""
 
-    base_demand: Quantity
-    reference_price: PositiveMoney
-    price_sensitivity: PositiveQuantity
-    shock_min: int
-    shock_max: int
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class MarketRegime(StrEnum):
+    """Latent weekly consumer-market regime."""
+
+    SLUMP = "slump"
+    NORMAL = "normal"
+    BOOM = "boom"
+
+
+class ConsumerCohortSpec(StrictModel):
+    """One hidden consumer cohort in the shared retail market."""
+
+    group: ConsumerGroup
+    base_quantity: PositiveQuantity
+    maximum_willingness_to_pay: PositiveMoney
+
+
+class RegimeComposition(StrictModel):
+    """Hidden cohort multipliers for one latent market regime."""
+
+    regime: MarketRegime
+    low: PositiveQuantity
+    medium: PositiveQuantity
+    high: PositiveQuantity
+
+    def multiplier(self, group: ConsumerGroup) -> PositiveQuantity:
+        """Return the multiplier for one cohort."""
+        return {
+            ConsumerGroup.LOW: self.low,
+            ConsumerGroup.MEDIUM: self.medium,
+            ConsumerGroup.HIGH: self.high,
+        }[group]
+
+
+class RegimeWillingnessShift(StrictModel):
+    """Hidden willingness-to-pay shift for one market regime."""
+
+    regime: MarketRegime
+    shift: EconomicDecimal
+
+
+class ConsumerMarketRules(StrictModel):
+    """Public market structure supplied to Agents without hidden parameters."""
+
+    consumer_group_count: Literal[3]
+    groups_have_distinct_unknown_willingness_to_pay: Literal[True]
+    purchase_priority: Literal["lowest_price_first"]
+    stockout_spills_to_next_lowest_price: Literal[True]
+    equal_price_allocation: Literal["deterministic_equal_share"]
+    regimes: tuple[MarketRegime, MarketRegime, MarketRegime]
+    minimum_regime_weeks: int = Field(ge=1)
+    maximum_regime_weeks: int = Field(ge=1)
+    normal_alternates_with_extreme_regimes: Literal[True]
+    regimes_may_change_market_size_and_group_composition: Literal[True]
+    willingness_to_pay_may_change_with_purchasing_power_and_regime: Literal[True]
+    exact_demand_parameters_are_hidden: Literal[True]
 
     @model_validator(mode="after")
-    def validate_shock_range(self) -> Self:
-        """Require a nonempty ordered shock interval."""
-        if self.shock_min > self.shock_max:
-            raise ValueError("shock_min must not exceed shock_max")
+    def validate_duration(self) -> Self:
+        """Require an ordered public regime-duration range."""
+        if self.minimum_regime_weeks > self.maximum_regime_weeks:
+            raise ValueError("minimum regime duration cannot exceed maximum")
         return self
+
+
+class ConsumerMarketSpec(StrictModel):
+    """Complete hidden parameters for the shared consumer market."""
+
+    cohorts: tuple[ConsumerCohortSpec, ...] = Field(min_length=3, max_length=3)
+    compositions: tuple[RegimeComposition, ...] = Field(min_length=3, max_length=3)
+    purchasing_power_shifts: tuple[EconomicDecimal, ...] = Field(min_length=1)
+    regime_willingness_shifts: tuple[RegimeWillingnessShift, ...] = Field(
+        min_length=3,
+        max_length=3,
+    )
+    minimum_regime_weeks: int = Field(default=6, ge=1)
+    maximum_regime_weeks: int = Field(default=10, ge=1)
+    initial_retail_price: PositiveMoney
+
+    @model_validator(mode="after")
+    def validate_market(self) -> Self:
+        """Require exactly one ordered cohort and composition per public category."""
+        groups = tuple(cohort.group for cohort in self.cohorts)
+        if groups != tuple(ConsumerGroup):
+            raise ValueError("consumer cohorts must follow low, medium, high order")
+        willingness = tuple(cohort.maximum_willingness_to_pay for cohort in self.cohorts)
+        if willingness != tuple(sorted(willingness)) or len(set(willingness)) != 3:
+            raise ValueError("consumer willingness-to-pay values must be distinct and increasing")
+        regimes = tuple(composition.regime for composition in self.compositions)
+        if regimes != tuple(MarketRegime):
+            raise ValueError("regime compositions must follow slump, normal, boom order")
+        shifts = self.purchasing_power_shifts
+        if shifts != tuple(sorted(set(shifts))) or ZERO not in shifts:
+            raise ValueError("purchasing-power shifts must be unique, increasing, and include zero")
+        shift_regimes = tuple(item.regime for item in self.regime_willingness_shifts)
+        if shift_regimes != tuple(MarketRegime):
+            raise ValueError("regime willingness shifts must follow slump, normal, boom order")
+        minimum_shift = min(shifts) + min(item.shift for item in self.regime_willingness_shifts)
+        if willingness[0] + minimum_shift <= ZERO:
+            raise ValueError("hidden shifts must preserve positive willingness to pay")
+        if self.minimum_regime_weeks > self.maximum_regime_weeks:
+            raise ValueError("minimum regime duration cannot exceed maximum")
+        return self
+
+    def composition(self, regime: MarketRegime) -> RegimeComposition:
+        """Return hidden composition parameters for one regime."""
+        return next(item for item in self.compositions if item.regime is regime)
+
+    def regime_willingness_shift(self, regime: MarketRegime) -> EconomicDecimal:
+        """Return the hidden willingness-to-pay shift for one regime."""
+        return next(item.shift for item in self.regime_willingness_shifts if item.regime is regime)
+
+    def public_rules(self) -> ConsumerMarketRules:
+        """Project only the market structure Agents are allowed to know."""
+        return ConsumerMarketRules(
+            consumer_group_count=3,
+            groups_have_distinct_unknown_willingness_to_pay=True,
+            purchase_priority="lowest_price_first",
+            stockout_spills_to_next_lowest_price=True,
+            equal_price_allocation="deterministic_equal_share",
+            regimes=(
+                MarketRegime.SLUMP,
+                MarketRegime.NORMAL,
+                MarketRegime.BOOM,
+            ),
+            minimum_regime_weeks=self.minimum_regime_weeks,
+            maximum_regime_weeks=self.maximum_regime_weeks,
+            normal_alternates_with_extreme_regimes=True,
+            regimes_may_change_market_size_and_group_composition=True,
+            willingness_to_pay_may_change_with_purchasing_power_and_regime=True,
+            exact_demand_parameters_are_hidden=True,
+        )
 
 
 class ScoringSpec(StrictModel):
     """Immutable identity of the active benchmark scoring contract."""
 
-    score_version: ScoreVersion = "s9-enterprise-v5"
+    score_version: ScoreVersion = "s9-enterprise-v9"
 
 
 class RuntimeSpec(StrictModel):
@@ -429,7 +554,7 @@ class ScenarioSpec(StrictModel):
     weeks: int = Field(ge=1)
     products: tuple[ProductSpec, ...] = Field(min_length=1)
     companies: tuple[CompanySpec, ...] = Field(min_length=1)
-    demand: DemandSpec
+    consumer_market: ConsumerMarketSpec
     scoring: ScoringSpec
     runtime: RuntimeSpec = RuntimeSpec()
 
@@ -498,6 +623,7 @@ class InventoryLot(StrictModel):
     lot_id: Identifier
     product: ProductId
     quantity: PositiveQuantity
+    unit_book_cost: Money = ZERO
     produced_week: int = Field(ge=1)
     expires_end_of_week: int = Field(ge=1)
 
@@ -508,12 +634,18 @@ class InventoryLot(StrictModel):
             raise ValueError("inventory cannot expire before production")
         return self
 
+    @property
+    def book_value(self) -> Money:
+        """Return the lot's private acquisition or production cost."""
+        return EconomicPrecision.round(self.quantity * self.unit_book_cost)
+
 
 class CompanyState(StrictModel):
     """The complete economic state of one company."""
 
     company_id: CompanyId
     cash: Money
+    operating_cost_payable: Money = ZERO
     inventory: tuple[InventoryLot, ...] = ()
     status: CompanyStatus = CompanyStatus.ACTIVE
     bankrupt_on: SimDay | None = None
@@ -535,8 +667,57 @@ class CompanyState(StrictModel):
         """Enter the terminal bankrupt state exactly once."""
         if not self.is_active:
             return self
-        return self.model_copy(
-            update={"status": CompanyStatus.BANKRUPT, "bankrupt_on": on}
+        return self.model_copy(update={"status": CompanyStatus.BANKRUPT, "bankrupt_on": on})
+
+    def _inventory_lots(self, product: ProductId) -> tuple[InventoryLot, ...]:
+        """Return inventory lots for one product in stored order."""
+        return tuple(lot for lot in self.inventory if lot.product is product)
+
+    def inventory_quantity(self, product: ProductId) -> Quantity:
+        """Return total on-hand quantity for one product."""
+        return sum(
+            (lot.quantity for lot in self._inventory_lots(product)),
+            start=ZERO,
+        )
+
+    def inventory_book_value(self, product: ProductId) -> Money:
+        """Return total private book value for one product."""
+        return sum(
+            (lot.book_value for lot in self._inventory_lots(product)),
+            start=ZERO,
+        )
+
+    def inventory_positions(
+        self,
+        product: ProductId | None = None,
+    ) -> tuple[InventoryBookPosition, ...]:
+        """Group inventory quantity and book value by product and expiry week."""
+        lots = self.inventory if product is None else self._inventory_lots(product)
+        keys = sorted({(lot.product, lot.expires_end_of_week) for lot in lots})
+        return tuple(
+            InventoryBookPosition(
+                product=position_product,
+                expires_end_of_week=expiry_week,
+                quantity=sum(
+                    (
+                        lot.quantity
+                        for lot in lots
+                        if lot.product is position_product
+                        and lot.expires_end_of_week == expiry_week
+                    ),
+                    start=ZERO,
+                ),
+                book_value=sum(
+                    (
+                        lot.book_value
+                        for lot in lots
+                        if lot.product is position_product
+                        and lot.expires_end_of_week == expiry_week
+                    ),
+                    start=ZERO,
+                ),
+            )
+            for position_product, expiry_week in keys
         )
 
 
@@ -557,6 +738,162 @@ class MarketSummary(StrictModel):
         return self
 
 
+class RetailPrice(StrictModel):
+    """One retailer's latest committed consumer price."""
+
+    company_id: CompanyId
+    product: ProductId
+    unit_price: PositiveMoney
+
+
+class ProductFlowSummary(StrictModel):
+    """Quantity and value summary for one product flow."""
+
+    product: ProductId
+    quantity: Quantity = ZERO
+    value: Money = ZERO
+    volume_weighted_unit_price: Money | None = None
+
+    @model_validator(mode="after")
+    def validate_average(self) -> Self:
+        """Pair a positive flow with a volume-weighted unit price."""
+        has_flow = self.quantity > ZERO
+        if has_flow != (self.volume_weighted_unit_price is not None):
+            raise ValueError("positive product flow and average price must be paired")
+        if not has_flow and self.value != ZERO:
+            raise ValueError("zero-quantity product flow cannot carry value")
+        return self
+
+
+class InventoryBookPosition(StrictModel):
+    """Private inventory quantity and book value in one expiry bucket."""
+
+    product: ProductId
+    expires_end_of_week: int = Field(ge=1)
+    quantity: Quantity
+    book_value: Money
+
+
+class CompanyWeeklyReportBase(StrictModel):
+    """Common authoritative weekly facts for one company."""
+
+    week: int = Field(ge=1)
+    company_id: CompanyId
+    tier: CompanyTier
+    status: CompanyStatus
+    opening_enterprise_value: Money
+    closing_enterprise_value: Money
+    weekly_surplus_change: EconomicDecimal
+    cumulative_surplus: EconomicDecimal
+    ending_cash: Money
+    ending_operating_cost_payable: Money = ZERO
+    purchases: tuple[ProductFlowSummary, ...] = ()
+    wholesale_sales: tuple[ProductFlowSummary, ...] = ()
+    operation_cost: Money = ZERO
+    expired_inventory: tuple[ProductFlowSummary, ...] = ()
+    ending_inventory: tuple[InventoryBookPosition, ...] = ()
+
+
+class FarmWeeklyReport(CompanyWeeklyReportBase):
+    """Private weekly operating report for a farm."""
+
+    report_type: Literal["farm"] = "farm"
+    tier: Literal[CompanyTier.FARM] = CompanyTier.FARM
+    realized_capacity: PositiveQuantity
+    weekly_base_unit_cost: PositiveMoney
+    produced_quantity: Quantity
+    production_cost: Money
+    average_production_cost: Money | None = None
+    capacity_utilization: UnitInterval
+    raw_milk_sold: Quantity
+    raw_milk_unsold: Quantity
+
+
+class ProcessorWeeklyReport(CompanyWeeklyReportBase):
+    """Private weekly operating report for a processor."""
+
+    report_type: Literal["processor"] = "processor"
+    tier: Literal[CompanyTier.PROCESSOR] = CompanyTier.PROCESSOR
+    realized_capacity: PositiveQuantity
+    weekly_base_unit_cost: PositiveMoney
+    raw_milk_purchased: Quantity
+    raw_milk_purchase_spend: Money
+    raw_milk_purchase_vwap: Money | None = None
+    raw_milk_processed: Quantity
+    bottled_milk_output: Quantity
+    realized_yield: Quantity
+    processing_cost: Money
+    capacity_utilization: UnitInterval
+    bottled_milk_sold: Quantity
+    bottled_milk_unsold: Quantity
+
+
+class RetailerWeeklyReport(CompanyWeeklyReportBase):
+    """Private weekly sales and inventory report for a retailer."""
+
+    report_type: Literal["retailer"] = "retailer"
+    tier: Literal[CompanyTier.RETAILER] = CompanyTier.RETAILER
+    procured_quantity: Quantity
+    procurement_spend: Money
+    procurement_vwap: Money | None = None
+    saleable_quantity: Quantity
+    saleable_book_value: Money
+    weighted_unit_cost: Money | None = None
+    committed_retail_price: PositiveMoney
+    sold_quantity: Quantity
+    consumer_revenue: Money
+    cost_of_goods_sold: Money
+    gross_profit: EconomicDecimal
+    operating_profit: EconomicDecimal
+    ending_inventory_quantity: Quantity
+    ending_inventory_book_value: Money
+    sell_through_rate: UnitInterval
+    sold_out: bool
+    market_share: UnitInterval
+    expiry_quantity: Quantity
+    expiry_book_loss: Money
+
+
+type CompanyWeeklyReport = Annotated[
+    FarmWeeklyReport | ProcessorWeeklyReport | RetailerWeeklyReport,
+    Field(discriminator="report_type"),
+]
+
+
+class PublicRetailerPerformance(StrictModel):
+    """Publicly observable weekly outcome for one retailer."""
+
+    company_id: CompanyId
+    status: CompanyStatus
+    posted_price: PositiveMoney | None = None
+    sold_quantity: Quantity
+    market_share: UnitInterval
+    sold_out: bool
+
+
+class PublicRetailMarketReport(StrictModel):
+    """Public shared-retail-market history without hidden demand parameters."""
+
+    week: int = Field(ge=1)
+    active_retailer_count: int = Field(ge=0)
+    total_sold_quantity: Quantity
+    volume_weighted_average_price: Money | None = None
+    retailers: tuple[PublicRetailerPerformance, ...]
+
+    @model_validator(mode="after")
+    def validate_market_totals(self) -> Self:
+        """Keep public totals aligned with retailer-level facts."""
+        if self.total_sold_quantity != sum(
+            (retailer.sold_quantity for retailer in self.retailers),
+            start=ZERO,
+        ):
+            raise ValueError("public retailer sales must sum to the market total")
+        has_sales = self.total_sold_quantity > ZERO
+        if has_sales != (self.volume_weighted_average_price is not None):
+            raise ValueError("positive public sales and average price must be paired")
+        return self
+
+
 class WorldState(StrictModel):
     """Immutable state after the latest completed week."""
 
@@ -566,6 +903,9 @@ class WorldState(StrictModel):
     companies: tuple[CompanyState, ...]
     operation_states: tuple[WeeklyOperationState, ...]
     previous_markets: tuple[MarketSummary, ...] = ()
+    retail_prices: tuple[RetailPrice, ...] = ()
+    company_weekly_reports: tuple[CompanyWeeklyReport, ...] = ()
+    public_retail_market_reports: tuple[PublicRetailMarketReport, ...] = ()
     next_lot_sequence: int = Field(default=1, ge=1)
 
     @model_validator(mode="after")
@@ -582,6 +922,21 @@ class WorldState(StrictModel):
         )
         if tuple(state.company_id for state in self.operation_states) != expected_operators:
             raise ValueError("world operation states must match productive companies")
+        report_keys = tuple(
+            (report.week, report.company_id) for report in self.company_weekly_reports
+        )
+        if len(report_keys) != len(set(report_keys)):
+            raise ValueError("company weekly reports must be unique")
+        if any(
+            report.week > self.completed_weeks or report.company_id not in configured
+            for report in self.company_weekly_reports
+        ):
+            raise ValueError("company weekly report lies outside the world state")
+        public_weeks = tuple(report.week for report in self.public_retail_market_reports)
+        if public_weeks != tuple(sorted(set(public_weeks))):
+            raise ValueError("public retail reports must use unique increasing weeks")
+        if any(week > self.completed_weeks for week in public_weeks):
+            raise ValueError("public retail report lies outside the world state")
         return self
 
 
@@ -612,12 +967,18 @@ class CompanyObservation(StrictModel):
     operation: CompanyOperation
     weekly_operation: WeeklyOperationState | None = None
     products: tuple[ProductSpec, ...]
-    demand: DemandSpec
+    consumer_market_rules: ConsumerMarketRules
     scoring: ScoringSpec
     cash: Money
+    operating_cost_payable: Money = ZERO
     inventory: tuple[InventoryPosition, ...]
     public_companies: tuple[PublicCompany, ...]
     previous_markets: tuple[MarketSummary, ...]
+    weekly_reports: tuple[CompanyWeeklyReport, ...] = Field(default=(), max_length=8)
+    public_retail_market_reports: tuple[PublicRetailMarketReport, ...] = Field(
+        default=(),
+        max_length=8,
+    )
     runtime: RuntimeSpec = RuntimeSpec()
     retail_price: Money | None = None
 
@@ -631,6 +992,16 @@ class CompanyObservation(StrictModel):
             self.weekly_operation.company_id != self.company_id
         ):
             raise ValueError("weekly operation must belong to the observed company")
+        report_weeks = tuple(report.week for report in self.weekly_reports)
+        if any(report.company_id != self.company_id for report in self.weekly_reports):
+            raise ValueError("private weekly reports must belong to the observed company")
+        if report_weeks != tuple(sorted(set(report_weeks))):
+            raise ValueError("private weekly reports must use unique increasing weeks")
+        public_weeks = tuple(report.week for report in self.public_retail_market_reports)
+        if public_weeks != tuple(sorted(set(public_weeks))):
+            raise ValueError("public retail reports must use unique increasing weeks")
+        if any(week >= self.sim_day.week for week in (*report_weeks, *public_weeks)):
+            raise ValueError("weekly reports must precede the current simulation week")
         return self
 
     def quantity(self, product: ProductId) -> Decimal:
@@ -702,14 +1073,54 @@ class MilkProcessedEvent(CompanyEvent):
 
 
 class ConsumerSaleEvent(CompanyEvent):
-    """A retailer's completed sale to its local consumers."""
+    """One retailer's settlement in the shared consumer market."""
 
     event_type: Literal["consumer_sale"] = "consumer_sale"
-    potential_demand_quantity: Quantity
-    demand_quantity: Quantity
+    saleable_quantity: Quantity
+    saleable_book_value: Money
     sold_quantity: Quantity
     retail_price: PositiveMoney | None = None
     revenue: Money
+    cost_of_goods_sold: Money
+    gross_profit: EconomicDecimal
+    sold_out: bool
+
+    @model_validator(mode="after")
+    def validate_sale(self) -> Self:
+        """Keep quantity, revenue, cost, and sold-out facts internally aligned."""
+        if self.sold_quantity > self.saleable_quantity:
+            raise ValueError("consumer sales cannot exceed saleable inventory")
+        if self.retail_price is None:
+            if self.sold_quantity != ZERO or self.revenue != ZERO:
+                raise ValueError("an unpriced retailer cannot complete consumer sales")
+        elif self.revenue != EconomicPrecision.round(self.sold_quantity * self.retail_price):
+            raise ValueError("consumer revenue must equal price times sold quantity")
+        if self.cost_of_goods_sold > self.saleable_book_value:
+            raise ValueError("consumer cost of goods cannot exceed saleable book value")
+        if self.gross_profit != self.revenue - self.cost_of_goods_sold:
+            raise ValueError("consumer gross profit must equal revenue minus cost")
+        if self.sold_out != (
+            self.saleable_quantity > ZERO and self.sold_quantity == self.saleable_quantity
+        ):
+            raise ValueError("sold_out must match exhausted positive inventory")
+        return self
+
+
+class RetailOperatingCostChargedEvent(CompanyEvent):
+    """One retailer's accrued weekly store cost and resulting payment."""
+
+    event_type: Literal["retail_operating_cost_charged"] = "retail_operating_cost_charged"
+    opening_payable: Money
+    cost_accrued: PositiveMoney
+    cash_paid: Money
+    closing_payable: Money
+
+    @model_validator(mode="after")
+    def validate_settlement(self) -> Self:
+        """Balance accrued cost, cash payment, and the closing payable."""
+        if self.opening_payable + self.cost_accrued != (self.cash_paid + self.closing_payable):
+            raise ValueError("retail operating-cost settlement must balance")
+        return self
 
 
 class InventoryExpiredEvent(CompanyEvent):
@@ -720,6 +1131,7 @@ class InventoryExpiredEvent(CompanyEvent):
     product: ProductId
     quantity: PositiveQuantity
     reference_value_loss: PositiveMoney
+    book_value_loss: Money = ZERO
 
 
 class CompanyBankruptEvent(CompanyEvent):
@@ -737,6 +1149,7 @@ type DomainEvent = Annotated[
     | DeliveryCompletedEvent
     | MilkProcessedEvent
     | ConsumerSaleEvent
+    | RetailOperatingCostChargedEvent
     | InventoryExpiredEvent
     | CompanyBankruptEvent,
     Field(discriminator="event_type"),
@@ -758,6 +1171,7 @@ class CompanySnapshot(StrictModel):
     tier: CompanyTier
     status: CompanyStatus
     cash: Money
+    operating_cost_payable: Money
     raw_milk_quantity: Quantity
     bottled_milk_quantity: Quantity
     inventory_value: Money
@@ -794,6 +1208,7 @@ class CompanyScore(StrictModel):
     status: CompanyStatus
     initial_value: PositiveMoney
     final_cash: Money
+    final_operating_cost_payable: Money
     final_inventory_value: Money
     final_value: Money
     surplus: EconomicDecimal
@@ -806,13 +1221,14 @@ class ScoreCard(StrictModel):
     score_version: ScoreVersion
     final_score: BenchmarkScore
     efficiency_raw: EconomicDecimal
-    efficiency_reference: Money
+    efficiency_oracle: Money
     efficiency_score: UnitInterval
     global_gini: UnitInterval
     fairness_score: UnitInterval
-    profit_participation_score: UnitInterval
+    non_loss_company_ratio: UnitInterval
     bankrupt_company_count: int = Field(ge=0)
     loss_making_company_count: int = Field(ge=0)
+    loss_making_company_rate: UnitInterval
     companies: tuple[CompanyScore, ...]
 
     @model_validator(mode="after")
@@ -821,14 +1237,17 @@ class ScoreCard(StrictModel):
         company_ids = [company.company_id for company in self.companies]
         if len(company_ids) != len(set(company_ids)):
             raise ValueError("score companies must be unique")
-        bankrupt = sum(
-            company.status is CompanyStatus.BANKRUPT for company in self.companies
-        )
+        bankrupt = sum(company.status is CompanyStatus.BANKRUPT for company in self.companies)
         losses = sum(company.surplus < ZERO for company in self.companies)
         if self.bankrupt_company_count != bankrupt:
             raise ValueError("bankrupt_company_count must match company status")
         if self.loss_making_company_count != losses:
             raise ValueError("loss_making_company_count must match company surplus")
+        expected_loss_rate = EconomicPrecision.round(Decimal(losses) / Decimal(len(self.companies)))
+        if self.loss_making_company_rate != expected_loss_rate:
+            raise ValueError("loss_making_company_rate must match company surplus")
+        if self.non_loss_company_ratio != EconomicPrecision.round(ONE - expected_loss_rate):
+            raise ValueError("non_loss_company_ratio must equal one minus loss rate")
         return self
 
 

@@ -72,25 +72,33 @@ class EnterpriseValuation:
         )
         operation_value = sum(
             (
-                job.output_quantity
-                * economy.scenario.product(job.output_product).reference_value
+                job.output_quantity * economy.scenario.product(job.output_product).reference_value
                 for job in economy.jobs
                 if job.company_id == company_id
             ),
             start=ZERO,
         )
-        return EconomicPrecision.round(
-            company.cash
-            + reserved_cash
-            + economy.scenario.inventory_value(inventory)
-            + operation_value
+        return max(
+            ZERO,
+            EconomicPrecision.round(
+                company.cash
+                + reserved_cash
+                + economy.scenario.inventory_value(inventory)
+                + operation_value
+                - company.operating_cost_payable
+            ),
         )
 
     @staticmethod
     def settled_value(scenario: ScenarioSpec, company: CompanyState) -> Money:
         """Value one commitment-free company state."""
-        return EconomicPrecision.round(
-            company.cash + scenario.inventory_value(company.inventory)
+        return max(
+            ZERO,
+            EconomicPrecision.round(
+                company.cash
+                + scenario.inventory_value(company.inventory)
+                - company.operating_cost_payable
+            ),
         )
 
     @staticmethod

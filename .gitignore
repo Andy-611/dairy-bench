@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp*/
+pytest-of-*/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -12,6 +13,7 @@ htmlcov/
 
 # Local runtime and test data
 .dairy-bench/
+.ua/
 .tmp/
 .tmp_pytest/
 .test-artifacts/

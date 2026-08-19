@@ -230,8 +230,10 @@ export function App() {
       : replaySourceError
         ? "Completed replay sources could not be loaded"
         : "The selected run failed");
-  const episode =
-    workspace.episode?.runId === selectedJob?.runId ? workspace.episode : null;
+  const evaluation =
+    workspace.evaluation?.runId === selectedJob?.runId
+      ? workspace.evaluation
+      : null;
   const activeProgress =
     workspace.activeJobs.find((job) => job.runId === selectedJob?.runId) ??
     workspace.activeJobs[0] ??
@@ -292,7 +294,7 @@ export function App() {
         <section className="hero">
           <div>
             <span className="eyebrow">
-              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v7").toUpperCase()}
+              {(selectedJob?.scenarioId ?? "flow.dairy.base.s9.v9").toUpperCase()}
             </span>
             <h1>Independent companies. One living dairy economy.</h1>
             <p>
@@ -377,33 +379,48 @@ export function App() {
           <EmptyState />
         ) : (
           <div className="dashboard">
-            {workspace.isEpisodeLoading && (
+            {workspace.isEvaluationLoading && (
               <div className="loading-banner result-loading" role="status">
                 <span className="spinner dark" />
-                Loading the completed score and company results…
+                Loading the latest settled score and company results...
               </div>
             )}
-            {workspace.episodeError && (
+            {workspace.evaluationError && (
               <div className="error-banner result-error" role="alert">
                 <span aria-hidden="true">!</span>
                 <div>
-                  <strong>The final score is unavailable</strong>
-                  <p>{workspace.episodeError}</p>
+                  <strong>The current score is unavailable</strong>
+                  <p>{workspace.evaluationError}</p>
                 </div>
               </div>
             )}
-            {episode && (
+            {evaluation && (
               <>
-                <RunQualityBanner quality={episode.quality} />
-                <EvaluationStandard
-                  benchmarkEligible={episode.quality.benchmarkEligible}
-                  score={episode.score}
+                <RunQualityBanner
+                  completedWeeks={evaluation.completedWeeks}
+                  provisional={evaluation.provisional}
+                  quality={evaluation.quality}
+                  totalWeeks={evaluation.totalWeeks}
                 />
-                {episode.agentUsage && (
-                  <TokenSummary summary={episode.agentUsage} />
+                <EvaluationStandard
+                  benchmarkEligible={evaluation.quality.benchmarkEligible}
+                  completedWeeks={evaluation.completedWeeks}
+                  provisional={evaluation.provisional}
+                  score={evaluation.score}
+                  totalWeeks={evaluation.totalWeeks}
+                />
+                {evaluation.agentUsage && (
+                  <TokenSummary summary={evaluation.agentUsage} />
                 )}
-                <CompanyTable companies={episode.companies} />
-                <MetricChart snapshots={episode.snapshots} />
+                <CompanyTable
+                  companies={evaluation.companies}
+                  completedWeeks={evaluation.completedWeeks}
+                  provisional={evaluation.provisional}
+                />
+                <MetricChart
+                  snapshots={evaluation.snapshots}
+                  totalWeeks={evaluation.totalWeeks}
+                />
               </>
             )}
             {timelineWeek !== null && (
@@ -424,7 +441,7 @@ export function App() {
       </main>
 
       <footer>
-        <span>Dairy Bench V7</span>
+        <span>Dairy Bench V9</span>
         <span>NewAPI credentials remain on the backend.</span>
       </footer>
     </div>
@@ -440,7 +457,7 @@ function buildRunRequest(
   if (profile.kind === "replay") {
     return sourceRunId
       ? { kind: profile.kind, profileId: profile.profileId, sourceRunId }
-      : "Completed Run Replay requires a completed source run ID.";
+      : "Exact Replay requires a completed source run ID.";
   }
 
   const parsedSeed = Number(seed);

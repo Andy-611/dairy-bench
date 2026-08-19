@@ -15,11 +15,13 @@ from company_bench.domain.models import (
     DomainEvent,
     EventRecord,
     Identifier,
+    InventoryBookPosition,
     Money,
     OperationQuantity,
     OrderQuantity,
     PositiveMoney,
     PositiveQuantity,
+    ProductFlowSummary,
     ProductId,
     ProtocolIssueKind,
     Quantity,
@@ -35,6 +37,7 @@ __all__ = [
     "CompanyDecision",
     "DecisionEnvelope",
     "DecisionOutcome",
+    "DecisionPhase",
     "DecisionStatus",
     "DeliveryExpiryBucket",
     "EconomicCommand",
@@ -59,6 +62,7 @@ __all__ = [
     "QuoteLevelAction",
     "QuoteLevelResult",
     "RejectionCategory",
+    "RetailPricingContext",
     "ScheduledCompletion",
     "SetQuoteLadder",
     "SetRetailPrice",
@@ -88,6 +92,14 @@ class WakeReason(StrEnum):
     OPERATION_COMPLETED = "operation_completed"
     DELIVERY_COMPLETED = "delivery_completed"
     EXTERNAL_EVENT = "external_event"
+    RETAIL_PRICING = "retail_pricing"
+
+
+class DecisionPhase(StrEnum):
+    """Economic authority granted to one Agent turn."""
+
+    OPERATIONS = "operations"
+    RETAIL_PRICING = "retail_pricing"
 
 
 class JournalEntryKind(StrEnum):
@@ -544,6 +556,27 @@ class PrivateEconomicsView(StrictModel):
     unit_economics: PrivateUnitEconomics = PrivateUnitEconomics()
 
 
+class RetailPricingContext(StrictModel):
+    """Private post-procurement facts for one sealed Sunday price decision."""
+
+    current_cash: Money
+    saleable_quantity: Quantity
+    saleable_book_value: Money
+    weighted_unit_cost: Money | None = None
+    current_week_procurement: ProductFlowSummary
+    inventory_by_expiry: tuple[InventoryBookPosition, ...] = ()
+    previous_retail_price: PositiveMoney | None = None
+    all_deliveries_completed: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_cost(self) -> Self:
+        """Pair positive saleable inventory with a weighted unit cost."""
+        has_inventory = self.saleable_quantity > ZERO
+        if has_inventory != (self.weighted_unit_cost is not None):
+            raise ValueError("saleable inventory and weighted unit cost must be paired")
+        return self
+
+
 class AgentTurn(StrictModel):
     """Runtime-bound input metadata for one company decision."""
 
@@ -551,6 +584,7 @@ class AgentTurn(StrictModel):
     company_id: CompanyId
     sim_day: SimDay
     state_version: int = Field(ge=0)
+    phase: DecisionPhase = DecisionPhase.OPERATIONS
     turn_number_this_week: int = Field(ge=1)
     turn_limit_this_week: int = Field(ge=1)
     wake_reasons: tuple[WakeReason, ...] = Field(min_length=1)
@@ -565,6 +599,7 @@ class AgentTurn(StrictModel):
     pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
     active_operation: OperationJobView | None = None
     private_economics: PrivateEconomicsView = PrivateEconomicsView()
+    retail_pricing_context: RetailPricingContext | None = None
     visible_events: tuple[DomainEvent, ...] = ()
     previous_outcome: DecisionOutcome | None = None
 
@@ -579,11 +614,24 @@ class AgentTurn(StrictModel):
         """Reject inconsistent identity, version, and wake metadata."""
         if self.turn_number_this_week > self.turn_limit_this_week:
             raise ValueError("turn_number_this_week cannot exceed turn_limit_this_week")
-        if (
-            self.turn_limit_this_week
-            != self.observation.runtime.max_turns_per_company_week
-        ):
-            raise ValueError("turn_limit_this_week must match the runtime turn limit")
+        pricing = self.phase is DecisionPhase.RETAIL_PRICING
+        expected_limit = 1 if pricing else self.observation.runtime.max_turns_per_company_week
+        if self.turn_limit_this_week != expected_limit:
+            message = (
+                "turn_limit_this_week must equal one for retail pricing"
+                if pricing
+                else "turn_limit_this_week must match the runtime turn limit"
+            )
+            raise ValueError(message)
+        if pricing != (self.retail_pricing_context is not None):
+            raise ValueError("retail pricing context must match the decision phase")
+        if pricing:
+            if not self.sim_day.is_settlement_day:
+                raise ValueError("retail pricing turns must occur on Sunday")
+            if self.wake_reasons != (WakeReason.RETAIL_PRICING,):
+                raise ValueError("retail pricing turns require their dedicated wake")
+        elif not self.sim_day.is_decision_day:
+            raise ValueError("operating turns must occur on Monday-Saturday")
         if len(self.wake_reasons) != len(set(self.wake_reasons)):
             raise ValueError("wake_reasons must be unique")
         if self.wake_signals:
@@ -691,6 +739,7 @@ class TurnRecord(StrictModel):
     observation_hash: Identifier
     protocol_issue_kind: ProtocolIssueKind | None = None
     protocol_error: str | None = Field(default=None, min_length=1, max_length=450)
+    protocol_fallback_applied: bool = False
     journal_sequence: int | None = Field(default=None, ge=1)
     replay_origin: TurnReplayOrigin | None = None
 
@@ -730,12 +779,22 @@ class TurnRecord(StrictModel):
         if (self.protocol_issue_kind is None) != (self.protocol_error is None):
             raise ValueError("protocol issue kind and message must be paired")
         if self.protocol_error is not None:
-            if self.outcome.accepted:
-                raise ValueError("a protocol error cannot produce an accepted outcome")
-            if self.outcome.rejection_category is not RejectionCategory.PROTOCOL:
-                raise ValueError("protocol errors require a protocol rejection category")
-            if not isinstance(self.envelope.decision, IdleDecision):
-                raise ValueError("protocol errors must normalize to an idle decision")
-            if self.outcome.reason != f"{PROTOCOL_ERROR_PREFIX}{self.protocol_error}":
-                raise ValueError("protocol error must match the outcome reason")
+            if self.protocol_fallback_applied:
+                if (
+                    self.turn.phase is not DecisionPhase.RETAIL_PRICING
+                    or not self.outcome.accepted
+                    or not isinstance(self.envelope.action, SetRetailPrice)
+                ):
+                    raise ValueError("protocol fallback requires accepted retail pricing")
+            else:
+                if self.outcome.accepted:
+                    raise ValueError("a protocol error cannot produce an accepted outcome")
+                if self.outcome.rejection_category is not RejectionCategory.PROTOCOL:
+                    raise ValueError("protocol errors require a protocol rejection category")
+                if not isinstance(self.envelope.decision, IdleDecision):
+                    raise ValueError("protocol errors must normalize to an idle decision")
+                if self.outcome.reason != f"{PROTOCOL_ERROR_PREFIX}{self.protocol_error}":
+                    raise ValueError("protocol error must match the outcome reason")
+        elif self.protocol_fallback_applied:
+            raise ValueError("protocol fallback requires a protocol issue")
         return self

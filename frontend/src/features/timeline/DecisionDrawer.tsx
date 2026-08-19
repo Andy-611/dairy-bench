@@ -1,13 +1,12 @@
 import { useEffect, useState } from "react";
-import type { ReactNode } from "react";
 
 import {
   companyLabel,
-  formatAuditPayload,
   humanizeIdentifier,
   productLabel,
 } from "../../shared/labels";
 import {
+  formatAuditPayload,
   formatExactDecimal,
   formatSignedExactDecimal,
   formatValue,
@@ -38,7 +37,9 @@ import type {
   TimelineDetailView,
   TurnTimelineItemView,
 } from "../../shared/api/types";
+import { DefinitionItem as Meta } from "../../shared/ui/DefinitionItem";
 import { DetailDrawer } from "../../shared/ui/DetailDrawer";
+import { DrawerSection } from "../../shared/ui/DrawerSection";
 import { TimelineError, TimelineNotice } from "./TimelineFeedback";
 
 type DetailLoader = (
@@ -141,7 +142,7 @@ function TurnDetail({
           }
         />
       </dl>
-      <DrawerSection number="1" title="Why the company acted">
+      <DrawerSection label="1" title="Why the company acted">
         <ul className="detail-list">
           {turn.wakeSignals.map((signal, index) => {
             const sourceEntryId = signal.sourceEntryId;
@@ -168,11 +169,11 @@ function TurnDetail({
         </ul>
       </DrawerSection>
 
-      <DrawerSection number="2" title="What the agent observed">
+      <DrawerSection label="2" title="What the agent observed">
         <ObservationDelta turn={turn} />
       </DrawerSection>
 
-      <DrawerSection number="3" title="Decision and engine outcome">
+      <DrawerSection label="3" title="Decision and engine outcome">
         <div className="decision-outcome-detail">
           <div>
             <span>Company decision</span>
@@ -205,7 +206,7 @@ function TurnDetail({
         </p>
       </DrawerSection>
 
-      <DrawerSection number="4" title="Agent trace provenance">
+      <DrawerSection label="4" title="Agent trace provenance">
         <TraceProvenance context={detail.context} traces={detail.traces} turn={turn} />
       </DrawerSection>
 
@@ -266,7 +267,7 @@ function SystemDetail({
 }) {
   return (
     <div className="drawer-body">
-      <DrawerSection number="SYSTEM" title={systemLabel(step.kind)}>
+      <DrawerSection label="SYSTEM" title={systemLabel(step.kind)}>
         <p>{step.summary}</p>
         <dl className="detail-metadata">
           <Meta label="Simulation day" value={simulationDayLabel(step.simDay)} />
@@ -305,7 +306,7 @@ function SystemDetail({
           />
         </dl>
       </DrawerSection>
-      <DrawerSection number="FX" title="Economic effects">
+      <DrawerSection label="FX" title="Economic effects">
         <EffectList effects={step.effects} />
       </DrawerSection>
       <RawAudit
@@ -600,26 +601,6 @@ function TraceProvenance({
   );
 }
 
-function DrawerSection({
-  children,
-  number,
-  title,
-}: {
-  readonly children: ReactNode;
-  readonly number: string;
-  readonly title: string;
-}) {
-  return (
-    <section className="drawer-section">
-      <header>
-        <span>{number}</span>
-        <h3>{title}</h3>
-      </header>
-      <div>{children}</div>
-    </section>
-  );
-}
-
 function EffectList({
   effects,
 }: {
@@ -676,15 +657,6 @@ function RawAudit({
         <pre>{formatAuditPayload(data)}</pre>
       )}
     </details>
-  );
-}
-
-function Meta({ label, value }: { readonly label: string; readonly value: string }) {
-  return (
-    <div>
-      <dt>{label}</dt>
-      <dd title={value}>{value}</dd>
-    </div>
   );
 }
 

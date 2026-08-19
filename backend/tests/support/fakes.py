@@ -1,6 +1,8 @@
 """Small deterministic Adapters used by contract and integration tests."""
 
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
+from decimal import Decimal
 
 from pydantic import TypeAdapter
 
@@ -10,17 +12,25 @@ from company_bench.agents.contracts import (
     ModelOutputError,
 )
 from company_bench.agents.providers.capabilities import (
+    CapabilitySource,
+    ModelCapability,
     ModelCapabilityCatalog,
-    verified_capabilities,
 )
-from company_bench.domain.models import PolicyKind, PolicyMetadata, PolicyProfileId
+from company_bench.domain.models import (
+    PolicyKind,
+    PolicyMetadata,
+    PolicyProfileId,
+    RetailerOperation,
+)
 from company_bench.runtime.models import (
     ActionDecision,
     AgentTurn,
     AttentionPlan,
     CompanyDecision,
+    DecisionPhase,
     EconomicCommand,
     IdleDecision,
+    SetRetailPrice,
 )
 
 _DECISION_ADAPTER = TypeAdapter(CompanyDecision)
@@ -29,6 +39,20 @@ _DECISION_ADAPTER = TypeAdapter(CompanyDecision)
 def model_capability_catalog(limits: dict[str, int]) -> ModelCapabilityCatalog:
     """Return a no-I/O catalog of gateway-confirmed model limits."""
     return ModelCapabilityCatalog(None, None, seeds=verified_capabilities(limits))
+
+
+def verified_capabilities(limits: dict[str, int]) -> tuple[ModelCapability, ...]:
+    """Build gateway-confirmed capability records for tests."""
+    verified_at = datetime.now(UTC)
+    return tuple(
+        ModelCapability(
+            model_id=model_id,
+            max_output_tokens=max_output_tokens,
+            source=CapabilitySource.GATEWAY,
+            verified_at=verified_at,
+        )
+        for model_id, max_output_tokens in limits.items()
+    )
 
 
 class FixedDecisionAgent:
@@ -43,7 +67,17 @@ class FixedDecisionAgent:
     def __init__(self, decisions: Iterable[CompanyDecision]) -> None:
         self._decisions = iter(decisions)
 
-    async def act(self, _: AgentTurn) -> CompanyDecision:
+    async def act(self, turn: AgentTurn) -> CompanyDecision:
+        if turn.phase is DecisionPhase.RETAIL_PRICING:
+            operation = turn.observation.operation
+            if not isinstance(operation, RetailerOperation):
+                raise TypeError("pricing test turn requires a retailer")
+            return company_decision(
+                SetRetailPrice(
+                    product=operation.input_product,
+                    unit_price=Decimal("3.5000"),
+                )
+            )
         try:
             return next(self._decisions)
         except StopIteration as error:

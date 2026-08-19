@@ -1,82 +1,26 @@
 # Dairy Bench
 
-Dairy Bench is an event-driven benchmark for nine independent companies in a
-perishable dairy supply chain: three farms, three processors, and three
-retailers. The default scenario is `flow.dairy.base.s9.v7` and spans 52 trading
-weeks.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-Every decision crosses one typed boundary:
+Dairy Bench is an event-driven benchmark for long-horizon business decisions in
+a perishable dairy supply chain. Nine independent companies—three farms, three
+processors, and three retailers—must coordinate production, spot trading,
+inventory, pricing, and cash without sharing private state.
 
-```text
-Wake -> AgentTurn -> one CompanyDecision -> EconomyEngine -> Journal -> next Wake
-```
+The current and only supported scenario is `flow.dairy.base.s9.v9`: 52 weekly
+settlements, deterministic physical rules, independent company Agents, a shared
+consumer market, durable recovery, and auditable enterprise scoring.
 
-Only `EconomyEngine` may mutate money, inventory, orders, jobs, deliveries, or
-trades. Model text never settles an economic transaction.
+## Quick start
 
-## Calendar and settlement
+Requirements:
 
-The smallest simulation unit is one day. Each week contains exactly seven
-frames in the operations timeline:
+- Windows 10/11
+- Python 3.12+
+- Node.js 20.19+
+- a NewAPI key only for model-backed profiles
 
-| Day | Runtime behavior |
-|---|---|
-| Monday | Open the week, realize private capacity/cost formulas, wake companies |
-| Tuesday-Saturday | Complete due work and deliveries, then run company decisions |
-| Sunday | Complete due commitments, close wholesale markets, settle consumer sales, expire inventory, snapshot the week |
-
-There are no Agent calls on Sunday. A company can act at most once per day and
-six times per week. Production, transformation, and delivery each take one day.
-Raw milk expires after two weekly settlements and bottled milk after four.
-
-Capacity and demand are **not fixed realized quantities**. Values such as farm
-normal capacity `60`, processor normal capacity `50`, and retailer base demand
-`40` remain inputs to the existing deterministic formulas. Capacity and unit
-cost are realized once per company-week; potential demand is realized once per
-retailer-week and purchased once on Sunday.
-
-## Policy profiles
-
-Dairy Bench exposes five policy profiles:
-
-- **Rule baseline**: deterministic rules and no model call.
-- **Model agents via NewAPI**: one isolated Agent per company. Any model family
-  in the configured NewAPI catalog may be used if it supports the required
-  function-call contract.
-- **Codex via NewAPI**: uses the Codex-compatible Responses route; Dairy Bench
-  remains the Agent runtime.
-- **Claude Code via NewAPI**: uses the Claude-compatible Messages route; Dairy
-  Bench remains the Agent runtime.
-- **Completed Run Replay**: replays a completed Turn Journal without model calls
-  and rejects observation or outcome drift.
-
-All model traffic crosses one `DecisionGateway` seam. Protocol adapters normalize
-Chat Completions, Responses, and Anthropic Messages into the same typed company
-decision. The benchmark does not launch Codex CLI or Claude Code processes.
-
-## Determinism and concurrency
-
-Independent `RunJob`s execute concurrently. Within one run, Agents woken on the
-same day observe the same base state and may infer concurrently. Their decisions
-are then applied serially in persisted order:
-
-```text
-SHA256(seed | absolute_day | company_id)
-```
-
-Provider latency therefore cannot change the economy. By default the backend
-allows up to 100 concurrent runs and 100 concurrent NewAPI requests. Lower the
-limits when required by the gateway:
-
-```powershell
-$env:DAIRY_BENCH_MAX_CONCURRENT_RUNS = "20"
-$env:DAIRY_BENCH_MAX_CONCURRENT_NEWAPI_REQUESTS = "50"
-```
-
-## Install and start
-
-Requirements: Python 3.12+, Node.js 20.19+, and a NewAPI key only for
-model-backed runs.
+Install the backend and frontend:
 
 ```powershell
 cd backend
@@ -87,7 +31,7 @@ npm.cmd install
 cd ..
 ```
 
-Configure or replace each NewAPI profile independently:
+Configure one or more isolated NewAPI profiles:
 
 ```bat
 start.cmd --configure-newapi model
@@ -95,34 +39,126 @@ start.cmd --configure-newapi codex
 start.cmd --configure-newapi claude-code
 ```
 
-The command validates `/v1/models`, stores a Windows-user-encrypted credential,
-and refreshes the isolated profile's model catalog. Before a model run is queued,
-the backend also validates its wire protocol, canonical tool call, and output
-limit, then refreshes the capability catalog. Restart a running backend after
-changing credentials.
+Each command validates `/v1/models`, stores the key with Windows user-scoped
+encryption, and refreshes that profile's model and capability catalogs. Keys
+remain backend-only and are never written to run journals or SQLite.
 
-Start the application:
+Start both processes:
 
 ```bat
 start.cmd
 ```
 
-The UI opens at `http://127.0.0.1:5173`. Use `start.cmd --check` for a read-only
-prerequisite and credential check.
+The dashboard opens at `http://127.0.0.1:5173`. Run `start.cmd --check` for a
+read-only dependency and profile check.
 
-The adapter requires exactly one authorized function call, disables parallel
-tool calls, and gives an invalid completion one structured repair attempt.
-Model output limits are calibrated once and cached locally; the confirmed model
-limit is sent directly, without staircase growth. The NewAPI key remains only
-in the backend process.
+## Policy profiles
 
-## Runs, recovery, and data
+| Profile | Controller | Model protocol |
+|---|---|---|
+| Rule baseline | Deterministic in-process rules | None |
+| Model agents via NewAPI | One isolated model Agent per company | Chat Completions |
+| Codex via NewAPI | Dairy Bench remains the Agent runtime | Responses |
+| Claude Code via NewAPI | Dairy Bench remains the Agent runtime | Anthropic Messages |
+| Exact Replay | Replays a completed V9 Turn Journal | None |
 
-The selected view is stored in `?run=...&week=...`. The UI always offers 52 week
-buttons; selecting one loads its Monday-Sunday frames. Stopped and interrupted
-runs retain their journal and atomic checkpoint and can resume under the same
-run ID. Failed runs are terminal. Protocol-invalid runs may retain a diagnostic
-score but are excluded from benchmark ranking.
+All model traffic goes through NewAPI. The protocol-specific profiles are wire
+adapters; the benchmark does not launch Codex CLI, Claude Code, or a vendor
+Company Agent runtime. Every model completion must contain exactly one
+authorized typed function call.
+
+## One trading week
+
+The simulation unit is one day:
+
+| Day | Runtime behavior |
+|---|---|
+| Monday | Open the week, realize private capacity and cost conditions, wake companies |
+| Tuesday–Saturday | Finish due work and deliveries, then process company decisions |
+| Sunday | Finish commitments, close spot markets, collect sealed retail prices, settle shared consumer sales, charge store costs, expire inventory, check bankruptcy, issue reports, and snapshot |
+
+Each active company can receive at most one operating call per day and six per
+week. Every active retailer receives one additional sealed Sunday pricing call
+after all procurement and deliveries. Competing retailers see the same
+pre-pricing state and learn the three prices only after all decisions commit.
+
+Production, processing, and delivery each take one simulated day. Raw milk
+expires after two weekly settlements; bottled milk expires after four.
+
+## V9 economy and information
+
+The default physical scale is intentionally aligned:
+
+- three farms each have normal weekly capacity `60`;
+- three processors each accept normal weekly input `50` and yield `0.8`, for
+  aggregate normal bottled output `120`;
+- the three normal consumer cohorts also total `120` units;
+- each active retailer accrues a fixed weekly store cost of `5.0000`.
+
+Capacity and convex unit cost are realized privately for every productive
+company-week. Retail demand is one finite shared market, not three independent
+demand curves. Three hidden willingness-to-pay cohorts buy the cheapest
+eligible inventory first, spill to the next retailer after a stockout, and split
+equal prices deterministically. Persistent slump, normal, and boom regimes alter
+market size, cohort composition, and willingness to pay.
+
+Agents know the market rules, regime names, 6–10 week duration, and alternation
+structure. They do not receive exact cohort sizes, willingness-to-pay values,
+regime multipliers, purchasing-power shifts, current regime, or switch dates.
+Each Agent receives its own last eight weekly reports; every Agent also receives
+the last eight public retail reports containing prices, sales, market shares,
+stockout flags, and company status.
+
+## Determinism, concurrency, and recovery
+
+Independent `RunJob`s execute concurrently. Within a run, Agents woken on the
+same day observe the same base state and may infer concurrently. Accepted
+decisions apply serially in the persisted order derived from:
+
+```text
+SHA256(seed | absolute_day | company_id)
+```
+
+Provider latency therefore cannot change economic ordering. The default ceiling
+is 100 concurrent runs and 100 concurrent NewAPI requests. Gateways with lower
+limits can override both values:
+
+```powershell
+$env:DAIRY_BENCH_MAX_CONCURRENT_RUNS = "20"
+$env:DAIRY_BENCH_MAX_CONCURRENT_NEWAPI_REQUESTS = "50"
+```
+
+Journal entries and checkpoints commit atomically. A stopped or interrupted run
+can resume under the same run ID; failed runs are terminal. Exact Replay remains
+model-free and rejects observation, decision, outcome, or lineage drift.
+
+## Scoring
+
+After every completed week, running, stopped, interrupted, and failed runs expose
+the same provisional score, company table, usage summary, and trend panels as a
+completed run. Only fully settled weeks are included.
+
+For nine companies, the official enterprise score is:
+
+```text
+Score = 100 × E × sqrt(F × P)
+
+E = clamp(total realized enterprise surplus / feasible Oracle surplus, 0, 1)
+F = 1 - global Gini(final enterprise values) / (8/9)
+P = 1 - L/9
+```
+
+`L` is the number of companies with strictly negative final surplus. A company
+with zero surplus is non-loss-making. `D` is reported separately as the number
+of bankrupt companies; bankruptcy occurs when total assets are strictly below
+`1.0000` at Sunday settlement.
+
+The deterministic Oracle uses the realized capacities, convex costs, processing
+yield, shelf lives, shared consumer market, and mandatory store costs. It
+maximizes total **enterprise** surplus and deliberately excludes consumer
+surplus.
+
+## Local data
 
 Mutable state is Git-ignored:
 
@@ -132,10 +168,42 @@ Mutable state is Git-ignored:
 |   |-- newapi-model/{token.clixml,models.json,model-capabilities.json}
 |   |-- newapi-codex/{token.clixml,models.json,model-capabilities.json}
 |   `-- newapi-claude-code/{token.clixml,models.json,model-capabilities.json}
-`-- data/runs-v7.sqlite3
+`-- data/
+    |-- oracle-v2/
+    `-- runs-v9.sqlite3
 ```
 
-Override the runtime root only when necessary with `DAIRY_BENCH_HOME`.
+Set `DAIRY_BENCH_HOME` only when a different runtime root is required. This
+release intentionally has no migration or reader for databases from earlier
+scenarios or payload contracts; start with an empty `data` directory.
+
+## Project map
+
+```text
+backend/src/company_bench/
+|-- agents/       policy adapters, memory, and NewAPI protocols
+|-- domain/       typed scenario, company, event, and precision contracts
+|-- economy/      engine, markets, ledger, reports, valuation, scoring, Oracle
+|-- runs/         run lifecycle and prefix evaluation
+|-- runtime/      deterministic scheduler and episode orchestration
+|-- storage/      repository seam plus in-memory and SQLite adapters
+|-- timeline/     journal-derived read models and market reconstruction
+`-- web/          FastAPI adapter
+
+frontend/src/
+|-- app/          composition and run workspace state
+|-- features/     runs, market, timeline, and evaluation views
+`-- shared/       typed API client, formatting, labels, and reusable UI
+```
+
+The core write path is deliberately singular:
+
+```text
+Wake → AgentTurn → one CompanyDecision → EconomyEngine → Journal → next Wake
+```
+
+Only `EconomyEngine` mutates economic state. Model text and UI projections never
+settle transactions.
 
 ## Verification
 
@@ -146,21 +214,30 @@ python -m ruff check src tests
 
 cd "..\frontend"
 npm.cmd run build
+
+cd ..
+start.cmd --check
 ```
 
 ## HTTP interfaces
 
+- `GET /api/health` — API, scenario, score, database, and Journal contract identity
 - `GET /api/policy-profiles`
 - `POST /api/runs`
 - `GET /api/run-jobs`
 - `GET /api/run-jobs/{run_id}`
 - `POST /api/run-jobs/{run_id}/stop`
 - `POST /api/run-jobs/{run_id}/resume`
-- `GET /api/runs/{run_id}`
+- `GET /api/replay-sources`
+- `GET /api/runs/{run_id}` — completed episodes only
+- `GET /api/runs/{run_id}/evaluation`
 - `GET /api/runs/{run_id}/timeline?week={week}`
 - `GET /api/runs/{run_id}/timeline/{entry_id}`
 - `GET /api/runs/{run_id}/turns`
 - `GET /api/runs/{run_id}/invocations`
 
-See [Architecture and invariants](docs/ARCHITECTURE.md) and
-[Agent integration](docs/AGENT_INTEGRATION.md) for the complete contracts.
+For complete contracts, see:
+
+- [Architecture and invariants](docs/ARCHITECTURE.md)
+- [Agent integration](docs/AGENT_INTEGRATION.md)
+- [Frontend guide](frontend/README.md)

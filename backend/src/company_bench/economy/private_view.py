@@ -2,30 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from decimal import Decimal
 
 from company_bench.domain.models import (
-    ZERO,
     CompanyId,
     CompanyObservation,
-    ConsumerSaleEvent,
     DomainEvent,
     FarmOperation,
-    InventoryExpiredEvent,
-    MilkProcessedEvent,
-    MilkProducedEvent,
     ProcessorOperation,
     RetailerOperation,
-    TradeExecutedEvent,
 )
 from company_bench.domain.precision import ECONOMIC_QUANTUM, EconomicPrecision
+from company_bench.economy.ledger import CompanyLedger
 from company_bench.runtime.models import (
     OrderBookView,
     PrivateCashFlow,
     PrivateEconomicsView,
     PrivateUnitEconomics,
 )
+
+__all__ = ("PrivateEconomicsProjector",)
 
 
 class PrivateEconomicsProjector:
@@ -39,51 +35,25 @@ class PrivateEconomicsProjector:
         events: tuple[DomainEvent, ...],
     ) -> PrivateEconomicsView:
         """Return cumulative cash flow and current executable unit economics."""
-        cash_flow = self._cash_flow(company_id, events)
+        ledger = CompanyLedger.from_events(company_id, events)
         return PrivateEconomicsView(
-            cash_flow=cash_flow,
+            cash_flow=self._cash_flow(ledger),
             unit_economics=self._unit_economics(observation, order_books),
         )
 
     @staticmethod
-    def _cash_flow(
-        company_id: CompanyId,
-        events: tuple[DomainEvent, ...],
-    ) -> PrivateCashFlow:
-        purchases = _sum(
-            event.total_value
-            for event in events
-            if isinstance(event, TradeExecutedEvent) and event.buyer_id == company_id
-        )
-        wholesale = _sum(
-            event.total_value
-            for event in events
-            if isinstance(event, TradeExecutedEvent) and event.seller_id == company_id
-        )
-        operation_cost = _sum(
-            event.cash_cost
-            for event in events
-            if isinstance(event, (MilkProducedEvent, MilkProcessedEvent))
-            and event.company_id == company_id
-        )
-        consumer_revenue = _sum(
-            event.revenue
-            for event in events
-            if isinstance(event, ConsumerSaleEvent) and event.company_id == company_id
-        )
-        expiry_loss = _sum(
-            event.reference_value_loss
-            for event in events
-            if isinstance(event, InventoryExpiredEvent) and event.company_id == company_id
-        )
+    def _cash_flow(ledger: CompanyLedger) -> PrivateCashFlow:
         return PrivateCashFlow(
-            purchase_spend=purchases,
-            wholesale_revenue=wholesale,
-            operation_cost=operation_cost,
-            consumer_revenue=consumer_revenue,
-            expiry_reference_loss=expiry_loss,
+            purchase_spend=ledger.purchase_spend,
+            wholesale_revenue=ledger.wholesale_revenue,
+            operation_cost=ledger.operation_cash_paid,
+            consumer_revenue=ledger.consumer_revenue,
+            expiry_reference_loss=ledger.expiry_reference_loss,
             net_cash_flow=EconomicPrecision.round(
-                wholesale + consumer_revenue - purchases - operation_cost
+                ledger.wholesale_revenue
+                + ledger.consumer_revenue
+                - ledger.purchase_spend
+                - ledger.operation_cash_paid
             ),
         )
 
@@ -112,9 +82,7 @@ class PrivateEconomicsProjector:
             break_even = (
                 None
                 if input_ask is None or processing_cost is None
-                else EconomicPrecision.round(
-                    (input_ask + processing_cost) / operation.yield_rate
-                )
+                else EconomicPrecision.round((input_ask + processing_cost) / operation.yield_rate)
             )
             return PrivateUnitEconomics(
                 input_product=operation.input_product,
@@ -164,7 +132,3 @@ def _best_bid(book: OrderBookView | None) -> Decimal | None:
 
 def _margin(revenue: Decimal | None, cost: Decimal | None) -> Decimal | None:
     return None if revenue is None or cost is None else EconomicPrecision.round(revenue - cost)
-
-
-def _sum(values: Iterable[Decimal]) -> Decimal:
-    return sum(values, start=ZERO)

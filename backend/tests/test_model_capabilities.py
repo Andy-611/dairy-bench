@@ -48,9 +48,7 @@ def test_catalog_single_flights_concurrent_calibration(tmp_path: Path) -> None:
     catalog = ModelCapabilityCatalog.production(tmp_path / "capabilities.json", probe)
 
     async def calibrate() -> tuple[int, ...]:
-        capabilities = await asyncio.gather(
-            *(catalog.ensure("unlisted-model") for _ in range(8))
-        )
+        capabilities = await asyncio.gather(*(catalog.ensure("unlisted-model") for _ in range(8)))
         return tuple(capability.max_output_tokens for capability in capabilities)
 
     assert asyncio.run(calibrate()) == (32_768,) * 8

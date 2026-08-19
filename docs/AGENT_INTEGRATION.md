@@ -1,157 +1,134 @@
 # Agent Integration Contract
 
+[English](AGENT_INTEGRATION.md) | [简体中文](AGENT_INTEGRATION.zh-CN.md)
+
 ## 1. Provider boundary
 
 Model-backed companies use NewAPI Chat Completions, Responses, or Anthropic
-Messages adapters behind one `DecisionGateway` seam. Each company owns an
-isolated `LlmCompanyAgent`, memory, and policy metadata; profiles share one
-global request semaphore while each credential owns its HTTP connection pool.
+Messages adapters behind one `DecisionGateway`. Every company owns an isolated
+`LlmCompanyAgent`, memory, and policy metadata. Credential profiles own their
+HTTP pools and share the application-level request semaphore.
 
-Codex and Claude Code are protocol-profile labels. Dairy Bench remains the
-Agent runtime and never launches their local coding-agent processes or grants
-shell, filesystem, MCP, plugin, or workspace access.
+The adapter accepts exactly one authorized function call. Free text, multiple
+calls, unknown tools, and model-supplied identity/time are invalid. One
+structured repair is allowed; a second invalid response becomes an audited
+protocol error.
 
-The adapter requires exactly one authorized function call. It never accepts a
-free-text command, multiple calls, an unknown tool, or a provider-specific
-identity/time field. Parallel tool calls are disabled. One invalid completion
-may receive one structured repair request; a second failure becomes a protocol
-invalid turn.
+## 2. Runtime-owned input
 
-## 2. Input owned by the runtime
+Every call receives a typed `AgentDecisionInput` containing memory, one
+`AgentTurn`, and derived decision constraints. The turn contains:
 
-Each call receives `AgentDecisionInput`:
+- runtime identity, simulation day, state version, phase, and turn budget;
+- typed wake causes and newly visible events;
+- company role, products, private weekly operation state, and public consumer
+  market rules;
+- cash, operating-cost payable, marked surplus, inventory/expiry, orders, books,
+  deliveries, and active operation;
+- private economics and prior outcome;
+- up to eight own weekly reports and eight public retail-market reports;
+- on Sunday pricing only, a private post-procurement `RetailPricingContext`.
 
-```text
-AgentDecisionInput
-├── memory
-├── turn: AgentTurn
-└── decision_constraints
-```
+The pricing context contains current cash, saleable quantity and book value,
+weighted unit cost, this week's procurement quantity/spend/VWAP, inventory by
+expiry, and previous retail price.
 
-`AgentTurn` contains:
+The Agent never receives the seed, competitor private ledgers, competitor
+cost/inventory/procurement, exact consumer cohort sizes or WTP,
+purchasing-power/regime shifts, regime multipliers, current hidden regime, or
+future transitions.
 
-- runtime-owned `turn_id`, `company_id`, `sim_day`, and `state_version`;
-- `turn_number_this_week` and `turn_limit_this_week`;
-- typed wake reasons and causal wake signals;
-- the company's role, public scenario rules, products, demand curve, and
-  private weekly operation realization;
-- available/reserved cash, marked surplus, available inventory and expiry;
-- owned open orders and anonymous relevant order books;
-- pending deliveries and the active physical operation;
-- private cash flow/unit economics, newly visible events, and prior outcome.
+## 3. Decision phases and tools
 
-The Agent does not receive the seed, other companies' private ledgers, hidden
-demand shock, hidden cost/capacity realizations, or future events.
+Monday-Saturday operations authorize:
 
-`decision_constraints` explicitly supplies one-day operation/delivery duration,
-one-day decision interval, default/max review days, days until Sunday, and used
-and remaining productive capacity. These are facts, not suggestions.
+- farm: `produce`, `set_quote_ladder`, `idle`;
+- processor: `transform`, `set_quote_ladder`, `idle`;
+- retailer: `set_quote_ladder`, `idle`.
 
-## 3. Output contract
+After Sunday market close, each active retailer receives one separate sealed
+pricing call. Its only authorized tool is `set_retail_price`; the price applies
+to that Sunday's consumer settlement. All retailers infer concurrently from the
+same state, so none can react to another current-week price.
 
-The Agent must call exactly one role-authorized decision tool. Every tool returns
-one discriminated `CompanyDecision`:
+Every accepted output is wrapped in a runtime-owned `DecisionEnvelope` before
+the engine sees it.
 
-```text
-ActionDecision(action, attention)
-IdleDecision(attention)
-```
+## 4. Public consumer rules
 
-Authorized economic actions are:
+Agents are explicitly told that:
 
-- farm: `produce`, sell `set_quote_ladder`, `idle`;
-- processor: buy/sell `set_quote_ladder`, `transform`, `idle`;
-- retailer: buy `set_quote_ladder`, `set_retail_price`, `idle`.
+- the shared market has three groups with distinct unknown WTP;
+- consumers choose the cheapest acceptable stocked retailer first;
+- stockouts spill demand to the next-lowest price;
+- equal prices receive deterministic equal-share allocation;
+- slump, normal, and boom regimes last 6-10 weeks;
+- normal alternates with extreme regimes, which can alter market size, group
+  composition, and WTP;
+- run-wide purchasing power may also move every group's WTP.
 
-The Runtime wraps the validated decision in a `DecisionEnvelope` with trusted
-identity, date, and state version before calling `EconomyEngine`.
+The engine keeps exact group quantities, WTP values, purchasing-power/regime
+shifts, multipliers, first extreme, current state, and transition timing hidden.
+Sold-out observations are censored:
+the Agent learns sales, not unserved latent demand.
 
-## 4. AttentionPlan
+## 5. Reports
 
-Every action and idle decision includes:
+Private weekly reports expose only the observed company's authoritative
+operations, cash/value change, costs, trades, inventory, and expiry. Retailer
+reports additionally expose procurement VWAP, saleable book cost, price, sales,
+revenue, COGS, gross profit, operating profit, weekly store cost, payable,
+sell-through, stockout, and market share.
 
-```json
-{
-  "review_after_days": 1,
-  "alerts": []
-}
-```
+Public retail reports expose every retailer's posted price, sold quantity,
+market share, stockout flag, and status, plus total sales and volume-weighted
+average price. Only completed past weeks are visible; both windows are capped at
+eight.
 
-- `review_after_days` may be `null`, `1`, or `2`.
-- `null` uses the one-day bounded fallback when another decision day exists.
-- The effective review must remain Monday-Saturday in the current week.
-- Up to three OR-combined alerts may watch `best_bid` or `best_ask` with
-  `at_least`/`at_most` thresholds.
-- An alert must be currently false, observable to that company, and nonduplicate.
+## 6. Attention and timing
 
-Accepted decisions do not create a routine extra wake. Reviews, matching price
-alerts, own trades, operation/delivery completions, rejection correction, and
-week opening are the valid causes. Same-company wakes on one day coalesce.
+Operating decisions include an `AttentionPlan`. `review_after_days` is `null`,
+`1`, or `2`; the effective review must remain Monday-Saturday in the current
+week. Up to three currently-false OR price alerts may watch the best bid/ask.
+Same-company wakes on one day coalesce. There is at most one operating call per
+day and six per week.
 
-## 5. Weekly operating rules visible to the Agent
+The Sunday price call has no attention scheduling and does not consume the
+operating budget. Invalid pricing output retains the prior/default price so the
+episode can finish, but marks the result protocol-invalid and diagnostic-only.
 
-- Companies may decide only Monday-Saturday.
-- One company receives at most one call per day and six calls per week.
-- Sunday closes wholesale books, settles consumer purchases once, expires due
-  inventory, and contains no Agent call.
-- Production, transformation, and delivery take one day and cannot cross into a later week.
-- Order books and retail price persist during the week and reset after Sunday.
-- Raw/bottled inventory expires after 2/4 weekly settlements.
+## 7. Market and precision semantics
 
-For productive companies, `weekly_operation` gives realized `K` and base unit
-cost `c`. For an additional input quantity `q` after used capacity `u`, the cash
-cost remains:
+- Quote ladders declare the complete zero-to-three-level target state.
+- Unchanged levels retain priority; changed levels are atomically replaced.
+- Bids reserve cash and asks reserve FEFO inventory.
+- Crosses execute at the resting maker price; delivery takes one day.
+- Production/transformation takes one day and cannot cross the week boundary.
+- All prices, quantities, costs, and values share exact `0.0001` precision.
+- Each active retailer knows its own `weekly_operating_cost`; it is accrued after
+  Sunday revenue, and any unpaid balance reduces marked enterprise value.
+
+For productive companies, the private weekly realization supplies `K` and `c`:
 
 ```text
 C(x) = c*x + curvature*c*x^2/(2*K)
 incremental cost = C(u+q) - C(u)
 ```
 
-The normal capacity values in the scenario are formula inputs; the Agent must
-use the private realized weekly values supplied in its observation.
+## 8. Determinism, memory, and audit
 
-## 6. Market semantics
+Same-day calls run concurrently and commit by
+`SHA256(seed | absolute_day | company_id)`. Provider response speed cannot
+improve priority. The Agent's private memory stores complete turn/outcome cycles
+and deterministically summarizes older cycles when its token budget is reached;
+weekly reports remain authoritative state rather than generated summaries.
 
-- `set_quote_ladder` declares the complete target state for one product/side.
-- Zero to three unique levels must be ordered best-to-worst; `[]` clears the
-  ladder.
-- Unchanged price/quantity levels preserve identity and time priority; changed
-  levels are atomically replaced and lose priority.
-- Total bids require full cash collateral; total asks require physical FEFO
-  inventory.
-- Crossing trades immediately at the resting maker price.
-- Cash transfers at match time; purchased inventory arrives one day later.
-- Every economic price and quantity uses at most four decimal places and every
-  productive/quote quantity is at least `0.0001`.
+Every physical provider call records model/profile/protocol metadata, usage,
+latency, attempts, prompt identity, and whether it produced the committed turn.
+Secrets are never journaled. Replay makes no provider call and must reproduce
+observations, decisions, protocol fallback, and engine outcomes exactly.
 
-## 7. Deterministic same-day application
-
-All Agents woken on the same day observe one base state and may infer in
-parallel. The Runtime validates all outputs and applies them serially by:
-
-```text
-SHA256(seed | absolute_day | company_id)
-```
-
-The persisted `apply_sequence` is the only economic order. A provider's response
-speed cannot improve market priority.
-
-## 8. Memory and audit
-
-After application, the Agent-owned memory receives the complete turn/outcome
-cycle. Compaction is deterministic and private to that company. Every physical
-provider call records profile ID, wire protocol, adapter version, configuration
-fingerprint, model, provider, usage, latency, attempts, prompt version, prompt
-hash, and whether it was applied to a committed turn. Credentials and raw
-secrets are never journaled.
-
-Replay Agents consume persisted source turns and make no provider call. They
-must match company, simulation day, observation, decision, and recomputed
-outcome exactly.
-
-## 9. Minimal adapter interface
-
-An Agent implementation needs one async operation:
+## 9. Minimal interface
 
 ```python
 class CompanyAgent(Protocol):
@@ -160,6 +137,6 @@ class CompanyAgent(Protocol):
     async def act(self, turn: AgentTurn) -> CompanyDecision: ...
 ```
 
-Provider adapters should not duplicate role authorization or economic
-validation. They construct the provider request, parse the single tool call,
-and return the typed union; Runtime and Engine remain authoritative.
+Provider adapters parse tool calls only. Role authorization belongs to the
+Agent boundary; scheduling belongs to Runtime; economic validation and mutation
+belong to `EconomyEngine`.

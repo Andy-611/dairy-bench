@@ -1,4 +1,4 @@
-import type { CompanyRole, DecimalText } from "./api/types";
+import type { DecimalText } from "./api/types";
 
 const valueFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
@@ -11,21 +11,11 @@ const percentFormatter = new Intl.NumberFormat("en-US", {
   style: "percent",
 });
 
-export const ROLE_LABELS: Readonly<Record<CompanyRole, string>> = {
-  farm: "Farm",
-  processor: "Processor",
-  retailer: "Retailer",
-};
-
 export function formatValue(value: number): string {
   return valueFormatter.format(value);
 }
 
 export function formatExactDecimal(value: DecimalText): string {
-  return value;
-}
-
-export function formatMarketPrice(value: DecimalText): string {
   return value;
 }
 
@@ -52,4 +42,9 @@ export function formatPercent(value: number): string {
 
 export function formatGrowth(value: DecimalText): string {
   return `${value}x`;
+}
+
+export function formatAuditPayload(data: unknown): string {
+  const payload = JSON.stringify(data, null, 2);
+  return payload ?? "null";
 }

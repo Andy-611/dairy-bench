@@ -2,12 +2,14 @@ import {
   formatExactDecimal,
   formatGrowth,
   formatSignedExactDecimal,
-  ROLE_LABELS,
 } from "../../shared/format";
 import type { CompanyResultView, CompanyRole } from "../../shared/api/types";
+import { ROLE_LABELS } from "../../shared/labels";
 
 interface CompanyTableProps {
   readonly companies: readonly CompanyResultView[];
+  readonly completedWeeks: number;
+  readonly provisional: boolean;
 }
 
 const ROLE_ORDER: Readonly<Record<CompanyRole, number>> = {
@@ -16,7 +18,11 @@ const ROLE_ORDER: Readonly<Record<CompanyRole, number>> = {
   retailer: 2,
 };
 
-export function CompanyTable({ companies }: CompanyTableProps) {
+export function CompanyTable({
+  companies,
+  completedWeeks,
+  provisional,
+}: CompanyTableProps) {
   const orderedCompanies = [...companies].sort(
     (left, right) =>
       ROLE_ORDER[left.role] - ROLE_ORDER[right.role] ||
@@ -30,22 +36,26 @@ export function CompanyTable({ companies }: CompanyTableProps) {
           <span className="eyebrow">COMPANIES</span>
           <h2>Company results</h2>
         </div>
-        <p>All financial and inventory values come from engine settlement.</p>
+        <p>
+          All financial and inventory values come from engine settlement
+          {provisional ? ` through week ${completedWeeks}` : ""}.
+        </p>
       </div>
       <div className="table-scroll">
         <table>
           <caption className="sr-only">
-            Final results for {companies.length} companies
+            {provisional ? `Week ${completedWeeks}` : "Final"} results for{" "}
+            {companies.length} companies
           </caption>
           <thead>
             <tr>
               <th scope="col">Tier / company</th>
               <th scope="col">Policy</th>
               <th className="numeric" scope="col">
-                Initial cash
+                Initial value
               </th>
               <th className="numeric" scope="col">
-                Final cash
+                {provisional ? "Current cash" : "Final cash"}
               </th>
               <th className="numeric" scope="col">
                 Inventory value
@@ -76,7 +86,7 @@ export function CompanyTable({ companies }: CompanyTableProps) {
                   </div>
                 </td>
                 <td>{company.policyName}</td>
-                <td className="numeric">{formatExactDecimal(company.initialCash)}</td>
+                <td className="numeric">{formatExactDecimal(company.initialValue)}</td>
                 <td className="numeric">{formatExactDecimal(company.finalCash)}</td>
                 <td className="numeric">{formatExactDecimal(company.inventoryValue)}</td>
                 <td

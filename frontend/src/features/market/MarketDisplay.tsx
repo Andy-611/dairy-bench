@@ -1,10 +1,9 @@
 import { useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties } from "react";
 
 import { companyLabel, productLabel } from "../../shared/labels";
 import {
   formatExactDecimal,
-  formatMarketPrice,
   isZeroDecimal,
 } from "../../shared/format";
 import {
@@ -21,7 +20,9 @@ import type {
   ObserverOrderBookView,
   OpenOrderView,
 } from "../../shared/api/types";
+import { DefinitionItem as MarketMeta } from "../../shared/ui/DefinitionItem";
 import { DetailDrawer } from "../../shared/ui/DetailDrawer";
+import { DrawerSection as MarketDrawerSection } from "../../shared/ui/DrawerSection";
 
 interface MarketDisplayProps {
   readonly absoluteDay: number;
@@ -143,7 +144,7 @@ function OrderFlow({
                   <span className="market-flow-contract">
                     <strong>
                       {bookSide(order.side).toUpperCase()} {formatExactDecimal(order.remainingQuantity)}{" "}
-                      {productLabel(order.product)} @ {formatMarketPrice(order.limitPrice)}
+                      {productLabel(order.product)} @ {formatExactDecimal(order.limitPrice)}
                     </strong>
                     <code>{order.orderId}</code>
                   </span>
@@ -187,7 +188,7 @@ function TradeTape({
               <span className="trade-contract">
                 <strong>{productLabel(trade.product)}</strong>
                 <span>
-                  {formatExactDecimal(trade.quantity)} @ {formatMarketPrice(trade.unitPrice)}
+                  {formatExactDecimal(trade.quantity)} @ {formatExactDecimal(trade.unitPrice)}
                 </span>
               </span>
               <span className="trade-route">
@@ -346,12 +347,12 @@ function PriceLevel({
   const orderCount = level.orders.length;
   const cells =
     side === "bid"
-      ? [String(orderCount), formatExactDecimal(level.size), formatMarketPrice(level.unitPrice)]
-      : [formatMarketPrice(level.unitPrice), formatExactDecimal(level.size), String(orderCount)];
+      ? [String(orderCount), formatExactDecimal(level.size), formatExactDecimal(level.unitPrice)]
+      : [formatExactDecimal(level.unitPrice), formatExactDecimal(level.size), String(orderCount)];
   return (
     <div className="price-level">
       <button
-        aria-label={`Open ${side} ${formatMarketPrice(level.unitPrice)} with ${orderCount} ${plural(orderCount, "order")}`}
+        aria-label={`Open ${side} ${formatExactDecimal(level.unitPrice)} with ${orderCount} ${plural(orderCount, "order")}`}
         className={`price-level-summary${selected ? " selected" : ""}`}
         data-price={level.unitPrice}
         data-side={side}
@@ -425,7 +426,7 @@ function OrderFlowDetail({
             <MarketMeta label="Product" value={productLabel(order.product)} />
             <MarketMeta
               label="Quantity / limit"
-              value={`${formatExactDecimal(order.remainingQuantity)} @ ${formatMarketPrice(order.limitPrice)}`}
+              value={`${formatExactDecimal(order.remainingQuantity)} @ ${formatExactDecimal(order.limitPrice)}`}
             />
             <MarketMeta label="Order ID" value={order.orderId} />
             <MarketMeta
@@ -471,7 +472,7 @@ function OrderFlowDetail({
                         <code>{match.tradeId}</code>
                         <strong>
                           {formatExactDecimal(match.quantity)} @{" "}
-                          {formatMarketPrice(match.unitPrice)}
+                          {formatExactDecimal(match.unitPrice)}
                         </strong>
                       </header>
                       <span>
@@ -544,7 +545,7 @@ function PriceLevelDetail({
       ariaLabel={`${side} end-of-day order book price level detail`}
       eyebrow="END-OF-DAY ORDER BOOK"
       onClose={onClose}
-      title={`${side.toUpperCase()} ${formatMarketPrice(level.unitPrice)} · ${productLabel(product)}`}
+      title={`${side.toUpperCase()} ${formatExactDecimal(level.unitPrice)} · ${productLabel(product)}`}
     >
       <div className="drawer-body market-drawer-body">
         <MarketDrawerSection
@@ -553,7 +554,7 @@ function PriceLevelDetail({
         >
           <dl className="market-detail-grid compact">
             <MarketMeta label="Side" value={side.toUpperCase()} />
-            <MarketMeta label="Price" value={formatMarketPrice(level.unitPrice)} />
+            <MarketMeta label="Price" value={formatExactDecimal(level.unitPrice)} />
             <MarketMeta label="Total size" value={formatExactDecimal(level.size)} />
             <MarketMeta label="Active orders" value={String(orderCount)} />
           </dl>
@@ -578,35 +579,6 @@ function PriceLevelDetail({
         </MarketDrawerSection>
       </div>
     </DetailDrawer>
-  );
-}
-
-function MarketDrawerSection({
-  children,
-  label,
-  title,
-}: {
-  readonly children: ReactNode;
-  readonly label: string;
-  readonly title: string;
-}) {
-  return (
-    <section className="drawer-section">
-      <header>
-        <span>{label}</span>
-        <h3>{title}</h3>
-      </header>
-      <div>{children}</div>
-    </section>
-  );
-}
-
-function MarketMeta({ label, value }: { readonly label: string; readonly value: string }) {
-  return (
-    <div>
-      <dt>{label}</dt>
-      <dd title={value}>{value}</dd>
-    </div>
   );
 }
 
@@ -640,5 +612,5 @@ function bookSide(side: OpenOrderView["side"]): BookSide {
 }
 
 function priceOrDash(value: ObserverOrderBookView["bestBid"]): string {
-  return value === null ? "—" : formatMarketPrice(value);
+  return value === null ? "—" : formatExactDecimal(value);
 }

@@ -1171,6 +1171,16 @@ tbody tr:hover {
   font-size: 12px;
 }
 
+.quality-banner.provisional {
+  color: var(--green-dark);
+  border-color: #cae0d4;
+  background: #eef8f3;
+}
+
+.quality-banner.provisional > span {
+  background: var(--green);
+}
+
 .progress-copy {
   display: grid;
   width: min(420px, 100%);
@@ -2917,15 +2927,6 @@ footer {
 .raw-audit pre {
   max-height: 420px;
   border-radius: 0 0 8px 8px;
-}
-
-.reconstruction-note {
-  padding: 11px;
-  color: #785d2c;
-  border: 1px solid #ead9b4;
-  border-radius: 8px;
-  background: #fff9ed;
-  font-size: 10px;
 }
 
 @media (max-width: 960px) {

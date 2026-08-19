@@ -14,7 +14,6 @@ import type {
   EconomicActionView,
   EconomicEffectView,
   EpisodeQualityView,
-  EpisodeView,
   InvocationOutcome,
   JsonValue,
   MarketMatchLegView,
@@ -23,6 +22,7 @@ import type {
   PolicyProfileView,
   ProtocolIssueKind,
   ReplaySourceView,
+  RunEvaluationView,
   RunDiagnosticsView,
   QuoteAlertView,
   RunJobView,
@@ -45,13 +45,6 @@ import type {
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 
-interface InvocationUsageView {
-  readonly model: string;
-  readonly outcome: InvocationOutcome;
-  readonly provider: string;
-  readonly usage: TokenUsageView;
-}
-
 const DECIMAL_TEXT_PATTERN =
   /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
@@ -71,7 +64,7 @@ export class DairyBenchApi {
   public async policyProfiles(
     signal?: AbortSignal,
   ): Promise<readonly PolicyProfileView[]> {
-    const payload = await this.getJson("/api/policy-profiles", signal);
+    const payload = await this.requestJson("/api/policy-profiles", signal);
     return array(payload, "policy profiles").map((profile, index) =>
       parsePolicyProfile(profile, `profiles[${index}]`),
     );
@@ -103,7 +96,7 @@ export class DairyBenchApi {
     offset = 0,
     signal?: AbortSignal,
   ): Promise<readonly RunJobView[]> {
-    const payload = await this.getJson(
+    const payload = await this.requestJson(
       `/api/run-jobs?limit=${limit}&offset=${offset}`,
       signal,
     );
@@ -113,7 +106,7 @@ export class DairyBenchApi {
   public async replaySources(
     signal?: AbortSignal,
   ): Promise<readonly ReplaySourceView[]> {
-    const payload = await this.getJson("/api/replay-sources", signal);
+    const payload = await this.requestJson("/api/replay-sources", signal);
     return array(payload, "ReplaySource[]").map(parseReplaySource);
   }
 
@@ -121,7 +114,7 @@ export class DairyBenchApi {
     runId: string,
     signal?: AbortSignal,
   ): Promise<RunJobView> {
-    const payload = await this.getJson(
+    const payload = await this.requestJson(
       `/api/run-jobs/${encodeURIComponent(runId)}`,
       signal,
     );
@@ -138,16 +131,15 @@ export class DairyBenchApi {
     );
   }
 
-  public async episode(
+  public async evaluation(
     runId: string,
     signal?: AbortSignal,
-  ): Promise<EpisodeView> {
-    const encodedRunId = encodeURIComponent(runId);
-    const [episode, invocations] = await Promise.all([
-      this.getJson(`/api/runs/${encodedRunId}`, signal),
-      this.getJson(`/api/runs/${encodedRunId}/invocations`, signal),
-    ]);
-    return parseEpisode(episode, parseInvocations(invocations));
+  ): Promise<RunEvaluationView> {
+    const evaluation = await this.requestJson(
+      `/api/runs/${encodeURIComponent(runId)}/evaluation`,
+      signal,
+    );
+    return parseRunEvaluation(evaluation);
   }
 
   public async timelineWeek(
@@ -155,7 +147,7 @@ export class DairyBenchApi {
     week: number,
     signal?: AbortSignal,
   ): Promise<TimelineWeekView> {
-    const payload = await this.getJson(
+    const payload = await this.requestJson(
       `/api/runs/${encodeURIComponent(runId)}/timeline?week=${week}`,
       signal,
     );
@@ -167,15 +159,19 @@ export class DairyBenchApi {
     entryId: string,
     signal?: AbortSignal,
   ): Promise<TimelineDetailView> {
-    const payload = await this.getJson(
+    const payload = await this.requestJson(
       `/api/runs/${encodeURIComponent(runId)}/timeline/${encodeURIComponent(entryId)}`,
       signal,
     );
     return parseTimelineDetail(payload);
   }
 
-  private async getJson(path: string, signal?: AbortSignal): Promise<unknown> {
-    const response = await fetch(`${this.baseUrl}${path}`, { signal });
+  private async requestJson(
+    path: string,
+    signal?: AbortSignal,
+    init: RequestInit = {},
+  ): Promise<unknown> {
+    const response = await fetch(`${this.baseUrl}${path}`, { ...init, signal });
     const payload = await readJsonBody(response, signal);
     if (!response.ok) {
       throw new ApiError(errorMessage(payload, response.status), response.status);
@@ -188,16 +184,11 @@ export class DairyBenchApi {
     signal?: AbortSignal,
     body?: Readonly<Record<string, unknown>>,
   ): Promise<RunJobView> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const payload = await this.requestJson(path, signal, {
       body: body === undefined ? undefined : JSON.stringify(body),
       headers: body === undefined ? undefined : { "Content-Type": "application/json" },
       method: "POST",
-      signal,
     });
-    const payload = await readJsonBody(response, signal);
-    if (!response.ok) {
-      throw new ApiError(errorMessage(payload, response.status), response.status);
-    }
     return parseRunJob(payload);
   }
 }
@@ -350,17 +341,14 @@ function errorMessage(payload: unknown, status: number): string {
   return `The backend request failed (HTTP ${status}).`;
 }
 
-function parseEpisode(
-  payload: unknown,
-  invocations: readonly InvocationUsageView[],
-): EpisodeView {
-  const episode = record(payload, "EpisodeResult");
-  const scenario = record(episode.scenario, "scenario");
-  const score = record(episode.score, "score");
+function parseRunEvaluation(payload: unknown): RunEvaluationView {
+  const evaluation = record(payload, "RunEvaluation");
+  const scenario = record(evaluation.scenario, "scenario");
+  const score = record(evaluation.score, "score");
   const companySpecs = array(scenario.companies, "scenario.companies").map(
     (item, index) => record(item, `scenario.companies[${index}]`),
   );
-  const policies = array(episode.policies, "policies").map((item, index) =>
+  const policies = array(evaluation.policies, "policies").map((item, index) =>
     record(item, `policies[${index}]`),
   );
   const companyScores = array(score.companies, "score.companies").map(
@@ -368,13 +356,15 @@ function parseEpisode(
   );
 
   return {
-    runId: text(episode.run_id, "run_id"),
+    runId: text(evaluation.run_id, "run_id"),
     scenarioId: text(scenario.scenario_id, "scenario.scenario_id"),
-    seed: number(episode.seed, "seed"),
-    weeks: number(scenario.weeks, "scenario.weeks"),
-    agentUsage: summarizeAgentUsage(invocations),
+    seed: number(evaluation.seed, "seed"),
+    completedWeeks: number(evaluation.completed_weeks, "completed_weeks"),
+    totalWeeks: number(scenario.weeks, "scenario.weeks"),
+    provisional: boolean(evaluation.provisional, "provisional"),
+    agentUsage: parseAgentUsage(evaluation.agent_usage, "agent_usage"),
     score: parseScore(score),
-    quality: parseEpisodeQuality(episode.quality, "quality"),
+    quality: parseEpisodeQuality(evaluation.quality, "quality"),
     companies: companyScores.map((companyScore, index) =>
       parseCompany(
         companyScore,
@@ -383,7 +373,7 @@ function parseEpisode(
         `score.companies[${index}]`,
       ),
     ),
-    snapshots: parseSnapshots(episode.snapshots),
+    snapshots: parseSnapshots(evaluation.snapshots),
   };
 }
 
@@ -423,16 +413,16 @@ function parseScore(score: JsonRecord): ScoreView {
   return {
     finalScore: decimalText(score.final_score, "score.final_score"),
     efficiencyRaw: decimalText(score.efficiency_raw, "score.efficiency_raw"),
-    efficiencyReference: decimalText(
-      score.efficiency_reference,
-      "score.efficiency_reference",
+    efficiencyOracle: decimalText(
+      score.efficiency_oracle,
+      "score.efficiency_oracle",
     ),
     efficiencyScore: decimalText(score.efficiency_score, "score.efficiency_score"),
     globalGini: decimalText(score.global_gini, "score.global_gini"),
     fairnessScore: decimalText(score.fairness_score, "score.fairness_score"),
-    profitParticipationScore: decimalText(
-      score.profit_participation_score,
-      "score.profit_participation_score",
+    nonLossCompanyRatio: decimalText(
+      score.non_loss_company_ratio,
+      "score.non_loss_company_ratio",
     ),
     bankruptCompanyCount: number(
       score.bankrupt_company_count,
@@ -442,53 +432,34 @@ function parseScore(score: JsonRecord): ScoreView {
       score.loss_making_company_count,
       "score.loss_making_company_count",
     ),
+    lossMakingCompanyRate: decimalText(
+      score.loss_making_company_rate,
+      "score.loss_making_company_rate",
+    ),
   };
 }
 
-function parseInvocations(payload: unknown): readonly InvocationUsageView[] {
-  return array(payload, "PolicyInvocation[]").map((item, index) => {
-    const path = `invocations[${index}]`;
-    const invocation = record(item, path);
-    return {
-      outcome: invocationOutcome(invocation.outcome, `${path}.outcome`),
-      provider: text(invocation.provider, `${path}.provider`),
-      model: text(invocation.model, `${path}.model`),
-      usage: parseTokenUsage(invocation.usage, `${path}.usage`),
-    };
-  });
-}
-
-function summarizeAgentUsage(
-  invocations: readonly InvocationUsageView[],
+function parseAgentUsage(
+  payload: unknown,
+  path: string,
 ): AgentUsageSummaryView | null {
-  if (invocations.length === 0) {
+  if (payload === null) {
     return null;
   }
-
-  const providers = new Set<string>();
-  const models = new Set<string>();
-  let successfulInvocations = 0;
-  let usage: TokenUsageView = {
-    inputTokens: 0,
-    cachedTokens: 0,
-    outputTokens: 0,
-    reasoningTokens: 0,
-    totalTokens: 0,
-  };
-
-  invocations.forEach((invocation) => {
-    providers.add(invocation.provider);
-    models.add(invocation.model);
-    successfulInvocations += invocation.outcome === "success" ? 1 : 0;
-    usage = addTokenUsage(usage, invocation.usage);
-  });
-
+  const summary = record(payload, path);
   return {
-    invocationCount: invocations.length,
-    successfulInvocations,
-    providers: [...providers],
-    models: [...models],
-    usage,
+    invocationCount: number(summary.invocation_count, `${path}.invocation_count`),
+    successfulInvocations: number(
+      summary.successful_invocations,
+      `${path}.successful_invocations`,
+    ),
+    providers: array(summary.providers, `${path}.providers`).map((provider, index) =>
+      text(provider, `${path}.providers[${index}]`),
+    ),
+    models: array(summary.models, `${path}.models`).map((model, index) =>
+      text(model, `${path}.models[${index}]`),
+    ),
+    usage: parseTokenUsage(summary.usage, `${path}.usage`),
   };
 }
 
@@ -503,19 +474,6 @@ function parseTokenUsage(payload: unknown, path: string): TokenUsageView {
       `${path}.reasoning_tokens`,
     ),
     totalTokens: number(usage.total_tokens, `${path}.total_tokens`),
-  };
-}
-
-function addTokenUsage(
-  left: TokenUsageView,
-  right: TokenUsageView,
-): TokenUsageView {
-  return {
-    inputTokens: left.inputTokens + right.inputTokens,
-    cachedTokens: left.cachedTokens + right.cachedTokens,
-    outputTokens: left.outputTokens + right.outputTokens,
-    reasoningTokens: left.reasoningTokens + right.reasoningTokens,
-    totalTokens: left.totalTokens + right.totalTokens,
   };
 }
 
@@ -544,7 +502,7 @@ function parseCompany(
     role: role(companyScore.tier, `${path}.tier`),
     status: companyStatus(companyScore.status, `${path}.status`),
     policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "Unknown policy",
-    initialCash: decimalText(companyScore.initial_value, `${path}.initial_value`),
+    initialValue: decimalText(companyScore.initial_value, `${path}.initial_value`),
     finalCash: decimalText(companyScore.final_cash, `${path}.final_cash`),
     inventoryValue: decimalText(
       companyScore.final_inventory_value,
@@ -1440,13 +1398,13 @@ function parseTimelineEffects(
       return {
         kind,
         companyId: text(effect.company_id, `${effectPath}.company_id`),
-        potentialDemand: decimalText(
-          effect.potential_demand_quantity,
-          `${effectPath}.potential_demand_quantity`,
+        saleableQuantity: decimalText(
+          effect.saleable_quantity,
+          `${effectPath}.saleable_quantity`,
         ),
-        demandQuantity: decimalText(
-          effect.demand_quantity,
-          `${effectPath}.demand_quantity`,
+        saleableBookValue: decimalText(
+          effect.saleable_book_value,
+          `${effectPath}.saleable_book_value`,
         ),
         soldQuantity: decimalText(
           effect.sold_quantity,
@@ -1457,6 +1415,34 @@ function parseTimelineEffects(
           `${effectPath}.retail_price`,
         ),
         revenue: decimalText(effect.revenue, `${effectPath}.revenue`),
+        costOfGoodsSold: decimalText(
+          effect.cost_of_goods_sold,
+          `${effectPath}.cost_of_goods_sold`,
+        ),
+        grossProfit: decimalText(
+          effect.gross_profit,
+          `${effectPath}.gross_profit`,
+        ),
+        soldOut: boolean(effect.sold_out, `${effectPath}.sold_out`),
+      };
+    }
+    if (kind === "retail_operating_cost_charged") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        openingPayable: decimalText(
+          effect.opening_payable,
+          `${effectPath}.opening_payable`,
+        ),
+        costAccrued: decimalText(
+          effect.cost_accrued,
+          `${effectPath}.cost_accrued`,
+        ),
+        cashPaid: decimalText(effect.cash_paid, `${effectPath}.cash_paid`),
+        closingPayable: decimalText(
+          effect.closing_payable,
+          `${effectPath}.closing_payable`,
+        ),
       };
     }
     if (kind === "inventory_expired") {
@@ -1465,9 +1451,13 @@ function parseTimelineEffects(
         companyId: text(effect.company_id, `${effectPath}.company_id`),
         product: text(effect.product, `${effectPath}.product`),
         quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
-        valueLoss: decimalText(
+        referenceValueLoss: decimalText(
           effect.reference_value_loss,
           `${effectPath}.reference_value_loss`,
+        ),
+        bookValueLoss: decimalText(
+          effect.book_value_loss,
+          `${effectPath}.book_value_loss`,
         ),
       };
     }

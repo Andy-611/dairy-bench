@@ -18,10 +18,10 @@ from company_bench.domain.models import (
     PolicyMetadata,
     PolicyProfileId,
 )
-from company_bench.runs.models import PolicyProfileView, RunJob
+from company_bench.runs.models import PolicyProfileView, RunJob, RunStatus
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.settings import MAX_PARALLELISM, require_parallelism
-from company_bench.storage.store import RunStore
+from company_bench.storage.repository import RunRepository
 
 
 class RunCoordinator:
@@ -29,7 +29,7 @@ class RunCoordinator:
 
     def __init__(
         self,
-        repository: RunStore,
+        repository: RunRepository,
         policy_factory: AgentFactory,
         runtime: EpisodeRuntime,
         *,
@@ -73,6 +73,11 @@ class RunCoordinator:
             source = self._repository.get(source_run_id) if source_run_id is not None else None
             if source is None:
                 raise ValueError("replay source_run_id was not found")
+            source_job = self._repository.get_job(source.run_id)
+            if source_job is None:
+                raise ValueError("replay source is missing its RunJob")
+            if source_job.status is not RunStatus.COMPLETED:
+                raise ValueError("replay source RunJob is not completed")
             active_seed = source.seed
         else:
             source = None
@@ -88,14 +93,14 @@ class RunCoordinator:
         if source_run_id is not None and not self._repository.list_turns(source_run_id):
             raise ValueError("replay source has no event-driven turn journal")
         run_id = f"run_{uuid4().hex}"
-        await self._policy_factory.ensure_available(profile_id, model)
-        metadata = self._policy_factory.profile_metadata(profile_id, model)
+        policy = await self._policy_factory.resolve_policy(profile_id, model)
+        metadata = policy.metadata
         job = RunJob(
             run_id=run_id,
             profile_id=profile_id,
             kind=kind,
             provider=metadata.provider,
-            model=model,
+            model=metadata.model,
             wire_protocol=metadata.wire_protocol,
             adapter_version=metadata.adapter_version,
             prompt_version=metadata.prompt_version,
@@ -152,11 +157,8 @@ class RunCoordinator:
         if task is not None:
             await asyncio.gather(task, return_exceptions=True)
         current = self._repository.get_job(run_id) or job
-        await self._policy_factory.ensure_available(current.profile_id, current.model)
-        _require_active_profile(
-            current,
-            self._policy_factory.profile_metadata(current.profile_id, current.model),
-        )
+        policy = await self._policy_factory.resolve_policy(current.profile_id, current.model)
+        _require_active_profile(current, policy.metadata)
         queued = current.queue_for_resume()
         self._repository.save_job(queued)
         self._schedule(queued)
@@ -192,11 +194,8 @@ class RunCoordinator:
                 scenario = self._runtime.scenario
                 if job.scenario_id != scenario.scenario_id or job.total_weeks != scenario.weeks:
                     raise ValueError("persisted job scenario does not match the active runtime")
-                await self._policy_factory.ensure_available(job.profile_id, job.model)
-                _require_active_profile(
-                    job,
-                    self._policy_factory.profile_metadata(job.profile_id, job.model),
-                )
+                policy = await self._policy_factory.resolve_policy(job.profile_id, job.model)
+                _require_active_profile(job, policy.metadata)
                 job = job.mark_running(datetime.now(UTC))
                 self._repository.save_job(job)
                 source = self._repository.get(job.source_run_id) if job.source_run_id else None
@@ -210,8 +209,7 @@ class RunCoordinator:
                 checkpoint = recovery.checkpoint if recovery is not None else None
                 agent_bundle = self._policy_factory.create_agents(
                     run_id=job.run_id,
-                    profile_id=job.profile_id,
-                    model=job.model,
+                    policy=policy,
                     source_turns=(
                         self._repository.list_turns(job.source_run_id)
                         if job.source_run_id is not None

@@ -46,6 +46,7 @@ __all__ = [
     "LimitOrder",
     "MarketError",
     "MarketState",
+    "OperatingCostSettlement",
     "OrderIdentity",
     "PriceTimeQueue",
     "QuoteLadderExecution",
@@ -147,10 +148,21 @@ class MarketError(ValueError):
     """A typed rejection that leaves the caller's persisted state untouched."""
 
 
+@dataclass(frozen=True, slots=True)
+class OperatingCostSettlement:
+    """Balanced cash-and-payable result for one weekly retail cost."""
+
+    opening_payable: Money
+    cost_accrued: PositiveMoney
+    cash_paid: Money
+    closing_payable: Money
+
+
 @dataclass(slots=True)
 class _Account:
     company_id: CompanyId
     cash: Money
+    operating_cost_payable: Money
     inventory: list[InventoryLot]
     status: CompanyStatus
     bankrupt_on: SimDay | None
@@ -182,6 +194,7 @@ class AssetLedger:
             state.company_id: _Account(
                 company_id=state.company_id,
                 cash=state.cash,
+                operating_cost_payable=state.operating_cost_payable,
                 inventory=list(state.inventory),
                 status=state.status,
                 bankrupt_on=state.bankrupt_on,
@@ -239,6 +252,28 @@ class AssetLedger:
             raise MarketError("cash credit must be nonnegative")
         self._account(company_id).cash += amount
 
+    def settle_operating_cost(
+        self,
+        company_id: CompanyId,
+        weekly_cost: PositiveMoney,
+    ) -> OperatingCostSettlement:
+        """Accrue one retail cost and pay as much as available cash permits."""
+        weekly_cost = EconomicPrecision.normalize_exact(weekly_cost)
+        if weekly_cost <= ZERO:
+            raise MarketError("weekly operating cost must be positive")
+        account = self._account(company_id)
+        opening = account.operating_cost_payable
+        due = opening + weekly_cost
+        paid = min(account.cash, due)
+        account.cash -= paid
+        account.operating_cost_payable = due - paid
+        return OperatingCostSettlement(
+            opening_payable=opening,
+            cost_accrued=weekly_cost,
+            cash_paid=paid,
+            closing_payable=account.operating_cost_payable,
+        )
+
     def reserve_cash(self, company_id: CompanyId, amount: Money) -> None:
         """Move exact cash out of a company's available balance."""
         self.debit_cash(company_id, amount)
@@ -294,11 +329,17 @@ class AssetLedger:
         self,
         buyer_id: CompanyId,
         lots: Iterable[InventoryLot],
+        unit_book_cost: Money,
     ) -> tuple[InventoryLot, ...]:
-        """Give dispatched lots globally unique buyer-side identities."""
+        """Give dispatched lots buyer identities and their acquisition cost."""
         self._account(buyer_id)
         return tuple(
-            lot.model_copy(update={"lot_id": self._allocate_lot_id(buyer_id, "trade")})
+            lot.model_copy(
+                update={
+                    "lot_id": self._allocate_lot_id(buyer_id, "trade"),
+                    "unit_book_cost": unit_book_cost,
+                }
+            )
             for lot in lots
         )
 
@@ -312,6 +353,7 @@ class AssetLedger:
             CompanyState(
                 company_id=company_id,
                 cash=(account := self._account(company_id)).cash,
+                operating_cost_payable=account.operating_cost_payable,
                 inventory=tuple(sorted(account.inventory, key=_lot_priority)),
                 status=account.status,
                 bankrupt_on=account.bankrupt_on,
@@ -336,6 +378,7 @@ class AssetLedger:
             company_id: _Account(
                 company_id=company_id,
                 cash=(account := staged._account(company_id)).cash,
+                operating_cost_payable=account.operating_cost_payable,
                 inventory=list(account.inventory),
                 status=account.status,
                 bankrupt_on=account.bankrupt_on,
@@ -867,16 +910,16 @@ class ContinuousSpotMarket:
                 seller,
                 quantity,
             )
-            updated_resting = (
-                updated_buyer if isinstance(resting, BuyOrder) else updated_seller
-            )
-            updated_incoming = (
-                updated_buyer if isinstance(active, BuyOrder) else updated_seller
-            )
+            updated_resting = updated_buyer if isinstance(resting, BuyOrder) else updated_seller
+            updated_incoming = updated_buyer if isinstance(active, BuyOrder) else updated_seller
             self._assets.credit_cash(seller.owner_id, value)
             self._assets.credit_cash(buyer.owner_id, refund)
             self._assets.restore_inventory(seller.owner_id, released_lots)
-            delivery_lots = self._assets.relabel_for_buyer(buyer.owner_id, seller_lots)
+            delivery_lots = self._assets.relabel_for_buyer(
+                buyer.owner_id,
+                seller_lots,
+                price,
+            )
             fill = TradeFill(
                 trade_id=trade_id_factory(len(fills) + 1),
                 product=self._state.product,

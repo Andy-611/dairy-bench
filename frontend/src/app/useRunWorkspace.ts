@@ -3,9 +3,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { DairyBenchApi } from "../shared/api/client";
 import { isAbortError, requestErrorMessage } from "../shared/requestErrors";
 import { isActiveRun } from "../shared/runStatus";
+import { completedWeeks } from "../shared/simulationCalendar";
 import type {
-  EpisodeView,
   ReplaySourceView,
+  RunEvaluationView,
   RunJobView,
 } from "../shared/api/types";
 
@@ -18,10 +19,10 @@ export interface RunWorkspace {
   readonly activeJobs: readonly RunJobView[];
   readonly canLoadMoreRuns: boolean;
   readonly clearError: () => void;
-  readonly episode: EpisodeView | null;
-  readonly episodeError: string | null;
+  readonly evaluation: RunEvaluationView | null;
+  readonly evaluationError: string | null;
   readonly error: string | null;
-  readonly isEpisodeLoading: boolean;
+  readonly isEvaluationLoading: boolean;
   readonly isReplaySourceLoading: boolean;
   readonly isRunHistoryLoading: boolean;
   readonly jobs: readonly RunJobView[];
@@ -54,13 +55,13 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
   const [selectedWeek, setSelectedWeek] = useState<number | null>(
     initialSelection.week,
   );
-  const [episode, setEpisode] = useState<EpisodeView | null>(null);
-  const [episodeError, setEpisodeError] = useState<string | null>(null);
+  const [evaluation, setEvaluation] = useState<RunEvaluationView | null>(null);
+  const [evaluationError, setEvaluationError] = useState<string | null>(null);
   const [jobListError, setJobListError] = useState<string | null>(null);
   const [selectionError, setSelectionError] = useState<string | null>(null);
   const [replaySourceError, setReplaySourceError] = useState<string | null>(null);
   const [isJobListLoading, setIsJobListLoading] = useState(true);
-  const [isEpisodeLoading, setIsEpisodeLoading] = useState(false);
+  const [isEvaluationLoading, setIsEvaluationLoading] = useState(false);
   const [isReplaySourceLoading, setIsReplaySourceLoading] = useState(true);
   const [canLoadMoreRuns, setCanLoadMoreRuns] = useState(false);
   const [runHistoryOffset, setRunHistoryOffset] = useState(0);
@@ -351,43 +352,50 @@ export function useRunWorkspace(api: DairyBenchApi): RunWorkspace {
   }, [selectedJob?.runId, selectedJob?.status]);
 
   useEffect(() => {
-    setEpisode(null);
-    setEpisodeError(null);
-    if (selectedJob?.status !== "completed") {
-      setIsEpisodeLoading(false);
+    setEvaluation((current) =>
+      current?.runId === selectedJob?.runId ? current : null,
+    );
+    setEvaluationError(null);
+    if (!selectedJob || completedWeeks(selectedJob.currentAbsoluteDay) === 0) {
+      setIsEvaluationLoading(false);
       return;
     }
 
     const controller = new AbortController();
-    setIsEpisodeLoading(true);
+    setIsEvaluationLoading(true);
     void api
-      .episode(selectedJob.runId, controller.signal)
-      .then(setEpisode)
+      .evaluation(selectedJob.runId, controller.signal)
+      .then(setEvaluation)
       .catch((reason: unknown) => {
         if (!isAbortError(reason)) {
-          setEpisodeError(
+          setEvaluationError(
             requestErrorMessage(reason, {
-              fallback: "The completed run result could not be loaded.",
+              fallback: "The latest settled run evaluation could not be loaded.",
             }),
           );
         }
       })
       .finally(() => {
         if (!controller.signal.aborted) {
-          setIsEpisodeLoading(false);
+          setIsEvaluationLoading(false);
         }
       });
     return () => controller.abort();
-  }, [api, selectedJob?.runId, selectedJob?.status]);
+  }, [
+    api,
+    selectedJob?.currentAbsoluteDay,
+    selectedJob?.runId,
+    selectedJob?.status,
+  ]);
 
   return {
     activeJobs,
     canLoadMoreRuns,
     clearError,
-    episode,
-    episodeError,
+    evaluation,
+    evaluationError,
     error: jobListError ?? selectionError,
-    isEpisodeLoading,
+    isEvaluationLoading,
     isReplaySourceLoading,
     isRunHistoryLoading: isJobListLoading,
     jobs,

@@ -222,9 +222,7 @@ class Scheduler:
         if len(retained_signals) == len(event.wake_signals):
             return
         if retained_signals:
-            self._events[event_id] = event.model_copy(
-                update={"wake_signals": retained_signals}
-            )
+            self._events[event_id] = event.model_copy(update={"wake_signals": retained_signals})
             return
         self._events.pop(event_id)
         self._wake_event_ids.pop(key)
@@ -278,11 +276,6 @@ class Scheduler:
         for event in checkpoint.pending_events:
             scheduler._restore_event(event)
         return scheduler
-
-    @classmethod
-    def from_checkpoint(cls, checkpoint: SchedulerCheckpoint) -> Self:
-        """Alias for restore, useful at persistence seams."""
-        return cls.restore(checkpoint)
 
     def _clamp(self, day: SimDay) -> SimDay:
         if day.absolute_day >= self._today.absolute_day:

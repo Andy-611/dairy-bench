@@ -15,7 +15,7 @@ from company_bench.runtime.models import (
     TurnRecord,
 )
 
-_CHECKPOINT_SCHEMA_VERSION: Final = 8
+_CHECKPOINT_SCHEMA_VERSION: Final = 9
 _DEFAULT_MAX_TOKENS: Final = 16_384
 _DEFAULT_CHARS_PER_TOKEN: Final = 2
 _SUMMARY_OMISSION: Final = "[older memory omitted]"
@@ -89,7 +89,7 @@ type MemorySummarizer = Callable[
 class AgentCheckpoint(StrictModel):
     """Portable state required to restore one company's memory exactly."""
 
-    schema_version: Literal[8] = _CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[9] = _CHECKPOINT_SCHEMA_VERSION
     run_id: Identifier
     company_id: CompanyId
     revision: int = Field(ge=0)

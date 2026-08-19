@@ -18,6 +18,8 @@ from company_bench.domain.models import (
     MilkProducedEvent,
     ProcessorOperation,
     ProductId,
+    RetailerOperation,
+    RetailOperatingCostChargedEvent,
     TradeExecutedEvent,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
@@ -50,6 +52,51 @@ def engine() -> EconomyEngine:
 def economy(engine: EconomyEngine) -> EconomyState:
     """Open the canonical first trading week."""
     return engine.open_week(engine.initial_state(DAIRY_S9_SCENARIO, seed=7))
+
+
+def test_company_state_owns_inventory_quantity_book_value_and_expiry_queries() -> None:
+    state = CompanyState(
+        company_id="retailer_a",
+        cash="100",
+        inventory=(
+            InventoryLot(
+                lot_id="raw_a",
+                product=ProductId.RAW_MILK,
+                quantity="2",
+                unit_book_cost="1",
+                produced_week=1,
+                expires_end_of_week=2,
+            ),
+            InventoryLot(
+                lot_id="raw_b",
+                product=ProductId.RAW_MILK,
+                quantity="3",
+                unit_book_cost="1.5",
+                produced_week=1,
+                expires_end_of_week=2,
+            ),
+            InventoryLot(
+                lot_id="bottled",
+                product=ProductId.BOTTLED_MILK,
+                quantity="4",
+                unit_book_cost="2",
+                produced_week=1,
+                expires_end_of_week=3,
+            ),
+        ),
+    )
+
+    positions = state.inventory_positions(ProductId.RAW_MILK)
+
+    assert state.inventory_quantity(ProductId.RAW_MILK) == Decimal("5")
+    assert state.inventory_book_value(ProductId.RAW_MILK) == Decimal("6.5")
+    assert len(positions) == 1
+    assert positions[0].quantity == Decimal("5")
+    assert positions[0].book_value == Decimal("6.5")
+    assert tuple(position.product for position in state.inventory_positions()) == (
+        ProductId.BOTTLED_MILK,
+        ProductId.RAW_MILK,
+    )
 
 
 def _day(weekday: Weekday, *, week: int = 1) -> SimDay:
@@ -101,11 +148,7 @@ def _company(economy: EconomyState, company_id: str) -> CompanyState:
 def _quantity(economy: EconomyState, company_id: str, product: ProductId) -> Decimal:
     """Aggregate one company's available product inventory."""
     return sum(
-        (
-            lot.quantity
-            for lot in _company(economy, company_id).inventory
-            if lot.product is product
-        ),
+        (lot.quantity for lot in _company(economy, company_id).inventory if lot.product is product),
         start=ZERO,
     )
 
@@ -134,9 +177,7 @@ def _quote(
     return SetQuoteLadder(
         side=side,
         product=product,
-        levels=(
-            QuoteLevel(quantity=Decimal(quantity), limit_price=Decimal(price)),
-        ),
+        levels=(QuoteLevel(quantity=Decimal(quantity), limit_price=Decimal(price)),),
     )
 
 
@@ -214,11 +255,20 @@ def test_scenario_uses_52_weeks_and_formula_driven_weekly_quantities(
     scenario = economy.scenario
 
     assert scenario.weeks == 52
+    assert scenario.scenario_id == "flow.dairy.base.s9.v9"
+    assert scenario.version == 9
     assert scenario.runtime.operation_duration_days == 1
     assert scenario.runtime.delivery_duration_days == 1
     assert scenario.runtime.max_turns_per_company_week == 6
     assert tuple(product.shelf_life_weeks for product in scenario.products) == (2, 4)
-    assert scenario.demand.base_demand == Decimal("40.0000")
+    assert tuple(cohort.base_quantity for cohort in scenario.consumer_market.cohorts) == (
+        Decimal("40.0000"),
+        Decimal("50.0000"),
+        Decimal("30.0000"),
+    )
+    assert tuple(
+        cohort.maximum_willingness_to_pay for cohort in scenario.consumer_market.cohorts
+    ) == (Decimal("3.0000"), Decimal("3.8000"), Decimal("5.0000"))
     assert tuple(
         company.operation.capacity.normal_capacity
         for company in scenario.companies
@@ -231,6 +281,27 @@ def test_scenario_uses_52_weeks_and_formula_driven_weekly_quantities(
         Decimal("50.0000"),
         Decimal("50.0000"),
     )
+    farm_capacity = sum(
+        company.operation.capacity.normal_capacity
+        for company in scenario.companies
+        if isinstance(company.operation, FarmOperation)
+    )
+    processor_output = sum(
+        company.operation.capacity.normal_capacity * company.operation.yield_rate
+        for company in scenario.companies
+        if isinstance(company.operation, ProcessorOperation)
+    )
+    normal_demand = sum(
+        (cohort.base_quantity for cohort in scenario.consumer_market.cohorts),
+        start=ZERO,
+    )
+    assert farm_capacity == Decimal("180.0000")
+    assert processor_output == normal_demand == Decimal("120.0000")
+    assert {
+        company.operation.weekly_operating_cost
+        for company in scenario.companies
+        if isinstance(company.operation, RetailerOperation)
+    } == {Decimal("5.0000")}
     assert any(
         state.weekly_capacity
         != scenario.company(state.company_id).operation.capacity.normal_capacity
@@ -268,9 +339,7 @@ def test_bankruptcy_uses_a_strict_sub_one_asset_threshold(
     assert _company(economy, "farm_a").status is CompanyStatus.ACTIVE
     assert _company(economy, "farm_b").status is CompanyStatus.BANKRUPT
     assert tuple(
-        event.company_id
-        for event in economy.events
-        if isinstance(event, CompanyBankruptEvent)
+        event.company_id for event in economy.events if isinstance(event, CompanyBankruptEvent)
     ) == ("farm_b",)
     with pytest.raises(ValueError, match="bankrupt companies"):
         engine.observe_active(economy, "farm_b", _day(Weekday.MONDAY))
@@ -297,9 +366,7 @@ def test_bankruptcy_delists_company_without_cancelling_funded_delivery(
     companies = tuple(
         company.model_copy(update={"inventory": (raw_lot,)})
         if company.company_id == "farm_a"
-        else company.model_copy(
-            update={"cash": Decimal("1.6"), "inventory": (bottled_lot,)}
-        )
+        else company.model_copy(update={"cash": Decimal("1.6"), "inventory": (bottled_lot,)})
         if company.company_id == "processor_a"
         else company
         for company in world.companies
@@ -331,22 +398,14 @@ def test_bankruptcy_delists_company_without_cancelling_funded_delivery(
         3,
     )
 
-    bankruptcy = next(
-        event
-        for event in purchase.events
-        if isinstance(event, CompanyBankruptEvent)
-    )
+    bankruptcy = next(event for event in purchase.events if isinstance(event, CompanyBankruptEvent))
     assert purchase.accepted
     assert _company(economy, "processor_a").status is CompanyStatus.BANKRUPT
     assert bankruptcy.total_assets == Decimal("0.8500")
-    assert bankruptcy.cancelled_order_ids == (
-        bottled_ask.quote_ladder_result.levels[0].order_id,
-    )
+    assert bankruptcy.cancelled_order_ids == (bottled_ask.quote_ladder_result.levels[0].order_id,)
     assert economy.deliveries
     assert all(
-        order.owner_id != "processor_a"
-        for market in economy.markets
-        for order in market.orders
+        order.owner_id != "processor_a" for market in economy.markets for order in market.orders
     )
 
     delivery = economy.deliveries[0]
@@ -690,29 +749,28 @@ def test_sunday_enforces_close_sale_and_expiry_order(engine: EconomyEngine) -> N
         engine,
         "retailer_a",
         ProductId.BOTTLED_MILK,
-        "50",
+        "100",
         expires_end_of_week=1,
     )
+    with pytest.raises(ValueError, match="Sunday"):
+        engine.close_markets(economy, _day(Weekday.SATURDAY))
+    with pytest.raises(ValueError, match="markets must close"):
+        engine.settle_consumer_sales(economy, _day(Weekday.SUNDAY))
+
+    sunday = _day(Weekday.SUNDAY)
+    closed = engine.close_markets(economy, sunday)
     priced, outcome = _apply(
         engine,
-        economy,
+        closed,
         "retailer_a",
         SetRetailPrice(product=ProductId.BOTTLED_MILK, unit_price=Decimal("3.5")),
-        _day(Weekday.MONDAY),
+        sunday,
         1,
     )
     assert outcome.accepted
-
-    with pytest.raises(ValueError, match="Sunday"):
-        engine.close_markets(priced, _day(Weekday.SATURDAY))
-    with pytest.raises(ValueError, match="markets must close"):
-        engine.settle_consumer_sales(priced, _day(Weekday.SUNDAY))
-
-    sunday = _day(Weekday.SUNDAY)
-    closed = engine.close_markets(priced, sunday)
     with pytest.raises(ValueError, match="consumer sales must settle"):
         engine.close_week(closed, sunday)
-    settled = engine.settle_consumer_sales(closed, sunday)
+    settled = engine.settle_consumer_sales(priced, sunday)
     result = engine.close_week(settled, sunday)
 
     sale = next(
@@ -720,12 +778,78 @@ def test_sunday_enforces_close_sale_and_expiry_order(engine: EconomyEngine) -> N
         for event in result.events
         if isinstance(event, ConsumerSaleEvent) and event.company_id == "retailer_a"
     )
+    charge = next(
+        event
+        for event in result.events
+        if isinstance(event, RetailOperatingCostChargedEvent) and event.company_id == "retailer_a"
+    )
+    expiry = next(
+        event
+        for event in result.events
+        if isinstance(event, InventoryExpiredEvent) and event.company_id == "retailer_a"
+    )
     assert sale.occurred_on == sunday
     assert sale.sold_quantity > ZERO
+    assert charge.cost_accrued == Decimal("5.0000")
+    assert charge.cash_paid == Decimal("5.0000")
+    assert charge.closing_payable == ZERO
+    assert result.events.index(sale) < result.events.index(charge) < result.events.index(expiry)
+    assert sum(isinstance(event, RetailOperatingCostChargedEvent) for event in result.events) == 3
+    report = next(
+        report
+        for report in result.state.company_weekly_reports
+        if report.company_id == "retailer_a"
+    )
+    assert report.operation_cost == Decimal("5.0000")
+    assert report.operating_profit == sale.gross_profit - Decimal("5.0000")
     assert result.snapshot.week == 1
     assert result.snapshot.consumer_sales == sale.sold_quantity
     assert any(isinstance(event, InventoryExpiredEvent) for event in result.events)
     assert result.state.completed_weeks == 1
+
+
+def test_unpaid_retail_operating_cost_becomes_a_liability_before_bankruptcy(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    companies = tuple(
+        company.model_copy(update={"cash": Decimal("2")})
+        if company.company_id == "retailer_a"
+        else company
+        for company in world.companies
+    )
+    economy = engine.open_week(world.model_copy(update={"companies": companies}))
+    sunday = _day(Weekday.SUNDAY)
+    sold = engine.settle_consumer_sales(
+        engine.close_markets(economy, sunday),
+        sunday,
+    )
+    result = engine.close_week(sold, sunday)
+    settled = result.state
+
+    retailer = next(company for company in settled.companies if company.company_id == "retailer_a")
+    charge = next(
+        event
+        for event in sold.events
+        if isinstance(event, RetailOperatingCostChargedEvent) and event.company_id == "retailer_a"
+    )
+    bankruptcy = next(
+        event
+        for event in result.events
+        if isinstance(event, CompanyBankruptEvent) and event.company_id == "retailer_a"
+    )
+    assert retailer.cash == ZERO
+    assert retailer.operating_cost_payable == Decimal("3.0000")
+    assert retailer.status is CompanyStatus.BANKRUPT
+    assert charge.opening_payable == ZERO
+    assert charge.cash_paid == Decimal("2.0000")
+    assert charge.closing_payable == Decimal("3.0000")
+    report = next(
+        report for report in settled.company_weekly_reports if report.company_id == "retailer_a"
+    )
+    assert report.operation_cost == Decimal("5.0000")
+    assert bankruptcy.total_assets == ZERO
+    assert result.events.index(charge) < result.events.index(bankruptcy)
 
 
 def test_raw_milk_produced_in_week_one_expires_at_end_of_week_two(
@@ -755,7 +879,7 @@ def test_raw_milk_produced_in_week_one_expires_at_end_of_week_two(
     assert _quantity(engine.open_week(week_two.state), "farm_a", ProductId.RAW_MILK) == ZERO
 
 
-def test_retail_prices_and_weekly_books_reset_only_after_sunday(
+def test_retail_prices_carry_forward_while_weekly_books_reset_after_sunday(
     engine: EconomyEngine,
 ) -> None:
     economy = _open_with_inventory(engine, "farm_a", ProductId.RAW_MILK, "5")
@@ -767,26 +891,34 @@ def test_retail_prices_and_weekly_books_reset_only_after_sunday(
         _day(Weekday.MONDAY),
         1,
     )
+    sunday = _day(Weekday.SUNDAY)
+    closed = engine.close_markets(quoted, sunday)
     priced, _ = _apply(
         engine,
-        quoted,
+        closed,
         "retailer_a",
         SetRetailPrice(product=ProductId.BOTTLED_MILK, unit_price=Decimal("3.5")),
-        _day(Weekday.SATURDAY),
+        sunday,
         2,
     )
 
-    assert engine.company_orders(priced, "farm_a")
-    observation = engine.observe_active(priced, "retailer_a", _day(Weekday.SATURDAY))
+    assert engine.company_orders(priced, "farm_a") == ()
+    observation = engine.observe_active(
+        priced,
+        "retailer_a",
+        sunday,
+        allow_settlement_day=True,
+    )
     assert observation.retail_price == Decimal("3.5000")
 
-    next_week = engine.open_week(_settle_week(engine, priced).state)
+    sold = engine.settle_consumer_sales(priced, sunday)
+    next_week = engine.open_week(engine.close_week(sold, sunday).state)
     assert engine.company_orders(next_week, "farm_a") == ()
     assert engine.observe_active(
         next_week,
         "retailer_a",
         _day(Weekday.MONDAY, week=2),
-    ).retail_price is None
+    ).retail_price == Decimal("3.5000")
 
 
 def test_schema_rejects_sub_quantum_operation_and_quote_values() -> None:

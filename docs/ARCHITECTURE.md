@@ -1,205 +1,217 @@
-# V7 Architecture and Invariants
+# V9 Architecture and Invariants
+
+[English](ARCHITECTURE.md) | [简体中文](ARCHITECTURE.zh-CN.md)
 
 ## 1. Simulation boundary
 
-The active scenario, `flow.dairy.base.s9.v7`, contains nine independent
-companies and 52 trading weeks. The authoritative clock is `SimDay`; an episode
-contains 364 days and no minute-level economic time.
+The active scenario, `flow.dairy.base.s9.v9`, contains three farms, three
+processors, three retailers, and 52 seven-day trading weeks. The authoritative
+decision path is:
 
 ```text
-TradingCalendar
-└── Week 1..52
-    ├── Monday..Saturday: decision days
-    └── Sunday: settlement day
+Wake -> AgentTurn -> CompanyDecision -> EconomyEngine -> Journal -> next Wake
 ```
 
-The core boundary remains:
+The runtime owns identity, time, state versions, and application order. Only
+`EconomyEngine` mutates cash, inventory, orders, jobs, deliveries, prices, or
+sales.
 
-```text
-AgentTurn -> CompanyDecision -> DecisionEnvelope -> EconomyEngine -> DecisionOutcome
-```
+## 2. Module ownership
 
-Identity, simulation day, state version, and application sequence are assigned
-by the runtime. The Agent never supplies them.
+- `domain/models.py`: immutable scenario, observation, event, report, snapshot,
+  and score contracts.
+- `economy/engine.py`: economic state transitions and weekly settlement.
+- `economy/consumer.py`: hidden regimes, finite cohorts, and shared-market
+  allocation.
+- `economy/ledger.py`: one typed event-ledger projection reused by reports and
+  private Agent economics.
+- `economy/private_view.py`: company-private cumulative cash flow and executable
+  unit economics.
+- `economy/reports.py`: authoritative private and public weekly reports.
+- `economy/oracle.py`: seed-specific full-information enterprise-surplus
+  reference.
+- `runtime/episode.py`: scheduling, concurrent inference, deterministic commit,
+  recovery, and replay.
+- `storage/repository.py`: the narrow atomic persistence interface;
+  `storage/memory.py` and `storage/sqlite.py` are its two adapters.
+- `agents/providers/newapi/`: the only model transport seam, separated into
+  configuration, HTTP transport, wire protocols, and decision gateway.
 
-## 2. Layer ownership
-
-- `domain/calendar.py` owns `SimDay`, weekdays, and episode bounds.
-- `domain/models.py` owns immutable scenario, observation, event, snapshot, and
-  score contracts.
-- `runtime/models.py` owns Agent decisions, wakes, scheduler events, and journal
-  records.
-- `economy/engine.py` is the only authority that mutates economic state.
-- `runtime/episode.py` schedules days, invokes policies, and commits results.
-- `runs/` owns independent job lifecycle and concurrency.
-- `storage/store.py` owns atomic journal/checkpoint persistence.
-- `timeline/` projects persisted state into 52 weekly views of seven days each.
-- `agents/providers/` is the sole model transport boundary through NewAPI.
-
-The dependency direction points toward typed domain contracts. Storage, web,
-and UI projections never become economic authorities.
+Dependencies point toward typed domain contracts; web, storage, and UI
+projections are never economic authorities.
 
 ## 3. Weekly lifecycle
 
-### Monday
+Monday opens the week and realizes each productive company's private capacity
+and unit-cost state. Monday-Saturday contain operations, wholesale trading,
+one-day jobs, and one-day deliveries. A company receives at most one operating
+turn per day and six per week.
 
-1. Open the trading week.
-2. Realize private productive capacity and base unit cost from the existing
-   seeded formulas.
-3. Reset weekly order books, retail prices, used capacity, and turn budgets.
-4. Wake every active company.
-
-### Tuesday-Saturday
-
-For each day:
-
-1. Start the day.
-2. Complete production/transformation jobs due that day.
-3. Complete deliveries due that day.
-4. Coalesce all same-company wakes into one Agent turn.
-5. Infer same-day decisions concurrently.
-6. Apply those decisions serially in deterministic order.
-
-Orders and retail prices persist through Saturday. Production, transformation,
-and delivery each take exactly one day and must complete within the same week.
-
-### Sunday
-
-Sunday has no Agent calls. Its fixed economic order is:
+Sunday executes in this order:
 
 1. Complete due jobs and deliveries.
-2. Close both wholesale order books and release unused collateral.
-3. Settle each retailer's consumer demand once.
-4. Expire inventory whose `expires_end_of_week` is due.
-5. Commit one immutable `WeekSnapshot`.
-6. Advance to the next week.
+2. Close both wholesale books and release unused collateral.
+3. Build the post-procurement pricing context for every active retailer.
+4. Query all retailers concurrently from the same pre-price state.
+5. Commit one price per retailer; reveal none until all queries finish.
+6. Settle the finite shared consumer market once and credit revenue.
+7. Accrue each active retailer's weekly store cost and pay it from cash.
+8. Expire due inventory, then perform the terminal bankruptcy check.
+9. Issue weekly reports and commit one snapshot.
 
-This order allows Saturday commitments to arrive before Sunday sales while
-preventing post-settlement decisions.
+The Sunday pricing call has the sole tool `set_retail_price` and does not consume
+the six operating turns. A protocol-invalid pricing response retains the prior
+price (or `3.5000` in week one), records the protocol violation, and allows the
+physical episode to continue as diagnostic-only.
 
-## 4. Formula frequency
+## 4. Shared consumer market and information boundary
 
-The migration changes time frequency, not the economic formula inputs.
+The hidden market has three finite willingness-to-pay cohorts. Each week,
+consumers buy from the cheapest retailer whose price they accept. Stockouts
+spill demand to the next-lowest price. Equal prices use deterministic equal-share
+water filling, with only indivisible `0.0001` residual quanta assigned by a
+seeded hash.
 
-- `normal_capacity=60` for farms and `normal_capacity=50` for processors are
-  parameters of `CapacityFunction`, not realized fixed capacities.
-- Weekly capacity retains seeded persistence, volatility, and clipping.
-- `base_demand=40` is a parameter of `DemandSpec`, not a fixed sale quantity.
-- Potential demand retains the seeded shock and continuous price-demand curve.
-- Productive cost retains the convex cumulative cost function.
+The market moves through slump, normal, and boom regimes. Every regime lasts
+6-10 weeks; normal alternates with an extreme regime, and slump/boom alternate
+across extreme periods. A regime changes total population, cohort composition,
+and WTP. A hidden run-wide purchasing-power shift also moves all WTP thresholds
+by a stable amount for the full episode. Canonical purchasing-power shifts are
+`-0.2/-0.1/0/0.1/0.2`; slump/normal/boom add `-0.2/0/+0.2` respectively.
 
-Each capacity/cost realization occurs once per company-week. Each potential
-demand realization occurs once per retailer-week and is settled on Sunday.
-Initial cash, reference values, and formula parameters are not multiplied by
-seven.
+Agents are told:
 
-## 5. Inventory, markets, and physical commitments
+- there are three cohorts with distinct unknown willingness to pay;
+- cheapest-first, stockout-spillover, and equal-price allocation rules;
+- the three regime names, 6-10 week duration, and alternation structure;
+- regimes may change market size, composition, and WTP, while run-wide
+  purchasing power may also move WTP.
 
-- Raw milk shelf life: 2 weekly settlements.
-- Bottled milk shelf life: 4 weekly settlements.
-- FEFO reservation and delivery preserve original lot expiry.
-- Orders are fully collateralized with cash or physical inventory.
-- A target quote ladder atomically keeps, places, replaces, or cancels up to
-  three levels.
-- Matching remains price-time priority at the resting maker price.
-- Cash transfers at trade time; inventory becomes usable after the one-day
-  delivery.
-- A company owns at most one active production resource.
-- All economic quantities use the `0.0001` quantum.
+Agents are not told cohort quantities, exact willingness-to-pay values,
+composition multipliers, exact purchasing-power/regime shifts, the first
+extreme, current regime, or transition week.
+The complete `ConsumerMarketSpec` remains engine-only; observations contain only
+`ConsumerMarketRules`.
 
-## 6. Attention and bounded turns
+## 5. Weekly reports and learning signal
 
-Every decision includes an `AttentionPlan`:
+Every observation includes at most the last eight completed reports for that
+company and the last eight public retail-market reports.
 
-- `review_after_days`: optional positive delay, maximum 2;
-- default review: 1 day when another Monday-Saturday remains;
-- up to three quote alerts;
-- no review may cross into Sunday or a later week.
+Private common fields include opening/closing enterprise value, weekly and
+cumulative surplus, cash, operating-cost payable, purchases, wholesale sales,
+operation cost, expiry, and inventory book positions. Role-specific fields add:
 
-Event wakes, alerts, and reviews for the same company/day coalesce. One company
-can receive at most one Agent call per day and six calls per week. Reaching the
-limit writes an explicit audit step and suppresses later wakes. Sunday never
-consumes a turn.
+- farm: realized capacity/cost, output, utilization, sold and unsold raw milk;
+- processor: raw procurement, processing, yield, utilization, output, and
+  bottled sales/inventory;
+- retailer: procurement quantity/VWAP, saleable inventory and weighted cost,
+  committed price, units sold, revenue, COGS, gross and operating profit, sell-through,
+  stockout, market share, expiry, and ending inventory.
 
-## 7. Deterministic concurrency
+The public retail report contains each retailer's status, posted price, sold
+quantity, market share, and stockout flag, plus market total sales and
+volume-weighted average price. Competitor cash, costs, purchases, and exact
+inventory remain private. Unmet latent demand is never disclosed.
 
-All companies woken on one day observe the same pre-apply state. Provider calls
-may run concurrently, but economic application is serial:
+## 6. Physical and accounting rules
 
-```text
-sort_key = SHA256(seed | absolute_day | company_id)
-```
+- Farm normal capacity is `60`; processor normal input capacity is `50`.
+  Across three firms this intentionally creates a `180` raw-supply buffer for
+  `150` processor input. With `0.8` yield, normal bottled capacity is exactly
+  `120`, matching normal three-cohort demand. Seeded persistence, volatility,
+  and bounds produce private weekly values.
+- Productive cost is convex:
+  `C(x)=c*x+curvature*c*x^2/(2*K)`.
+- Processor yield is `0.8` bottled units per raw input unit.
+- Raw and bottled milk last 2 and 4 weekly settlements respectively.
+- FEFO reservations and delivery preserve lot origin, expiry, and book cost.
+- Bids and asks are fully collateralized; matches use price-time priority and
+  the resting maker price.
+- Every economic price, quantity, value, and cost uses the shared `0.0001`
+  precision. Retail prices have no separate rounding rule.
+- Each active retailer accrues `5.0000` after Sunday consumer revenue. Available
+  cash pays the balance; any unpaid amount remains a liability and reduces value.
 
-Each committed turn persists `apply_sequence`. Consequently network latency,
-completion order, and parallel run load cannot change the simulated economy.
+## 7. Determinism, concurrency, and recovery
 
-Different `RunJob`s own separate runtimes, schedulers, economy states,
-checkpoints, journals, and policy instances. Each credential profile owns one
-NewAPI HTTP connection pool; all profiles share one bounded request semaphore.
-
-## 8. Persistence and replay
-
-One atomic progress transaction stores:
-
-- new immutable `TurnRecord`s;
-- new immutable `SystemStepRecord`s;
-- the complete current checkpoint;
-- run progress through the completed week.
-
-A completion transaction stores the final `EpisodeResult` and removes the
-checkpoint. Interrupted/stopped runs resume from the same run ID. Completed
-replay uses the source observations and decisions but recomputes every engine
-outcome; any journal, event, snapshot, score, or quality drift fails replay.
-
-V7 intentionally uses a fresh `runs-v7.sqlite3` schema and does not read older
-runtime payloads.
-
-## 9. Bankruptcy and delisting
-
-After every authoritative economic transition, the engine marks guaranteed
-enterprise assets at fixed product references. This includes available and
-order-reserved cash, on-hand and order-reserved inventory, in-transit purchases,
-and the guaranteed output of funded operations.
-
-An active company is declared bankrupt only when this value is strictly below
-`1.0000`; equality remains active. Declaration is terminal: all open orders are
-cancelled, any retail price is removed, future Agent wakes are cancelled, and a
-single `CompanyBankruptEvent` is journaled. Already funded operations and
-in-transit deliveries still settle into the estate, but cannot reactivate the
-company.
-
-## 10. Scoring
-
-One valid episode produces one score after all 52 weekly snapshots exist:
+Same-day Agents observe one pre-apply state and may infer concurrently. Their
+decisions commit serially by:
 
 ```text
-E_raw = Σ_i [V_i(T) - V_i(0)]
-E_ref = seeded maximum net value across 52 retailer-week markets
-E = clip(E_raw / E_ref, 0, 1)
-G_all = Gini(V_1(T), ..., V_9(T))
-F_all = clip(1 - G_all / (8/9), 0, 1)
-L = companies with V_i(T) - V_i(0) < 0
-P = 1 - L / 9
-Score = 100 × E × sqrt(F_all × P)
+SHA256(seed | absolute_day | company_id)
 ```
 
-`V_i(T)` is final cash plus reference-valued inventory. Under
-`s9-enterprise-v5`, fairness uses the standard Gini over all nine final asset
-values, not capital-growth rates or tier-specific Ginis. The UI also reports
-`D`, the number of irreversible bankruptcy events, and `L`, the number of
-loss-making companies; neither rate is displayed. Protocol validity remains
-independent: any invalid Agent turn makes the result diagnostic-only.
+Sunday prices also use one shared observation state; allocation occurs only
+after every price is committed. Provider latency cannot alter the economy.
 
-## 11. Required invariants
+Independent `RunJob`s own separate runtime, scheduler, economy, policies,
+Journal, and Checkpoint. Atomic progress transactions make interrupted runs
+resumable. Replay re-executes source decisions and fails on observation,
+protocol-fallback, outcome, event, snapshot, score, or quality drift.
 
-1. Exactly 52 weekly settlements and 52 snapshots complete an episode.
-2. Every projected week contains exactly seven ordered `TimelineDayFrame`s.
-3. Company decisions exist only Monday-Saturday and at most once per company/day.
-4. Sunday order is completions, market close, consumer sales, expiry, snapshot.
-5. Weekly capacity and demand are formula realizations, never hard-coded output.
-6. No job, delivery, review, or open order crosses a week boundary.
-7. Same-day concurrent inference always has deterministic serial application.
-8. Only the engine mutates economic state.
-9. Journal/checkpoint progress is atomic and replay drift is fatal.
-10. Bankruptcy below `1.0000` is immediate and irreversible; a bankrupt company
-    receives no future Agent call.
+The launcher reuses an existing backend only when `/api/health` matches the API,
+scenario, score, database, and Journal payload contracts. A stale checkout on
+port 8000 is treated as an explicit conflict.
+
+V9 intentionally uses `runs-v9.sqlite3` with database schema 16 and payload
+schema 10. The repository accepts only the current contracts; it contains no
+migration or reader for earlier runtime databases.
+
+## 8. Bankruptcy
+
+After authoritative economic transitions, guaranteed value includes cash,
+reference-valued owned/reserved inventory, in-transit purchases, and funded
+operation output, less operating-cost payables. A company is bankrupt only when
+this value is strictly below
+`1.0000`; equality remains active. Bankruptcy is irreversible, delists orders
+and retail price, cancels future wakes, and emits one event.
+
+## 9. Scoring
+
+For a settled horizon `T` from week 1 through week 52:
+
+```text
+E_raw    = sum_i [V_i(T) - V_i(0)]
+E_oracle = seed-specific full-information enterprise-surplus reference
+E        = clip(E_raw / E_oracle, 0, 1)
+G_all    = Gini(V_1(T), ..., V_9(T))
+F_all    = clip(1 - G_all / (8/9), 0, 1)
+L        = count_i[V_i(T) - V_i(0) < 0]
+P        = 1 - L/9
+Score    = 100 * E * sqrt(F_all * P)
+```
+
+`V_i(T)` is cash plus reference-valued terminal inventory less operating-cost
+payables. The Oracle uses the
+realized capacity/cost paths, convex costs, processor yield, perishability,
+realized hidden WTP, shared cohorts, retailer operating costs, and terminal
+reference values. Its objective contains
+enterprise surplus only; consumer surplus is excluded. A small upward numerical
+margin prevents solver tolerance from understating the reference.
+
+`D` is the bankruptcy count. `L` is the strictly loss-making company count;
+zero surplus is non-loss and therefore included in `P`. Counts and the loss rate
+are diagnostics, while `D` is not a rate. Any protocol-invalid turn makes the
+score diagnostic-only.
+
+`RunEvaluationProjector` reads either the immutable completed episode or the
+latest durable checkpoint behind one interface. A running, stopped,
+interrupted, or failed run is scored only after at least one full week has
+settled. Current partial-week events and Agent turns are excluded, and the
+Oracle is solved for the same `T`-week horizon. Prefix scores are marked
+provisional and never enter formal rankings; the immutable week-52 episode
+remains the official result and Exact Replay source.
+
+## 10. Required invariants
+
+1. Exactly 52 settlements and snapshots complete the canonical episode.
+2. Operating turns occur Monday-Saturday; Sunday adds only sealed retailer pricing.
+3. Every retailer receives at most one price decision before shared settlement.
+4. Hidden demand parameters never enter an Agent observation or prompt payload.
+5. Reports contain only completed past weeks and at most eight rolling weeks.
+6. Shared sales are input-order independent and never exceed inventory or population.
+7. No job, delivery, review, or wholesale order crosses a weekly boundary.
+8. Only the engine mutates economic state; Journal and Checkpoint commits are atomic.
+9. Same-state inference plus deterministic commit makes provider timing irrelevant.
+10. Net value below, but not equal to, `1.0000` triggers irreversible bankruptcy.

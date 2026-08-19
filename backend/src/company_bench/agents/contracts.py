@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from company_bench.domain.models import Identifier, ProtocolIssueKind, StrictModel
 from company_bench.runs.models import ProviderAttempt, ProviderCallAudit, TokenUsage
 from company_bench.runtime.models import (
+    ActionDecision,
     AgentTurn,
     AttentionPlan,
     CompanyDecision,
+    EconomicCommand,
     IdleDecision,
     Produce,
     SetQuoteLadder,
@@ -47,9 +50,7 @@ class QuoteDecisionInput(SetQuoteLadder):
 
 
 class RetailPriceDecisionInput(SetRetailPrice):
-    """Set a retail price, then arm the supplied attention plan."""
-
-    attention: AttentionPlan
+    """Set a sealed retail price for the next consumer settlement."""
 
 
 _DECISION_TOOL_MODELS: dict[DecisionToolName, type[BaseModel]] = {
@@ -59,11 +60,33 @@ _DECISION_TOOL_MODELS: dict[DecisionToolName, type[BaseModel]] = {
     "set_retail_price": RetailPriceDecisionInput,
     "idle": IdleDecision,
 }
+_ECONOMIC_COMMAND_ADAPTER = TypeAdapter(EconomicCommand)
 
 
 def decision_tool_model(name: DecisionToolName) -> type[BaseModel]:
     """Return the canonical Pydantic model for one decision tool."""
     return _DECISION_TOOL_MODELS[name]
+
+
+def decode_decision_tool_input(
+    name: DecisionToolName,
+    arguments: Mapping[str, object],
+) -> CompanyDecision:
+    """Convert one validated tool input into its provider-neutral decision."""
+    submitted = decision_tool_model(name).model_validate({"kind": name, **arguments})
+    if isinstance(submitted, IdleDecision):
+        return submitted
+
+    action_payload = submitted.model_dump()
+    attention = (
+        AttentionPlan()
+        if isinstance(submitted, RetailPriceDecisionInput)
+        else AttentionPlan.model_validate(action_payload.pop("attention"))
+    )
+    return ActionDecision(
+        action=_ECONOMIC_COMMAND_ADAPTER.validate_python(action_payload),
+        attention=attention,
+    )
 
 
 class DecisionModelRequest(StrictModel):

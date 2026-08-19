@@ -2,332 +2,302 @@ from decimal import Decimal
 
 import pytest
 
-from company_bench.domain.calendar import SimDay, Weekday
+from company_bench.domain.calendar import SimDay
 from company_bench.domain.models import (
     ZERO,
     CompanyBankruptEvent,
     CompanySnapshot,
+    CompanyState,
     CompanyStatus,
     ConsumerSaleEvent,
     DomainEvent,
+    MarketRegime,
+    MarketSummary,
     RetailerOperation,
     ScenarioSpec,
-    ScoreCard,
     WeekSnapshot,
     WorldState,
 )
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.consumer import SharedConsumerMarket
 from company_bench.economy.engine import EconomyEngine
+from company_bench.economy.oracle import ORACLE_VERSION, EnterpriseOracle, OracleResult
 from company_bench.economy.scoring import Evaluator
 
 
-def _scenario(weeks: int = 1) -> ScenarioSpec:
-    return DAIRY_S9_SCENARIO.model_copy(
-        update={
-            "weeks": weeks,
-            "demand": DAIRY_S9_SCENARIO.demand.model_copy(
-                update={"shock_min": 0, "shock_max": 0}
-            ),
-        }
-    )
+class _FixedOracle:
+    def __init__(self, value: Decimal = Decimal("100")) -> None:
+        self._value = value
+        self.horizons: list[int | None] = []
 
-
-def _state(
-    scenario: ScenarioSpec,
-    week: int,
-    cash: dict[str, Decimal] | None = None,
-    bankrupt: frozenset[str] = frozenset(),
-) -> WorldState:
-    initial = EconomyEngine().initial_state(scenario, seed=42)
-    if week == 0:
-        return initial
-    balances = cash or {}
-    return initial.model_copy(
-        update={
-            "completed_weeks": week,
-            "companies": tuple(
-                company.model_copy(
-                    update={
-                        "cash": balances.get(
-                            company.company_id,
-                            scenario.company(company.company_id).initial_cash,
-                        ),
-                        "status": (
-                            CompanyStatus.BANKRUPT
-                            if company.company_id in bankrupt
-                            else CompanyStatus.ACTIVE
-                        ),
-                        "bankrupt_on": (
-                            SimDay.at(week=1)
-                            if company.company_id in bankrupt
-                            else None
-                        ),
-                    }
-                )
-                for company in initial.companies
-            ),
-        }
-    )
-
-
-def _snapshot(
-    scenario: ScenarioSpec,
-    week: int,
-    cash: dict[str, Decimal] | None = None,
-    *,
-    potential_demand: Decimal = Decimal("40"),
-    bankrupt: frozenset[str] = frozenset(),
-) -> WeekSnapshot:
-    balances = cash or {}
-    companies = tuple(
-        _company_snapshot(
-            scenario,
-            week,
-            company.company_id,
-            balances.get(company.company_id, company.initial_cash),
-            (
-                CompanyStatus.BANKRUPT
-                if company.company_id in bankrupt
-                else CompanyStatus.ACTIVE
-            ),
+    def evaluate(
+        self,
+        _: ScenarioSpec,
+        __: int,
+        weeks: int | None = None,
+    ) -> OracleResult:
+        self.horizons.append(weeks)
+        return OracleResult(
+            oracle_version=ORACLE_VERSION,
+            input_hash="test-oracle",
+            solver="test",
+            solver_status="optimal",
+            enterprise_surplus_upper_bound=self._value,
         )
-        for company in scenario.companies
+
+
+def _scenario() -> ScenarioSpec:
+    return ScenarioSpec.model_validate_json(
+        DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1}).model_dump_json()
     )
-    retailer_count = sum(
-        isinstance(company.operation, RetailerOperation) for company in scenario.companies
+
+
+def _facts(
+    surpluses: tuple[Decimal, ...],
+    *,
+    bankrupt_index: int | None = None,
+) -> tuple[
+    ScenarioSpec,
+    WorldState,
+    WorldState,
+    tuple[WeekSnapshot, ...],
+    tuple[DomainEvent, ...],
+]:
+    scenario = _scenario()
+    engine = EconomyEngine()
+    initial = engine.initial_state(scenario, 42)
+    sunday = SimDay(absolute_day=7)
+    final_companies = tuple(
+        CompanyState(
+            company_id=company.company_id,
+            cash=company.initial_cash + surplus,
+            status=(CompanyStatus.BANKRUPT if index == bankrupt_index else CompanyStatus.ACTIVE),
+            bankrupt_on=sunday if index == bankrupt_index else None,
+        )
+        for index, (company, surplus) in enumerate(zip(scenario.companies, surpluses, strict=True))
     )
-    return WeekSnapshot(
-        week=week,
-        companies=companies,
-        markets=(),
-        consumer_demand=potential_demand * retailer_count,
+    final = WorldState(
+        scenario=scenario,
+        seed=42,
+        completed_weeks=1,
+        companies=final_companies,
+        operation_states=initial.operation_states,
+    )
+    company_snapshots = tuple(
+        CompanySnapshot(
+            week=1,
+            company_id=spec.company_id,
+            tier=spec.tier,
+            status=state.status,
+            cash=state.cash,
+            operating_cost_payable=ZERO,
+            raw_milk_quantity=ZERO,
+            bottled_milk_quantity=ZERO,
+            inventory_value=ZERO,
+            net_worth=state.cash,
+            surplus=state.cash - spec.initial_cash,
+            weekly_consumer_sales=ZERO,
+            weekly_expired_quantity=ZERO,
+        )
+        for spec, state in zip(scenario.companies, final_companies, strict=True)
+    )
+    population = SharedConsumerMarket(scenario.consumer_market).population(42, 1)
+    snapshot = WeekSnapshot(
+        week=1,
+        companies=company_snapshots,
+        markets=tuple(
+            MarketSummary(product=product.product, volume=ZERO) for product in scenario.products
+        ),
+        consumer_demand=population.quantity,
         consumer_sales=ZERO,
         expired_quantity=ZERO,
     )
-
-
-def _company_snapshot(
-    scenario: ScenarioSpec,
-    week: int,
-    company_id: str,
-    cash: Decimal,
-    status: CompanyStatus,
-) -> CompanySnapshot:
-    company = scenario.company(company_id)
-    return CompanySnapshot(
-        week=week,
-        company_id=company_id,
-        tier=company.tier,
-        status=status,
-        cash=cash,
-        raw_milk_quantity=ZERO,
-        bottled_milk_quantity=ZERO,
-        inventory_value=ZERO,
-        net_worth=cash,
-        surplus=cash - company.initial_cash,
-        weekly_consumer_sales=ZERO,
-        weekly_expired_quantity=ZERO,
-    )
-
-
-def _consumer_events(
-    scenario: ScenarioSpec,
-    *,
-    potential_demand: Decimal = Decimal("40"),
-) -> tuple[DomainEvent, ...]:
-    return tuple(
+    sales: tuple[DomainEvent, ...] = tuple(
         ConsumerSaleEvent(
-            occurred_on=SimDay.at(week=week, weekday=Weekday.SUNDAY),
+            occurred_on=sunday,
             company_id=company.company_id,
-            potential_demand_quantity=potential_demand,
-            demand_quantity=potential_demand,
+            saleable_quantity=ZERO,
+            saleable_book_value=ZERO,
             sold_quantity=ZERO,
-            retail_price=None,
+            retail_price=Decimal("3.5000"),
             revenue=ZERO,
+            cost_of_goods_sold=ZERO,
+            gross_profit=ZERO,
+            sold_out=False,
         )
-        for week in range(1, scenario.weeks + 1)
         for company in scenario.companies
-        if isinstance(company.operation, RetailerOperation)
+        if company.tier.value == "retailer"
     )
+    bankruptcy: tuple[DomainEvent, ...] = (
+        (
+            CompanyBankruptEvent(
+                occurred_on=sunday,
+                company_id=final_companies[bankrupt_index].company_id,
+                total_assets=final_companies[bankrupt_index].cash,
+            ),
+        )
+        if bankrupt_index is not None
+        else ()
+    )
+    return scenario, initial, final, (snapshot,), (*sales, *bankruptcy)
 
 
 def _evaluate(
-    scenario: ScenarioSpec,
-    final_cash: dict[str, Decimal],
-    snapshots: tuple[WeekSnapshot, ...],
-    events: tuple[DomainEvent, ...] | None = None,
-    bankrupt: frozenset[str] = frozenset(),
-) -> ScoreCard:
-    return Evaluator().evaluate(
-        scenario,
-        _state(scenario, 0),
-        _state(scenario, scenario.weeks, final_cash, bankrupt),
-        snapshots,
-        _consumer_events(scenario) if events is None else events,
-    )
+    surpluses: tuple[Decimal, ...],
+    *,
+    oracle: Decimal = Decimal("100"),
+    bankrupt_index: int | None = None,
+):
+    facts = _facts(surpluses, bankrupt_index=bankrupt_index)
+    return Evaluator(oracle=_FixedOracle(oracle)).evaluate(*facts)
 
 
-def test_score_card_exposes_only_the_official_s9_contract() -> None:
-    assert set(ScoreCard.model_fields) == {
-        "score_version",
-        "final_score",
-        "efficiency_raw",
-        "efficiency_reference",
-        "efficiency_score",
-        "global_gini",
-        "fairness_score",
-        "profit_participation_score",
-        "bankrupt_company_count",
-        "loss_making_company_count",
-        "companies",
-    }
+def test_score_card_uses_oracle_fairness_and_non_loss_contract() -> None:
+    score = _evaluate((Decimal("10"),) * 9)
 
-
-def test_evaluator_combines_efficiency_global_fairness_and_profit_participation() -> None:
-    scenario = _scenario()
-    expected_reference = Decimal("273.375")
-    per_company_gain = expected_reference / Decimal("18")
-    final_cash = {
-        company.company_id: company.initial_cash + per_company_gain
-        for company in scenario.companies
-    }
-
-    score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
-
-    assert score.score_version == "s9-enterprise-v5"
-    assert score.efficiency_raw == expected_reference / Decimal("2")
-    assert score.efficiency_reference == expected_reference
-    assert score.efficiency_score == Decimal("0.5")
+    assert score.score_version == "s9-enterprise-v9"
+    assert score.efficiency_raw == Decimal("90.0000")
+    assert score.efficiency_oracle == Decimal("100.0000")
+    assert score.efficiency_score == Decimal("0.9000")
     assert score.global_gini == ZERO
-    assert score.fairness_score == Decimal("1")
-    assert score.profit_participation_score == Decimal("1")
-    assert score.bankrupt_company_count == 0
+    assert score.fairness_score == Decimal("1.0000")
+    assert score.non_loss_company_ratio == Decimal("1.0000")
     assert score.loss_making_company_count == 0
-    assert score.final_score == Decimal("50.0")
+    assert score.loss_making_company_rate == ZERO
+    assert score.bankrupt_company_count == 0
+    assert score.final_score == Decimal("90.0000")
 
 
-def test_global_gini_uses_all_nine_companies_final_assets() -> None:
-    scenario = _scenario()
-    surviving_id = scenario.companies[-1].company_id
-    bankrupt = frozenset(
-        company.company_id
-        for company in scenario.companies
-        if company.company_id != surviving_id
+def test_evaluator_matches_the_oracle_to_the_settled_prefix() -> None:
+    oracle = _FixedOracle()
+    scenario, initial, final, snapshots, events = _facts((Decimal("0"),) * 9)
+    scenario = ScenarioSpec.model_validate_json(
+        scenario.model_copy(update={"weeks": 2}).model_dump_json()
     )
-    final_cash = {company_id: ZERO for company_id in bankrupt}
-    final_cash[surviving_id] = Decimal("9000")
-    bankruptcies = tuple(
-        CompanyBankruptEvent(
-            occurred_on=SimDay.at(week=1),
-            company_id=company_id,
-            total_assets=ZERO,
-        )
-        for company_id in bankrupt
-    )
+    initial = initial.model_copy(update={"scenario": scenario})
+    final = final.model_copy(update={"scenario": scenario})
 
-    score = _evaluate(
+    Evaluator(oracle=oracle).evaluate(
         scenario,
-        final_cash,
-        (_snapshot(scenario, 1, final_cash, bankrupt=bankrupt),),
-        (*_consumer_events(scenario), *bankruptcies),
-        bankrupt,
+        initial,
+        final,
+        snapshots,
+        events,
     )
 
-    assert score.efficiency_raw == ZERO
-    assert score.global_gini == Decimal("0.8889")
-    assert score.fairness_score == ZERO
-    assert score.profit_participation_score == Decimal("0.1111")
-    assert score.bankrupt_company_count == 8
-    assert score.loss_making_company_count == 8
-    assert score.final_score == ZERO
+    assert oracle.horizons == [1]
 
 
-def test_profit_participation_counts_only_negative_final_surplus() -> None:
-    scenario = _scenario()
-    final_cash = {
-        company.company_id: Decimal("900" if index < 6 else "1400")
-        for index, company in enumerate(scenario.companies)
-    }
-
-    score = _evaluate(scenario, final_cash, (_snapshot(scenario, 1, final_cash),))
-
-    assert score.efficiency_score == Decimal("1")
-    assert score.loss_making_company_count == 6
-    assert score.profit_participation_score == Decimal("0.3333")
-    assert score.final_score == Decimal("54.2467")
-
-
-def test_bankruptcy_count_comes_from_irreversible_exit_events() -> None:
-    scenario = _scenario(weeks=2)
-    final_cash = {
-        company.company_id: company.initial_cash
-        for company in scenario.companies
-    }
-    bankrupt = frozenset({"processor_a"})
-    week_one_cash = dict(final_cash)
-    week_one_cash["processor_a"] = Decimal("0.9999")
-    bankruptcy = CompanyBankruptEvent(
-        occurred_on=SimDay.at(week=1),
-        company_id="processor_a",
-        total_assets=Decimal("0.9999"),
-    )
-
+def test_zero_surplus_is_non_loss_while_only_negative_surplus_enters_l() -> None:
     score = _evaluate(
-        scenario,
-        final_cash,
         (
-            _snapshot(scenario, 1, week_one_cash, bankrupt=bankrupt),
-            _snapshot(scenario, 2, final_cash, bankrupt=bankrupt),
-        ),
-        (*_consumer_events(scenario), bankruptcy),
-        bankrupt,
+            Decimal("10"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("-1"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+        )
     )
+
+    assert score.loss_making_company_count == 1
+    assert score.loss_making_company_rate == Decimal("0.1111")
+    assert score.non_loss_company_ratio == Decimal("0.8889")
+
+
+def test_bankruptcy_is_a_count_and_requires_strictly_sub_one_assets() -> None:
+    surpluses = (Decimal("-999.5"), *(Decimal("0") for _ in range(8)))
+    score = _evaluate(tuple(surpluses), oracle=Decimal("100"), bankrupt_index=0)
 
     assert score.bankrupt_company_count == 1
-    assert score.loss_making_company_count == 0
+    assert score.loss_making_company_count == 1
 
 
-def test_evaluator_rejects_an_incomplete_company_snapshot() -> None:
-    scenario = _scenario()
-    final_cash = {company.company_id: company.initial_cash for company in scenario.companies}
-    snapshot = _snapshot(scenario, 1, final_cash)
-    incomplete = snapshot.model_copy(update={"companies": snapshot.companies[:-1]})
+def test_evaluator_fails_closed_when_realized_surplus_exceeds_oracle() -> None:
+    with pytest.raises(ValueError, match="exceeds the Oracle"):
+        _evaluate((Decimal("20"),) * 9, oracle=Decimal("100"))
 
-    with pytest.raises(ValueError, match="each scenario company exactly once"):
-        _evaluate(scenario, final_cash, (incomplete,))
+
+def test_evaluator_recomputes_shared_consumer_allocation() -> None:
+    scenario, initial, final, snapshots, events = _facts((Decimal("0"),) * 9)
+    first = next(event for event in events if isinstance(event, ConsumerSaleEvent))
+    tampered = first.model_copy(
+        update={
+            "saleable_quantity": Decimal("1"),
+        }
+    )
+    changed = tuple(tampered if event is first else event for event in events)
+
+    with pytest.raises(ValueError, match="shared-market rules"):
+        Evaluator(oracle=_FixedOracle()).evaluate(
+            scenario,
+            initial,
+            final,
+            snapshots,
+            changed,
+        )
 
 
 def test_evaluator_rejects_an_incomplete_consumer_sale_grid() -> None:
-    scenario = _scenario()
-    final_cash = {company.company_id: company.initial_cash for company in scenario.companies}
-    events = _consumer_events(scenario)
+    scenario, initial, final, snapshots, events = _facts((Decimal("0"),) * 9)
 
-    with pytest.raises(ValueError, match="every week and retailer exactly once"):
-        _evaluate(
+    with pytest.raises(ValueError, match="each week and retailer once"):
+        Evaluator(oracle=_FixedOracle()).evaluate(
             scenario,
-            final_cash,
-            (_snapshot(scenario, 1, final_cash),),
+            initial,
+            final,
+            snapshots,
             events[:-1],
         )
 
 
-def test_evaluator_rejects_consumer_potential_that_does_not_match_seed() -> None:
+def test_oracle_uses_realized_wtp_and_retail_operating_costs() -> None:
     scenario = _scenario()
-    final_cash = {company.company_id: company.initial_cash for company in scenario.companies}
-    events = _consumer_events(scenario)
-    first = events[0]
-    assert isinstance(first, ConsumerSaleEvent)
-    tampered = first.model_copy(
+    controlled_market = scenario.consumer_market.model_copy(
+        update={"purchasing_power_shifts": (ZERO,)}
+    )
+    scenario = ScenarioSpec.model_validate_json(
+        scenario.model_copy(update={"consumer_market": controlled_market}).model_dump_json()
+    )
+    higher_wtp = controlled_market.model_copy(
         update={
-            "potential_demand_quantity": Decimal("41"),
-            "demand_quantity": Decimal("41"),
+            "regime_willingness_shifts": tuple(
+                shift.model_copy(update={"shift": Decimal("0.2")})
+                if shift.regime is MarketRegime.NORMAL
+                else shift
+                for shift in controlled_market.regime_willingness_shifts
+            )
         }
     )
-
-    with pytest.raises(ValueError, match="does not match the episode seed"):
-        _evaluate(
-            scenario,
-            final_cash,
-            (_snapshot(scenario, 1, final_cash),),
-            (tampered, *events[1:]),
+    expensive_retailers = tuple(
+        company.model_copy(
+            update={
+                "operation": company.operation.model_copy(
+                    update={"weekly_operating_cost": Decimal("10")}
+                )
+            }
         )
+        if isinstance(company.operation, RetailerOperation)
+        else company
+        for company in scenario.companies
+    )
+    oracle = EnterpriseOracle()
+    base = oracle.evaluate(scenario, 42).enterprise_surplus_upper_bound
+    with_higher_wtp = oracle.evaluate(
+        ScenarioSpec.model_validate_json(
+            scenario.model_copy(update={"consumer_market": higher_wtp}).model_dump_json()
+        ),
+        42,
+    ).enterprise_surplus_upper_bound
+    with_higher_cost = oracle.evaluate(
+        ScenarioSpec.model_validate_json(
+            scenario.model_copy(update={"companies": expensive_retailers}).model_dump_json()
+        ),
+        42,
+    ).enterprise_surplus_upper_bound
+
+    assert with_higher_wtp > base
+    assert base - with_higher_cost == pytest.approx(Decimal("15"), abs=Decimal("0.01"))

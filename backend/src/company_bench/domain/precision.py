@@ -20,12 +20,8 @@ class EconomicPrecision:
         decimal_tuple = value.as_tuple()
         excess_places = ECONOMIC_QUANTUM.as_tuple().exponent - decimal_tuple.exponent
         digits = decimal_tuple.digits
-        if excess_places > 0 and (
-            excess_places > len(digits) or any(digits[-excess_places:])
-        ):
-            raise ValueError(
-                f"economic value must be an exact multiple of {ECONOMIC_QUANTUM}"
-            )
+        if excess_places > 0 and (excess_places > len(digits) or any(digits[-excess_places:])):
+            raise ValueError(f"economic value must be an exact multiple of {ECONOMIC_QUANTUM}")
         return value
 
     @staticmethod
@@ -77,30 +73,3 @@ def economic_field(
 ECONOMIC_NORMALIZER = AfterValidator(EconomicPrecision.normalize_exact)
 
 type EconomicDecimal = Annotated[Decimal, economic_field(), ECONOMIC_NORMALIZER]
-
-
-def require_numeric_economic_schema(node: object) -> None:
-    """Make provider schemas enforce the quantum on JSON numbers, not strings."""
-    if isinstance(node, dict):
-        if node.get("multipleOf") == float(ECONOMIC_QUANTUM):
-            alternatives = node.get("anyOf") or node.get("oneOf")
-            numeric = None
-            if isinstance(alternatives, list):
-                numeric = next(
-                    (
-                        alternative
-                        for alternative in alternatives
-                        if isinstance(alternative, dict)
-                        and alternative.get("type") == "number"
-                    ),
-                    None,
-                )
-            if numeric is not None:
-                node.pop("anyOf", None)
-                node.pop("oneOf", None)
-                node.update(numeric)
-        for child in node.values():
-            require_numeric_economic_schema(child)
-    elif isinstance(node, list):
-        for child in node:
-            require_numeric_economic_schema(child)

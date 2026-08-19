@@ -19,17 +19,18 @@ from company_bench.domain.models import (
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.models import (
     ReplaySource,
+    RunEvaluation,
     RunJob,
     RunStatus,
     RunStopReason,
 )
-from company_bench.storage.store import InMemoryRunStore
+from company_bench.storage.memory import InMemoryRunRepository
 from company_bench.web.app import create_app
 
 TEST_SCENARIO = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
 
 
-class _TrackedOwnedRepository(InMemoryRunStore):
+class _TrackedOwnedRepository(InMemoryRunRepository):
     """Expose whether the Web lifespan released its owned repository."""
 
     def __init__(self) -> None:
@@ -41,7 +42,7 @@ class _TrackedOwnedRepository(InMemoryRunStore):
         self.close_calls += 1
 
 
-def _app(repository: InMemoryRunStore) -> FastAPI:
+def _app(repository: InMemoryRunRepository) -> FastAPI:
     """Create an app with deterministic server-side policy availability."""
     factory = AgentFactory(TEST_SCENARIO, repository)
     return create_app(BenchmarkApplication.create(repository, factory))
@@ -65,9 +66,16 @@ def _wait_for_terminal_job(
 
 
 def test_run_list_and_detail_http_flow() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     with TestClient(_app(repository)) as client:
-        assert client.get("/api/health").json() == {"status": "ok"}
+        assert client.get("/api/health").json() == {
+            "status": "ok",
+            "api_version": "0.10.0",
+            "scenario_id": TEST_SCENARIO.scenario_id,
+            "score_version": TEST_SCENARIO.scoring.score_version,
+            "database_schema": 16,
+            "journal_payload_version": 10,
+        }
 
         created = client.post(
             "/api/runs",
@@ -90,13 +98,14 @@ def test_run_list_and_detail_http_flow() -> None:
             "score_version",
             "final_score",
             "efficiency_raw",
-            "efficiency_reference",
+            "efficiency_oracle",
             "efficiency_score",
             "global_gini",
             "fairness_score",
-            "profit_participation_score",
+            "non_loss_company_ratio",
             "bankrupt_company_count",
             "loss_making_company_count",
+            "loss_making_company_rate",
             "companies",
         }
         result = EpisodeResult.model_validate(detail_payload)
@@ -104,8 +113,16 @@ def test_run_list_and_detail_http_flow() -> None:
         assert result.scenario == TEST_SCENARIO
         assert len(result.scenario.companies) == 9
         assert len(result.snapshots) == 1
+        evaluation_response = client.get(f"/api/runs/{submitted.run_id}/evaluation")
+        assert evaluation_response.status_code == 200
+        evaluation = RunEvaluation.model_validate(evaluation_response.json())
+        assert evaluation.run_id == result.run_id
+        assert evaluation.completed_weeks == 1
+        assert not evaluation.provisional
+        assert evaluation.agent_usage is None
+        assert evaluation.score == result.score
         turns = client.get(f"/api/runs/{submitted.run_id}/turns").json()
-        assert len(turns) == 6 * len(TEST_SCENARIO.companies)
+        assert len(turns) == 6 * len(TEST_SCENARIO.companies) + 3
         assert turns[0]["turn"]["state_version"] == 0
         decision = turns[0]["envelope"]["decision"]
         assert decision["kind"] == "action"
@@ -142,7 +159,7 @@ def test_run_list_and_detail_http_flow() -> None:
         ]
         assert (
             next(profile for profile in profiles if profile["profile_id"] == "replay")["label"]
-            == "Completed Run Replay"
+            == "Exact Replay"
         )
 
         replayed = client.post(
@@ -162,12 +179,13 @@ def test_run_list_and_detail_http_flow() -> None:
         assert all(policy.source_run_id == result.run_id for policy in replay.policies)
 
         assert client.get("/api/runs/missing").status_code == 404
+        assert client.get("/api/runs/missing/evaluation").status_code == 404
         assert client.get("/api/run-jobs/missing").status_code == 404
         assert client.get("/api/runs/missing/invocations").status_code == 404
 
 
 def test_run_job_history_http_lists_all_states_newest_first() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
 
     with TestClient(_app(repository)) as client:
@@ -207,7 +225,7 @@ def test_run_job_history_http_lists_all_states_newest_first() -> None:
 
 
 def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     stopped = RunJob(
         run_id="http_stopped",
         profile_id=PolicyProfileId.BASELINE,
@@ -231,7 +249,7 @@ def test_stop_run_http_is_idempotent_and_missing_is_not_found() -> None:
 
 
 def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
     stopped = RunJob(
         run_id="http_resume_stopped",
@@ -273,7 +291,7 @@ def test_resume_run_http_preserves_identity_and_rejects_invalid_requests() -> No
 
 
 def test_replay_sources_http_lists_all_completed_runs_newest_first() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     submitted_at = datetime(2026, 1, 1, tzinfo=UTC)
     completed_jobs = tuple(
         RunJob(
@@ -327,7 +345,7 @@ def _clean_quality() -> EpisodeQuality:
 
 
 def test_http_validation_and_localhost_cors() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     with TestClient(_app(repository)) as client:
         assert (
             client.post(
@@ -405,7 +423,7 @@ def test_default_repository_uses_configured_database(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    database = tmp_path / "data" / "runs-v7.sqlite3"
+    database = tmp_path / "data" / "runs-v9.sqlite3"
     monkeypatch.setenv("DAIRY_BENCH_HOME", str(tmp_path))
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
@@ -417,11 +435,11 @@ def test_default_repository_uses_configured_database(
     assert database.is_file()
 
 
-def test_default_app_runs_the_v7_scenario(monkeypatch: MonkeyPatch) -> None:
+def test_default_app_runs_the_v9_scenario(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODEL", raising=False)
     monkeypatch.delenv("DAIRY_BENCH_NEWAPI_MODELS", raising=False)
     monkeypatch.delenv("NEWAPI_API_KEY", raising=False)
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         submitted = RunJob.model_validate(
@@ -448,7 +466,7 @@ def test_model_profile_exposes_the_full_newapi_catalog_without_credentials(
         "DAIRY_BENCH_NEWAPI_MODEL_MODELS",
         "gpt-default-model,claude-model,gemini-model,deepseek-model",
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
 
     with TestClient(create_app(BenchmarkApplication.create(repository))) as client:
         profiles = client.get("/api/policy-profiles").json()
@@ -488,7 +506,7 @@ def test_lifespan_reclaims_owned_resources_when_coordinator_close_fails(
     async def fail_coordinator_close(_: object) -> None:
         raise RuntimeError("coordinator close failed")
 
-    monkeypatch.setattr(application_module, "SQLiteRunStore", lambda _: repository)
+    monkeypatch.setattr(application_module, "SQLiteRunRepository", lambda _: repository)
     monkeypatch.setattr(application_module.RunCoordinator, "close", fail_coordinator_close)
 
     with (
@@ -508,7 +526,7 @@ def test_lifespan_reclaims_owned_resources_when_start_fails(
     async def fail_start(_: object) -> None:
         raise RuntimeError("coordinator start failed")
 
-    monkeypatch.setattr(application_module, "SQLiteRunStore", lambda _: repository)
+    monkeypatch.setattr(application_module, "SQLiteRunRepository", lambda _: repository)
     monkeypatch.setattr(application_module.RunCoordinator, "start", fail_start)
 
     with (

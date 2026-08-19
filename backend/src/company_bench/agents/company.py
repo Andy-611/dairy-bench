@@ -56,6 +56,7 @@ from company_bench.runtime.models import (
     AgentTurn,
     AttentionPlan,
     CompanyDecision,
+    DecisionPhase,
     EconomicCommand,
     IdleDecision,
     MarketSide,
@@ -68,7 +69,7 @@ from company_bench.runtime.models import (
     WakeReason,
 )
 
-DECISION_PROMPT_VERSION: Final = "dairy-company-v7.0"
+DECISION_PROMPT_VERSION: Final = "dairy-company-v9.0"
 
 
 class CompanyAgent(Protocol):
@@ -171,7 +172,7 @@ class AgentDecisionInput(StrictModel):
 
 
 class LlmCompanyAgent:
-    """Use one isolated provider gateway and Agent-owned V7 memory."""
+    """Use one isolated provider gateway and Agent-owned V9 memory."""
 
     metadata: PolicyMetadata
 
@@ -207,7 +208,7 @@ class LlmCompanyAgent:
         if turn.company_id != self._company_id:
             raise ValueError("an Agent cannot control another company")
         allowed_tools = _allowed_tools(turn)
-        instructions = _decision_instructions(allowed_tools)
+        instructions = _decision_instructions(turn, allowed_tools)
         request = DecisionModelRequest(
             invocation_id=f"inv_{uuid4().hex}",
             run_id=self._run_id,
@@ -374,7 +375,7 @@ class LlmCompanyAgent:
 
 
 class BaselineCompanyAgent:
-    """Transparent V7 actor for the weekly dairy market."""
+    """Transparent fixed V9 actor for the weekly dairy market."""
 
     metadata = PolicyMetadata(
         name="event-baseline",
@@ -385,6 +386,15 @@ class BaselineCompanyAgent:
     async def act(self, turn: AgentTurn) -> CompanyDecision:
         """Choose a feasible action and its next attention plan."""
         operation = turn.observation.operation
+        if turn.phase is DecisionPhase.RETAIL_PRICING:
+            if not isinstance(operation, RetailerOperation):
+                raise TypeError("only retailers receive pricing turns")
+            return _baseline_decision(
+                SetRetailPrice(
+                    product=operation.input_product,
+                    unit_price=Decimal("3.5000"),
+                )
+            )
         if isinstance(operation, FarmOperation):
             action = self._farm_action(turn)
         elif isinstance(operation, ProcessorOperation):
@@ -433,7 +443,7 @@ class BaselineCompanyAgent:
         sell_command = _sell_ladder(
             turn,
             operation.output_product,
-            turn.observation.demand.base_demand,
+            Decimal("40"),
             (Decimal("2.50"), Decimal("2.65"), Decimal("2.80")),
         )
         if sell_command is not None:
@@ -459,15 +469,10 @@ class BaselineCompanyAgent:
     def _retailer_action(turn: AgentTurn) -> EconomicCommand | None:
         operation = turn.observation.operation
         assert isinstance(operation, RetailerOperation)
-        if turn.observation.retail_price is None:
-            return SetRetailPrice(
-                product=operation.input_product,
-                unit_price=turn.observation.demand.reference_price,
-            )
         order_quantity = _floor_order_quantity(
             max(
                 Decimal("0"),
-                turn.observation.demand.base_demand
+                Decimal("40")
                 - turn.observation.quantity(operation.input_product)
                 - _pending_quantity(turn, operation.input_product),
             )
@@ -543,6 +548,7 @@ class ReplayCompanyAgent:
             record.envelope.decision != source.envelope.decision
             or record.protocol_issue_kind != source.protocol_issue_kind
             or record.protocol_error != source.protocol_error
+            or record.protocol_fallback_applied != source.protocol_fallback_applied
             or not same_outcome
         ):
             raise ReplayDriftError(f"replay outcome drift at {self._company_id} turn {self._index}")
@@ -576,22 +582,50 @@ def observation_hash(turn: AgentTurn) -> str:
 def _allowed_tools(turn: AgentTurn) -> tuple[DecisionToolName, ...]:
     """Expose only decision tools authorized for the observed company role."""
     operation = turn.observation.operation
+    if turn.phase is DecisionPhase.RETAIL_PRICING:
+        if not isinstance(operation, RetailerOperation):
+            raise TypeError("only retailers may receive a pricing phase")
+        return ("set_retail_price",)
     if isinstance(operation, FarmOperation):
         return ("produce", "set_quote_ladder", "idle")
     if isinstance(operation, ProcessorOperation):
         return ("transform", "set_quote_ladder", "idle")
     if isinstance(operation, RetailerOperation):
-        return (
-            "set_quote_ladder",
-            "set_retail_price",
-            "idle",
-        )
+        return ("set_quote_ladder", "idle")
     raise TypeError(f"unsupported operation: {type(operation).__name__}")
 
 
-def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
+def _decision_instructions(
+    turn: AgentTurn,
+    allowed: tuple[DecisionToolName, ...],
+) -> str:
     """Build the stable provider-neutral company decision prompt."""
     tools = ", ".join(allowed)
+    if turn.phase is DecisionPhase.RETAIL_PRICING:
+        return (
+            "You are making your retailer's single sealed Sunday price decision. "
+            "The wholesale market is closed and every current-week purchase and delivery "
+            "is already reflected in retail_pricing_context. Competitors decide from the "
+            "same pre-price state; no retailer sees another retailer's current decision "
+            "before all prices are revealed together. Set exactly one retail price using "
+            f"set_retail_price at the shared {ECONOMIC_QUANTUM} economic precision. "
+            "This price governs this week's consumer settlement. The shared market has "
+            "three consumer groups with distinct but unknown sizes and maximum willingness "
+            "to pay. Consumers buy from the lowest-priced eligible retailer first, and a "
+            "stockout spills demand to the next-lowest price; equal prices receive a "
+            "deterministic equal-share allocation. The market moves among slump, normal, "
+            "and boom regimes, each lasting 6-10 weeks; normal alternates with an extreme "
+            "regime. Regimes may change both total market size and consumer-group "
+            "composition. Maximum willingness to pay may also change with run-wide "
+            "purchasing power and the current regime. Exact group quantities, "
+            "willingness-to-pay values, purchasing-power and regime shifts, regime "
+            "multipliers, current regime, first extreme, and transition week are hidden. "
+            "After consumer revenue is credited, your store accrues the weekly operating "
+            "cost shown in observation.operation. Any unpaid balance is a liability that "
+            "reduces enterprise value. "
+            "Infer demand from your private reports and the public rolling retail reports. "
+            f"Authorized decision tool: {tools}."
+        )
     return (
         "You are the sole Agent for one dairy company in a continuous spot market. "
         "Your sole objective is to maximize your own company's profit. "
@@ -604,7 +638,10 @@ def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
         "order. "
         "inventory_expiry splits owned spot inventory into available and reserved "
         "quantities by expiry; in-transit lots remain in pending_deliveries. "
-        "marked_surplus is guaranteed marked asset value minus initial cash, including "
+        "For a retailer, observation.operation.weekly_operating_cost accrues after "
+        "Sunday consumer revenue; any unpaid balance remains a liability. "
+        "marked_surplus is guaranteed marked asset value minus liabilities and initial "
+        "cash, including "
         "reserved assets, pending deliveries, and active-operation output at reference "
         "values. If that guaranteed asset value falls below 1, the company is "
         "irreversibly bankrupt, delisted, and receives no future turn. Public company "
@@ -634,8 +671,17 @@ def _decision_instructions(allowed: tuple[DecisionToolName, ...]) -> str:
         "condition is needed; otherwise provide up to three OR price alerts over the "
         "best visible quote: bids[0].unit_price for best_bid or asks[0].unit_price for "
         "best_ask. Every alert must still be false when armed. "
-        "Sunday has no company decision: open orders close, consumer purchases settle once, "
-        "and expiring inventory is removed. Background monitoring consumes no turn, but "
+        "On Sunday, open orders close and retailers receive one additional sealed pricing "
+        "turn after all purchases and deliveries; it does not consume the six operating "
+        "turns. Consumer purchases then settle once and expiring inventory is removed. "
+        "The shared retail market has three consumer groups with different unknown maximum "
+        "willingness to pay. Consumers choose the lowest eligible price first, spill to the "
+        "next price after stockouts, and split equal prices deterministically. Slump, normal, "
+        "and boom regimes each last 6-10 weeks; normal alternates with extreme regimes, and "
+        "a regime may change market size and group composition. Exact demand quantities, "
+        "willingness-to-pay values, multipliers, current regime, and switch dates are hidden. "
+        "Use your last eight private weekly reports and the last eight public retail-market "
+        "reports to learn them. Background monitoring consumes no turn, but "
         "every model call counts against the six-turn weekly budget and a company can act "
         "at most once per day. Use idle when no economic action is justified. Do not poll "
         "for ordinary quote changes. "

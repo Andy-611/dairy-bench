@@ -71,10 +71,6 @@ class TimelineNotFoundError(LookupError):
     """Raised when a run or journal entry does not exist."""
 
 
-class TimelineUnsupportedError(ValueError):
-    """Raised when a run predates V7 weekly-market semantics."""
-
-
 class TimelineSource(Protocol):
     """Minimal persistence Interface required by the timeline projector."""
 
@@ -199,8 +195,12 @@ class RunTimelineProjector:
         job = self._source.get_job(run_id)
         recovery = self._source.load_recovery(run_id)
         checkpoint = recovery.checkpoint if recovery is not None else None
-        if result is None and job is None and checkpoint is None:
+        if job is None:
+            if result is not None or checkpoint is not None:
+                raise ValueError(f"run '{run_id}' data is missing its RunJob")
             raise TimelineNotFoundError(f"run '{run_id}' was not found")
+        if result is not None and checkpoint is not None:
+            raise ValueError(f"run '{run_id}' has both a result and an active checkpoint")
         scenario = (
             result.scenario
             if result is not None
@@ -210,6 +210,14 @@ class RunTimelineProjector:
         )
         if scenario is None:
             raise TimelineNotFoundError(f"run '{run_id}' has no readable scenario")
+        if (
+            job.scenario_id != scenario.scenario_id
+            or job.seed != (result.seed if result is not None else checkpoint.economy.seed)
+            or job.total_weeks != scenario.weeks
+        ):
+            raise ValueError(f"run '{run_id}' scenario differs from its RunJob")
+        if result is not None and job.status is not RunStatus.COMPLETED:
+            raise ValueError(f"run '{run_id}' result requires a completed RunJob")
         turns = recovery.turns if recovery is not None else self._source.list_turns(run_id)
         stored_system_steps = (
             recovery.system_steps
@@ -227,7 +235,7 @@ class RunTimelineProjector:
             )
         )
 
-        source_run_id = job.source_run_id if job is not None else None
+        source_run_id = job.source_run_id
         current_invocations = self._source.list_invocations(run_id)
         trace_run_id, origins = self._resolve_lineage(
             run_id,
@@ -244,23 +252,8 @@ class RunTimelineProjector:
         for invocation in trace_invocations:
             if invocation.domain_turn_id is not None:
                 trace_lists[invocation.domain_turn_id].append(invocation)
-        mode = (
-            job.kind.value
-            if job is not None
-            else next(
-                (policy.kind.value for policy in result.policies),
-                "unknown",
-            )
-            if result is not None
-            else "unknown"
-        )
-        profile_id = (
-            job.profile_id
-            if job is not None
-            else next((policy.profile_id for policy in result.policies), None)
-            if result is not None
-            else None
-        )
+        mode = job.kind.value
+        profile_id = job.profile_id
         snapshots = (
             result.snapshots
             if result is not None
@@ -519,9 +512,12 @@ class RunTimelineProjector:
             return run_id, {}
         if run_id in visited or source_run_id in visited:
             raise ValueError("replay source lineage contains a cycle")
+        source_job = self._source.get_job(source_run_id)
+        if source_job is None:
+            raise ValueError(f"replay source '{source_run_id}' is missing its RunJob")
         direct = self._direct_origins(turns, source_run_id, complete=complete)
         source_turns = self._source.list_turns(source_run_id)
-        source_source_run_id = self._source_run_id(source_run_id)
+        source_source_run_id = source_job.source_run_id
         if source_source_run_id is None:
             return source_run_id, direct
         trace_run_id, source_origins = self._resolve_lineage(
@@ -568,10 +564,6 @@ class RunTimelineProjector:
             raise ValueError("replay source and current journals differ")
         return origins
 
-    def _source_run_id(self, run_id: str) -> str | None:
-        job = self._source.get_job(run_id)
-        return job.source_run_id if job is not None else None
-
 
 def _sum_usage(invocations: Iterable[PolicyInvocation]) -> TokenUsage:
     """Aggregate physical-call counters without estimating money."""
@@ -593,7 +585,9 @@ def _require_replay_pair(current: TurnRecord, source: TurnRecord) -> None:
     if (
         current.observation_hash != source.observation_hash
         or current.envelope.decision != source.envelope.decision
+        or current.protocol_issue_kind != source.protocol_issue_kind
         or current.protocol_error != source.protocol_error
+        or current.protocol_fallback_applied != source.protocol_fallback_applied
         or not same_outcome
     ):
         raise ValueError(f"replay lineage drift at source turn '{source.turn.turn_id}'")

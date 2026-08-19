@@ -11,6 +11,7 @@ from company_bench.agents.company import (
     LlmCompanyAgent,
     observation_hash,
 )
+from company_bench.agents.contracts import DecisionModelRequest
 from company_bench.agents.memory import MemoryExchange
 from company_bench.domain.models import (
     CompanyObservation,
@@ -30,6 +31,7 @@ from company_bench.runtime.models import (
     CompanyDecision,
     DecisionEnvelope,
     DecisionOutcome,
+    DecisionPhase,
     DecisionStatus,
     DeliveryExpiryBucket,
     EconomicCommand,
@@ -47,7 +49,7 @@ from company_bench.runtime.models import (
     TurnRecord,
     WakeReason,
 )
-from company_bench.storage.store import InMemoryRunStore
+from company_bench.storage.memory import InMemoryRunRepository
 from tests.support.fakes import ScriptedDecisionGateway, company_decision
 
 
@@ -56,12 +58,25 @@ def _llm_agent(
     decision: CompanyDecision,
     *,
     company_id: str = "farm_a",
-    repository: InMemoryRunStore | None = None,
+    repository: InMemoryRunRepository | None = None,
     memory_token_budget: int = 12_288,
-) -> tuple[LlmCompanyAgent, ScriptedDecisionGateway, InMemoryRunStore]:
-    """Create one isolated scripted V7 Agent and its audit repository."""
-    audit_repository = repository if repository is not None else InMemoryRunStore()
-    gateway = ScriptedDecisionGateway(lambda _: decision)
+) -> tuple[LlmCompanyAgent, ScriptedDecisionGateway, InMemoryRunRepository]:
+    """Create one isolated scripted V9 Agent and its audit repository."""
+    audit_repository = repository if repository is not None else InMemoryRunRepository()
+
+    def scripted_decision(request: DecisionModelRequest) -> CompanyDecision:
+        turn = request.turn
+        if turn.phase is DecisionPhase.RETAIL_PRICING:
+            operation = turn.observation.operation
+            return company_decision(
+                SetRetailPrice(
+                    product=operation.input_product,
+                    unit_price=Decimal("3.5000"),
+                )
+            )
+        return decision
+
+    gateway = ScriptedDecisionGateway(scripted_decision)
     agent = LlmCompanyAgent(
         run_id=run_id,
         company_id=company_id,
@@ -72,7 +87,7 @@ def _llm_agent(
             kind=PolicyKind.MODEL,
             profile_id=PolicyProfileId.NEWAPI_MODEL,
             provider="scripted",
-            model="scripted-v7",
+            model="scripted-v9",
             wire_protocol="scripted-tools",
             adapter_version="scripted-v1",
             config_fingerprint="scripted-config",
@@ -93,7 +108,7 @@ def _turn(
     pending_deliveries: tuple[IncomingDeliveryView, ...] = (),
     active_operation: OperationJobView | None = None,
 ) -> AgentTurn:
-    """Create one runtime-owned V7 company turn."""
+    """Create one runtime-owned V9 company turn."""
     return AgentTurn(
         turn_id=f"{run_id}.{observation.company_id}.t1",
         company_id=observation.company_id,
@@ -113,7 +128,7 @@ def _turn(
 
 
 def _observation(company_id: str) -> CompanyObservation:
-    """Read one company's initial V7 observation."""
+    """Read one company's initial V9 observation."""
     engine = EconomyEngine()
     world = engine.initial_state(DAIRY_S9_SCENARIO, seed=42)
     return next(
@@ -145,7 +160,7 @@ def _three_level_quantities(quantity: Decimal) -> tuple[Decimal, Decimal, Decima
     return first, second, quantity - first - second
 
 
-def test_quote_ladder_uses_the_strict_v7_action_schema() -> None:
+def test_quote_ladder_uses_the_strict_v9_action_schema() -> None:
     adapter = TypeAdapter(EconomicCommand)
     command = adapter.validate_json(
         '{"kind":"set_quote_ladder","product":"raw_milk",'
@@ -221,19 +236,18 @@ def test_quote_ladder_enforces_depth_order_and_exact_quantities() -> None:
             "retailer_a",
             (
                 "set_quote_ladder",
-                "set_retail_price",
                 "idle",
             ),
         ),
     ),
 )
-async def test_llm_agent_exposes_v7_commands_and_weekly_market_facts(
+async def test_llm_agent_exposes_v9_commands_and_weekly_market_facts(
     company_id: str,
     allowed_tools: tuple[str, ...],
 ) -> None:
     observation = _observation(company_id)
     agent, gateway, _ = _llm_agent(
-        "v3_prompt",
+        "test_prompt",
         company_decision(),
         company_id=company_id,
     )
@@ -255,7 +269,7 @@ async def test_llm_agent_exposes_v7_commands_and_weekly_market_facts(
         ),
     )
 
-    await agent.act(_turn("v3_prompt", observation, order_books=(market,)))
+    await agent.act(_turn("test_prompt", observation, order_books=(market,)))
 
     request = gateway.decision_requests[0]
     prompt_input = json.loads(request.input_text)
@@ -289,6 +303,31 @@ async def test_llm_agent_exposes_v7_commands_and_weekly_market_facts(
     assert constraints["max_review_days"] == observation.runtime.max_review_days
     assert constraints["days_until_settlement"] == observation.sim_day.days_until_settlement
     observed_payload = prompt_input["turn"]["observation"]
+    public_rules = observed_payload["consumer_market_rules"]
+    assert public_rules == {
+        "consumer_group_count": 3,
+        "groups_have_distinct_unknown_willingness_to_pay": True,
+        "purchase_priority": "lowest_price_first",
+        "stockout_spills_to_next_lowest_price": True,
+        "equal_price_allocation": "deterministic_equal_share",
+        "regimes": ["slump", "normal", "boom"],
+        "minimum_regime_weeks": 6,
+        "maximum_regime_weeks": 10,
+        "normal_alternates_with_extreme_regimes": True,
+        "regimes_may_change_market_size_and_group_composition": True,
+        "willingness_to_pay_may_change_with_purchasing_power_and_regime": True,
+        "exact_demand_parameters_are_hidden": True,
+    }
+    assert not {
+        "consumer_market",
+        "cohorts",
+        "compositions",
+        "base_quantity",
+        "maximum_willingness_to_pay",
+        "initial_retail_price",
+        "current_regime",
+        "next_transition_week",
+    }.intersection(observed_payload)
     if observation.weekly_operation is None:
         assert "weekly_operation" not in observed_payload
         assert "used_operation_capacity" not in constraints
@@ -461,18 +500,10 @@ async def test_baseline_processor_procures_transforms_and_trades_while_busy() ->
 
 
 @pytest.mark.asyncio
-async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> None:
+async def test_baseline_retailer_buys_only_uncovered_target_inventory() -> None:
     agent = BaselineCompanyAgent()
     observation = _observation("retailer_a")
 
-    assert await agent.act(_turn("retailer_price", observation)) == company_decision(
-        SetRetailPrice(
-            product=ProductId.BOTTLED_MILK,
-            unit_price=Decimal("3.50"),
-        ),
-    )
-
-    priced = observation.model_copy(update={"retail_price": Decimal("3.50")})
     delivery = IncomingDeliveryView(
         trade_id="trade_1",
         product=ProductId.BOTTLED_MILK,
@@ -488,7 +519,7 @@ async def test_baseline_retailer_prices_then_buys_only_uncovered_demand() -> Non
     assert await agent.act(
         _turn(
             "retailer_buy",
-            priced,
+            observation,
             wake_reason=WakeReason.PRICE_ALERT,
             pending_deliveries=(delivery,),
         )
@@ -618,7 +649,7 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
     first_observation: CompanyObservation,
 ) -> None:
     run_id = "physical_retry"
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     first, _, _ = _llm_agent(
         run_id,
         company_decision(),
@@ -644,7 +675,7 @@ async def test_retried_domain_turn_preserves_each_physical_provider_call(
 async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
     run_id = "llm_runtime_cycle"
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     agents: dict[str, LlmCompanyAgent] = {}
     for company in scenario.companies:
         agent, _, _ = _llm_agent(
@@ -663,8 +694,9 @@ async def test_llm_agents_complete_a_runtime_day_with_audited_memory() -> None:
     )
 
     invocations = repository.list_invocations(run_id)
-    checkpoint = repository.get_checkpoint(run_id)
-    assert checkpoint is not None
+    recovery = repository.load_recovery(run_id)
+    assert recovery is not None
+    checkpoint = recovery.checkpoint
     assert tuple(state.company_id for state in checkpoint.agent_states) == tuple(
         company.company_id for company in scenario.companies
     )

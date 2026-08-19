@@ -43,7 +43,8 @@ from company_bench.runtime.models import (
     SystemStepRecord,
     TurnRecord,
 )
-from company_bench.storage.store import InMemoryRunStore, SQLiteRunStore
+from company_bench.storage.memory import InMemoryRunRepository
+from company_bench.storage.sqlite import SQLiteRunRepository
 from company_bench.timeline.market import MarketProjectionError, MarketTimelineProjector
 from company_bench.timeline.models import (
     DecisionDispositionSource,
@@ -56,8 +57,24 @@ from company_bench.timeline.projector import RunTimelineProjector
 from tests.support.fakes import FixedDecisionAgent, company_decision
 
 
+class _JobHidingRunRepository(InMemoryRunRepository):
+    """Hide selected lifecycle records while retaining their persisted data."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._hidden_job_ids: set[str] = set()
+
+    def hide_job(self, run_id: str) -> None:
+        self._hidden_job_ids.add(run_id)
+
+    def get_job(self, run_id: str) -> RunJob | None:
+        if run_id in self._hidden_job_ids:
+            return None
+        return super().get_job(run_id)
+
+
 def _complete(
-    repository: InMemoryRunStore,
+    repository: InMemoryRunRepository,
     execution: EpisodeExecution,
     *,
     mode: PolicyKind,
@@ -258,7 +275,7 @@ class _ThreeFillMarketTimelineAgent:
 @pytest.mark.asyncio
 async def test_timeline_projects_system_steps_turns_and_typed_state_changes() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
         42,
@@ -345,7 +362,7 @@ async def test_timeline_identifies_runtime_attention_rejection() -> None:
         )
         for company in scenario.companies
     }
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         agents,
         42,
@@ -375,7 +392,7 @@ async def test_market_timeline_projects_trade_tape_and_end_state_bid_ask_book() 
             "companies": companies,
         }
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: _MarketTimelineAgent() for company in companies},
         23,
@@ -502,7 +519,7 @@ async def test_market_timeline_replays_three_independently_filled_ladder_levels(
             "companies": companies,
         }
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: _ThreeFillMarketTimelineAgent() for company in companies},
         31,
@@ -586,7 +603,7 @@ async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> Non
             "companies": companies,
         }
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: _TwoBidMarketTimelineAgent() for company in companies},
         23,
@@ -654,7 +671,7 @@ async def test_market_timeline_rejects_a_maker_that_skips_fifo_priority() -> Non
 @pytest.mark.asyncio
 async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = _JobHidingRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -734,13 +751,49 @@ async def test_replay_timeline_resolves_source_turn_and_all_physical_calls() -> 
     assert {trace.preview.profile_id for trace in detail.traces} == {PolicyProfileId.NEWAPI_MODEL}
     assert sum(trace.preview.applied_to_committed_turn for trace in detail.traces) == 1
 
+    repository.hide_job(source.episode.run_id)
+    with pytest.raises(ValueError, match=r"replay source .* missing its RunJob"):
+        projector.read_week(replay.episode.run_id, 1)
+
+
+@pytest.mark.asyncio
+async def test_timeline_rejects_completed_result_without_run_job() -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
+    repository = _JobHidingRunRepository()
+    execution = await EpisodeRuntime(scenario).run(
+        {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
+        10,
+        run_id="orphan_timeline_result",
+        store=repository,
+    )
+    _complete(repository, execution, mode=PolicyKind.BASELINE)
+    repository.hide_job(execution.episode.run_id)
+
+    with pytest.raises(ValueError, match="data is missing its RunJob"):
+        RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
+
+
+@pytest.mark.asyncio
+async def test_timeline_rejects_checkpoint_without_run_job() -> None:
+    scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
+    repository = InMemoryRunRepository()
+    execution = await EpisodeRuntime(scenario).run(
+        {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
+        11,
+        run_id="orphan_timeline_checkpoint",
+        store=repository,
+    )
+
+    with pytest.raises(ValueError, match="data is missing its RunJob"):
+        RunTimelineProjector(repository).read_week(execution.episode.run_id, 1)
+
 
 @pytest.mark.asyncio
 async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
     tmp_path: Path,
 ) -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    memory = InMemoryRunStore()
+    memory = InMemoryRunRepository()
     await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
         12,
@@ -751,17 +804,17 @@ async def test_sqlite_rolls_back_system_step_when_checkpoint_validation_fails(
     assert recovery is not None
     checkpoint = recovery.checkpoint
 
-    with SQLiteRunStore(tmp_path / "atomic.sqlite3") as repository:
+    with SQLiteRunRepository(tmp_path / "atomic.sqlite3") as repository:
         with pytest.raises(ValueError, match="follow completed company turns"):
             repository.save_progress((), (recovery.system_steps[0],), checkpoint)
         assert repository.list_system_steps(checkpoint.run_id) == ()
-        assert repository.get_checkpoint(checkpoint.run_id) is None
+        assert repository.load_recovery(checkpoint.run_id) is None
 
 
 @pytest.mark.asyncio
 async def test_timeline_does_not_invent_unpersisted_system_steps() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    durable = InMemoryRunStore()
+    durable = InMemoryRunRepository()
     execution = await EpisodeRuntime(scenario).run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
         4,
@@ -771,10 +824,13 @@ async def test_timeline_does_not_invent_unpersisted_system_steps() -> None:
     recovery = durable.load_recovery(execution.episode.run_id)
     assert recovery is not None
 
-    journal_only = InMemoryRunStore()
-    for record in execution.turns:
-        journal_only.record_turn(record)
-    journal_only.record_system_step(recovery.system_steps[-1])
+    journal_only = InMemoryRunRepository()
+    turns = tuple(
+        record.model_copy(update={"journal_sequence": sequence})
+        for sequence, record in enumerate(execution.turns, start=1)
+    )
+    final_step = recovery.system_steps[-1].model_copy(update={"journal_sequence": len(turns) + 1})
+    journal_only.save_progress(turns, (final_step,), recovery.checkpoint)
     _complete(journal_only, execution, mode=PolicyKind.BASELINE)
 
     page = RunTimelineProjector(journal_only).read_week(execution.episode.run_id, 1)
@@ -784,7 +840,7 @@ async def test_timeline_does_not_invent_unpersisted_system_steps() -> None:
 
 
 class _StopAfterFirstProgress:
-    def __init__(self, repository: InMemoryRunStore) -> None:
+    def __init__(self, repository: InMemoryRunRepository) -> None:
         self.repository = repository
 
     def save_progress(
@@ -801,7 +857,7 @@ class _StopAfterFirstProgress:
 @pytest.mark.asyncio
 async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     run_id = "failed_ladder_history"
     agents: dict[str, CompanyAgent] = {
         company.company_id: FixedDecisionAgent((company_decision(),))
@@ -832,8 +888,9 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
             run_id=run_id,
             store=_StopAfterFirstProgress(repository),
         )
-    checkpoint = repository.get_checkpoint(run_id)
-    assert checkpoint is not None
+    recovery = repository.load_recovery(run_id)
+    assert recovery is not None
+    checkpoint = recovery.checkpoint
     repository.save_job(
         RunJob(
             run_id=run_id,
@@ -889,7 +946,7 @@ async def test_failed_run_timeline_preserves_rejected_ladder_and_provider_audit(
 @pytest.mark.asyncio
 async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},
@@ -942,7 +999,7 @@ async def test_running_replay_timeline_accepts_a_valid_source_prefix() -> None:
 @pytest.mark.asyncio
 async def test_replay_of_replay_resolves_the_ultimate_trace_run() -> None:
     scenario = DAIRY_S9_SCENARIO.model_copy(update={"weeks": 1})
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     runtime = EpisodeRuntime(scenario)
     source = await runtime.run(
         {company.company_id: BaselineCompanyAgent() for company in scenario.companies},

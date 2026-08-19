@@ -14,11 +14,14 @@ from company_bench.domain.models import (
     CompanyId,
     CompanyObservation,
     EpisodeQuality,
+    EpisodeResult,
     EventRecord,
     Identifier,
     PolicyDescriptor,
     PolicyKind,
     PolicyProfileId,
+    ScenarioSpec,
+    ScoreCard,
     StrictModel,
     WeekSnapshot,
 )
@@ -205,6 +208,113 @@ class ReplaySource(StrictModel):
     benchmark_eligible: bool
 
 
+class TokenUsage(StrictModel):
+    """Provider token counters retained without estimating money."""
+
+    input_tokens: int = Field(default=0, ge=0)
+    cached_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        """Add physical provider usage without losing cached-token detail."""
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+
+class AgentUsageSummary(StrictModel):
+    """Compact provider usage for one settled evaluation horizon."""
+
+    invocation_count: int = Field(ge=1)
+    successful_invocations: int = Field(ge=0)
+    providers: tuple[str, ...] = Field(min_length=1)
+    models: tuple[str, ...] = Field(min_length=1)
+    usage: TokenUsage
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> AgentUsageSummary:
+        """Keep successful calls and identity sets inside the summary."""
+        if self.successful_invocations > self.invocation_count:
+            raise ValueError("successful invocations cannot exceed all invocations")
+        if len(self.providers) != len(set(self.providers)):
+            raise ValueError("usage providers must be unique")
+        if len(self.models) != len(set(self.models)):
+            raise ValueError("usage models must be unique")
+        return self
+
+    @classmethod
+    def from_invocations(
+        cls,
+        invocations: Iterable[PolicyInvocation],
+        through_week: int,
+    ) -> AgentUsageSummary | None:
+        """Aggregate calls belonging to fully settled weeks only."""
+        settled = tuple(invocation for invocation in invocations if invocation.week <= through_week)
+        if not settled:
+            return None
+        return cls(
+            invocation_count=len(settled),
+            successful_invocations=sum(
+                invocation.outcome is InvocationOutcome.SUCCESS for invocation in settled
+            ),
+            providers=tuple(dict.fromkeys(invocation.provider for invocation in settled)),
+            models=tuple(dict.fromkeys(invocation.model for invocation in settled)),
+            usage=sum((invocation.usage for invocation in settled), start=TokenUsage()),
+        )
+
+
+class RunEvaluation(StrictModel):
+    """Settled economic projection available throughout a run's lifecycle."""
+
+    run_id: Identifier
+    scenario: ScenarioSpec
+    seed: int
+    completed_weeks: int = Field(ge=1)
+    provisional: bool
+    agent_usage: AgentUsageSummary | None = None
+    policies: tuple[PolicyDescriptor, ...]
+    snapshots: tuple[WeekSnapshot, ...]
+    score: ScoreCard
+    quality: EpisodeQuality
+
+    @model_validator(mode="after")
+    def validate_horizon(self) -> RunEvaluation:
+        """Align every projected fact to the most recent settled week."""
+        if self.completed_weeks > self.scenario.weeks:
+            raise ValueError("evaluation exceeds the scenario horizon")
+        if len(self.snapshots) != self.completed_weeks:
+            raise ValueError("evaluation snapshots must cover each settled week")
+        if not self.provisional and self.completed_weeks != self.scenario.weeks:
+            raise ValueError("only a full-horizon evaluation can be final")
+        return self
+
+    @classmethod
+    def from_episode(
+        cls,
+        episode: EpisodeResult,
+        agent_usage: AgentUsageSummary | None = None,
+    ) -> RunEvaluation:
+        """Project one immutable completed episode without recomputing it."""
+        return cls(
+            run_id=episode.run_id,
+            scenario=episode.scenario,
+            seed=episode.seed,
+            completed_weeks=episode.scenario.weeks,
+            provisional=False,
+            agent_usage=agent_usage,
+            policies=episode.policies,
+            snapshots=episode.snapshots,
+            score=episode.score,
+            quality=episode.quality,
+        )
+
+
 class CompanyRuntimeCursor(StrictModel):
     """Per-company counters required for deterministic turn restoration."""
 
@@ -216,9 +326,9 @@ class CompanyRuntimeCursor(StrictModel):
 
 
 class RunCheckpoint(StrictModel):
-    """Current mutable state needed to resume one V7 episode."""
+    """Current mutable state needed to resume one V9 episode."""
 
-    schema_version: Literal[11] = 11
+    schema_version: Literal[12] = 12
     run_id: Identifier
     episode_started_at: datetime
     economy: EconomyState
@@ -357,26 +467,6 @@ class InvocationOutcome(StrEnum):
     INFRASTRUCTURE_ERROR = "infrastructure_error"
 
 
-class TokenUsage(StrictModel):
-    """Provider token counters retained without estimating money."""
-
-    input_tokens: int = Field(default=0, ge=0)
-    cached_tokens: int = Field(default=0, ge=0)
-    output_tokens: int = Field(default=0, ge=0)
-    reasoning_tokens: int = Field(default=0, ge=0)
-    total_tokens: int = Field(default=0, ge=0)
-
-    def __add__(self, other: TokenUsage) -> TokenUsage:
-        """Add physical provider usage without losing cached-token detail."""
-        return TokenUsage(
-            input_tokens=self.input_tokens + other.input_tokens,
-            cached_tokens=self.cached_tokens + other.cached_tokens,
-            output_tokens=self.output_tokens + other.output_tokens,
-            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
-            total_tokens=self.total_tokens + other.total_tokens,
-        )
-
-
 class ProviderAttemptOutcome(StrEnum):
     """Physical outcome of one request sent to a model provider."""
 
@@ -439,7 +529,7 @@ class ProviderCallAudit(StrictModel):
 
 
 class PolicyInvocation(ProviderCallAudit):
-    """Auditable provider call for one V7 atomic company turn."""
+    """Auditable provider call for one V9 atomic company turn."""
 
     invocation_id: Identifier
     run_id: Identifier

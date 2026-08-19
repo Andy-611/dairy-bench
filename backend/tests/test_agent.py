@@ -54,7 +54,7 @@ from company_bench.runtime.models import (
     TurnRecord,
     WakeReason,
 )
-from company_bench.storage.store import InMemoryRunStore
+from company_bench.storage.memory import InMemoryRunRepository
 from tests.support.fakes import (
     ScriptedDecisionGateway,
     company_decision,
@@ -109,7 +109,7 @@ def _model_profile(
 def test_model_profile_registry_routes_only_to_the_selected_adapter(
     selected_profile: PolicyProfileId,
 ) -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     factories = {
         profile_id: _RecordingGatewayFactory()
         for profile_id in (
@@ -127,10 +127,10 @@ def test_model_profile_registry_routes_only_to_the_selected_adapter(
         ),
     )
 
+    policy = asyncio.run(factory.resolve_policy(selected_profile, "gpt-test-default"))
     bundle = factory.create_agents(
         run_id="profile_route",
-        profile_id=selected_profile,
-        model="gpt-test-default",
+        policy=policy,
     )
     asyncio.run(bundle.close())
 
@@ -177,7 +177,7 @@ class _RecordingGatewayFactory:
 
 
 def test_model_mode_owns_nine_independent_newapi_gateways() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     gateway_factory = _RecordingGatewayFactory()
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
@@ -185,10 +185,12 @@ def test_model_mode_owns_nine_independent_newapi_gateways() -> None:
         model_profiles=(_model_profile(gateway_factory),),
     )
 
+    policy = asyncio.run(
+        factory.resolve_policy(PolicyProfileId.NEWAPI_MODEL, "gemini-test-selected")
+    )
     bundle = factory.create_agents(
         run_id="model_run",
-        profile_id=PolicyProfileId.NEWAPI_MODEL,
-        model="gemini-test-selected",
+        policy=policy,
     )
     agents = tuple(bundle.agents.values())
     asyncio.run(bundle.close())
@@ -302,7 +304,7 @@ class _AuditedOutputErrorGateway:
 def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
     first_observation: CompanyObservation,
 ) -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     turn = AgentTurn(
         turn_id="failed_run.farm_a.t1",
         company_id=first_observation.company_id,
@@ -388,7 +390,7 @@ def test_output_failure_retains_provider_audit_and_binds_protocol_outcome(
 
 
 async def _run_model_job_until(
-    repository: InMemoryRunStore,
+    repository: InMemoryRunRepository,
     factory: AgentFactory,
     expected_status: RunStatus,
 ) -> RunJob:
@@ -416,7 +418,7 @@ async def _run_model_job_until(
 
 
 def test_infrastructure_failure_interrupts_job_without_result() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     gateway_factory = _RecordingGatewayFactory(_UnavailableGateway)
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
@@ -431,7 +433,7 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
     assert interrupted.prompt_version == DECISION_PROMPT_VERSION
     assert "PolicyInfrastructureError" in (interrupted.error_message or "")
     assert repository.get(interrupted.run_id) is None
-    assert repository.get_checkpoint(interrupted.run_id) is not None
+    assert repository.load_recovery(interrupted.run_id) is not None
     invocations = repository.list_invocations(interrupted.run_id)
     assert invocations
     assert all(
@@ -455,7 +457,7 @@ def test_infrastructure_failure_interrupts_job_without_result() -> None:
 def test_quota_exhaustion_stops_job_and_prompt_drift_blocks_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
         repository,
@@ -467,7 +469,7 @@ def test_quota_exhaustion_stops_job_and_prompt_drift_blocks_resume(
     assert stopped.stop_reason is RunStopReason.QUOTA_EXHAUSTED
     assert "PolicyQuotaExhaustedError" in (stopped.error_message or "")
     assert repository.get(stopped.run_id) is None
-    assert repository.get_checkpoint(stopped.run_id) is not None
+    assert repository.load_recovery(stopped.run_id) is not None
     assert all(
         invocation.outcome is InvocationOutcome.INFRASTRUCTURE_ERROR
         for invocation in repository.list_invocations(stopped.run_id)
@@ -514,7 +516,7 @@ def test_permanent_model_failure_marks_job_failed_without_result(
     expected_error: str,
     outcome: InvocationOutcome,
 ) -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     gateway_factory = _RecordingGatewayFactory(gateway_type)
     factory = AgentFactory(
         DAIRY_S9_SCENARIO,
@@ -527,7 +529,7 @@ def test_permanent_model_failure_marks_job_failed_without_result(
     assert failed.status is RunStatus.FAILED
     assert expected_error in (failed.error_message or "")
     assert repository.get(failed.run_id) is None
-    assert repository.get_checkpoint(failed.run_id) is not None
+    assert repository.load_recovery(failed.run_id) is not None
     assert all(
         invocation.outcome is outcome for invocation in repository.list_invocations(failed.run_id)
     )

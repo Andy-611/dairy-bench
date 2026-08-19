@@ -18,8 +18,6 @@ from company_bench.agents.contracts import (
     ModelOutputError,
     ModelQuotaExhaustedError,
 )
-from company_bench.agents.providers import newapi as newapi_module
-from company_bench.agents.providers.capabilities import ModelCapabilityError
 from company_bench.agents.providers.newapi import (
     DEFAULT_NEWAPI_BASE_URL,
     NewApiAnthropicMessagesGateway,
@@ -31,6 +29,8 @@ from company_bench.agents.providers.newapi import (
     NewApiTransport,
     NewApiWireProtocol,
 )
+from company_bench.agents.providers.newapi import gateway as newapi_gateway
+from company_bench.agents.providers.newapi import wire as newapi_wire
 from company_bench.domain.models import CompanyObservation, ProductId, ProtocolIssueKind
 from company_bench.runs.models import ProviderAttemptOutcome
 from company_bench.runtime.models import (
@@ -40,6 +40,7 @@ from company_bench.runtime.models import (
     MarketSide,
     QuoteLevel,
     SetQuoteLadder,
+    SetRetailPrice,
     SimDay,
     WakeReason,
 )
@@ -240,16 +241,26 @@ def _responses_sse_response(
     )
 
 
+def _decision_arguments(
+    name: str,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    """Supply attention only to tools whose public contract accepts it."""
+    return (
+        arguments
+        if name == "set_retail_price" or "attention" in arguments
+        else {**arguments, "attention": {}}
+    )
+
+
 def _responses_call(name: str, arguments: dict[str, object]) -> dict[str, object]:
     """Build one native Responses function-call item."""
-    if "attention" not in arguments:
-        arguments = {**arguments, "attention": {}}
     return {
         "id": f"fc_{name}",
         "type": "function_call",
         "call_id": f"call_{name}",
         "name": name,
-        "arguments": json.dumps(arguments),
+        "arguments": json.dumps(_decision_arguments(name, arguments)),
         "status": "completed",
     }
 
@@ -282,20 +293,18 @@ def _anthropic_response(
 
 def _anthropic_call(name: str, arguments: dict[str, object]) -> dict[str, object]:
     """Build one Anthropic tool-use block."""
-    if "attention" not in arguments:
-        arguments = {**arguments, "attention": {}}
     return {
         "id": f"toolu_{name}",
         "type": "tool_use",
         "name": name,
-        "input": arguments,
+        "input": _decision_arguments(name, arguments),
     }
 
 
 def _tool_call(name: str, arguments: object) -> dict[str, object]:
     """Build one OpenAI-compatible function call."""
-    if isinstance(arguments, dict) and "attention" not in arguments:
-        arguments = {**arguments, "attention": {}}
+    if isinstance(arguments, dict):
+        arguments = _decision_arguments(name, arguments)
     return {
         "id": f"call_{name}",
         "type": "function",
@@ -408,12 +417,33 @@ def test_capability_probe_confirms_documented_candidate_on_success() -> None:
     assert asyncio.run(_probe_limit(handler, 16_384)) == 16_384
 
 
-def test_capability_probe_rejects_unknown_limit_when_gateway_silently_accepts_ceiling() -> None:
+def test_capability_probe_confirms_128k_default_for_an_unknown_model() -> None:
+    requests: list[dict[str, object]] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
         return _completion_response(request, [_tool_call("idle", {})])
 
-    with pytest.raises(ModelCapabilityError, match="without reporting its exact"):
-        asyncio.run(_probe_limit(handler, None))
+    assert asyncio.run(_probe_limit(handler, None)) == 128_000
+    assert requests[0]["max_tokens"] == 128_000
+
+
+def test_capability_probe_reads_a_limit_from_a_gateway_wrapped_500() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 2:
+            return _completion_response(request, [_tool_call("idle", {})])
+        return _error_response(
+            request,
+            500,
+            "server_error",
+            "max_tokens must be less than 65537",
+        )
+
+    assert asyncio.run(_probe_limit(handler, None)) == 65_536
+    assert [request["max_tokens"] for request in requests] == [128_000, 65_536]
 
 
 def test_gateway_sends_common_tools_and_parses_decision() -> None:
@@ -544,6 +574,48 @@ def test_responses_gateway_uses_native_sse_and_parses_one_tool() -> None:
     idle = next(tool for tool in payload["tools"] if tool["name"] == "idle")
     attention = idle["parameters"]["$defs"]["AttentionPlan"]
     assert attention["required"] == ["review_after_days", "alerts"]
+
+
+def test_responses_retail_pricing_omits_attention_and_uses_empty_domain_plan() -> None:
+    observation = _observation()
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return _responses_sse_response(
+            request,
+            [
+                _responses_call(
+                    "set_retail_price",
+                    {"product": "bottled_milk", "unit_price": 4.2},
+                )
+            ],
+        )
+
+    async def operation() -> DecisionModelResult:
+        config = _config()
+        decision_request = _decision_request(observation).model_copy(
+            update={"allowed_tools": ("set_retail_price",)}
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            transport = NewApiTransport(config, client=client)
+            return await NewApiResponsesGateway(config, transport).generate_decision(
+                decision_request
+            )
+
+    result = asyncio.run(operation())
+
+    assert result.decision == ActionDecision(
+        action=SetRetailPrice(
+            product=ProductId.BOTTLED_MILK,
+            unit_price=Decimal("4.2"),
+        ),
+        attention=AttentionPlan(),
+    )
+    parameters = requests[0]["tools"][0]["parameters"]
+    assert parameters["required"] == ["product", "unit_price"]
+    assert "attention" not in parameters["properties"]
+    _assert_strict_object_schemas(parameters)
 
 
 def test_anthropic_gateway_uses_messages_and_normalizes_cached_usage() -> None:
@@ -746,7 +818,7 @@ def test_repair_budget_failure_preserves_the_first_physical_attempt() -> None:
     observation = _observation()
     request = _decision_request(observation)
     config = _config()
-    payload = newapi_module._chat_request(config, request)
+    payload = newapi_wire._chat_request(config, request)
     initial_budget = (len(payload.model_dump_json(exclude_none=True).encode()) + 1) // 2
     calls = 0
 
@@ -1334,7 +1406,7 @@ class _RetryOrderTransport(httpx.AsyncBaseTransport):
 async def test_retry_backoff_releases_the_shared_request_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(newapi_module, "_retry_delay_seconds", lambda _: 1.0)
+    monkeypatch.setattr(newapi_gateway, "_retry_delay_seconds", lambda _: 1.0)
     config = _config(max_attempts=2)
     provider = _RetryOrderTransport()
     request = _decision_request(_observation())

@@ -1,4 +1,5 @@
 import type { PolicyProfileView, RunJobView } from "../../shared/api/types";
+import { shortRunId } from "../../shared/labels";
 import { isActiveRun, isResumableRun } from "../../shared/runStatus";
 import { completedWeeks } from "../../shared/simulationCalendar";
 
@@ -119,8 +120,4 @@ function runStatusLabel(job: RunJobView): string {
     return "STOPPED · QUOTA EXHAUSTED";
   }
   return job.status.toUpperCase();
-}
-
-function shortRunId(runId: string): string {
-  return runId.length > 20 ? `${runId.slice(0, 20)}...` : runId;
 }

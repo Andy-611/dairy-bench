@@ -4,16 +4,93 @@ from decimal import Decimal
 
 from company_bench.domain.calendar import SimDay
 from company_bench.domain.models import (
+    ConsumerSaleEvent,
     InventoryExpiredEvent,
     MilkProcessedEvent,
+    MilkProducedEvent,
     ProductId,
+    RetailOperatingCostChargedEvent,
     TradeExecutedEvent,
 )
 from company_bench.domain.precision import EconomicPrecision
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.economy.engine import EconomyEngine
-from company_bench.runtime.economics import PrivateEconomicsProjector
+from company_bench.economy.ledger import CompanyLedger
+from company_bench.economy.private_view import PrivateEconomicsProjector
 from company_bench.runtime.models import OrderBookView, PriceLevelView
+
+
+def test_company_ledger_projects_every_owned_economic_flow_once() -> None:
+    events = (
+        _trade("purchase", ProductId.RAW_MILK, "farm_a", "processor_a", "14"),
+        _trade("sale", ProductId.BOTTLED_MILK, "processor_a", "retailer_a", "25"),
+        MilkProducedEvent(
+            occurred_on=SimDay.at(week=1),
+            company_id="processor_a",
+            requested_quantity="2",
+            actual_quantity="2",
+            unit_cost="1.5",
+            cash_cost="3",
+        ),
+        MilkProcessedEvent(
+            occurred_on=SimDay.at(week=1),
+            company_id="processor_a",
+            requested_input="10",
+            actual_input="10",
+            output_quantity="8",
+            cash_cost="4",
+        ),
+        RetailOperatingCostChargedEvent(
+            occurred_on=SimDay.at(week=1),
+            company_id="processor_a",
+            opening_payable="0",
+            cost_accrued="5",
+            cash_paid="2",
+            closing_payable="3",
+        ),
+        ConsumerSaleEvent(
+            occurred_on=SimDay.at(week=1),
+            company_id="processor_a",
+            saleable_quantity="5",
+            saleable_book_value="10",
+            sold_quantity="4",
+            retail_price="3",
+            revenue="12",
+            cost_of_goods_sold="8",
+            gross_profit="4",
+            sold_out=False,
+        ),
+        InventoryExpiredEvent(
+            occurred_on=SimDay.at(week=1),
+            company_id="processor_a",
+            lot_id="expired",
+            product=ProductId.BOTTLED_MILK,
+            quantity="1",
+            reference_value_loss="3",
+            book_value_loss="2",
+        ),
+        _trade("rival", ProductId.RAW_MILK, "farm_b", "processor_b", "99"),
+    )
+
+    ledger = CompanyLedger.from_events("processor_a", events)
+
+    assert ledger.purchase_spend == Decimal("14")
+    assert ledger.purchase(ProductId.RAW_MILK).quantity == Decimal("10")
+    assert ledger.purchase(ProductId.RAW_MILK).volume_weighted_unit_price == Decimal("1.4")
+    assert ledger.wholesale_revenue == Decimal("25")
+    assert ledger.wholesale_sale(ProductId.BOTTLED_MILK).quantity == Decimal("10")
+    assert ledger.operation_cost_accrued == Decimal("12")
+    assert ledger.operation_cash_paid == Decimal("9")
+    assert ledger.consumer_revenue == Decimal("12")
+    assert ledger.consumer_sold_quantity == Decimal("4")
+    assert ledger.expiry_reference_loss == Decimal("3")
+    assert ledger.expiry(ProductId.BOTTLED_MILK).value == Decimal("2")
+    assert ledger.produced_quantity == Decimal("2")
+    assert ledger.production_cost == Decimal("3")
+    assert ledger.processed_input_quantity == Decimal("10")
+    assert ledger.processed_output_quantity == Decimal("8")
+    assert ledger.processing_cost == Decimal("4")
+    assert ledger.require_weekly_consumer_sale() is ledger.consumer_sales[0]
 
 
 def test_processor_private_economics_combines_ledger_and_executable_prices() -> None:
@@ -95,10 +172,8 @@ def test_farm_and_retailer_unit_economics_use_only_executable_prices() -> None:
         economy,
         "retailer_a",
         SimDay.at(week=1),
-    ).model_copy(
-        update={"retail_price": Decimal("3.00")}
-    )
-    retailer = projector.project(
+    ).model_copy(update={"retail_price": Decimal("3.00")})
+    retailer_view = projector.project(
         "retailer_a",
         retailer_observation,
         (
@@ -107,8 +182,18 @@ def test_farm_and_retailer_unit_economics_use_only_executable_prices() -> None:
                 asks=(PriceLevelView(unit_price="2.20", quantity="10", order_count=1),),
             ),
         ),
-        (),
-    ).unit_economics
+        (
+            RetailOperatingCostChargedEvent(
+                occurred_on=SimDay.at(week=1),
+                company_id="retailer_a",
+                opening_payable="0",
+                cost_accrued="5",
+                cash_paid="2",
+                closing_payable="3",
+            ),
+        ),
+    )
+    retailer = retailer_view.unit_economics
 
     assert farm.marginal_operation_cost is not None
     assert farm.break_even_output_price == farm.marginal_operation_cost
@@ -120,6 +205,8 @@ def test_farm_and_retailer_unit_economics_use_only_executable_prices() -> None:
     assert retailer.expected_unit_margin == EconomicPrecision.round(
         retailer_observation.retail_price - Decimal("2.20")
     )
+    assert retailer_view.cash_flow.operation_cost == Decimal("2")
+    assert retailer_view.cash_flow.net_cash_flow == Decimal("-2")
 
 
 def _trade(

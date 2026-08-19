@@ -11,7 +11,6 @@ import company_bench.application as application_module
 from company_bench.agents.factory import AgentFactory
 from company_bench.agents.providers.capabilities import (
     CapabilityDocument,
-    verified_capabilities,
 )
 from company_bench.agents.providers.newapi import (
     NewApiAnthropicMessagesGateway,
@@ -23,7 +22,8 @@ from company_bench.application import BenchmarkApplication
 from company_bench.domain.models import PolicyProfileId
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
 from company_bench.runs.coordinator import RunCoordinator
-from company_bench.storage.store import InMemoryRunStore
+from company_bench.storage.memory import InMemoryRunRepository
+from tests.support.fakes import verified_capabilities
 
 
 def test_application_shares_one_newapi_transport_across_gateways(
@@ -42,15 +42,15 @@ def test_application_shares_one_newapi_transport_across_gateways(
         ).model_dump_json(),
         encoding="utf-8",
     )
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     application = BenchmarkApplication.create(repository)
     transport = application._owned_transports[0]
     factory = application._coordinator._policy_factory
 
+    policy = asyncio.run(factory.resolve_policy(PolicyProfileId.NEWAPI_MODEL, "gemini-2.5-pro"))
     bundle = factory.create_agents(
         run_id="shared_transport",
-        profile_id=PolicyProfileId.NEWAPI_MODEL,
-        model="gemini-2.5-pro",
+        policy=policy,
     )
     gateways = tuple(
         gateway for gateway in bundle._gateways if isinstance(gateway, NewApiModelGateway)
@@ -102,15 +102,15 @@ def test_application_routes_each_profile_through_its_declared_wire_adapter(
             encoding="utf-8",
         )
 
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     application = BenchmarkApplication.create(repository)
     factory = application._coordinator._policy_factory
     try:
         for profile_id, _, model, gateway_type in specs:
+            policy = asyncio.run(factory.resolve_policy(profile_id, model))
             bundle = factory.create_agents(
                 run_id=f"route_{profile_id.value}",
-                profile_id=profile_id,
-                model=model,
+                policy=policy,
             )
             try:
                 assert all(isinstance(gateway, gateway_type) for gateway in bundle._gateways)
@@ -177,7 +177,7 @@ class _BlockedClosingCoordinator:
 
 
 def test_application_closes_every_transport_when_one_close_fails() -> None:
-    repository = InMemoryRunStore()
+    repository = InMemoryRunRepository()
     first = _ClosingTransport(RuntimeError("first transport close failed"))
     second = _ClosingTransport()
     application = BenchmarkApplication(
@@ -195,7 +195,7 @@ def test_application_closes_every_transport_when_one_close_fails() -> None:
 
 def test_application_finishes_transport_cleanup_before_propagating_cancellation() -> None:
     async def exercise() -> _BlockedClosingTransport:
-        repository = InMemoryRunStore()
+        repository = InMemoryRunRepository()
         transport = _BlockedClosingTransport()
         application = BenchmarkApplication(
             repository,
@@ -217,7 +217,7 @@ def test_application_finishes_transport_cleanup_before_propagating_cancellation(
 
 def test_application_finishes_coordinator_cleanup_before_propagating_cancellation() -> None:
     async def exercise() -> tuple[_BlockedClosingCoordinator, _ClosingTransport]:
-        repository = InMemoryRunStore()
+        repository = InMemoryRunRepository()
         coordinator = _BlockedClosingCoordinator()
         transport = _ClosingTransport()
         application = BenchmarkApplication(
@@ -254,7 +254,7 @@ def test_application_preflights_all_profile_configs_before_opening_store(
         nonlocal opened
         opened = True
 
-    monkeypatch.setattr(application_module, "SQLiteRunStore", open_store)
+    monkeypatch.setattr(application_module, "SQLiteRunRepository", open_store)
 
     with pytest.raises(ValueError):
         BenchmarkApplication.create()
@@ -286,7 +286,7 @@ def test_failed_profile_composition_closes_created_transports(
     )
 
     with pytest.raises(RuntimeError, match="invalid capability catalog"):
-        BenchmarkApplication.create(InMemoryRunStore())
+        BenchmarkApplication.create(InMemoryRunRepository())
 
     assert len(transports) == 1
     assert transports[0]._client is None

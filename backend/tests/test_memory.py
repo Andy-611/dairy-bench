@@ -60,7 +60,7 @@ def test_memory_rejects_cross_company_and_cross_run_state(
         memory.remember(_exchange(observations["processor_a"], 2))
 
     checkpoint = memory.checkpoint()
-    assert checkpoint.schema_version == 8
+    assert checkpoint.schema_version == 9
     with pytest.raises(ValueError, match="another company"):
         ConversationMemory.restore(RUN_ID, "farm_b", checkpoint)
     with pytest.raises(ValueError, match="another run"):

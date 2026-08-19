@@ -39,11 +39,13 @@ from company_bench.domain.models import (
     PolicyKind,
     ProtocolIssueKind,
     ProtocolReport,
+    RetailerOperation,
     ScenarioSpec,
     TradeExecutedEvent,
     WeekSnapshot,
 )
 from company_bench.economy.engine import EconomyEngine, EconomyState
+from company_bench.economy.private_view import PrivateEconomicsProjector
 from company_bench.economy.scoring import Evaluator
 from company_bench.runs.models import (
     CompanyRuntimeCursor,
@@ -56,19 +58,21 @@ from company_bench.runtime.attention import (
     AttentionMatch,
     AttentionRejected,
 )
-from company_bench.runtime.economics import PrivateEconomicsProjector
 from company_bench.runtime.models import (
     PROTOCOL_ERROR_PREFIX,
+    ActionDecision,
     AgentTurn,
     AttentionPlan,
     CompanyDecision,
     DecisionEnvelope,
     DecisionOutcome,
+    DecisionPhase,
     DecisionStatus,
     IdleDecision,
     JournalEntryKind,
     JournalEntryReference,
     RejectionCategory,
+    SetRetailPrice,
     SimDay,
     SystemEventKind,
     SystemStepRecord,
@@ -122,15 +126,16 @@ class _PendingTurn:
     protocol_error: str | None = None
     decision_error: str | None = None
     attention_plan: ArmedAttention | None = None
+    commit_fallback: bool = False
 
     @property
     def preflight_accepted(self) -> bool:
         """Return whether the engine may receive this decision."""
-        return self.protocol_error is None and self.decision_error is None
+        return self.decision_error is None and (self.protocol_error is None or self.commit_fallback)
 
 
 class EpisodeRuntime:
-    """Run one V7 episode with deterministic daily scheduling and atomic decisions."""
+    """Run one V9 episode with deterministic daily scheduling and atomic decisions."""
 
     def __init__(
         self,
@@ -266,7 +271,7 @@ class EpisodeRuntime:
             pending_system_steps = list(new_steps)
             pending_completed_weeks = list(completed_weeks)
             if completed:
-                self._save_progress(
+                await self._commit_progress(
                     store,
                     (),
                     tuple(pending_system_steps),
@@ -280,10 +285,9 @@ class EpisodeRuntime:
                     event_records,
                     snapshots,
                     cursors,
+                    tuple(pending_completed_weeks),
+                    on_week_completed,
                 )
-                if on_week_completed is not None:
-                    for completed_week in pending_completed_weeks:
-                        await on_week_completed(completed_week)
                 break
 
             wake_events = [event for event in bucket if event.kind is SystemEventKind.COMPANY_WAKE]
@@ -315,7 +319,7 @@ class EpisodeRuntime:
                     event for event in same_day if event.kind is SystemEventKind.COMPANY_WAKE
                 )
             if completed:
-                self._save_progress(
+                await self._commit_progress(
                     store,
                     (),
                     tuple(pending_system_steps),
@@ -329,17 +333,15 @@ class EpisodeRuntime:
                     event_records,
                     snapshots,
                     cursors,
+                    tuple(pending_completed_weeks),
+                    on_week_completed,
                 )
-                if on_week_completed is not None:
-                    for completed_week in pending_completed_weeks:
-                        await on_week_completed(completed_week)
                 break
             merged_wakes = self._merge_wakes(
                 tuple(
                     wake
                     for wake in wake_events
-                    if wake.company_id is not None
-                    and economy.is_active(wake.company_id)
+                    if wake.company_id is not None and economy.is_active(wake.company_id)
                 )
             )
             ready_wakes = self._defer_busy_wakes(
@@ -348,7 +350,7 @@ class EpisodeRuntime:
                 cursors,
             )
             if not ready_wakes:
-                self._save_progress(
+                await self._commit_progress(
                     store,
                     (),
                     tuple(pending_system_steps),
@@ -362,10 +364,9 @@ class EpisodeRuntime:
                     event_records,
                     snapshots,
                     cursors,
+                    tuple(pending_completed_weeks),
+                    on_week_completed,
                 )
-                if on_week_completed is not None:
-                    for completed_week in pending_completed_weeks:
-                        await on_week_completed(completed_week)
                 continue
             (
                 eligible,
@@ -384,7 +385,7 @@ class EpisodeRuntime:
             system_steps.extend(limit_steps)
             pending_system_steps.extend(limit_steps)
             if not eligible:
-                self._save_progress(
+                await self._commit_progress(
                     store,
                     (),
                     tuple(pending_system_steps),
@@ -398,11 +399,14 @@ class EpisodeRuntime:
                     event_records,
                     snapshots,
                     cursors,
+                    tuple(pending_completed_weeks),
+                    on_week_completed,
                 )
-                if on_week_completed is not None:
-                    for completed_week in pending_completed_weeks:
-                        await on_week_completed(completed_week)
                 continue
+
+            pricing_round = all(self._is_pricing_wake(event) for event in eligible)
+            if pricing_round != any(self._is_pricing_wake(event) for event in eligible):
+                raise RuntimeError("retail pricing wakes cannot mix with operating wakes")
 
             for event in eligible:
                 if event.company_id is not None:
@@ -479,6 +483,7 @@ class EpisodeRuntime:
                     observation_hash=observation_hash(item.turn),
                     protocol_issue_kind=item.protocol_issue_kind,
                     protocol_error=item.protocol_error,
+                    protocol_fallback_applied=item.commit_fallback,
                     journal_sequence=next_journal_sequence,
                     replay_origin=self._replay_origin(
                         agents[item.turn.company_id],
@@ -490,9 +495,10 @@ class EpisodeRuntime:
                 turns.append(record)
                 new_records.append(record)
                 company_id = item.turn.company_id
-                turn_counts[(economy.week, company_id)] = (
-                    turn_counts.get((economy.week, company_id), 0) + 1
-                )
+                if item.turn.phase is DecisionPhase.OPERATIONS:
+                    turn_counts[(economy.week, company_id)] = (
+                        turn_counts.get((economy.week, company_id), 0) + 1
+                    )
                 previous_outcomes[company_id] = outcome
                 cursors[company_id].available_on = self._available_after(record)
                 agent = agents[company_id]
@@ -503,24 +509,26 @@ class EpisodeRuntime:
                 self._schedule_rejection_retry(
                     scheduler,
                     record,
-                    turn_counts[(economy.week, company_id)],
+                    turn_counts.get((economy.week, company_id), 0),
                 )
                 self._install_attention(
                     scheduler,
                     cursors[company_id],
                     record,
                     item.attention_plan,
-                    turn_counts[(economy.week, company_id)],
+                    turn_counts.get((economy.week, company_id), 0),
                 )
                 self._schedule_trade_wakes(scheduler, record)
+            if pricing_round:
+                self._schedule_settlement(scheduler, economy.week, scheduler.today)
             self._schedule_price_alerts(scheduler, economy, cursors)
             self._retire_bankrupt_companies(economy, scheduler, cursors)
             for record in new_records:
                 company_id = record.turn.company_id
                 audit_key = (economy.week, company_id)
                 if (
-                    turn_counts[audit_key]
-                    != self.scenario.runtime.max_turns_per_company_week
+                    record.turn.phase is DecisionPhase.RETAIL_PRICING
+                    or turn_counts[audit_key] != self.scenario.runtime.max_turns_per_company_week
                     or audit_key in turn_limit_audits
                 ):
                     continue
@@ -536,7 +544,7 @@ class EpisodeRuntime:
                 turn_limit_audits.add(audit_key)
                 system_steps.append(step)
                 pending_system_steps.append(step)
-            self._save_progress(
+            await self._commit_progress(
                 store,
                 tuple(new_records),
                 tuple(pending_system_steps),
@@ -550,10 +558,9 @@ class EpisodeRuntime:
                 event_records,
                 snapshots,
                 cursors,
+                tuple(pending_completed_weeks),
+                on_week_completed,
             )
-            if on_week_completed is not None:
-                for completed_week in pending_completed_weeks:
-                    await on_week_completed(completed_week)
 
         final_state = economy.base_state
         if final_state.completed_weeks != self.scenario.weeks:
@@ -653,6 +660,11 @@ class EpisodeRuntime:
                 )
         return tuple(ready)
 
+    @staticmethod
+    def _is_pricing_wake(event: ScheduledEvent) -> bool:
+        """Return whether one wake belongs to the sealed Sunday pricing round."""
+        return event.wake_reasons == (WakeReason.RETAIL_PRICING,)
+
     def _next_decision_day(self, day: SimDay) -> SimDay | None:
         """Move a causal wake onto the first valid Monday-Saturday."""
         calendar = self.scenario.calendar
@@ -749,6 +761,28 @@ class EpisodeRuntime:
                 before = len(economy.events)
                 economy = self._engine.close_markets(economy, event.scheduled_for)
                 self._append_events(event_records, economy.events[before:])
+                active_retailers = tuple(
+                    company.company_id
+                    for company in economy.scenario.companies
+                    if isinstance(company.operation, RetailerOperation)
+                    and economy.is_active(company.company_id)
+                )
+                for company_id in active_retailers:
+                    scheduler.schedule_wake(
+                        company_id,
+                        event.scheduled_for,
+                        WakeReason.RETAIL_PRICING,
+                        source=JournalEntryReference(
+                            entry_id=entry_id,
+                            entry_type=JournalEntryKind.SYSTEM_STEP,
+                        ),
+                    )
+                if not active_retailers:
+                    self._schedule_settlement(
+                        scheduler,
+                        economy.week,
+                        event.scheduled_for,
+                    )
             elif event.kind is SystemEventKind.CONSUMER_SALES:
                 before = len(economy.events)
                 economy = self._engine.settle_consumer_sales(
@@ -873,10 +907,12 @@ class EpisodeRuntime:
             if self._event_is_visible(record.event, company_id)
         )
         cursor.last_visible_event_sequence = len(event_records)
+        pricing = self._is_pricing_wake(wake_event)
         observation = self._engine.observe_active(
             economy,
             company_id,
             wake_event.scheduled_for,
+            allow_settlement_day=pricing,
         )
         order_books = self._engine.order_books(economy, company_id)
         return AgentTurn(
@@ -884,8 +920,11 @@ class EpisodeRuntime:
             company_id=company_id,
             sim_day=wake_event.scheduled_for,
             state_version=economy.state_version,
-            turn_number_this_week=turn_number_this_week,
-            turn_limit_this_week=self.scenario.runtime.max_turns_per_company_week,
+            phase=(DecisionPhase.RETAIL_PRICING if pricing else DecisionPhase.OPERATIONS),
+            turn_number_this_week=1 if pricing else turn_number_this_week,
+            turn_limit_this_week=(
+                1 if pricing else self.scenario.runtime.max_turns_per_company_week
+            ),
             wake_reasons=wake_event.wake_reasons,
             wake_signals=wake_event.wake_signals,
             observation=observation,
@@ -905,6 +944,9 @@ class EpisodeRuntime:
                 observation,
                 order_books,
                 tuple(record.event for record in event_records),
+            ),
+            retail_pricing_context=(
+                self._engine.retail_pricing_context(economy, company_id) if pricing else None
             ),
             visible_events=visible,
             previous_outcome=previous_outcome,
@@ -949,15 +991,16 @@ class EpisodeRuntime:
                 f"Agent turn timed out after {self._agent_timeout_seconds:g} seconds"
             ) from error
         except ReplayedProtocolError as error:
-            return _PendingTurn(
+            pending = _PendingTurn(
                 turn=turn,
                 decision=IdleDecision(attention=AttentionPlan()),
                 protocol_issue_kind=error.issue_kind,
                 protocol_error=str(error),
             )
+            return self._pricing_fallback(pending) if self._is_pricing_turn(turn) else pending
         except (ModelOutputError, ValidationError) as error:
             reason = f"{type(error).__name__}: {str(error).strip()}"[:450]
-            return _PendingTurn(
+            pending = _PendingTurn(
                 turn=turn,
                 decision=IdleDecision(attention=AttentionPlan()),
                 protocol_issue_kind=(
@@ -967,6 +1010,7 @@ class EpisodeRuntime:
                 ),
                 protocol_error=reason or type(error).__name__,
             )
+            return self._pricing_fallback(pending) if self._is_pricing_turn(turn) else pending
         except Exception as error:
             raise PolicyExecutionError(
                 f"unexpected Agent failure: {type(error).__name__}"
@@ -974,6 +1018,11 @@ class EpisodeRuntime:
 
     def _prepare_attention(self, item: _PendingTurn) -> _PendingTurn:
         """Preflight attention semantics before applying the economic decision."""
+        if self._is_pricing_turn(item.turn):
+            action = item.decision.action if isinstance(item.decision, ActionDecision) else None
+            if isinstance(action, SetRetailPrice):
+                return item
+            return self._pricing_fallback(item)
         if item.protocol_error is not None:
             return item
         try:
@@ -991,6 +1040,38 @@ class EpisodeRuntime:
         )
 
     @staticmethod
+    def _is_pricing_turn(turn: AgentTurn) -> bool:
+        return turn.phase is DecisionPhase.RETAIL_PRICING
+
+    def _pricing_fallback(self, item: _PendingTurn) -> _PendingTurn:
+        """Commit the prior/default price while retaining a protocol-invalid audit."""
+        context = item.turn.retail_pricing_context
+        operation = item.turn.observation.operation
+        if context is None or not isinstance(operation, RetailerOperation):
+            raise RuntimeError("retail pricing fallback requires its typed context")
+        unit_price = (
+            context.previous_retail_price
+            or item.turn.observation.retail_price
+            or self.scenario.consumer_market.initial_retail_price
+        )
+        return _PendingTurn(
+            turn=item.turn,
+            decision=ActionDecision(
+                action=SetRetailPrice(
+                    product=operation.input_product,
+                    unit_price=unit_price,
+                ),
+                attention=AttentionPlan(),
+            ),
+            protocol_issue_kind=(item.protocol_issue_kind or ProtocolIssueKind.INVALID_RESPONSE),
+            protocol_error=(
+                item.protocol_error
+                or "retail pricing turn did not return set_retail_price; prior price retained"
+            ),
+            commit_fallback=True,
+        )
+
+    @staticmethod
     def _application_order(
         pending: tuple[_PendingTurn, ...],
         seed: int,
@@ -1000,9 +1081,7 @@ class EpisodeRuntime:
 
         def priority(item: _PendingTurn) -> tuple[bytes, str]:
             company_id = item.turn.company_id
-            digest = hashlib.sha256(
-                f"{seed}|{on.absolute_day}|{company_id}".encode()
-            ).digest()
+            digest = hashlib.sha256(f"{seed}|{on.absolute_day}|{company_id}".encode()).digest()
             return digest, company_id
 
         return tuple(sorted(pending, key=priority))
@@ -1060,7 +1139,8 @@ class EpisodeRuntime:
         turns_this_week: int,
     ) -> None:
         if (
-            record.outcome.accepted
+            record.turn.phase is DecisionPhase.RETAIL_PRICING
+            or record.outcome.accepted
             or turns_this_week >= self.scenario.runtime.max_turns_per_company_week
         ):
             return
@@ -1097,6 +1177,10 @@ class EpisodeRuntime:
             sunday,
             event_id=f"w{week}.market_close",
         )
+
+    @staticmethod
+    def _schedule_settlement(scheduler: Scheduler, week: int, sunday: SimDay) -> None:
+        """Schedule consumer settlement only after every sealed price is committed."""
         scheduler.schedule_system(
             SystemEventKind.CONSUMER_SALES,
             sunday,
@@ -1133,6 +1217,8 @@ class EpisodeRuntime:
         turns_this_week: int,
     ) -> None:
         """Persist accepted attention and schedule only its fallback review."""
+        if record.turn.phase is DecisionPhase.RETAIL_PRICING:
+            return
         if not record.outcome.accepted:
             return
         if plan is None:
@@ -1251,6 +1337,9 @@ class EpisodeRuntime:
             company_id = wake.company_id
             if company_id is None:
                 raise ValueError("wake event is missing company_id")
+            if self._is_pricing_wake(wake):
+                eligible.append(wake)
+                continue
             key = (economy.week, company_id)
             if counts.get(key, 0) < limit:
                 eligible.append(wake)
@@ -1389,9 +1478,49 @@ class EpisodeRuntime:
     ) -> dict[tuple[int, str], int]:
         counts: dict[tuple[int, str], int] = {}
         for record in turns:
+            if record.turn.phase is DecisionPhase.RETAIL_PRICING:
+                continue
             key = (record.turn.sim_day.week, record.turn.company_id)
             counts[key] = counts.get(key, 0) + 1
         return counts
+
+    async def _commit_progress(
+        self,
+        store: RuntimeStore | None,
+        new_records: tuple[TurnRecord, ...],
+        new_system_steps: tuple[SystemStepRecord, ...],
+        run_id: str,
+        episode_started_at: datetime,
+        economy: EconomyState,
+        scheduler: Scheduler,
+        agents: Mapping[str, CompanyAgent],
+        turns: list[TurnRecord],
+        system_steps: list[SystemStepRecord],
+        events: list[EventRecord],
+        snapshots: list[WeekSnapshot],
+        cursors: Mapping[str, _Cursor],
+        completed_weeks: tuple[int, ...],
+        on_week_completed: WeekCallback | None,
+    ) -> None:
+        """Persist one atomic frontier, then publish its settled-week callbacks."""
+        self._save_progress(
+            store,
+            new_records,
+            new_system_steps,
+            run_id,
+            episode_started_at,
+            economy,
+            scheduler,
+            agents,
+            turns,
+            system_steps,
+            events,
+            snapshots,
+            cursors,
+        )
+        if on_week_completed is not None:
+            for completed_week in completed_weeks:
+                await on_week_completed(completed_week)
 
     @staticmethod
     def _save_progress(

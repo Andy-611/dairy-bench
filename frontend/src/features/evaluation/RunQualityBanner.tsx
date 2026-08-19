@@ -1,7 +1,10 @@
 import type { EpisodeQualityView, ProtocolIssueKind } from "../../shared/api/types";
 
 interface RunQualityBannerProps {
+  readonly completedWeeks: number;
+  readonly provisional: boolean;
   readonly quality: EpisodeQualityView;
+  readonly totalWeeks: number;
 }
 
 const ISSUE_LABELS: Readonly<Record<ProtocolIssueKind, string>> = {
@@ -13,24 +16,35 @@ const ISSUE_LABELS: Readonly<Record<ProtocolIssueKind, string>> = {
   unauthorized_decision_tool: "unauthorized decision tool",
 };
 
-export function RunQualityBanner({ quality }: RunQualityBannerProps) {
-  if (quality.benchmarkEligible) {
+export function RunQualityBanner({
+  completedWeeks,
+  provisional,
+  quality,
+  totalWeeks,
+}: RunQualityBannerProps) {
+  if (!provisional && quality.benchmarkEligible) {
     return null;
   }
   const issues = quality.issues
     .map((issue) => `${issue.count} ${ISSUE_LABELS[issue.kind]}`)
     .join(" · ");
   return (
-    <section className="quality-banner" role="status">
-      <span aria-hidden="true">!</span>
+    <section
+      className={`quality-banner${quality.benchmarkEligible ? " provisional" : ""}`}
+      role="status"
+    >
+      <span aria-hidden="true">{quality.benchmarkEligible ? "i" : "!"}</span>
       <div>
         <strong>
-          Run completed, but {quality.invalidTurnCount} of {quality.totalTurnCount}{" "}
-          turns violated the model-decision protocol
+          {provisional
+            ? `Provisional result through week ${completedWeeks} of ${totalWeeks}`
+            : `Run completed, but ${quality.invalidTurnCount} of ${quality.totalTurnCount} turns violated the model-decision protocol`}
         </strong>
         <p>
-          The economic result is preserved for diagnosis but excluded from benchmark
-          rankings. {issues}.
+          {provisional
+            ? "It refreshes after each weekly settlement and remains outside formal rankings until the full horizon completes."
+            : "The economic result is preserved for diagnosis but excluded from benchmark rankings."}
+          {!quality.benchmarkEligible && ` Protocol issues so far: ${issues}.`}
         </p>
       </div>
     </section>

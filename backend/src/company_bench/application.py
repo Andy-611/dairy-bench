@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 
 from company_bench.agents.factory import AgentFactory, ModelPolicyProfile
 from company_bench.agents.providers.capabilities import ModelCapabilityCatalog
@@ -18,19 +19,24 @@ from company_bench.agents.providers.newapi import (
     NewApiResponsesGateway,
     NewApiTransport,
 )
-from company_bench.domain.models import EpisodeResult, PolicyProfileId
+from company_bench.domain.models import EpisodeResult, PolicyProfileId, ScenarioSpec
 from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.oracle import EnterpriseOracle
+from company_bench.economy.scoring import Evaluator
 from company_bench.runs.coordinator import RunCoordinator
+from company_bench.runs.evaluation import RunEvaluationProjector
 from company_bench.runs.models import (
     PolicyInvocation,
     PolicyProfileView,
     ReplaySource,
+    RunEvaluation,
     RunJob,
 )
 from company_bench.runtime.episode import EpisodeRuntime
 from company_bench.runtime.models import TurnRecord
 from company_bench.settings import MAX_PARALLELISM, ExecutionLimits, RuntimePaths
-from company_bench.storage.store import RunStore, SQLiteRunStore
+from company_bench.storage.repository import RunRepository
+from company_bench.storage.sqlite import SQLiteRunRepository
 from company_bench.timeline.models import TimelineDetail, TimelineWeek
 from company_bench.timeline.projector import RunTimelineProjector
 
@@ -72,7 +78,7 @@ _MODEL_PROFILE_SPECS = (
 
 
 def _compose_model_factory(
-    store: RunStore,
+    store: RunRepository,
     paths: RuntimePaths,
     limits: ExecutionLimits,
     configured_profiles: tuple[tuple[_ModelProfileSpec, NewApiConfig | None], ...],
@@ -139,7 +145,7 @@ async def _close_transports(
 async def _close_resources(
     coordinator: RunCoordinator,
     transports: tuple[NewApiTransport, ...],
-    store: SQLiteRunStore | None,
+    store: SQLiteRunRepository | None,
 ) -> tuple[BaseException, ...]:
     """Close every owned resource without allowing one failure to skip the rest."""
     failures: list[BaseException] = []
@@ -175,24 +181,29 @@ class BenchmarkApplication:
 
     def __init__(
         self,
-        store: RunStore,
+        store: RunRepository,
         agent_factory: AgentFactory,
         *,
         max_concurrent_runs: int = MAX_PARALLELISM,
-        owned_store: SQLiteRunStore | None = None,
+        oracle_cache_directory: Path | None = None,
+        owned_store: SQLiteRunRepository | None = None,
         owned_transports: tuple[NewApiTransport, ...] = (),
     ) -> None:
+        evaluator = Evaluator(oracle=EnterpriseOracle(oracle_cache_directory))
         runtime = EpisodeRuntime(
             agent_factory.scenario,
+            evaluator=evaluator,
             agent_timeout_seconds=agent_factory.policy_timeout_seconds,
         )
         self._store = store
+        self._scenario = agent_factory.scenario
         self._coordinator = RunCoordinator(
             store,
             agent_factory,
             runtime,
             max_concurrent_runs=max_concurrent_runs,
         )
+        self._evaluation = RunEvaluationProjector(store, evaluator)
         self._timeline = RunTimelineProjector(store)
         self._owned_store = owned_store
         self._owned_transports = owned_transports
@@ -200,7 +211,7 @@ class BenchmarkApplication:
     @classmethod
     def create(
         cls,
-        store: RunStore | None = None,
+        store: RunRepository | None = None,
         agent_factory: AgentFactory | None = None,
     ) -> BenchmarkApplication:
         """Compose production Adapters while retaining explicit test seams."""
@@ -214,10 +225,10 @@ class BenchmarkApplication:
             if agent_factory is None
             else ()
         )
-        owned_store = SQLiteRunStore(paths.database) if store is None else None
+        owned_store = SQLiteRunRepository(paths.database) if store is None else None
         active_store = owned_store or store
         if active_store is None:
-            raise AssertionError("application composition requires a RunStore")
+            raise AssertionError("application composition requires a RunRepository")
         owned_transports: tuple[NewApiTransport, ...] = ()
         try:
             if agent_factory is None:
@@ -231,6 +242,7 @@ class BenchmarkApplication:
                 active_store,
                 agent_factory,
                 max_concurrent_runs=limits.max_concurrent_runs,
+                oracle_cache_directory=paths.oracle_cache,
                 owned_store=owned_store,
                 owned_transports=owned_transports,
             )
@@ -265,6 +277,11 @@ class BenchmarkApplication:
     def profiles(self) -> tuple[PolicyProfileView, ...]:
         return self._coordinator.profiles()
 
+    @property
+    def scenario(self) -> ScenarioSpec:
+        """Return the sole active benchmark scenario."""
+        return self._scenario
+
     async def submit(
         self,
         *,
@@ -297,6 +314,9 @@ class BenchmarkApplication:
 
     def run(self, run_id: str) -> EpisodeResult | None:
         return self._store.get(run_id)
+
+    def evaluation(self, run_id: str) -> RunEvaluation | None:
+        return self._evaluation.read(run_id)
 
     def invocations(self, run_id: str) -> tuple[PolicyInvocation, ...]:
         return self._store.list_invocations(run_id)

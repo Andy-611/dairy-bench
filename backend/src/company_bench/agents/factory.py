@@ -62,6 +62,26 @@ class AgentBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedPolicy:
+    """One calibrated policy identity and its optional model configuration."""
+
+    profile_id: PolicyProfileId
+    metadata: PolicyMetadata
+    model_config: NewApiModelConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.metadata.profile_id is not self.profile_id:
+            raise ValueError("resolved policy metadata belongs to another profile")
+        if self.metadata.kind is not self.profile_id.kind:
+            raise ValueError("resolved policy kind must match its profile")
+        model_backed = self.profile_id.kind is PolicyKind.MODEL
+        if model_backed != (self.model_config is not None):
+            raise ValueError("resolved model profiles require one model configuration")
+        if self.model_config is not None and self.metadata.model != self.model_config.model:
+            raise ValueError("resolved policy model identity is inconsistent")
+
+
+@dataclass(frozen=True, slots=True)
 class ModelPolicyProfile:
     """One configured model profile behind the provider-neutral Agent seam."""
 
@@ -99,16 +119,11 @@ class ModelPolicyProfile:
             unavailable_reason=None if self.available else _MODEL_UNAVAILABLE,
         )
 
-    async def ensure(self, model: str | None) -> None:
-        """Validate availability and calibrate the selected model."""
-        config, capabilities = self.dependencies()
-        await capabilities.ensure(config.require_model(model))
-
-    def resolve(self, model: str | None) -> NewApiModelConfig:
-        """Resolve one selected model with its calibrated output limit."""
+    async def resolve(self, model: str | None) -> NewApiModelConfig:
+        """Calibrate and resolve one selected model and output limit."""
         config, capabilities = self.dependencies()
         selected = config.require_model(model)
-        capability = capabilities.require(selected)
+        capability = await capabilities.ensure(selected)
         return config.select_model(selected, max_output_tokens=capability.max_output_tokens)
 
     def dependencies(self) -> tuple[NewApiConfig, ModelCapabilityCatalog]:
@@ -153,7 +168,7 @@ class AgentFactory:
             PolicyProfileView(
                 profile_id=PolicyProfileId.REPLAY,
                 kind=PolicyKind.REPLAY,
-                label="Completed Run Replay",
+                label="Exact Replay",
                 available=True,
                 description="Deterministically replay a completed run without calling models.",
             ),
@@ -173,16 +188,13 @@ class AgentFactory:
         self,
         *,
         run_id: str,
-        profile_id: PolicyProfileId,
-        model: str | None = None,
+        policy: ResolvedPolicy,
         source_turns: tuple[TurnRecord, ...] = (),
         checkpoints: tuple[AgentCheckpoint, ...] = (),
         completed_turns: tuple[TurnRecord, ...] = (),
     ) -> AgentBundle:
         """Create fresh event-driven company actors for one episode."""
-        kind = profile_id.kind
-        if kind is not PolicyKind.MODEL and model is not None:
-            raise ValueError("model is only valid for Model Agents")
+        profile_id = policy.profile_id
         if profile_id is PolicyProfileId.BASELINE:
             return AgentBundle(
                 {company.company_id: BaselineCompanyAgent() for company in self._scenario.companies}
@@ -191,8 +203,9 @@ class AgentFactory:
             return self._replay_agents(source_turns, completed_turns)
 
         profile = self._model_profile(profile_id)
-        config = profile.resolve(model)
-        metadata = _model_metadata(profile, config)
+        config = policy.model_config
+        if config is None:
+            raise ValueError("resolved model policy has no model configuration")
         checkpoint_by_company = {checkpoint.company_id: checkpoint for checkpoint in checkpoints}
         agents: dict[str, CompanyAgent] = {}
         gateways: list[DecisionGateway] = []
@@ -204,38 +217,37 @@ class AgentFactory:
                 company_id=company.company_id,
                 gateway=gateway,
                 audit_sink=self._audit_sink,
-                metadata=metadata,
+                metadata=policy.metadata,
                 checkpoint=checkpoint_by_company.get(company.company_id),
                 memory_token_budget=self._scenario.runtime.compaction_trigger_tokens,
             )
         return AgentBundle(agents, tuple(gateways))
 
-    async def ensure_available(
+    async def resolve_policy(
         self,
         profile_id: PolicyProfileId,
         model: str | None = None,
-    ) -> None:
-        """Calibrate and reject unavailable model profiles before queueing a run."""
-        if profile_id.kind is PolicyKind.MODEL:
-            await self._model_profile(profile_id).ensure(model)
-        elif model is not None:
-            raise ValueError("model is only valid for Model Agents")
-
-    def profile_metadata(
-        self,
-        profile_id: PolicyProfileId,
-        model: str | None = None,
-    ) -> PolicyMetadata:
-        """Resolve the exact persisted identity for one policy selection."""
+    ) -> ResolvedPolicy:
+        """Calibrate once and return the complete policy used by one run."""
         if profile_id.kind is PolicyKind.MODEL:
             profile = self._model_profile(profile_id)
-            return _model_metadata(profile, profile.resolve(model))
+            config = await profile.resolve(model)
+            return ResolvedPolicy(
+                profile_id=profile_id,
+                metadata=_model_metadata(profile, config),
+                model_config=config,
+            )
         if model is not None:
             raise ValueError("model is only valid for Model Agents")
-        return PolicyMetadata(
-            name=("event-baseline" if profile_id is PolicyProfileId.BASELINE else "turn-replay"),
-            kind=profile_id.kind,
+        return ResolvedPolicy(
             profile_id=profile_id,
+            metadata=PolicyMetadata(
+                name=(
+                    "event-baseline" if profile_id is PolicyProfileId.BASELINE else "turn-replay"
+                ),
+                kind=profile_id.kind,
+                profile_id=profile_id,
+            ),
         )
 
     def _model_profile(self, profile_id: PolicyProfileId) -> ModelPolicyProfile:
@@ -252,7 +264,7 @@ class AgentFactory:
     ) -> AgentBundle:
         """Build replay actors at the persisted per-company cursor."""
         if not source_turns:
-            raise ValueError("Completed Run Replay requires a source turn journal")
+            raise ValueError("Exact Replay requires a completed source turn journal")
         completed_by_company = {
             company.company_id: sum(
                 record.turn.company_id == company.company_id for record in completed_turns

@@ -1,3 +1,5 @@
+"""Enterprise-efficiency, fairness, and non-loss scoring for Dairy Bench V9."""
+
 from decimal import Decimal
 
 from company_bench.domain.models import (
@@ -18,18 +20,25 @@ from company_bench.domain.models import (
     WorldState,
 )
 from company_bench.domain.precision import EconomicPrecision
-from company_bench.economy.demand import ConsumerDemandCurve
+from company_bench.economy.consumer import RetailOffer, SharedConsumerMarket
+from company_bench.economy.oracle import EnterpriseOracle
 from company_bench.economy.valuation import EnterpriseValuation
 
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
+_ORACLE_TOLERANCE = Decimal("0.0001")
 
 
 class Evaluator:
-    """Calculate the complete S9 benchmark score behind one pure interface."""
+    """Calculate the complete S9 enterprise score behind one pure interface."""
 
-    def __init__(self, valuation: EnterpriseValuation | None = None) -> None:
+    def __init__(
+        self,
+        valuation: EnterpriseValuation | None = None,
+        oracle: EnterpriseOracle | None = None,
+    ) -> None:
         self._valuation = valuation or EnterpriseValuation()
+        self._oracle = oracle or EnterpriseOracle()
 
     def evaluate(
         self,
@@ -39,15 +48,13 @@ class Evaluator:
         snapshots: tuple[WeekSnapshot, ...],
         events: tuple[DomainEvent, ...],
     ) -> ScoreCard:
-        """Validate and score one complete deterministic episode."""
+        """Validate and score one settled prefix of a deterministic episode."""
         self._validate_episode(scenario, initial_state, final_state, snapshots)
-        demand_curve = ConsumerDemandCurve(spec=scenario.demand)
         self._validate_consumer_sales(
             scenario,
             initial_state.seed,
             snapshots,
             events,
-            demand_curve,
         )
         initial = {company.company_id: company for company in initial_state.companies}
         final = {company.company_id: company for company in final_state.companies}
@@ -66,52 +73,48 @@ class Evaluator:
             (company.surplus for company in company_scores),
             start=ZERO,
         )
-        efficiency_reference_raw = self._efficiency_reference(
+        oracle = self._oracle.evaluate(
             scenario,
             initial_state.seed,
-            demand_curve,
+            final_state.completed_weeks,
         )
-        efficiency_score_raw = (
-            self._unit_interval(efficiency_raw / efficiency_reference_raw)
-            if efficiency_reference_raw > ZERO
+        efficiency_oracle = oracle.enterprise_surplus_upper_bound
+        if efficiency_raw > efficiency_oracle + _ORACLE_TOLERANCE:
+            raise ValueError(
+                "realized enterprise surplus exceeds the Oracle reference; "
+                "score integrity cannot be guaranteed"
+            )
+        efficiency = (
+            self._unit_interval(efficiency_raw / efficiency_oracle)
+            if efficiency_oracle > ZERO
             else ZERO
         )
         company_count = len(company_scores)
-        global_gini_raw = self._gini(
-            tuple(company.final_value for company in company_scores)
-        )
+        global_gini = self._gini(tuple(company.final_value for company in company_scores))
         maximum_gini = Decimal(company_count - 1) / Decimal(company_count)
-        fairness_score_raw = (
-            self._unit_interval(_ONE - global_gini_raw / maximum_gini)
-            if maximum_gini > ZERO
-            else _ONE
+        fairness = (
+            self._unit_interval(_ONE - global_gini / maximum_gini) if maximum_gini > ZERO else _ONE
         )
-        loss_making_company_count = sum(
-            company.surplus < ZERO for company in company_scores
-        )
-        profit_participation_raw = (
-            _ONE - Decimal(loss_making_company_count) / Decimal(company_count)
-        )
-        bankrupt_company_count = self._bankrupt_company_count(events, final_state)
+        loss_count = sum(company.surplus < ZERO for company in company_scores)
+        loss_rate = Decimal(loss_count) / Decimal(company_count)
+        non_loss_ratio = _ONE - loss_rate
+        bankrupt_count = self._bankrupt_company_count(events, final_state)
         final_score = EconomicPrecision.round(
-            _HUNDRED
-            * efficiency_score_raw
-            * (fairness_score_raw * profit_participation_raw).sqrt()
+            _HUNDRED * efficiency * (fairness * non_loss_ratio).sqrt()
         )
 
         return ScoreCard(
             score_version=scenario.scoring.score_version,
             final_score=final_score,
             efficiency_raw=efficiency_raw,
-            efficiency_reference=EconomicPrecision.round(efficiency_reference_raw),
-            efficiency_score=EconomicPrecision.round(efficiency_score_raw),
-            global_gini=EconomicPrecision.round(global_gini_raw),
-            fairness_score=EconomicPrecision.round(fairness_score_raw),
-            profit_participation_score=EconomicPrecision.round(
-                profit_participation_raw
-            ),
-            bankrupt_company_count=bankrupt_company_count,
-            loss_making_company_count=loss_making_company_count,
+            efficiency_oracle=efficiency_oracle,
+            efficiency_score=EconomicPrecision.round(efficiency),
+            global_gini=EconomicPrecision.round(global_gini),
+            fairness_score=EconomicPrecision.round(fairness),
+            non_loss_company_ratio=EconomicPrecision.round(non_loss_ratio),
+            bankrupt_company_count=bankrupt_count,
+            loss_making_company_count=loss_count,
+            loss_making_company_rate=EconomicPrecision.round(loss_rate),
             companies=company_scores,
         )
 
@@ -135,6 +138,7 @@ class Evaluator:
             status=final.status,
             initial_value=initial_value,
             final_cash=final.cash,
+            final_operating_cost_payable=final.operating_cost_payable,
             final_inventory_value=final_inventory,
             final_value=final_value,
             surplus=final_value - initial_value,
@@ -159,9 +163,7 @@ class Evaluator:
         final_state: WorldState,
     ) -> int:
         """Count unique authoritative exits and validate terminal company status."""
-        bankruptcies = tuple(
-            event for event in events if isinstance(event, CompanyBankruptEvent)
-        )
+        bankruptcies = tuple(event for event in events if isinstance(event, CompanyBankruptEvent))
         event_ids = [event.company_id for event in bankruptcies]
         if len(event_ids) != len(set(event_ids)):
             raise ValueError("each company may declare bankruptcy only once")
@@ -182,86 +184,52 @@ class Evaluator:
         seed: int,
         snapshots: tuple[WeekSnapshot, ...],
         events: tuple[DomainEvent, ...],
-        demand_curve: ConsumerDemandCurve,
     ) -> None:
-        """Validate the unique complete consumer-sale grid and snapshot totals."""
+        """Recompute every settled shared-market allocation from authoritative facts."""
         retailer_ids = tuple(
             company.company_id
             for company in scenario.companies
             if isinstance(company.operation, RetailerOperation)
         )
-        expected_keys = tuple(
+        expected_keys = {
             (week, company_id)
-            for week in range(1, scenario.weeks + 1)
+            for week in range(1, len(snapshots) + 1)
             for company_id in retailer_ids
-        )
+        }
         sales = tuple(event for event in events if isinstance(event, ConsumerSaleEvent))
-        indexed_sales = {(event.occurred_on.week, event.company_id): event for event in sales}
-        if len(indexed_sales) != len(sales):
-            raise ValueError("consumer sale events must be unique per week and retailer")
-        if set(indexed_sales) != set(expected_keys):
-            raise ValueError("consumer sale events must cover every week and retailer exactly once")
+        indexed = {(event.occurred_on.week, event.company_id): event for event in sales}
+        if len(indexed) != len(sales) or set(indexed) != expected_keys:
+            raise ValueError("consumer sale events must cover each week and retailer once")
 
-        for sale in sales:
-            expected_potential = demand_curve.potential(
-                seed,
-                sale.occurred_on.week,
-                sale.company_id,
-            )
-            if sale.potential_demand_quantity != expected_potential:
-                raise ValueError("consumer sale potential does not match the episode seed")
-            expected_demand = demand_curve.quantity(
-                sale.potential_demand_quantity,
-                sale.retail_price,
-            )
-            if sale.demand_quantity != expected_demand:
-                raise ValueError("consumer sale demand does not match the continuous curve")
-            if sale.sold_quantity > sale.demand_quantity:
-                raise ValueError("consumer sales cannot exceed demand")
-            expected_revenue = (
-                EconomicPrecision.round(sale.sold_quantity * sale.retail_price)
-                if sale.retail_price is not None
-                else ZERO
-            )
-            if sale.revenue != expected_revenue:
-                raise ValueError("consumer sale revenue does not match price times quantity")
-            if sale.retail_price is None and sale.sold_quantity != ZERO:
-                raise ValueError("a retailer without a price cannot complete consumer sales")
-
+        market = SharedConsumerMarket(scenario.consumer_market)
         snapshots_by_week = {snapshot.week: snapshot for snapshot in snapshots}
-        for week in range(1, scenario.weeks + 1):
-            weekly_sales = tuple(
-                indexed_sales[(week, company_id)] for company_id in retailer_ids
+        for week in range(1, len(snapshots) + 1):
+            weekly_sales = tuple(indexed[(week, company_id)] for company_id in retailer_ids)
+            expected = market.settle(
+                seed,
+                week,
+                tuple(
+                    RetailOffer(
+                        company_id=sale.company_id,
+                        unit_price=sale.retail_price,
+                        available_quantity=sale.saleable_quantity,
+                    )
+                    for sale in weekly_sales
+                ),
             )
-            snapshot = snapshots_by_week[week]
-            if snapshot.consumer_demand != sum(
-                (sale.potential_demand_quantity for sale in weekly_sales),
-                start=ZERO,
+            expected_by_company = {sale.company_id: sale.sold_quantity for sale in expected.sales}
+            if any(
+                sale.sold_quantity != expected_by_company[sale.company_id] for sale in weekly_sales
             ):
-                raise ValueError("snapshot consumer demand does not match consumer events")
+                raise ValueError("consumer sale allocation does not match shared-market rules")
+            snapshot = snapshots_by_week[week]
+            if snapshot.consumer_demand != expected.population.quantity:
+                raise ValueError("snapshot consumer demand does not match hidden population")
             if snapshot.consumer_sales != sum(
                 (sale.sold_quantity for sale in weekly_sales),
                 start=ZERO,
             ):
                 raise ValueError("snapshot consumer sales do not match consumer events")
-
-    @staticmethod
-    def _efficiency_reference(
-        scenario: ScenarioSpec,
-        seed: int,
-        demand_curve: ConsumerDemandCurve,
-    ) -> Decimal:
-        """Derive this seed's reference directly from every retailer-week market."""
-        total = ZERO
-        for week in range(1, scenario.weeks + 1):
-            for company in scenario.companies:
-                operation = company.operation
-                if not isinstance(operation, RetailerOperation):
-                    continue
-                potential = demand_curve.potential(seed, week, company.company_id)
-                unit_cost = scenario.product(operation.input_product).reference_value
-                total += demand_curve.max_net_value(potential, unit_cost)
-        return total
 
     @staticmethod
     def _unit_interval(value: Decimal) -> Decimal:
@@ -275,16 +243,16 @@ class Evaluator:
         final_state: WorldState,
         snapshots: tuple[WeekSnapshot, ...],
     ) -> None:
-        """Reject mismatched, incomplete, or internally inconsistent episode facts."""
+        """Reject mismatched or internally inconsistent settled-prefix facts."""
         if initial_state.scenario != scenario or final_state.scenario != scenario:
             raise ValueError("states do not belong to the supplied scenario")
         if initial_state.seed != final_state.seed:
             raise ValueError("initial and final seeds differ")
         if initial_state.completed_weeks != 0:
             raise ValueError("evaluation must start before week one")
-        if final_state.completed_weeks != scenario.weeks:
-            raise ValueError("evaluation requires a complete episode")
-        expected_weeks = tuple(range(1, scenario.weeks + 1))
+        if not 1 <= final_state.completed_weeks <= scenario.weeks:
+            raise ValueError("evaluation requires at least one completed week")
+        expected_weeks = tuple(range(1, final_state.completed_weeks + 1))
         if tuple(snapshot.week for snapshot in snapshots) != expected_weeks:
             raise ValueError("snapshots must cover every week exactly once")
 
@@ -296,17 +264,16 @@ class Evaluator:
         bottled_reference = scenario.product(ProductId.BOTTLED_MILK).reference_value
         bankrupt_ids: set[CompanyId] = set()
         for snapshot in snapshots:
-            if tuple(company.company_id for company in snapshot.companies) != expected_company_ids:
-                raise ValueError("every snapshot must contain each scenario company exactly once")
+            if tuple(company.company_id for company in snapshot.companies) != (
+                expected_company_ids
+            ):
+                raise ValueError("every snapshot must contain each scenario company once")
             for company in snapshot.companies:
                 if company.week != snapshot.week:
-                    raise ValueError("company snapshot week does not match its parent snapshot")
+                    raise ValueError("company snapshot week does not match its parent")
                 if company.tier is not scenario.company(company.company_id).tier:
                     raise ValueError("company snapshot tier does not match the scenario")
-                if (
-                    company.company_id in bankrupt_ids
-                    and company.status is CompanyStatus.ACTIVE
-                ):
+                if company.company_id in bankrupt_ids and company.status is CompanyStatus.ACTIVE:
                     raise ValueError("bankrupt companies cannot become active again")
                 if company.status is CompanyStatus.BANKRUPT:
                     bankrupt_ids.add(company.company_id)

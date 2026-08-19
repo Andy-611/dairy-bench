@@ -214,14 +214,6 @@ export function attentionFallbackSummary(attention: AttentionPlanView): string {
     : `review after ${attention.reviewAfterDays} ${plural(attention.reviewAfterDays, "day")}`;
 }
 
-export function attentionSummary(attention: AttentionPlanView): string {
-  const fallback = attentionFallbackSummary(attention);
-  if (attention.alerts.length === 0) {
-    return fallback;
-  }
-  return `watch ${attention.alerts.map(quoteAlertSummary).join(" or ")} · fallback ${fallback}`;
-}
-
 export function effectSummary(effect: EconomicEffectView): string {
   switch (effect.kind) {
     case "milk_produced":
@@ -234,6 +226,8 @@ export function effectSummary(effect: EconomicEffectView): string {
       return `${companyLabel(effect.companyId)} received ${formatExactDecimal(effect.quantity)} ${productLabel(effect.product)}`;
     case "consumer_sale":
       return `${companyLabel(effect.companyId)} sold ${formatExactDecimal(effect.soldQuantity)} to consumers for ${formatExactDecimal(effect.revenue)}`;
+    case "retail_operating_cost_charged":
+      return `${companyLabel(effect.companyId)} opened with ${formatExactDecimal(effect.openingPayable)} payable, accrued ${formatExactDecimal(effect.costAccrued)} in store operating cost, paid ${formatExactDecimal(effect.cashPaid)}, and closed with ${formatExactDecimal(effect.closingPayable)} payable`;
     case "inventory_expired":
       return `${companyLabel(effect.companyId)} discarded ${formatExactDecimal(effect.quantity)} ${productLabel(effect.product)}`;
     case "company_bankrupt":

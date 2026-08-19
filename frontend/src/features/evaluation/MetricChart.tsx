@@ -3,6 +3,7 @@ import { formatValue } from "../../shared/format";
 
 interface MetricChartProps {
   readonly snapshots: readonly WeeklySnapshotView[];
+  readonly totalWeeks: number;
 }
 
 interface WeekMetrics {
@@ -81,20 +82,22 @@ function linePath(
     .join(" ");
 }
 
-export function MetricChart({ snapshots }: MetricChartProps) {
+export function MetricChart({ snapshots, totalWeeks }: MetricChartProps) {
   const metrics = aggregateSnapshots(snapshots);
   const firstWeek = metrics[0]?.week ?? 1;
-  const lastWeek = metrics.at(-1)?.week ?? 52;
-  const tickWeeks = [1, 13, 26, 39, 52].filter(
-    (week) => week >= firstWeek && week <= lastWeek,
-  );
+  const lastWeek = metrics.at(-1)?.week ?? totalWeeks;
+  const tickWeeks = chartTicks(firstWeek, lastWeek);
   const weekSpan = lastWeek - firstWeek || 1;
 
   return (
     <section className="panel chart-panel">
       <div className="section-heading">
         <div>
-          <span className="eyebrow">52-WEEK TREND</span>
+          <span className="eyebrow">
+            {lastWeek < totalWeeks
+              ? `TREND THROUGH WEEK ${lastWeek}`
+              : `${totalWeeks}-WEEK TREND`}
+          </span>
           <h2>Supply-chain trends</h2>
         </div>
         <p>Each series uses its own vertical scale.</p>
@@ -106,7 +109,9 @@ export function MetricChart({ snapshots }: MetricChartProps) {
           role="img"
           viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         >
-          <title id="trend-title">52-week supply-chain trends</title>
+          <title id="trend-title">
+            Supply-chain trends through week {lastWeek}
+          </title>
           <desc id="trend-description">
             Cumulative system surplus, inventory value, and weekly consumer
             sales.
@@ -187,4 +192,16 @@ export function MetricChart({ snapshots }: MetricChartProps) {
       </div>
     </section>
   );
+}
+
+function chartTicks(firstWeek: number, lastWeek: number): readonly number[] {
+  const span = Math.max(0, lastWeek - firstWeek);
+  const positions = [0, 0.25, 0.5, 0.75, 1];
+  return [
+    ...new Set(
+      positions.map(
+        (position) => firstWeek + Math.round(span * position),
+      ),
+    ),
+  ];
 }
