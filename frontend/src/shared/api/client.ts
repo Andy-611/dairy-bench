@@ -1,0 +1,1967 @@
+import { companyLabel } from "../labels";
+import { isAbortError } from "../requestErrors";
+import type {
+  AgentUsageSummaryView,
+  AgentTraceView,
+  AttentionPlanView,
+  CompanyResultView,
+  CompanyRole,
+  CompanyStatus,
+  WeeklySnapshotView,
+  DecimalText,
+  DecisionDispositionSource,
+  DecisionStateChangeView,
+  EconomicActionView,
+  EconomicEffectView,
+  EpisodeQualityView,
+  InvocationOutcome,
+  JsonValue,
+  MarketMatchLegView,
+  PolicyMode,
+  PolicyProfileId,
+  PolicyProfileView,
+  ProtocolIssueKind,
+  ReplaySourceView,
+  RunEvaluationView,
+  RunDiagnosticsView,
+  QuoteAlertView,
+  RunJobView,
+  RunRequest,
+  RunStopReason,
+  RunStatus,
+  ScoreView,
+  SystemTimelineItemView,
+  TimelineContextView,
+  TimelineDecisionView,
+  TimelineDayFrameView,
+  TimelineDetailView,
+  TimelineWeekSummaryView,
+  TimelineWeekView,
+  TokenUsageView,
+  TracePreviewView,
+  TurnTimelineItemView,
+  WakeSignalView,
+} from "./types";
+
+type JsonRecord = Readonly<Record<string, unknown>>;
+
+const DECIMAL_TEXT_PATTERN =
+  /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+export class ApiError extends Error {
+  public constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export class DairyBenchApi {
+  public constructor(private readonly baseUrl = "") {}
+
+  public async policyProfiles(
+    signal?: AbortSignal,
+  ): Promise<readonly PolicyProfileView[]> {
+    const payload = await this.requestJson("/api/policy-profiles", signal);
+    return array(payload, "policy profiles").map((profile, index) =>
+      parsePolicyProfile(profile, `profiles[${index}]`),
+    );
+  }
+
+  public async submitRun(
+    request: RunRequest,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    return this.postJob(
+      "/api/runs",
+      signal,
+      runRequestPayload(request),
+    );
+  }
+
+  public async resumeRun(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    return this.postJob(
+      `/api/run-jobs/${encodeURIComponent(runId)}/resume`,
+      signal,
+    );
+  }
+
+  public async runJobs(
+    limit = 100,
+    offset = 0,
+    signal?: AbortSignal,
+  ): Promise<readonly RunJobView[]> {
+    const payload = await this.requestJson(
+      `/api/run-jobs?limit=${limit}&offset=${offset}`,
+      signal,
+    );
+    return array(payload, "RunJob[]").map(parseRunJob);
+  }
+
+  public async replaySources(
+    signal?: AbortSignal,
+  ): Promise<readonly ReplaySourceView[]> {
+    const payload = await this.requestJson("/api/replay-sources", signal);
+    return array(payload, "ReplaySource[]").map(parseReplaySource);
+  }
+
+  public async runJob(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    const payload = await this.requestJson(
+      `/api/run-jobs/${encodeURIComponent(runId)}`,
+      signal,
+    );
+    return parseRunJob(payload);
+  }
+
+  public async stopRun(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<RunJobView> {
+    return this.postJob(
+      `/api/run-jobs/${encodeURIComponent(runId)}/stop`,
+      signal,
+    );
+  }
+
+  public async evaluation(
+    runId: string,
+    signal?: AbortSignal,
+  ): Promise<RunEvaluationView> {
+    const evaluation = await this.requestJson(
+      `/api/runs/${encodeURIComponent(runId)}/evaluation`,
+      signal,
+    );
+    return parseRunEvaluation(evaluation);
+  }
+
+  public async timelineWeek(
+    runId: string,
+    week: number,
+    signal?: AbortSignal,
+  ): Promise<TimelineWeekView> {
+    const payload = await this.requestJson(
+      `/api/runs/${encodeURIComponent(runId)}/timeline?week=${week}`,
+      signal,
+    );
+    return parseTimelineWeek(payload);
+  }
+
+  public async timelineDetail(
+    runId: string,
+    entryId: string,
+    signal?: AbortSignal,
+  ): Promise<TimelineDetailView> {
+    const payload = await this.requestJson(
+      `/api/runs/${encodeURIComponent(runId)}/timeline/${encodeURIComponent(entryId)}`,
+      signal,
+    );
+    return parseTimelineDetail(payload);
+  }
+
+  private async requestJson(
+    path: string,
+    signal?: AbortSignal,
+    init: RequestInit = {},
+  ): Promise<unknown> {
+    const response = await fetch(`${this.baseUrl}${path}`, { ...init, signal });
+    const payload = await readJsonBody(response, signal);
+    if (!response.ok) {
+      throw new ApiError(errorMessage(payload, response.status), response.status);
+    }
+    return payload;
+  }
+
+  private async postJob(
+    path: string,
+    signal?: AbortSignal,
+    body?: Readonly<Record<string, unknown>>,
+  ): Promise<RunJobView> {
+    const payload = await this.requestJson(path, signal, {
+      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      method: "POST",
+    });
+    return parseRunJob(payload);
+  }
+}
+
+async function readJsonBody(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  try {
+    const payload: unknown = await response.json();
+    signal?.throwIfAborted();
+    return payload;
+  } catch (reason: unknown) {
+    if (isAbortError(reason)) {
+      throw reason;
+    }
+    if (signal?.aborted) {
+      throw new DOMException("The request was cancelled.", "AbortError");
+    }
+    return null;
+  }
+}
+
+function runRequestPayload(request: RunRequest): Readonly<Record<string, unknown>> {
+  if (request.kind === "replay") {
+    return {
+      profile_id: request.profileId,
+      source_run_id: request.sourceRunId,
+    };
+  }
+  return request.kind === "model"
+    ? {
+        profile_id: request.profileId,
+        model: request.model,
+        seed: request.seed,
+      }
+    : { profile_id: request.profileId, seed: request.seed };
+}
+
+function parsePolicyProfile(
+  payload: unknown,
+  path: string,
+): PolicyProfileView {
+  const profile = record(payload, path);
+  const profileId = policyProfileId(profile.profile_id, `${path}.profile_id`);
+  const fields = {
+    label: text(profile.label, `${path}.label`),
+    available: boolean(profile.available, `${path}.available`),
+    provider: nullableText(profile.provider, `${path}.provider`),
+    model: nullableText(profile.model, `${path}.model`),
+    models: array(profile.models, `${path}.models`).map((model, index) =>
+      text(model, `${path}.models[${index}]`),
+    ),
+    description: text(profile.description, `${path}.description`),
+    unavailableReason: nullableText(
+      profile.unavailable_reason,
+      `${path}.unavailable_reason`,
+    ),
+  };
+  if (profileId === "baseline") {
+    return {
+      ...fields,
+      profileId,
+      kind: expectedPolicyKind(profile.kind, `${path}.kind`, "baseline"),
+    };
+  }
+  if (profileId === "replay") {
+    return {
+      ...fields,
+      profileId,
+      kind: expectedPolicyKind(profile.kind, `${path}.kind`, "replay"),
+    };
+  }
+  return {
+    ...fields,
+    profileId,
+    kind: expectedPolicyKind(profile.kind, `${path}.kind`, "model"),
+  };
+}
+
+function parseRunJob(payload: unknown): RunJobView {
+  const job = record(payload, "RunJob");
+  const profileId = policyProfileId(job.profile_id, "profile_id");
+  const fields = {
+    runId: text(job.run_id, "run_id"),
+    revision: number(job.revision, "revision"),
+    model: nullableText(job.model, "model"),
+    status: runStatus(job.status, "status"),
+    seed: number(job.seed, "seed"),
+    sourceRunId: nullableText(job.source_run_id, "source_run_id"),
+    scenarioId: text(job.scenario_id, "scenario_id"),
+    currentAbsoluteDay: number(
+      job.current_absolute_day,
+      "current_absolute_day",
+    ),
+    totalWeeks: number(job.total_weeks, "total_weeks"),
+    submittedAt: dateTime(job.submitted_at, "submitted_at"),
+    startedAt: nullableDateTime(job.started_at, "started_at"),
+    finishedAt: nullableDateTime(job.finished_at, "finished_at"),
+    errorMessage: nullableText(job.error_message, "error_message"),
+    stopReason: nullableRunStopReason(job.stop_reason, "stop_reason"),
+    quality:
+      job.quality === null
+        ? null
+        : parseEpisodeQuality(job.quality, "quality"),
+  };
+  if (profileId === "baseline") {
+    return {
+      ...fields,
+      profileId,
+      mode: expectedPolicyKind(job.kind, "kind", "baseline"),
+    };
+  }
+  if (profileId === "replay") {
+    return {
+      ...fields,
+      profileId,
+      mode: expectedPolicyKind(job.kind, "kind", "replay"),
+    };
+  }
+  return {
+    ...fields,
+    profileId,
+    mode: expectedPolicyKind(job.kind, "kind", "model"),
+  };
+}
+
+function parseReplaySource(payload: unknown): ReplaySourceView {
+  const source = record(payload, "ReplaySource");
+  return {
+    runId: text(source.run_id, "run_id"),
+    submittedAt: dateTime(source.submitted_at, "submitted_at"),
+    benchmarkEligible: boolean(
+      source.benchmark_eligible,
+      "benchmark_eligible",
+    ),
+  };
+}
+
+function errorMessage(payload: unknown, status: number): string {
+  if (isRecord(payload)) {
+    const detail = payload.detail;
+    if (typeof detail === "string") {
+      return detail;
+    }
+    if (Array.isArray(detail)) {
+      return `The request failed validation (${detail.length} issues).`;
+    }
+  }
+  return `The backend request failed (HTTP ${status}).`;
+}
+
+function parseRunEvaluation(payload: unknown): RunEvaluationView {
+  const evaluation = record(payload, "RunEvaluation");
+  const scenario = record(evaluation.scenario, "scenario");
+  const score = record(evaluation.score, "score");
+  const companySpecs = array(scenario.companies, "scenario.companies").map(
+    (item, index) => record(item, `scenario.companies[${index}]`),
+  );
+  const policies = array(evaluation.policies, "policies").map((item, index) =>
+    record(item, `policies[${index}]`),
+  );
+  const companyScores = array(score.companies, "score.companies").map(
+    (item, index) => record(item, `score.companies[${index}]`),
+  );
+
+  return {
+    runId: text(evaluation.run_id, "run_id"),
+    scenarioId: text(scenario.scenario_id, "scenario.scenario_id"),
+    seed: number(evaluation.seed, "seed"),
+    completedWeeks: number(evaluation.completed_weeks, "completed_weeks"),
+    totalWeeks: number(scenario.weeks, "scenario.weeks"),
+    provisional: boolean(evaluation.provisional, "provisional"),
+    agentUsage: parseAgentUsage(evaluation.agent_usage, "agent_usage"),
+    score: parseScore(score),
+    quality: parseEpisodeQuality(evaluation.quality, "quality"),
+    companies: companyScores.map((companyScore, index) =>
+      parseCompany(
+        companyScore,
+        companySpecs,
+        policies,
+        `score.companies[${index}]`,
+      ),
+    ),
+    snapshots: parseSnapshots(evaluation.snapshots),
+  };
+}
+
+function parseEpisodeQuality(
+  payload: unknown,
+  path: string,
+): EpisodeQualityView {
+  const quality = record(payload, path);
+  const protocol = record(quality.protocol, `${path}.protocol`);
+  return {
+    benchmarkEligible: boolean(
+      quality.benchmark_eligible,
+      `${path}.benchmark_eligible`,
+    ),
+    totalTurnCount: number(
+      protocol.total_turn_count,
+      `${path}.protocol.total_turn_count`,
+    ),
+    invalidTurnCount: number(
+      protocol.invalid_turn_count,
+      `${path}.protocol.invalid_turn_count`,
+    ),
+    issues: array(protocol.issues, `${path}.protocol.issues`).map(
+      (value, index) => {
+        const issuePath = `${path}.protocol.issues[${index}]`;
+        const issue = record(value, issuePath);
+        return {
+          kind: protocolIssueKind(issue.kind, `${issuePath}.kind`),
+          count: number(issue.count, `${issuePath}.count`),
+        };
+      },
+    ),
+  };
+}
+
+function parseScore(score: JsonRecord): ScoreView {
+  return {
+    finalScore: decimalText(score.final_score, "score.final_score"),
+    efficiencyRaw: decimalText(score.efficiency_raw, "score.efficiency_raw"),
+    efficiencyOracle: decimalText(
+      score.efficiency_oracle,
+      "score.efficiency_oracle",
+    ),
+    efficiencyScore: decimalText(score.efficiency_score, "score.efficiency_score"),
+    globalGini: decimalText(score.global_gini, "score.global_gini"),
+    fairnessScore: decimalText(score.fairness_score, "score.fairness_score"),
+    nonLossCompanyRatio: decimalText(
+      score.non_loss_company_ratio,
+      "score.non_loss_company_ratio",
+    ),
+    bankruptCompanyCount: number(
+      score.bankrupt_company_count,
+      "score.bankrupt_company_count",
+    ),
+    lossMakingCompanyCount: number(
+      score.loss_making_company_count,
+      "score.loss_making_company_count",
+    ),
+    lossMakingCompanyRate: decimalText(
+      score.loss_making_company_rate,
+      "score.loss_making_company_rate",
+    ),
+  };
+}
+
+function parseAgentUsage(
+  payload: unknown,
+  path: string,
+): AgentUsageSummaryView | null {
+  if (payload === null) {
+    return null;
+  }
+  const summary = record(payload, path);
+  return {
+    invocationCount: number(summary.invocation_count, `${path}.invocation_count`),
+    successfulInvocations: number(
+      summary.successful_invocations,
+      `${path}.successful_invocations`,
+    ),
+    providers: array(summary.providers, `${path}.providers`).map((provider, index) =>
+      text(provider, `${path}.providers[${index}]`),
+    ),
+    models: array(summary.models, `${path}.models`).map((model, index) =>
+      text(model, `${path}.models[${index}]`),
+    ),
+    usage: parseTokenUsage(summary.usage, `${path}.usage`),
+  };
+}
+
+function parseTokenUsage(payload: unknown, path: string): TokenUsageView {
+  const usage = record(payload, path);
+  return {
+    inputTokens: number(usage.input_tokens, `${path}.input_tokens`),
+    cachedTokens: number(usage.cached_tokens, `${path}.cached_tokens`),
+    outputTokens: number(usage.output_tokens, `${path}.output_tokens`),
+    reasoningTokens: number(
+      usage.reasoning_tokens,
+      `${path}.reasoning_tokens`,
+    ),
+    totalTokens: number(usage.total_tokens, `${path}.total_tokens`),
+  };
+}
+
+function parseCompany(
+  companyScore: JsonRecord,
+  companySpecs: readonly JsonRecord[],
+  policies: readonly JsonRecord[],
+  path: string,
+): CompanyResultView {
+  const companyId = text(companyScore.company_id, `${path}.company_id`);
+  const companySpec = companySpecs.find(
+    (candidate) => candidate.company_id === companyId,
+  );
+  const policy = policies.find((candidate) => candidate.company_id === companyId);
+
+  if (!companySpec) {
+    throw new Error(`The backend response has no specification for ${companyId}.`);
+  }
+
+  return {
+    companyId,
+    companyName: companyLabel(
+      companyId,
+      text(companySpec.name, `company ${companyId}.name`),
+    ),
+    role: role(companyScore.tier, `${path}.tier`),
+    status: companyStatus(companyScore.status, `${path}.status`),
+    policyName: policy ? text(policy.name, `policy ${companyId}.name`) : "Unknown policy",
+    initialValue: decimalText(companyScore.initial_value, `${path}.initial_value`),
+    finalCash: decimalText(companyScore.final_cash, `${path}.final_cash`),
+    inventoryValue: decimalText(
+      companyScore.final_inventory_value,
+      `${path}.final_inventory_value`,
+    ),
+    surplus: decimalText(companyScore.surplus, `${path}.surplus`),
+    growth: decimalText(companyScore.growth, `${path}.growth`),
+  };
+}
+
+function parseSnapshots(payload: unknown): readonly WeeklySnapshotView[] {
+  return array(payload, "snapshots").flatMap((item, weekIndex) => {
+    const week = record(item, `snapshots[${weekIndex}]`);
+    const weekNumber = number(week.week, `snapshots[${weekIndex}].week`);
+    return array(week.companies, `snapshots[${weekIndex}].companies`).map(
+      (company, companyIndex) => {
+        const snapshot = record(
+          company,
+          `snapshots[${weekIndex}].companies[${companyIndex}]`,
+        );
+        return {
+          week: weekNumber,
+          companyId: text(snapshot.company_id, "snapshot.company_id"),
+          cash: decimalText(snapshot.cash, "snapshot.cash"),
+          inventoryValue: decimalText(
+            snapshot.inventory_value,
+            "snapshot.inventory_value",
+          ),
+          cumulativeSurplus: decimalText(snapshot.surplus, "snapshot.surplus"),
+          consumerSalesQuantity: decimalText(
+            snapshot.weekly_consumer_sales,
+            "snapshot.weekly_consumer_sales",
+          ),
+          expiredQuantity: decimalText(
+            snapshot.weekly_expired_quantity,
+            "snapshot.weekly_expired_quantity",
+          ),
+        };
+      },
+    );
+  });
+}
+
+function parseTimelineWeek(payload: unknown): TimelineWeekView {
+  const timeline = record(payload, "TimelineWeek");
+  return {
+    context: parseTimelineContext(timeline.context, "context"),
+    selectedWeek: number(timeline.selected_week, "selected_week"),
+    weekSummaries: array(timeline.week_summaries, "week_summaries").map(
+      (item, index) =>
+        parseTimelineWeekSummary(item, `week_summaries[${index}]`),
+    ),
+    days: array(timeline.days, "days").map((item, index) =>
+      parseTimelineDayFrame(item, `days[${index}]`),
+    ),
+  };
+}
+
+function parseTimelineDetail(payload: unknown): TimelineDetailView {
+  const detail = record(payload, "TimelineDetail");
+  const item = parseTimelineItem(detail.item, "item");
+  const turnRecord =
+    detail.turn === null
+      ? null
+      : jsonValue(detail.turn, "TimelineDetail.turn");
+  const systemStepRecord =
+    detail.system_step === null
+      ? null
+      : jsonValue(detail.system_step, "TimelineDetail.system_step");
+  if (
+    (item.entryType === "turn") !== (turnRecord !== null) ||
+    (item.entryType === "system") !== (systemStepRecord !== null)
+  ) {
+    throw new Error(
+      "Timeline detail must contain the complete journal record for its entry type.",
+    );
+  }
+  return {
+    context: parseTimelineContext(detail.context, "context"),
+    entry: item,
+    turnRecord,
+    systemStepRecord,
+    traces: array(detail.traces, "traces").map((value, index) =>
+      parseAgentTrace(value, `traces[${index}]`),
+    ),
+  };
+}
+
+function parseTimelineContext(
+  payload: unknown,
+  path: string,
+): TimelineContextView {
+  const context = record(payload, path);
+  return {
+    currentRunId: text(context.run_id, `${path}.run_id`),
+    scenarioId: text(context.scenario_id, `${path}.scenario_id`),
+    scenarioVersion: number(
+      context.scenario_version,
+      `${path}.scenario_version`,
+    ),
+    totalWeeks: number(context.total_weeks, `${path}.total_weeks`),
+    status: runStatus(context.status, `${path}.status`),
+    profileId:
+      context.profile_id === null
+        ? null
+        : policyProfileId(context.profile_id, `${path}.profile_id`),
+    mode: text(context.mode, `${path}.mode`),
+    sourceRunId: nullableText(context.source_run_id, `${path}.source_run_id`),
+    traceRunId: text(context.trace_run_id, `${path}.trace_run_id`),
+    isReplay: boolean(context.replay, `${path}.replay`),
+    currentModelCallCount: number(
+      context.model_call_count,
+      `${path}.model_call_count`,
+    ),
+    sourceModelCallCount: number(
+      context.source_model_call_count,
+      `${path}.source_model_call_count`,
+    ),
+    currentUsage: parseTokenUsage(
+      context.current_usage,
+      `${path}.current_usage`,
+    ),
+    sourceUsage: parseTokenUsage(
+      context.source_usage,
+      `${path}.source_usage`,
+    ),
+    checkpointDay:
+      context.checkpoint_on === null
+        ? null
+        : simDay(context.checkpoint_on, `${path}.checkpoint_on`),
+    checkpointStateVersion: nullableNumber(
+      context.checkpoint_state_version,
+      `${path}.checkpoint_state_version`,
+    ),
+    diagnostics: parseRunDiagnostics(context.diagnostics, `${path}.diagnostics`),
+  };
+}
+
+function parseRunDiagnostics(
+  payload: unknown,
+  path: string,
+): RunDiagnosticsView {
+  const diagnostics = record(payload, path);
+  return {
+    completedWeeks: number(
+      diagnostics.completed_weeks,
+      `${path}.completed_weeks`,
+    ),
+    benchmarkEligible: nullableBoolean(
+      diagnostics.benchmark_eligible,
+      `${path}.benchmark_eligible`,
+    ),
+    protocolInvalidTurns: number(
+      diagnostics.protocol_invalid_turns,
+      `${path}.protocol_invalid_turns`,
+    ),
+    economicRejections: number(
+      diagnostics.economic_rejections,
+      `${path}.economic_rejections`,
+    ),
+    attentionRejections: number(
+      diagnostics.attention_rejections,
+      `${path}.attention_rejections`,
+    ),
+    tradeCount: number(diagnostics.trade_count, `${path}.trade_count`),
+    lastTradeWeek: nullableNumber(
+      diagnostics.last_trade_week,
+      `${path}.last_trade_week`,
+    ),
+    zeroTradeWeekStreak: number(
+      diagnostics.zero_trade_week_streak,
+      `${path}.zero_trade_week_streak`,
+    ),
+    consumerDemand: decimalText(diagnostics.consumer_demand, `${path}.consumer_demand`),
+    consumerSales: decimalText(diagnostics.consumer_sales, `${path}.consumer_sales`),
+    consumerFillRate: decimalText(
+      diagnostics.consumer_fill_rate,
+      `${path}.consumer_fill_rate`,
+    ),
+    expiredQuantity: decimalText(
+      diagnostics.expired_quantity,
+      `${path}.expired_quantity`,
+    ),
+    nearInsolventCompanyIds: array(
+      diagnostics.near_insolvent_company_ids,
+      `${path}.near_insolvent_company_ids`,
+    ).map((value, index) =>
+      text(value, `${path}.near_insolvent_company_ids[${index}]`),
+    ),
+  };
+}
+
+function parseTimelineWeekSummary(
+  payload: unknown,
+  path: string,
+): TimelineWeekSummaryView {
+  const summary = record(payload, path);
+  return {
+    week: number(summary.week, `${path}.week`),
+    turnCount: number(summary.turn_count, `${path}.turn_count`),
+    acceptedCount: number(summary.accepted_count, `${path}.accepted_count`),
+    rejectedCount: number(summary.rejected_count, `${path}.rejected_count`),
+    idleCount: number(summary.idle_count, `${path}.idle_count`),
+    systemStepCount: number(
+      summary.system_step_count,
+      `${path}.system_step_count`,
+    ),
+    eventCount: number(summary.event_count, `${path}.event_count`),
+    tradeQuantity: decimalText(
+      summary.trade_quantity,
+      `${path}.trade_quantity`,
+    ),
+    consumerSales: decimalText(
+      summary.consumer_sales,
+      `${path}.consumer_sales`,
+    ),
+    expiredQuantity: decimalText(
+      summary.expired_quantity,
+      `${path}.expired_quantity`,
+    ),
+  };
+}
+
+function parseTimelineDayFrame(
+  payload: unknown,
+  path: string,
+): TimelineDayFrameView {
+  const day = record(payload, path);
+  return {
+    simDay: simDay(day.sim_day, `${path}.sim_day`),
+    systemSteps: array(day.system_steps, `${path}.system_steps`).map(
+      (value, index) =>
+        parseSystemTimelineItem(value, `${path}.system_steps[${index}]`),
+    ),
+    turns: array(day.turns, `${path}.turns`).map((value, index) =>
+      parseTurnTimelineItem(value, `${path}.turns[${index}]`),
+    ),
+    market: parseMarketFrame(day.market, `${path}.market`),
+  };
+}
+
+function parseMarketFrame(
+  payload: unknown,
+  path: string,
+): TimelineDayFrameView["market"] {
+  const frame = record(payload, path);
+  return {
+    stateVersion: number(frame.state_version, `${path}.state_version`),
+    orderFlow: array(frame.order_flow, `${path}.order_flow`).map((value, index) =>
+      parseMarketOrderFlow(value, `${path}.order_flow[${index}]`),
+    ),
+    trades: array(frame.trades, `${path}.trades`).map((value, index) =>
+      parseTimelineTrade(value, `${path}.trades[${index}]`),
+    ),
+    closingOrderBooks: array(
+      frame.closing_order_books,
+      `${path}.closing_order_books`,
+    ).map((value, index) =>
+      parseObserverOrderBook(value, `${path}.closing_order_books[${index}]`),
+    ),
+  };
+}
+
+function parseMarketOrderFlow(
+  payload: unknown,
+  path: string,
+): TimelineDayFrameView["market"]["orderFlow"][number] {
+  const flow = record(payload, path);
+  const action = text(flow.action, `${path}.action`);
+  const applySequence = number(flow.apply_sequence, `${path}.apply_sequence`);
+  if (action === "keep") {
+    return {
+      action,
+      applySequence,
+      preservedOrder: parseOpenOrder(
+        flow.preserved_order,
+        `${path}.preserved_order`,
+      ),
+    };
+  }
+  if (action === "cancel") {
+    return {
+      action,
+      applySequence,
+      cancelledOrder: parseOpenOrder(flow.cancelled_order, `${path}.cancelled_order`),
+    };
+  }
+  if (action !== "place" && action !== "replace") {
+    throw new Error(`Backend field ${path}.action is not a market order action.`);
+  }
+  const applied = {
+    applySequence,
+    incomingOrder: parseOpenOrder(flow.incoming_order, `${path}.incoming_order`),
+    matches: array(flow.matches, `${path}.matches`).map((value, index) =>
+      parseMarketMatch(value, `${path}.matches[${index}]`),
+    ),
+    matchedQuantity: decimalText(flow.matched_quantity, `${path}.matched_quantity`),
+    remainingQuantity: decimalText(
+      flow.remaining_quantity,
+      `${path}.remaining_quantity`,
+    ),
+    withdrawnQuantity: decimalText(
+      flow.withdrawn_quantity,
+      `${path}.withdrawn_quantity`,
+    ),
+  };
+  return action === "place"
+    ? { action, ...applied }
+    : {
+        action,
+        ...applied,
+        replacedOrder: parseOpenOrder(flow.replaced_order, `${path}.replaced_order`),
+      };
+}
+
+function parseMarketMatch(
+  payload: unknown,
+  path: string,
+): MarketMatchLegView {
+  const match = record(payload, path);
+  return {
+    tradeId: text(match.trade_id, `${path}.trade_id`),
+    makerOrder: parseOpenOrder(match.maker_order, `${path}.maker_order`),
+    quantity: decimalText(match.quantity, `${path}.quantity`),
+    unitPrice: decimalText(match.unit_price, `${path}.unit_price`),
+    makerRemainingQuantity: decimalText(
+      match.maker_remaining_quantity,
+      `${path}.maker_remaining_quantity`,
+    ),
+    makerWithdrawnQuantity: decimalText(
+      match.maker_withdrawn_quantity,
+      `${path}.maker_withdrawn_quantity`,
+    ),
+  };
+}
+
+function parseTimelineTrade(
+  payload: unknown,
+  path: string,
+): TimelineDayFrameView["market"]["trades"][number] {
+  const trade = record(payload, path);
+  return {
+    applySequence: number(trade.apply_sequence, `${path}.apply_sequence`),
+    tradeId: text(trade.trade_id, `${path}.trade_id`),
+    makerOrderId: text(trade.maker_order_id, `${path}.maker_order_id`),
+    takerOrderId: text(trade.taker_order_id, `${path}.taker_order_id`),
+    product: text(trade.product, `${path}.product`),
+    sellerId: text(trade.seller_id, `${path}.seller_id`),
+    buyerId: text(trade.buyer_id, `${path}.buyer_id`),
+    quantity: decimalText(trade.quantity, `${path}.quantity`),
+    unitPrice: decimalText(trade.unit_price, `${path}.unit_price`),
+    arrivesOn: simDay(trade.arrives_on, `${path}.arrives_on`),
+  };
+}
+
+function parseObserverOrderBook(
+  payload: unknown,
+  path: string,
+): TimelineDayFrameView["market"]["closingOrderBooks"][number] {
+  const book = record(payload, path);
+  return {
+    product: text(book.product, `${path}.product`),
+    bids: array(book.bids, `${path}.bids`).map((value, index) =>
+      parseMarketPriceLevel(value, `${path}.bids[${index}]`),
+    ),
+    asks: array(book.asks, `${path}.asks`).map((value, index) =>
+      parseMarketPriceLevel(value, `${path}.asks[${index}]`),
+    ),
+    lastTradePrice: nullableDecimalText(
+      book.last_trade_price,
+      `${path}.last_trade_price`,
+    ),
+    bestBid: nullableDecimalText(book.best_bid, `${path}.best_bid`),
+    bestAsk: nullableDecimalText(book.best_ask, `${path}.best_ask`),
+    spread: nullableDecimalText(book.spread, `${path}.spread`),
+  };
+}
+
+function parseMarketPriceLevel(
+  payload: unknown,
+  path: string,
+): TimelineDayFrameView["market"]["closingOrderBooks"][number]["bids"][number] {
+  const level = record(payload, path);
+  return {
+    unitPrice: decimalText(level.unit_price, `${path}.unit_price`),
+    size: decimalText(level.size, `${path}.size`),
+    orders: array(level.orders, `${path}.orders`).map((value, index) =>
+      parseOpenOrder(value, `${path}.orders[${index}]`),
+    ),
+  };
+}
+
+function parseTimelineItem(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView | SystemTimelineItemView {
+  const item = record(payload, path);
+  const entryType = text(item.entry_type, `${path}.entry_type`);
+  if (entryType === "turn") {
+    return parseTurnTimelineItem(item, path);
+  }
+  if (entryType === "system_step") {
+    return parseSystemTimelineItem(item, path);
+  }
+  throw new Error(`Backend field ${path}.entry_type is not a timeline item.`);
+}
+
+function parseTurnTimelineItem(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView {
+  const item = record(payload, path);
+  const outcome = record(item.outcome, `${path}.outcome`);
+  const companyId = text(item.company_id, `${path}.company_id`);
+  const companyName = text(item.company_name, `${path}.company_name`);
+  const replayOrigin =
+    item.replay_origin === null
+      ? null
+      : record(item.replay_origin, `${path}.replay_origin`);
+  return {
+    entryType: "turn",
+    entryId: text(item.entry_id, `${path}.entry_id`),
+    companyId,
+    companyName: companyLabel(companyId, companyName),
+    role: role(item.tier, `${path}.tier`),
+    simDay: simDay(item.sim_day, `${path}.sim_day`),
+    stateVersion: number(item.state_version, `${path}.state_version`),
+    applySequence: number(item.apply_sequence, `${path}.apply_sequence`),
+    journalSequence: nullableNumber(
+      item.journal_sequence,
+      `${path}.journal_sequence`,
+    ),
+    turnNumberThisWeek: number(
+      item.turn_number_this_week,
+      `${path}.turn_number_this_week`,
+    ),
+    turnLimitThisWeek: number(
+      item.turn_limit_this_week,
+      `${path}.turn_limit_this_week`,
+    ),
+    wakeSignals: array(item.wake_signals, `${path}.wake_signals`).map(
+      (value, index) =>
+        parseWakeSignal(value, `${path}.wake_signals[${index}]`),
+    ),
+    observation: parseObservation(item.observation, `${path}.observation`),
+    observationDelta: parseObservationDelta(
+      item.observation_delta,
+      `${path}.observation_delta`,
+    ),
+    decision: parseTimelineDecision(item.decision, `${path}.decision`),
+    accepted: boolean(outcome.accepted, `${path}.outcome.accepted`),
+    dispositionSource: decisionDispositionSource(
+      item.disposition_source,
+      `${path}.disposition_source`,
+    ),
+    reason: nullableText(outcome.reason, `${path}.outcome.reason`),
+    resultingStateVersion: number(
+      outcome.resulting_state_version,
+      `${path}.outcome.resulting_state_version`,
+    ),
+    quoteLadderResult:
+      outcome.quote_ladder_result === null
+        ? null
+        : parseQuoteLadderResult(
+            outcome.quote_ladder_result,
+            `${path}.outcome.quote_ladder_result`,
+          ),
+    outcomeJobId: nullableText(outcome.job_id, `${path}.outcome.job_id`),
+    effects: parseTimelineEffects(item.effects, `${path}.effects`),
+    stateChanges: array(item.state_changes, `${path}.state_changes`).map(
+      (value, index) =>
+        parseDecisionStateChange(value, `${path}.state_changes[${index}]`),
+    ),
+    nextAvailableOn:
+      item.next_available_on === null
+        ? null
+        : simDay(item.next_available_on, `${path}.next_available_on`),
+    reviewOn:
+      item.review_on === null
+        ? null
+        : simDay(item.review_on, `${path}.review_on`),
+    sourceRunId:
+      replayOrigin === null
+        ? null
+        : text(
+            replayOrigin.source_run_id,
+            `${path}.replay_origin.source_run_id`,
+          ),
+    sourceTurnId:
+      replayOrigin === null
+        ? null
+        : text(
+            replayOrigin.source_turn_id,
+            `${path}.replay_origin.source_turn_id`,
+          ),
+    traces: array(item.traces, `${path}.traces`).map((value, index) =>
+      parseTracePreview(value, `${path}.traces[${index}]`),
+    ),
+    protocolError: nullableText(
+      item.protocol_error,
+      `${path}.protocol_error`,
+    ),
+    title: text(item.title, `${path}.title`),
+    summary: text(item.summary, `${path}.summary`),
+  };
+}
+
+function parseSystemTimelineItem(
+  payload: unknown,
+  path: string,
+): SystemTimelineItemView {
+  const item = record(payload, path);
+  return {
+    entryType: "system",
+    entryId: text(item.entry_id, `${path}.entry_id`),
+    simDay: simDay(item.sim_day, `${path}.sim_day`),
+    kind: text(item.kind, `${path}.kind`),
+    journalSequence: nullableNumber(
+      item.journal_sequence,
+      `${path}.journal_sequence`,
+    ),
+    stateVersionBefore: nullableNumber(
+      item.state_version_before,
+      `${path}.state_version_before`,
+    ),
+    stateVersionAfter: nullableNumber(
+      item.state_version_after,
+      `${path}.state_version_after`,
+    ),
+    referenceIds: array(item.reference_ids, `${path}.reference_ids`).map(
+      (value, index) => text(value, `${path}.reference_ids[${index}]`),
+    ),
+    effects: parseTimelineEffects(item.effects, `${path}.effects`),
+    affectedCompanyIds: array(
+      item.affected_company_ids,
+      `${path}.affected_company_ids`,
+    ).map((value, index) =>
+      text(value, `${path}.affected_company_ids[${index}]`),
+    ),
+    title: text(item.title, `${path}.title`),
+    summary: text(item.summary, `${path}.summary`),
+  };
+}
+
+function parseWakeSignal(payload: unknown, path: string): WakeSignalView {
+  const signal = record(payload, path);
+  const source =
+    signal.source === null
+      ? null
+      : record(signal.source, `${path}.source`);
+  const sourceType =
+    source === null
+      ? null
+      : text(source.entry_type, `${path}.source.entry_type`);
+  if (
+    sourceType !== null &&
+    sourceType !== "turn" &&
+    sourceType !== "system_step"
+  ) {
+    throw new Error(`Backend field ${path}.source.entry_type is invalid.`);
+  }
+  return {
+    reason: text(signal.reason, `${path}.reason`),
+    sourceEntryId:
+      source === null
+        ? null
+        : text(source.entry_id, `${path}.source.entry_id`),
+    sourceEntryType: sourceType,
+    referenceIds: array(signal.reference_ids, `${path}.reference_ids`).map(
+      (value, index) => text(value, `${path}.reference_ids[${index}]`),
+    ),
+  };
+}
+
+function parseObservation(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"] {
+  const observation = record(payload, path);
+  return {
+    cash: decimalText(observation.cash, `${path}.cash`),
+    reservedCash: decimalText(
+      observation.reserved_cash,
+      `${path}.reserved_cash`,
+    ),
+    markedSurplus: decimalText(
+      observation.marked_surplus,
+      `${path}.marked_surplus`,
+    ),
+    inventory: parseInventoryPositions(observation.inventory, `${path}.inventory`),
+    inventoryExpiry: parseInventoryExpiry(
+      observation.inventory_expiry,
+      `${path}.inventory_expiry`,
+    ),
+    retailPrice: nullableDecimalText(
+      observation.retail_price,
+      `${path}.retail_price`,
+    ),
+    openOrders: array(observation.open_orders, `${path}.open_orders`).map(
+      (value, index) =>
+        parseOpenOrder(value, `${path}.open_orders[${index}]`),
+    ),
+    orderBooks: array(observation.order_books, `${path}.order_books`).map(
+      (value, index) => parseOrderBook(value, `${path}.order_books[${index}]`),
+    ),
+    pendingDeliveries: array(
+      observation.pending_deliveries,
+      `${path}.pending_deliveries`,
+    ).map((value, index) =>
+      parseIncomingDelivery(value, `${path}.pending_deliveries[${index}]`),
+    ),
+    activeOperation:
+      observation.active_operation === null
+        ? null
+        : parseOperationJob(
+            observation.active_operation,
+            `${path}.active_operation`,
+          ),
+    remainingOperationCapacity: nullableDecimalText(
+      observation.remaining_operation_capacity,
+      `${path}.remaining_operation_capacity`,
+    ),
+    visibleEventCount: number(
+      observation.visible_event_count,
+      `${path}.visible_event_count`,
+    ),
+    visibleEvents: parseTimelineEffects(
+      observation.visible_events,
+      `${path}.visible_events`,
+    ),
+  };
+}
+
+function parseOpenOrder(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["openOrders"][number] {
+  const order = record(payload, path);
+  const side = text(order.side, `${path}.side`);
+  if (side !== "buy" && side !== "sell") {
+    throw new Error(`Backend field ${path}.side is not a market side.`);
+  }
+  return {
+    orderId: text(order.order_id, `${path}.order_id`),
+    ownerId: text(order.owner_id, `${path}.owner_id`),
+    side,
+    product: text(order.product, `${path}.product`),
+    remainingQuantity: decimalText(
+      order.remaining_quantity,
+      `${path}.remaining_quantity`,
+    ),
+    limitPrice: decimalText(order.limit_price, `${path}.limit_price`),
+    placedOn: simDay(order.placed_on, `${path}.placed_on`),
+    prioritySequence: number(
+      order.priority_sequence,
+      `${path}.priority_sequence`,
+    ),
+    queueAheadQuantity: decimalText(
+      order.queue_ahead_quantity,
+      `${path}.queue_ahead_quantity`,
+    ),
+  };
+}
+
+function parseInventoryPositions(
+  payload: unknown,
+  path: string,
+): Readonly<Record<string, DecimalText>> {
+  return Object.fromEntries(
+    array(payload, path).map((value, index) => {
+      const itemPath = `${path}[${index}]`;
+      const position = record(value, itemPath);
+      return [
+        text(position.product, `${itemPath}.product`),
+        decimalText(position.quantity, `${itemPath}.quantity`),
+      ];
+    }),
+  );
+}
+
+function parseOrderBook(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["orderBooks"][number] {
+  const market = record(payload, path);
+  return {
+    product: text(market.product, `${path}.product`),
+    bids: parsePriceLevels(market.bids, `${path}.bids`),
+    asks: parsePriceLevels(market.asks, `${path}.asks`),
+    lastTradePrice: nullableDecimalText(
+      market.last_trade_price,
+      `${path}.last_trade_price`,
+    ),
+    weeklyVolume: decimalText(market.weekly_volume, `${path}.weekly_volume`),
+  };
+}
+
+function parsePriceLevels(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["orderBooks"][number]["bids"] {
+  return array(payload, path).map((value, index) => {
+    const itemPath = `${path}[${index}]`;
+    const level = record(value, itemPath);
+    return {
+      unitPrice: decimalText(level.unit_price, `${itemPath}.unit_price`),
+      quantity: decimalText(level.quantity, `${itemPath}.quantity`),
+      orderCount: number(level.order_count, `${itemPath}.order_count`),
+    };
+  });
+}
+
+function parseInventoryExpiry(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["inventoryExpiry"] {
+  return array(payload, path).map((value, index) => {
+    const itemPath = `${path}[${index}]`;
+    const bucket = record(value, itemPath);
+    return {
+      product: text(bucket.product, `${itemPath}.product`),
+      expiresEndOfWeek: number(
+        bucket.expires_end_of_week,
+        `${itemPath}.expires_end_of_week`,
+      ),
+      availableQuantity: decimalText(
+        bucket.available_quantity,
+        `${itemPath}.available_quantity`,
+      ),
+      reservedQuantity: decimalText(
+        bucket.reserved_quantity,
+        `${itemPath}.reserved_quantity`,
+      ),
+    };
+  });
+}
+
+function parseIncomingDelivery(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observation"]["pendingDeliveries"][number] {
+  const delivery = record(payload, path);
+  return {
+    tradeId: text(delivery.trade_id, `${path}.trade_id`),
+    product: text(delivery.product, `${path}.product`),
+    quantity: decimalText(delivery.quantity, `${path}.quantity`),
+    arrivesOn: simDay(delivery.arrives_on, `${path}.arrives_on`),
+    expiryBuckets: array(delivery.expiry_buckets, `${path}.expiry_buckets`).map(
+      (value, index) => {
+        const bucketPath = `${path}.expiry_buckets[${index}]`;
+        const bucket = record(value, bucketPath);
+        return {
+          quantity: decimalText(bucket.quantity, `${bucketPath}.quantity`),
+          expiresEndOfWeek: number(
+            bucket.expires_end_of_week,
+            `${bucketPath}.expires_end_of_week`,
+          ),
+        };
+      },
+    ),
+  };
+}
+
+function parseOperationJob(
+  payload: unknown,
+  path: string,
+): NonNullable<TurnTimelineItemView["observation"]["activeOperation"]> {
+  const operation = record(payload, path);
+  const kind = text(operation.kind, `${path}.kind`);
+  if (kind !== "production" && kind !== "transformation") {
+    throw new Error(`Backend field ${path}.kind is not an operation kind.`);
+  }
+  return {
+    jobId: text(operation.job_id, `${path}.job_id`),
+    kind,
+    completesOn: simDay(operation.completes_on, `${path}.completes_on`),
+    outputProduct: text(operation.output_product, `${path}.output_product`),
+    outputQuantity: decimalText(
+      operation.output_quantity,
+      `${path}.output_quantity`,
+    ),
+  };
+}
+
+function parseObservationDelta(
+  payload: unknown,
+  path: string,
+): TurnTimelineItemView["observationDelta"] {
+  const delta = record(payload, path);
+  return {
+    cashBefore: nullableDecimalText(delta.cash_before, `${path}.cash_before`),
+    cashAfter: decimalText(delta.cash_after, `${path}.cash_after`),
+    cashChange: nullableDecimalText(delta.cash_change, `${path}.cash_change`),
+    inventory: array(delta.inventory, `${path}.inventory`).map(
+      (value, index) => {
+        const itemPath = `${path}.inventory[${index}]`;
+        const item = record(value, itemPath);
+        return {
+          product: text(item.product, `${itemPath}.product`),
+          before: nullableDecimalText(item.before, `${itemPath}.before`),
+          after: decimalText(item.after, `${itemPath}.after`),
+          change: nullableDecimalText(item.change, `${itemPath}.change`),
+        };
+      },
+    ),
+    retailPriceBefore: nullableDecimalText(
+      delta.retail_price_before,
+      `${path}.retail_price_before`,
+    ),
+    retailPriceAfter: nullableDecimalText(
+      delta.retail_price_after,
+      `${path}.retail_price_after`,
+    ),
+    openOrderCountBefore: nullableNumber(
+      delta.open_order_count_before,
+      `${path}.open_order_count_before`,
+    ),
+    openOrderCountAfter: number(
+      delta.open_order_count_after,
+      `${path}.open_order_count_after`,
+    ),
+  };
+}
+
+function parseTimelineEffects(
+  payload: unknown,
+  path: string,
+): readonly EconomicEffectView[] {
+  return array(payload, path).map((value, index) => {
+    const effectPath = `${path}[${index}]`;
+    const effect = record(value, effectPath);
+    const kind = text(effect.event_type, `${effectPath}.event_type`);
+    if (kind === "milk_produced") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        requestedQuantity: decimalText(
+          effect.requested_quantity,
+          `${effectPath}.requested_quantity`,
+        ),
+        actualQuantity: decimalText(
+          effect.actual_quantity,
+          `${effectPath}.actual_quantity`,
+        ),
+        unitCost: decimalText(effect.unit_cost, `${effectPath}.unit_cost`),
+        cashCost: decimalText(effect.cash_cost, `${effectPath}.cash_cost`),
+      };
+    }
+    if (kind === "trade_executed") {
+      return {
+        kind,
+        tradeId: text(effect.trade_id, `${effectPath}.trade_id`),
+        sellerId: text(effect.seller_id, `${effectPath}.seller_id`),
+        buyerId: text(effect.buyer_id, `${effectPath}.buyer_id`),
+        product: text(effect.product, `${effectPath}.product`),
+        quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
+        unitPrice: decimalText(effect.unit_price, `${effectPath}.unit_price`),
+        totalValue: decimalText(
+          effect.total_value,
+          `${effectPath}.total_value`,
+        ),
+      };
+    }
+    if (kind === "delivery_completed") {
+      return {
+        kind,
+        tradeId: text(effect.trade_id, `${effectPath}.trade_id`),
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        product: text(effect.product, `${effectPath}.product`),
+        quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
+      };
+    }
+    if (kind === "milk_processed") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        requestedInput: decimalText(
+          effect.requested_input,
+          `${effectPath}.requested_input`,
+        ),
+        actualInput: decimalText(
+          effect.actual_input,
+          `${effectPath}.actual_input`,
+        ),
+        outputQuantity: decimalText(
+          effect.output_quantity,
+          `${effectPath}.output_quantity`,
+        ),
+        cashCost: decimalText(effect.cash_cost, `${effectPath}.cash_cost`),
+      };
+    }
+    if (kind === "consumer_sale") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        saleableQuantity: decimalText(
+          effect.saleable_quantity,
+          `${effectPath}.saleable_quantity`,
+        ),
+        saleableBookValue: decimalText(
+          effect.saleable_book_value,
+          `${effectPath}.saleable_book_value`,
+        ),
+        soldQuantity: decimalText(
+          effect.sold_quantity,
+          `${effectPath}.sold_quantity`,
+        ),
+        retailPrice: nullableDecimalText(
+          effect.retail_price,
+          `${effectPath}.retail_price`,
+        ),
+        revenue: decimalText(effect.revenue, `${effectPath}.revenue`),
+        costOfGoodsSold: decimalText(
+          effect.cost_of_goods_sold,
+          `${effectPath}.cost_of_goods_sold`,
+        ),
+        grossProfit: decimalText(
+          effect.gross_profit,
+          `${effectPath}.gross_profit`,
+        ),
+        soldOut: boolean(effect.sold_out, `${effectPath}.sold_out`),
+      };
+    }
+    if (kind === "retail_operating_cost_charged") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        openingPayable: decimalText(
+          effect.opening_payable,
+          `${effectPath}.opening_payable`,
+        ),
+        costAccrued: decimalText(
+          effect.cost_accrued,
+          `${effectPath}.cost_accrued`,
+        ),
+        cashPaid: decimalText(effect.cash_paid, `${effectPath}.cash_paid`),
+        closingPayable: decimalText(
+          effect.closing_payable,
+          `${effectPath}.closing_payable`,
+        ),
+      };
+    }
+    if (kind === "inventory_expired") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        product: text(effect.product, `${effectPath}.product`),
+        quantity: decimalText(effect.quantity, `${effectPath}.quantity`),
+        referenceValueLoss: decimalText(
+          effect.reference_value_loss,
+          `${effectPath}.reference_value_loss`,
+        ),
+        bookValueLoss: decimalText(
+          effect.book_value_loss,
+          `${effectPath}.book_value_loss`,
+        ),
+      };
+    }
+    if (kind === "company_bankrupt") {
+      return {
+        kind,
+        companyId: text(effect.company_id, `${effectPath}.company_id`),
+        totalAssets: decimalText(
+          effect.total_assets,
+          `${effectPath}.total_assets`,
+        ),
+        cancelledOrderIds: array(
+          effect.cancelled_order_ids,
+          `${effectPath}.cancelled_order_ids`,
+        ).map((orderId, orderIndex) =>
+          text(
+            orderId,
+            `${effectPath}.cancelled_order_ids[${orderIndex}]`,
+          ),
+        ),
+        retailPriceRemoved: boolean(
+          effect.retail_price_removed,
+          `${effectPath}.retail_price_removed`,
+        ),
+      };
+    }
+    throw new Error(`Backend field ${effectPath}.event_type is unknown.`);
+  });
+}
+
+function parseTimelineDecision(
+  payload: unknown,
+  path: string,
+): TimelineDecisionView {
+  const decision = record(payload, path);
+  const kind = text(decision.kind, `${path}.kind`);
+  const attention = parseAttentionPlan(decision.attention, `${path}.attention`);
+  if (kind === "action") {
+    return {
+      kind,
+      action: parseEconomicAction(decision.action, `${path}.action`),
+      attention,
+    };
+  }
+  if (kind === "idle") {
+    return { kind, attention };
+  }
+  throw new Error(`Backend field ${path}.kind is not a company decision.`);
+}
+
+function parseAttentionPlan(payload: unknown, path: string): AttentionPlanView {
+  const attention = record(payload, path);
+  return {
+    reviewAfterDays: nullableNumber(
+      attention.review_after_days,
+      `${path}.review_after_days`,
+    ),
+    alerts: array(attention.alerts, `${path}.alerts`).map((value, index) =>
+      parseQuoteAlert(value, `${path}.alerts[${index}]`),
+    ),
+  };
+}
+
+function parseEconomicAction(payload: unknown, path: string): EconomicActionView {
+  const action = record(payload, path);
+  const kind = text(action.kind, `${path}.kind`);
+  if (kind === "produce") {
+    return {
+      kind,
+      product: text(action.product, `${path}.product`),
+      quantity: decimalText(action.quantity, `${path}.quantity`),
+    };
+  }
+  if (kind === "transform") {
+    return {
+      kind,
+      inputProduct: text(action.input_product, `${path}.input_product`),
+      outputProduct: text(action.output_product, `${path}.output_product`),
+      inputQuantity: decimalText(
+        action.input_quantity,
+        `${path}.input_quantity`,
+      ),
+    };
+  }
+  if (kind === "set_quote_ladder") {
+    const side = text(action.side, `${path}.side`);
+    if (side !== "buy" && side !== "sell") {
+      throw new Error(`Backend field ${path}.side is not a market side.`);
+    }
+    return {
+      kind,
+      side,
+      product: text(action.product, `${path}.product`),
+      levels: array(action.levels, `${path}.levels`).map((value, index) =>
+        parseQuoteLevel(value, `${path}.levels[${index}]`),
+      ),
+    };
+  }
+  if (kind === "set_retail_price") {
+    return {
+      kind,
+      product: text(action.product, `${path}.product`),
+      unitPrice: decimalText(action.unit_price, `${path}.unit_price`),
+    };
+  }
+  throw new Error(`Backend field ${path}.kind is not an economic action.`);
+}
+
+function parseQuoteLevel(
+  payload: unknown,
+  path: string,
+): Extract<
+  EconomicActionView,
+  { readonly kind: "set_quote_ladder" }
+>["levels"][number] {
+  const level = record(payload, path);
+  return {
+    quantity: decimalText(level.quantity, `${path}.quantity`),
+    limitPrice: decimalText(level.limit_price, `${path}.limit_price`),
+  };
+}
+
+function parseQuoteLadderResult(
+  payload: unknown,
+  path: string,
+): NonNullable<TurnTimelineItemView["quoteLadderResult"]> {
+  const result = record(payload, path);
+  return {
+    levels: array(result.levels, `${path}.levels`).map((value, index) => {
+      const levelPath = `${path}.levels[${index}]`;
+      const level = record(value, levelPath);
+      const action = text(level.action, `${levelPath}.action`);
+      if (action !== "keep" && action !== "place" && action !== "replace") {
+        throw new Error(
+          `Backend field ${levelPath}.action is not a quote action.`,
+        );
+      }
+      return {
+        level: parseQuoteLevel(level.level, `${levelPath}.level`),
+        action,
+        orderId: text(level.order_id, `${levelPath}.order_id`),
+        replacedOrderId: nullableText(
+          level.replaced_order_id,
+          `${levelPath}.replaced_order_id`,
+        ),
+        prioritySequence: number(
+          level.priority_sequence,
+          `${levelPath}.priority_sequence`,
+        ),
+        remainingQuantity: decimalText(
+          level.remaining_quantity,
+          `${levelPath}.remaining_quantity`,
+        ),
+      };
+    }),
+    cancelledOrderIds: array(
+      result.cancelled_order_ids,
+      `${path}.cancelled_order_ids`,
+    ).map((value, index) =>
+      text(value, `${path}.cancelled_order_ids[${index}]`),
+    ),
+  };
+}
+
+function parseQuoteAlert(payload: unknown, path: string): QuoteAlertView {
+  const alert = record(payload, path);
+  const quote = text(alert.quote, `${path}.quote`);
+  const operator = text(alert.operator, `${path}.operator`);
+  if (quote !== "best_ask" && quote !== "best_bid") {
+    throw new Error(`Backend field ${path}.quote is not a supported quote.`);
+  }
+  if (operator !== "at_least" && operator !== "at_most") {
+    throw new Error(`Backend field ${path}.operator is not a price comparison.`);
+  }
+  return {
+    product: text(alert.product, `${path}.product`),
+    quote,
+    operator,
+    price: decimalText(alert.price, `${path}.price`),
+  };
+}
+
+function parseTracePreview(
+  payload: unknown,
+  path: string,
+): TracePreviewView {
+  const preview = record(payload, path);
+  return {
+    traceRunId: text(preview.trace_run_id, `${path}.trace_run_id`),
+    invocationId: text(preview.invocation_id, `${path}.invocation_id`),
+    isSourceTrace: boolean(preview.source_trace, `${path}.source_trace`),
+    profileId: policyProfileId(preview.profile_id, `${path}.profile_id`),
+    provider: text(preview.provider, `${path}.provider`),
+    model: text(preview.model, `${path}.model`),
+    wireProtocol: text(preview.wire_protocol, `${path}.wire_protocol`),
+    adapterVersion: text(preview.adapter_version, `${path}.adapter_version`),
+    configFingerprint: text(
+      preview.config_fingerprint,
+      `${path}.config_fingerprint`,
+    ),
+    outcome: invocationOutcome(preview.outcome, `${path}.outcome`),
+    usage: parseTokenUsage(preview.usage, `${path}.usage`),
+    latencyMs: number(preview.latency_ms, `${path}.latency_ms`),
+    attempts: number(preview.attempts, `${path}.attempts`),
+    appliedToCommittedTurn: boolean(
+      preview.applied_to_committed_turn,
+      `${path}.applied_to_committed_turn`,
+    ),
+  };
+}
+
+function parseDecisionStateChange(
+  payload: unknown,
+  path: string,
+): DecisionStateChangeView {
+  const change = record(payload, path);
+  const changeType = text(change.change_type, `${path}.change_type`);
+  if (changeType === "order_placed") {
+    const side = text(change.side, `${path}.side`);
+    if (side !== "buy" && side !== "sell") {
+      throw new Error(`Backend field ${path}.side is not a market side.`);
+    }
+    return {
+      changeType,
+      orderId: text(change.order_id, `${path}.order_id`),
+      side,
+      product: text(change.product, `${path}.product`),
+      quantity: decimalText(change.quantity, `${path}.quantity`),
+      limitPrice: decimalText(change.limit_price, `${path}.limit_price`),
+    };
+  }
+  if (changeType === "order_cancelled") {
+    return {
+      changeType,
+      orderId: text(change.order_id, `${path}.order_id`),
+    };
+  }
+  if (changeType === "order_replaced") {
+    return {
+      changeType,
+      replacedOrderId: text(
+        change.replaced_order_id,
+        `${path}.replaced_order_id`,
+      ),
+      orderId: text(change.order_id, `${path}.order_id`),
+      quantity: decimalText(change.quantity, `${path}.quantity`),
+      limitPrice: decimalText(change.limit_price, `${path}.limit_price`),
+    };
+  }
+  if (changeType === "retail_price_changed") {
+    return {
+      changeType,
+      product: text(change.product, `${path}.product`),
+      before:
+        change.before === null
+          ? null
+          : decimalText(change.before, `${path}.before`),
+      after: decimalText(change.after, `${path}.after`),
+    };
+  }
+  throw new Error(`Backend field ${path}.change_type is not a state change.`);
+}
+
+function parseAgentTrace(payload: unknown, path: string): AgentTraceView {
+  const trace = record(payload, path);
+  return { preview: parseTracePreview(trace.preview, `${path}.preview`) };
+}
+
+function simDay(payload: unknown, path: string): { readonly absoluteDay: number } {
+  const day = record(payload, path);
+  return { absoluteDay: number(day.absolute_day, `${path}.absolute_day`) };
+}
+
+function jsonValue(value: unknown, path: string): JsonValue {
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => jsonValue(item, `${path}[${index}]`));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        jsonValue(item, `${path}.${key}`),
+      ]),
+    );
+  }
+  throw new Error(`Backend field ${path} is not valid JSON.`);
+}
+
+function record(value: unknown, path: string): JsonRecord {
+  if (!isRecord(value)) {
+    throw new Error(`Backend field ${path} must be an object.`);
+  }
+  return value;
+}
+
+function array(value: unknown, path: string): readonly unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Backend field ${path} must be an array.`);
+  }
+  return value;
+}
+
+function text(value: unknown, path: string): string {
+  const parsed = plainText(value, path);
+  if (parsed.length === 0) {
+    throw new Error(`Backend field ${path} must be non-empty text.`);
+  }
+  return parsed;
+}
+
+function number(value: unknown, path: string): number {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Backend field ${path} must be a finite number.`);
+  }
+  return parsed;
+}
+
+function decimalText(value: unknown, path: string): DecimalText {
+  const parsed = plainText(value, path);
+  if (parsed.trim() !== parsed || !DECIMAL_TEXT_PATTERN.test(parsed)) {
+    throw new Error(`Backend field ${path} must be finite decimal text.`);
+  }
+  return parsed as DecimalText;
+}
+
+function boolean(value: unknown, path: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`Backend field ${path} must be a boolean.`);
+  }
+  return value;
+}
+
+function role(value: unknown, path: string): CompanyRole {
+  if (value === "farm" || value === "processor" || value === "retailer") {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known company tier.`);
+}
+
+function decisionDispositionSource(
+  value: unknown,
+  path: string,
+): DecisionDispositionSource {
+  if (
+    value === "economic_engine" ||
+    value === "runtime_attention" ||
+    value === "runtime_protocol"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known disposition source.`);
+}
+
+function policyMode(value: unknown, path: string): PolicyMode {
+  if (
+    value === "baseline" ||
+    value === "model" ||
+    value === "replay"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known run mode.`);
+}
+
+function policyProfileId(value: unknown, path: string): PolicyProfileId {
+  if (
+    value === "baseline" ||
+    value === "newapi-model" ||
+    value === "newapi-codex" ||
+    value === "newapi-claude-code" ||
+    value === "replay"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known policy profile ID.`);
+}
+
+function expectedPolicyKind<const Kind extends PolicyMode>(
+  value: unknown,
+  path: string,
+  expected: Kind,
+): Kind {
+  const kind = policyMode(value, path);
+  if (kind !== expected) {
+    throw new Error(`Backend field ${path} must be ${expected}, received ${kind}.`);
+  }
+  return expected;
+}
+
+function runStatus(value: unknown, path: string): RunStatus {
+  if (
+    value === "queued" ||
+    value === "running" ||
+    value === "interrupted" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "stopped"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known run status.`);
+}
+
+function invocationOutcome(value: unknown, path: string): InvocationOutcome {
+  if (
+    value === "success" ||
+    value === "agent_error" ||
+    value === "infrastructure_error"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known invocation outcome.`);
+}
+
+function companyStatus(value: unknown, path: string): CompanyStatus {
+  if (value === "active" || value === "bankrupt") {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known company status.`);
+}
+
+function nullableRunStopReason(
+  value: unknown,
+  path: string,
+): RunStopReason | null {
+  if (value === null) {
+    return null;
+  }
+  if (value === "user_requested" || value === "quota_exhausted") {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known stop reason.`);
+}
+
+function protocolIssueKind(value: unknown, path: string): ProtocolIssueKind {
+  if (
+    value === "context_too_large" ||
+    value === "invalid_arguments" ||
+    value === "invalid_response" ||
+    value === "missing_tool_call" ||
+    value === "multiple_tool_calls" ||
+    value === "unauthorized_decision_tool"
+  ) {
+    return value;
+  }
+  throw new Error(`Backend field ${path} is not a known protocol issue.`);
+}
+
+function nullableBoolean(value: unknown, path: string): boolean | null {
+  return value === null ? null : boolean(value, path);
+}
+
+function nullableText(value: unknown, path: string): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`Backend field ${path} must be text or null.`);
+  }
+  return value.length > 0 ? value : null;
+}
+
+function nullableNumber(value: unknown, path: string): number | null {
+  return value === null ? null : number(value, path);
+}
+
+function nullableDecimalText(
+  value: unknown,
+  path: string,
+): DecimalText | null {
+  return value === null ? null : decimalText(value, path);
+}
+
+function dateTime(value: unknown, path: string): string {
+  const parsed = text(value, path);
+  if (Number.isNaN(Date.parse(parsed))) {
+    throw new Error(`Backend field ${path} is not a valid date-time.`);
+  }
+  return parsed;
+}
+
+function nullableDateTime(value: unknown, path: string): string | null {
+  return value === null ? null : dateTime(value, path);
+}
+
+function plainText(value: unknown, path: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`Backend field ${path} must be text.`);
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}

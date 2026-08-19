@@ -1,466 +1,928 @@
-import asyncio
-from collections.abc import Callable
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
-from company_bench.dairy_scenario import DAIRY_V1_SCENARIO
-from company_bench.engine import EconomyEngine
-from company_bench.models import (
-    CompanyDecision,
+from company_bench.domain.calendar import SimDay, Weekday
+from company_bench.domain.models import (
+    MAX_SEED,
+    CompanyBankruptEvent,
     CompanyState,
+    CompanyStatus,
     ConsumerSaleEvent,
-    DecisionRejectedEvent,
-    FarmDecision,
+    DeliveryCompletedEvent,
+    FarmOperation,
     InventoryExpiredEvent,
+    InventoryLot,
     MilkProcessedEvent,
     MilkProducedEvent,
-    NoOpDecision,
-    ProcessorDecision,
+    ProcessorOperation,
     ProductId,
-    RecordedDecision,
-    RetailerDecision,
+    RetailerOperation,
+    RetailOperatingCostChargedEvent,
     TradeExecutedEvent,
-    WorldState,
 )
-from company_bench.policies import BaselinePolicy
-from company_bench.scoring import Evaluator
+from company_bench.domain.scenario import DAIRY_S9_SCENARIO
+from company_bench.economy.engine import EconomyEngine, EconomyState
+from company_bench.runtime.models import (
+    ActionDecision,
+    AttentionPlan,
+    DecisionEnvelope,
+    DecisionOutcome,
+    EconomicCommand,
+    MarketSide,
+    Produce,
+    QuoteLevel,
+    QuoteLevelAction,
+    SetQuoteLadder,
+    SetRetailPrice,
+    Transform,
+)
+
+ZERO = Decimal()
 
 
-def _record(
-    engine: EconomyEngine,
-    state: WorldState,
-    choose: Callable[[str], CompanyDecision],
-) -> tuple[RecordedDecision, ...]:
-    """Bind custom decisions to the current morning observations."""
-    return tuple(
-        RecordedDecision(
-            observation_id=observation.observation_id,
-            day=observation.day,
-            company_id=observation.company_id,
-            decision=choose(observation.company_id),
-        )
-        for observation in engine.observe(state)
+@pytest.fixture
+def engine() -> EconomyEngine:
+    """Return one stateless economy engine."""
+    return EconomyEngine()
+
+
+@pytest.fixture
+def economy(engine: EconomyEngine) -> EconomyState:
+    """Open the canonical first trading week."""
+    return engine.open_week(engine.initial_state(DAIRY_S9_SCENARIO, seed=7))
+
+
+def test_company_state_owns_inventory_quantity_book_value_and_expiry_queries() -> None:
+    state = CompanyState(
+        company_id="retailer_a",
+        cash="100",
+        inventory=(
+            InventoryLot(
+                lot_id="raw_a",
+                product=ProductId.RAW_MILK,
+                quantity="2",
+                unit_book_cost="1",
+                produced_week=1,
+                expires_end_of_week=2,
+            ),
+            InventoryLot(
+                lot_id="raw_b",
+                product=ProductId.RAW_MILK,
+                quantity="3",
+                unit_book_cost="1.5",
+                produced_week=1,
+                expires_end_of_week=2,
+            ),
+            InventoryLot(
+                lot_id="bottled",
+                product=ProductId.BOTTLED_MILK,
+                quantity="4",
+                unit_book_cost="2",
+                produced_week=1,
+                expires_end_of_week=3,
+            ),
+        ),
+    )
+
+    positions = state.inventory_positions(ProductId.RAW_MILK)
+
+    assert state.inventory_quantity(ProductId.RAW_MILK) == Decimal("5")
+    assert state.inventory_book_value(ProductId.RAW_MILK) == Decimal("6.5")
+    assert len(positions) == 1
+    assert positions[0].quantity == Decimal("5")
+    assert positions[0].book_value == Decimal("6.5")
+    assert tuple(position.product for position in state.inventory_positions()) == (
+        ProductId.BOTTLED_MILK,
+        ProductId.RAW_MILK,
     )
 
 
-def _baseline_records(
-    engine: EconomyEngine,
-    state: WorldState,
-) -> tuple[RecordedDecision, ...]:
-    """Run one BaselinePolicy concurrently for all observations."""
-    observations = engine.observe(state)
+def _day(weekday: Weekday, *, week: int = 1) -> SimDay:
+    """Build one named day in a trading week."""
+    return SimDay.at(week=week, weekday=weekday)
 
-    async def decide_all() -> tuple[CompanyDecision, ...]:
-        policy = BaselinePolicy()
-        return tuple(
-            await asyncio.gather(
-                *(policy.decide(observation) for observation in observations)
-            )
-        )
 
-    decisions = asyncio.run(decide_all())
-    return tuple(
-        RecordedDecision(
-            observation_id=observation.observation_id,
-            day=observation.day,
-            company_id=observation.company_id,
-            decision=decision,
-        )
-        for observation, decision in zip(
-            observations,
-            decisions,
-            strict=True,
-        )
+def _envelope(
+    economy: EconomyState,
+    company_id: str,
+    command: EconomicCommand,
+    on: SimDay,
+    sequence: int,
+) -> DecisionEnvelope:
+    """Bind one command to authoritative runtime identity and state."""
+    identity = f"{company_id}.d{on.absolute_day}.{sequence}"
+    return DecisionEnvelope(
+        turn_id=f"turn.{identity}",
+        decision_id=f"decision.{identity}",
+        company_id=company_id,
+        issued_on=on,
+        state_version=economy.state_version,
+        decision=ActionDecision(action=command, attention=AttentionPlan()),
     )
 
 
-def _no_op(_: str) -> CompanyDecision:
-    """Return a valid no-op for any operation."""
-    return NoOpDecision()
+def _apply(
+    engine: EconomyEngine,
+    economy: EconomyState,
+    company_id: str,
+    command: EconomicCommand,
+    on: SimDay,
+    sequence: int,
+) -> tuple[EconomyState, DecisionOutcome]:
+    """Apply one command and return its sole outcome."""
+    updated, outcomes = engine.apply_batch(
+        economy,
+        (_envelope(economy, company_id, command, on, sequence),),
+        first_apply_sequence=sequence,
+    )
+    return updated, outcomes[0]
 
 
-def test_scenario_is_strongly_typed_frozen_and_six_company() -> None:
-    scenario = DAIRY_V1_SCENARIO
+def _company(economy: EconomyState, company_id: str) -> CompanyState:
+    """Return one company's available state."""
+    return next(company for company in economy.companies if company.company_id == company_id)
 
-    assert scenario.days == 30
-    assert len(scenario.companies) == 6
-    assert {company.tier.value for company in scenario.companies} == {
-        "farm",
-        "processor",
-        "retailer",
-    }
-    with pytest.raises(ValidationError):
-        scenario.model_copy(update={"unexpected": "field"}).model_validate(
-            {
-                **scenario.model_dump(),
-                "unexpected": "field",
+
+def _quantity(economy: EconomyState, company_id: str, product: ProductId) -> Decimal:
+    """Aggregate one company's available product inventory."""
+    return sum(
+        (lot.quantity for lot in _company(economy, company_id).inventory if lot.product is product),
+        start=ZERO,
+    )
+
+
+def _produce(quantity: Decimal | str) -> Produce:
+    """Build a raw-milk production command."""
+    return Produce(product=ProductId.RAW_MILK, quantity=Decimal(quantity))
+
+
+def _transform(quantity: Decimal | str) -> Transform:
+    """Build a raw-to-bottled transformation command."""
+    return Transform(
+        input_product=ProductId.RAW_MILK,
+        output_product=ProductId.BOTTLED_MILK,
+        input_quantity=Decimal(quantity),
+    )
+
+
+def _quote(
+    side: MarketSide,
+    product: ProductId,
+    quantity: Decimal | str,
+    price: Decimal | str,
+) -> SetQuoteLadder:
+    """Build one single-level target quote ladder."""
+    return SetQuoteLadder(
+        side=side,
+        product=product,
+        levels=(QuoteLevel(quantity=Decimal(quantity), limit_price=Decimal(price)),),
+    )
+
+
+def _cancel(side: MarketSide, product: ProductId) -> SetQuoteLadder:
+    """Build an empty target ladder that cancels one side."""
+    return SetQuoteLadder(side=side, product=product, levels=())
+
+
+def _open_with_lots(
+    engine: EconomyEngine,
+    company_id: str,
+    lots: tuple[InventoryLot, ...],
+    *,
+    cash: Decimal = Decimal("1000"),
+) -> EconomyState:
+    """Open week one with explicit test inventory for one company."""
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    companies = tuple(
+        company.model_copy(update={"cash": cash, "inventory": lots})
+        if company.company_id == company_id
+        else company
+        for company in world.companies
+    )
+    return engine.open_week(world.model_copy(update={"companies": companies}))
+
+
+def _open_with_inventory(
+    engine: EconomyEngine,
+    company_id: str,
+    product: ProductId,
+    quantity: Decimal | str,
+    *,
+    expires_end_of_week: int = 4,
+    cash: Decimal = Decimal("1000"),
+) -> EconomyState:
+    """Open week one with one traceable lot."""
+    return _open_with_lots(
+        engine,
+        company_id,
+        (
+            InventoryLot(
+                lot_id=f"seed.{company_id}.{product.value}",
+                product=product,
+                quantity=Decimal(quantity),
+                produced_week=1,
+                expires_end_of_week=expires_end_of_week,
+            ),
+        ),
+        cash=cash,
+    )
+
+
+def _complete_job(
+    engine: EconomyEngine,
+    economy: EconomyState,
+    outcome: DecisionOutcome,
+) -> EconomyState:
+    """Complete the operation scheduled by one accepted decision."""
+    assert outcome.accepted and outcome.job_id is not None
+    completion = outcome.scheduled_completions[0]
+    return engine.complete_operation(economy, outcome.job_id, completion.scheduled_for)
+
+
+def _settle_week(engine: EconomyEngine, economy: EconomyState):
+    """Run the fixed Sunday close, consumer settlement, and week close."""
+    sunday = _day(Weekday.SUNDAY, week=economy.week)
+    closed = engine.close_markets(economy, sunday)
+    sold = engine.settle_consumer_sales(closed, sunday)
+    return engine.close_week(sold, sunday)
+
+
+def test_scenario_uses_52_weeks_and_formula_driven_weekly_quantities(
+    economy: EconomyState,
+) -> None:
+    scenario = economy.scenario
+
+    assert scenario.weeks == 52
+    assert scenario.scenario_id == "flow.dairy.base.s9.v9"
+    assert scenario.version == 9
+    assert scenario.runtime.operation_duration_days == 1
+    assert scenario.runtime.delivery_duration_days == 1
+    assert scenario.runtime.max_turns_per_company_week == 6
+    assert tuple(product.shelf_life_weeks for product in scenario.products) == (2, 4)
+    assert tuple(cohort.base_quantity for cohort in scenario.consumer_market.cohorts) == (
+        Decimal("40.0000"),
+        Decimal("50.0000"),
+        Decimal("30.0000"),
+    )
+    assert tuple(
+        cohort.maximum_willingness_to_pay for cohort in scenario.consumer_market.cohorts
+    ) == (Decimal("3.0000"), Decimal("3.8000"), Decimal("5.0000"))
+    assert tuple(
+        company.operation.capacity.normal_capacity
+        for company in scenario.companies
+        if isinstance(company.operation, (FarmOperation, ProcessorOperation))
+    ) == (
+        Decimal("60.0000"),
+        Decimal("60.0000"),
+        Decimal("60.0000"),
+        Decimal("50.0000"),
+        Decimal("50.0000"),
+        Decimal("50.0000"),
+    )
+    farm_capacity = sum(
+        company.operation.capacity.normal_capacity
+        for company in scenario.companies
+        if isinstance(company.operation, FarmOperation)
+    )
+    processor_output = sum(
+        company.operation.capacity.normal_capacity * company.operation.yield_rate
+        for company in scenario.companies
+        if isinstance(company.operation, ProcessorOperation)
+    )
+    normal_demand = sum(
+        (cohort.base_quantity for cohort in scenario.consumer_market.cohorts),
+        start=ZERO,
+    )
+    assert farm_capacity == Decimal("180.0000")
+    assert processor_output == normal_demand == Decimal("120.0000")
+    assert {
+        company.operation.weekly_operating_cost
+        for company in scenario.companies
+        if isinstance(company.operation, RetailerOperation)
+    } == {Decimal("5.0000")}
+    assert any(
+        state.weekly_capacity
+        != scenario.company(state.company_id).operation.capacity.normal_capacity
+        for state in economy.operation_states
+    )
+
+
+@pytest.mark.parametrize("seed", [-1, True, MAX_SEED + 1])
+def test_engine_rejects_invalid_seed(engine: EconomyEngine, seed: int) -> None:
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        engine.initial_state(DAIRY_S9_SCENARIO, seed)
+
+
+def test_bankruptcy_uses_a_strict_sub_one_asset_threshold(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    companies = tuple(
+        company.model_copy(
+            update={
+                "cash": (
+                    Decimal("1.0000")
+                    if company.company_id == "farm_a"
+                    else Decimal("0.9999")
+                    if company.company_id == "farm_b"
+                    else company.cash
+                )
             }
         )
-    with pytest.raises(ValidationError):
-        FarmDecision(
-            produce_quantity=Decimal("-1"),
-            raw_offer_quantity=Decimal("1"),
-            minimum_raw_price=Decimal("1"),
-        )
+        for company in world.companies
+    )
+
+    economy = engine.open_week(world.model_copy(update={"companies": companies}))
+
+    assert _company(economy, "farm_a").status is CompanyStatus.ACTIVE
+    assert _company(economy, "farm_b").status is CompanyStatus.BANKRUPT
+    assert tuple(
+        event.company_id for event in economy.events if isinstance(event, CompanyBankruptEvent)
+    ) == ("farm_b",)
+    with pytest.raises(ValueError, match="bankrupt companies"):
+        engine.observe_active(economy, "farm_b", _day(Weekday.MONDAY))
 
 
-@pytest.mark.parametrize("seed", [-1, True, 2_147_483_648])
-def test_engine_rejects_invalid_seed(seed: int) -> None:
-    with pytest.raises(ValueError, match="seed must be"):
-        EconomyEngine().initial_state(DAIRY_V1_SCENARIO, seed)
+def test_bankruptcy_delists_company_without_cancelling_funded_delivery(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    raw_lot = InventoryLot(
+        lot_id="seed.farm_a.raw",
+        product=ProductId.RAW_MILK,
+        quantity=Decimal("0.5"),
+        produced_week=1,
+        expires_end_of_week=2,
+    )
+    bottled_lot = InventoryLot(
+        lot_id="seed.processor_a.bottled",
+        product=ProductId.BOTTLED_MILK,
+        quantity=Decimal("0.2"),
+        produced_week=1,
+        expires_end_of_week=4,
+    )
+    companies = tuple(
+        company.model_copy(update={"inventory": (raw_lot,)})
+        if company.company_id == "farm_a"
+        else company.model_copy(update={"cash": Decimal("1.6"), "inventory": (bottled_lot,)})
+        if company.company_id == "processor_a"
+        else company
+        for company in world.companies
+    )
+    economy = engine.open_week(world.model_copy(update={"companies": companies}))
+    monday = _day(Weekday.MONDAY)
+    economy, bottled_ask = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _quote(MarketSide.SELL, ProductId.BOTTLED_MILK, "0.2", "2"),
+        monday,
+        1,
+    )
+    economy, _ = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "0.5", "3.2"),
+        monday,
+        2,
+    )
+    economy, purchase = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _quote(MarketSide.BUY, ProductId.RAW_MILK, "0.5", "3.2"),
+        monday,
+        3,
+    )
 
-
-def test_baseline_settles_the_complete_chain_without_negative_balances() -> None:
-    engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-
-    result = engine.step(state, _baseline_records(engine, state))
-
-    assert result.state.day == 1
-    assert result.snapshot.markets[0].volume == Decimal("100")
-    assert result.snapshot.markets[1].volume == Decimal("80.0")
-    assert all(company.cash >= 0 for company in result.state.companies)
+    bankruptcy = next(event for event in purchase.events if isinstance(event, CompanyBankruptEvent))
+    assert purchase.accepted
+    assert _company(economy, "processor_a").status is CompanyStatus.BANKRUPT
+    assert bankruptcy.total_assets == Decimal("0.8500")
+    assert bankruptcy.cancelled_order_ids == (bottled_ask.quote_ladder_result.levels[0].order_id,)
+    assert economy.deliveries
     assert all(
-        lot.quantity > 0
-        for company in result.state.companies
-        for lot in company.inventory
-    )
-    assert sum(
-        isinstance(event, MilkProducedEvent) for event in result.events
-    ) == 2
-    assert sum(
-        isinstance(event, MilkProcessedEvent) for event in result.events
-    ) == 2
-    assert sum(
-        isinstance(event, TradeExecutedEvent) for event in result.events
-    ) == 4
-    assert sum(
-        isinstance(event, ConsumerSaleEvent) for event in result.events
-    ) == 2
-
-
-def test_market_caps_purchase_by_cash() -> None:
-    engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=7)
-
-    def decide(company_id: str) -> CompanyDecision:
-        if company_id == "farm_a":
-            return FarmDecision(
-                produce_quantity=Decimal("50"),
-                raw_offer_quantity=Decimal("50"),
-                minimum_raw_price=Decimal("100"),
-            )
-        if company_id == "processor_a":
-            return ProcessorDecision(
-                raw_bid_quantity=Decimal("50"),
-                maximum_raw_price=Decimal("100"),
-                process_quantity=Decimal("0"),
-                bottled_offer_quantity=Decimal("0"),
-                minimum_bottled_price=Decimal("1"),
-            )
-        return NoOpDecision()
-
-    result = engine.step(state, _record(engine, state, decide))
-    raw_trades = [
-        event
-        for event in result.events
-        if isinstance(event, TradeExecutedEvent)
-        and event.product == ProductId.RAW_MILK
-    ]
-    processor = next(
-        company
-        for company in result.state.companies
-        if company.company_id == "processor_a"
+        order.owner_id != "processor_a" for market in economy.markets for order in market.orders
     )
 
-    assert len(raw_trades) == 1
-    assert raw_trades[0].quantity == Decimal("10")
-    assert processor.cash == Decimal("0")
-    assert sum(
+    delivery = economy.deliveries[0]
+    delivered = engine.complete_delivery(economy, delivery.delivery_id, delivery.arrives_on)
+
+    assert _company(delivered, "processor_a").status is CompanyStatus.BANKRUPT
+    assert _quantity(delivered, "processor_a", ProductId.RAW_MILK) == Decimal("0.5")
+    rejected, outcome = _apply(
+        engine,
+        delivered,
+        "processor_a",
+        SetRetailPrice(product=ProductId.BOTTLED_MILK, unit_price=Decimal("3")),
+        delivery.arrives_on,
+        4,
+    )
+    assert rejected == delivered
+    assert not outcome.accepted
+    assert outcome.reason == "company is bankrupt and delisted"
+
+
+def test_observations_expose_monday_and_private_weekly_economics(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    observations = engine.observe(world)
+
+    assert len(observations) == 9
+    assert {observation.sim_day for observation in observations} == {_day(Weekday.MONDAY)}
+    assert all(observation.scenario_weeks == 52 for observation in observations)
+    assert all("seed" not in observation.model_dump() for observation in observations)
+    assert all(
+        (observation.weekly_operation is not None)
+        == isinstance(observation.operation, (FarmOperation, ProcessorOperation))
+        for observation in observations
+    )
+
+
+def test_active_observations_require_the_current_decision_week(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    with pytest.raises(ValueError, match="current active week"):
+        engine.observe_active(economy, "farm_a", _day(Weekday.MONDAY, week=2))
+    with pytest.raises(ValueError, match="Monday-Saturday"):
+        engine.observe_active(economy, "farm_a", _day(Weekday.SUNDAY))
+
+
+def test_production_costs_cash_and_completes_one_day_later(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    monday = _day(Weekday.MONDAY)
+    starting_cash = _company(economy, "farm_a").cash
+    started, outcome = _apply(engine, economy, "farm_a", _produce("10"), monday, 1)
+
+    assert outcome.accepted
+    assert outcome.next_available_on == _day(Weekday.TUESDAY)
+    assert outcome.scheduled_completions[0].scheduled_for == _day(Weekday.TUESDAY)
+    assert _company(started, "farm_a").cash < starting_cash
+    assert _quantity(started, "farm_a", ProductId.RAW_MILK) == ZERO
+
+    completed = _complete_job(engine, started, outcome)
+    lot = _company(completed, "farm_a").inventory[0]
+
+    assert lot.quantity == Decimal("10.0000")
+    assert lot.produced_week == 1
+    assert lot.expires_end_of_week == 2
+    assert isinstance(completed.events[-1], MilkProducedEvent)
+    assert completed.events[-1].occurred_on == _day(Weekday.TUESDAY)
+
+
+def test_operation_is_busy_and_weekly_capacity_is_atomic(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    monday = _day(Weekday.MONDAY)
+    started, first = _apply(engine, economy, "farm_a", _produce("1"), monday, 1)
+    busy, second = _apply(engine, started, "farm_a", _produce("1"), monday, 2)
+
+    assert first.accepted
+    assert not second.accepted
+    assert "busy" in (second.reason or "")
+    assert busy == started
+
+    capacity = economy.operation_states[0].weekly_capacity
+    rejected, overrun = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _produce(capacity + Decimal("0.0001")),
+        monday,
+        3,
+    )
+    assert not overrun.accepted
+    assert "production capacity" in (overrun.reason or "")
+    assert rejected == economy
+
+
+def test_equal_later_batches_have_higher_convex_cost(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    first_started, first = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _produce("10"),
+        _day(Weekday.MONDAY),
+        1,
+    )
+    first_job = first_started.jobs[0]
+    after_first = _complete_job(engine, first_started, first)
+    second_started, second = _apply(
+        engine,
+        after_first,
+        "farm_a",
+        _produce("10"),
+        _day(Weekday.WEDNESDAY),
+        2,
+    )
+    second_job = second_started.jobs[0]
+
+    assert second.accepted
+    assert second_job.cash_cost > first_job.cash_cost
+
+
+def test_transformation_consumes_input_and_produces_bottled_milk_next_day(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_inventory(
+        engine,
+        "processor_a",
+        ProductId.RAW_MILK,
+        "20",
+        expires_end_of_week=2,
+    )
+    started, outcome = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _transform("10"),
+        _day(Weekday.MONDAY),
+        1,
+    )
+
+    assert outcome.accepted
+    assert _quantity(started, "processor_a", ProductId.RAW_MILK) == Decimal("10.0000")
+    completed = _complete_job(engine, started, outcome)
+    bottled = next(
+        lot
+        for lot in _company(completed, "processor_a").inventory
+        if lot.product is ProductId.BOTTLED_MILK
+    )
+
+    assert bottled.quantity == Decimal("8.0000")
+    assert bottled.expires_end_of_week == 4
+    assert isinstance(completed.events[-1], MilkProcessedEvent)
+
+
+def test_quote_authorization_and_collateral_fail_without_side_effects(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    monday = _day(Weekday.MONDAY)
+    unauthorized, wrong_side = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.BUY, ProductId.RAW_MILK, "1", "1"),
+        monday,
+        1,
+    )
+    unstocked, no_inventory = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "1", "1"),
+        monday,
+        2,
+    )
+    overfunded, no_cash = _apply(
+        engine,
+        economy,
+        "processor_a",
+        _quote(MarketSide.BUY, ProductId.RAW_MILK, "1000", "2"),
+        monday,
+        3,
+    )
+
+    assert not wrong_side.accepted and "not authorized" in (wrong_side.reason or "")
+    assert not no_inventory.accepted and "inventory" in (no_inventory.reason or "")
+    assert not no_cash.accepted and "cash" in (no_cash.reason or "")
+    assert unauthorized == unstocked == overfunded == economy
+
+
+def test_quote_ladder_keeps_replaces_and_cancels_identity_atomically(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_inventory(engine, "farm_a", ProductId.RAW_MILK, "20")
+    monday = _day(Weekday.MONDAY)
+    quoted, placed = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "10", "1.2"),
+        monday,
+        1,
+    )
+    original = placed.quote_ladder_result
+    assert original is not None
+    original_id = original.levels[0].order_id
+
+    kept_state, kept = _apply(
+        engine,
+        quoted,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "10", "1.2"),
+        _day(Weekday.TUESDAY),
+        2,
+    )
+    assert kept.quote_ladder_result is not None
+    assert kept.quote_ladder_result.levels[0].action is QuoteLevelAction.KEEP
+    assert kept.quote_ladder_result.levels[0].order_id == original_id
+    assert kept_state == quoted
+
+    replaced_state, replaced = _apply(
+        engine,
+        quoted,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "8", "1.3"),
+        _day(Weekday.WEDNESDAY),
+        3,
+    )
+    assert replaced.quote_ladder_result is not None
+    assert replaced.quote_ladder_result.levels[0].action is QuoteLevelAction.REPLACE
+    assert replaced.quote_ladder_result.levels[0].replaced_order_id == original_id
+
+    cancelled_state, cancelled = _apply(
+        engine,
+        replaced_state,
+        "farm_a",
+        _cancel(MarketSide.SELL, ProductId.RAW_MILK),
+        _day(Weekday.THURSDAY),
+        4,
+    )
+    assert cancelled.quote_ladder_result is not None
+    assert cancelled.quote_ladder_result.cancelled_order_ids
+    assert engine.company_orders(cancelled_state, "farm_a") == ()
+    assert _quantity(cancelled_state, "farm_a", ProductId.RAW_MILK) == Decimal("20.0000")
+
+
+def test_trade_pays_immediately_and_delivers_one_day_later(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_inventory(
+        engine,
+        "farm_a",
+        ProductId.RAW_MILK,
+        "10",
+        expires_end_of_week=2,
+    )
+    seller_cash = _company(economy, "farm_a").cash
+    buyer_cash = _company(economy, "processor_a").cash
+    quoted, _ = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "10", "1.5"),
+        _day(Weekday.MONDAY),
+        1,
+    )
+    traded, outcome = _apply(
+        engine,
+        quoted,
+        "processor_a",
+        _quote(MarketSide.BUY, ProductId.RAW_MILK, "4", "1.5"),
+        _day(Weekday.MONDAY),
+        2,
+    )
+
+    assert outcome.accepted
+    assert isinstance(outcome.events[0], TradeExecutedEvent)
+    assert _company(traded, "farm_a").cash == seller_cash + Decimal("6.0000")
+    assert _company(traded, "processor_a").cash == buyer_cash - Decimal("6.0000")
+    delivery = traded.deliveries[0]
+    assert delivery.arrives_on == _day(Weekday.TUESDAY)
+    assert _quantity(traded, "processor_a", ProductId.RAW_MILK) == ZERO
+    pending = engine.pending_delivery_views(traded, "processor_a")[0]
+    assert pending.expiry_buckets[0].expires_end_of_week == 2
+
+    delivered = engine.complete_delivery(traded, delivery.delivery_id, delivery.arrives_on)
+    assert _quantity(delivered, "processor_a", ProductId.RAW_MILK) == Decimal("4.0000")
+    assert isinstance(delivered.events[-1], DeliveryCompletedEvent)
+
+
+def test_inventory_expiry_distinguishes_available_and_reserved_fefo_lots(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_lots(
+        engine,
+        "farm_a",
         (
-            lot.quantity
-            for lot in processor.inventory
-            if lot.product == ProductId.RAW_MILK
+            InventoryLot(
+                lot_id="early",
+                product=ProductId.RAW_MILK,
+                quantity=Decimal("3"),
+                produced_week=1,
+                expires_end_of_week=1,
+            ),
+            InventoryLot(
+                lot_id="later",
+                product=ProductId.RAW_MILK,
+                quantity=Decimal("4"),
+                produced_week=1,
+                expires_end_of_week=2,
+            ),
         ),
-        start=Decimal("0"),
-    ) == Decimal("10")
-
-
-def test_fractional_affordability_is_rounded_down() -> None:
-    engine = EconomyEngine()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=7)
-    state = initial.model_copy(
-        update={
-            "companies": tuple(
-                CompanyState(
-                    company_id=company.company_id,
-                    cash=(
-                        Decimal("20")
-                        if company.company_id == "processor_a"
-                        else company.cash
-                    ),
-                    inventory=company.inventory,
-                )
-                for company in initial.companies
-            )
-        }
+    )
+    quoted, _ = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "5", "1.5"),
+        _day(Weekday.MONDAY),
+        1,
     )
 
-    def decide(company_id: str) -> CompanyDecision:
-        if company_id == "farm_a":
-            return FarmDecision(
-                produce_quantity=Decimal("50"),
-                raw_offer_quantity=Decimal("50"),
-                minimum_raw_price=Decimal("1.4"),
-            )
-        if company_id == "processor_a":
-            return ProcessorDecision(
-                raw_bid_quantity=Decimal("50"),
-                maximum_raw_price=Decimal("1.4"),
-                process_quantity=Decimal("0"),
-                bottled_offer_quantity=Decimal("0"),
-                minimum_bottled_price=Decimal("1"),
-            )
-        return NoOpDecision()
+    buckets = engine.inventory_expiry(quoted, "farm_a")
+    assert (buckets[0].available_quantity, buckets[0].reserved_quantity) == (
+        ZERO,
+        Decimal("3.0000"),
+    )
+    assert (buckets[1].available_quantity, buckets[1].reserved_quantity) == (
+        Decimal("2.0000"),
+        Decimal("2.0000"),
+    )
 
-    result = engine.step(state, _record(engine, state, decide))
-    trade = next(
+
+def test_sunday_enforces_close_sale_and_expiry_order(engine: EconomyEngine) -> None:
+    economy = _open_with_inventory(
+        engine,
+        "retailer_a",
+        ProductId.BOTTLED_MILK,
+        "100",
+        expires_end_of_week=1,
+    )
+    with pytest.raises(ValueError, match="Sunday"):
+        engine.close_markets(economy, _day(Weekday.SATURDAY))
+    with pytest.raises(ValueError, match="markets must close"):
+        engine.settle_consumer_sales(economy, _day(Weekday.SUNDAY))
+
+    sunday = _day(Weekday.SUNDAY)
+    closed = engine.close_markets(economy, sunday)
+    priced, outcome = _apply(
+        engine,
+        closed,
+        "retailer_a",
+        SetRetailPrice(product=ProductId.BOTTLED_MILK, unit_price=Decimal("3.5")),
+        sunday,
+        1,
+    )
+    assert outcome.accepted
+    with pytest.raises(ValueError, match="consumer sales must settle"):
+        engine.close_week(closed, sunday)
+    settled = engine.settle_consumer_sales(priced, sunday)
+    result = engine.close_week(settled, sunday)
+
+    sale = next(
         event
         for event in result.events
-        if isinstance(event, TradeExecutedEvent)
+        if isinstance(event, ConsumerSaleEvent) and event.company_id == "retailer_a"
     )
-    processor = next(
-        company
-        for company in result.state.companies
-        if company.company_id == "processor_a"
-    )
-
-    assert trade.quantity == Decimal("14.2857")
-    assert processor.cash == Decimal("0.00002")
-
-
-def test_fefo_moves_oldest_lot_then_expiration_removes_it() -> None:
-    engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=9)
-
-    def day_one(company_id: str) -> CompanyDecision:
-        if company_id == "farm_a":
-            return FarmDecision(
-                produce_quantity=Decimal("10"),
-                raw_offer_quantity=Decimal("0"),
-                minimum_raw_price=Decimal("1"),
-            )
-        return NoOpDecision()
-
-    first = engine.step(state, _record(engine, state, day_one))
-
-    def day_two(company_id: str) -> CompanyDecision:
-        if company_id == "farm_a":
-            return FarmDecision(
-                produce_quantity=Decimal("10"),
-                raw_offer_quantity=Decimal("10"),
-                minimum_raw_price=Decimal("1"),
-            )
-        if company_id == "processor_a":
-            return ProcessorDecision(
-                raw_bid_quantity=Decimal("10"),
-                maximum_raw_price=Decimal("1"),
-                process_quantity=Decimal("0"),
-                bottled_offer_quantity=Decimal("0"),
-                minimum_bottled_price=Decimal("1"),
-            )
-        return NoOpDecision()
-
-    second = engine.step(
-        first.state,
-        _record(engine, first.state, day_two),
-    )
-    farm = next(
-        company
-        for company in second.state.companies
-        if company.company_id == "farm_a"
-    )
-    expired = [
+    charge = next(
         event
-        for event in second.events
-        if isinstance(event, InventoryExpiredEvent)
-    ]
+        for event in result.events
+        if isinstance(event, RetailOperatingCostChargedEvent) and event.company_id == "retailer_a"
+    )
+    expiry = next(
+        event
+        for event in result.events
+        if isinstance(event, InventoryExpiredEvent) and event.company_id == "retailer_a"
+    )
+    assert sale.occurred_on == sunday
+    assert sale.sold_quantity > ZERO
+    assert charge.cost_accrued == Decimal("5.0000")
+    assert charge.cash_paid == Decimal("5.0000")
+    assert charge.closing_payable == ZERO
+    assert result.events.index(sale) < result.events.index(charge) < result.events.index(expiry)
+    assert sum(isinstance(event, RetailOperatingCostChargedEvent) for event in result.events) == 3
+    report = next(
+        report
+        for report in result.state.company_weekly_reports
+        if report.company_id == "retailer_a"
+    )
+    assert report.operation_cost == Decimal("5.0000")
+    assert report.operating_profit == sale.gross_profit - Decimal("5.0000")
+    assert result.snapshot.week == 1
+    assert result.snapshot.consumer_sales == sale.sold_quantity
+    assert any(isinstance(event, InventoryExpiredEvent) for event in result.events)
+    assert result.state.completed_weeks == 1
 
-    assert len(farm.inventory) == 1
-    assert farm.inventory[0].produced_day == 2
-    assert farm.inventory[0].quantity == Decimal("10")
+
+def test_unpaid_retail_operating_cost_becomes_a_liability_before_bankruptcy(
+    engine: EconomyEngine,
+) -> None:
+    world = engine.initial_state(DAIRY_S9_SCENARIO, seed=7)
+    companies = tuple(
+        company.model_copy(update={"cash": Decimal("2")})
+        if company.company_id == "retailer_a"
+        else company
+        for company in world.companies
+    )
+    economy = engine.open_week(world.model_copy(update={"companies": companies}))
+    sunday = _day(Weekday.SUNDAY)
+    sold = engine.settle_consumer_sales(
+        engine.close_markets(economy, sunday),
+        sunday,
+    )
+    result = engine.close_week(sold, sunday)
+    settled = result.state
+
+    retailer = next(company for company in settled.companies if company.company_id == "retailer_a")
+    charge = next(
+        event
+        for event in sold.events
+        if isinstance(event, RetailOperatingCostChargedEvent) and event.company_id == "retailer_a"
+    )
+    bankruptcy = next(
+        event
+        for event in result.events
+        if isinstance(event, CompanyBankruptEvent) and event.company_id == "retailer_a"
+    )
+    assert retailer.cash == ZERO
+    assert retailer.operating_cost_payable == Decimal("3.0000")
+    assert retailer.status is CompanyStatus.BANKRUPT
+    assert charge.opening_payable == ZERO
+    assert charge.cash_paid == Decimal("2.0000")
+    assert charge.closing_payable == Decimal("3.0000")
+    report = next(
+        report for report in settled.company_weekly_reports if report.company_id == "retailer_a"
+    )
+    assert report.operation_cost == Decimal("5.0000")
+    assert bankruptcy.total_assets == ZERO
+    assert result.events.index(charge) < result.events.index(bankruptcy)
+
+
+def test_raw_milk_produced_in_week_one_expires_at_end_of_week_two(
+    engine: EconomyEngine,
+    economy: EconomyState,
+) -> None:
+    started, outcome = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _produce("5"),
+        _day(Weekday.MONDAY),
+        1,
+    )
+    completed = _complete_job(engine, started, outcome)
+    week_one = _settle_week(engine, completed)
+    assert _quantity(engine.open_week(week_one.state), "farm_a", ProductId.RAW_MILK) == Decimal(
+        "5.0000"
+    )
+
+    week_two_economy = engine.open_week(week_one.state)
+    week_two = _settle_week(engine, week_two_economy)
+    expired = [event for event in week_two.events if isinstance(event, InventoryExpiredEvent)]
+
     assert len(expired) == 1
-    assert expired[0].company_id == "processor_a"
-    assert expired[0].quantity == Decimal("10")
+    assert expired[0].occurred_on == _day(Weekday.SUNDAY, week=2)
+    assert _quantity(engine.open_week(week_two.state), "farm_a", ProductId.RAW_MILK) == ZERO
 
 
-def test_wrong_decision_type_is_rejected_without_side_effects() -> None:
-    engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=4)
-
-    def decide(company_id: str) -> CompanyDecision:
-        if company_id == "farm_a":
-            return RetailerDecision(
-                bottled_bid_quantity=Decimal("10"),
-                maximum_bottled_price=Decimal("3"),
-                retail_price=Decimal("4"),
-            )
-        return NoOpDecision()
-
-    result = engine.step(state, _record(engine, state, decide))
-
-    assert any(
-        isinstance(event, DecisionRejectedEvent)
-        and event.company_id == "farm_a"
-        for event in result.events
+def test_retail_prices_carry_forward_while_weekly_books_reset_after_sunday(
+    engine: EconomyEngine,
+) -> None:
+    economy = _open_with_inventory(engine, "farm_a", ProductId.RAW_MILK, "5")
+    quoted, _ = _apply(
+        engine,
+        economy,
+        "farm_a",
+        _quote(MarketSide.SELL, ProductId.RAW_MILK, "5", "1.5"),
+        _day(Weekday.MONDAY),
+        1,
     )
-    farm = next(
-        company
-        for company in result.state.companies
-        if company.company_id == "farm_a"
-    )
-    assert farm.cash == Decimal("1000")
-    assert farm.inventory == ()
-
-
-def test_same_seed_and_decisions_are_exactly_reproducible() -> None:
-    engine = EconomyEngine()
-    left = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-    right = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-
-    left_result = engine.step(left, _baseline_records(engine, left))
-    right_result = engine.step(right, _baseline_records(engine, right))
-
-    assert left_result == right_result
-
-
-def test_observation_hides_seed_and_exposes_public_rules() -> None:
-    engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=314159)
-
-    observation = engine.observe(state)[0]
-
-    assert observation.observation_id == (
-        "flow.dairy.base.s6.v1|1|farm_a"
-    )
-    assert observation.products == DAIRY_V1_SCENARIO.products
-    assert observation.demand == DAIRY_V1_SCENARIO.demand
-    assert observation.scoring == DAIRY_V1_SCENARIO.scoring
-
-
-def test_equal_price_priority_rotates_between_companies() -> None:
-    engine = EconomyEngine()
-    state = engine.initial_state(DAIRY_V1_SCENARIO, seed=1)
-
-    def decide(company_id: str) -> CompanyDecision:
-        if company_id == "farm_a":
-            return FarmDecision(
-                produce_quantity=Decimal("10"),
-                raw_offer_quantity=Decimal("10"),
-                minimum_raw_price=Decimal("1"),
-            )
-        if company_id.startswith("processor_"):
-            return ProcessorDecision(
-                raw_bid_quantity=Decimal("10"),
-                maximum_raw_price=Decimal("1"),
-                process_quantity=Decimal("0"),
-                bottled_offer_quantity=Decimal("0"),
-                minimum_bottled_price=Decimal("1"),
-            )
-        return NoOpDecision()
-
-    first = engine.step(state, _record(engine, state, decide))
-    second = engine.step(
-        first.state,
-        _record(engine, first.state, decide),
-    )
-    buyers = [
-        next(
-            event.buyer_id
-            for event in result.events
-            if isinstance(event, TradeExecutedEvent)
-            and event.product == ProductId.RAW_MILK
-        )
-        for result in (first, second)
-    ]
-
-    assert buyers == ["processor_a", "processor_b"]
-
-
-def test_thirty_day_baseline_can_be_scored_read_only() -> None:
-    engine = EconomyEngine()
-    evaluator = Evaluator()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-    state = initial
-    snapshots = []
-    events = []
-
-    for _ in range(DAIRY_V1_SCENARIO.days):
-        result = engine.step(state, _baseline_records(engine, state))
-        state = result.state
-        snapshots.append(result.snapshot)
-        events.extend(result.events)
-
-    state_before_scoring = state.model_dump_json()
-    score = evaluator.evaluate(
-        DAIRY_V1_SCENARIO,
-        initial,
-        state,
-        tuple(snapshots),
-        tuple(events),
+    sunday = _day(Weekday.SUNDAY)
+    closed = engine.close_markets(quoted, sunday)
+    priced, _ = _apply(
+        engine,
+        closed,
+        "retailer_a",
+        SetRetailPrice(product=ProductId.BOTTLED_MILK, unit_price=Decimal("3.5")),
+        sunday,
+        2,
     )
 
-    assert state.day == 30
-    assert state.model_dump_json() == state_before_scoring
-    assert score.efficiency == sum(
-        (company.surplus for company in score.companies),
-        start=Decimal("0"),
+    assert engine.company_orders(priced, "farm_a") == ()
+    observation = engine.observe_active(
+        priced,
+        "retailer_a",
+        sunday,
+        allow_settlement_day=True,
     )
-    assert score.fairness == Decimal("1") - score.gini
-    assert Decimal("0") <= score.consumer_fill_rate <= Decimal("1")
-    assert not hasattr(score, "final_score")
+    assert observation.retail_price == Decimal("3.5000")
+
+    sold = engine.settle_consumer_sales(priced, sunday)
+    next_week = engine.open_week(engine.close_week(sold, sunday).state)
+    assert engine.company_orders(next_week, "farm_a") == ()
+    assert engine.observe_active(
+        next_week,
+        "retailer_a",
+        _day(Weekday.MONDAY, week=2),
+    ).retail_price == Decimal("3.5000")
 
 
-def test_no_op_retailers_have_zero_fill_rate() -> None:
-    engine = EconomyEngine()
-    evaluator = Evaluator()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-    state = initial
-    snapshots = []
-    events = []
-
-    for _ in range(DAIRY_V1_SCENARIO.days):
-        result = engine.step(state, _record(engine, state, _no_op))
-        state = result.state
-        snapshots.append(result.snapshot)
-        events.extend(result.events)
-
-    score = evaluator.evaluate(
-        DAIRY_V1_SCENARIO,
-        initial,
-        state,
-        tuple(snapshots),
-        tuple(events),
-    )
-
-    assert score.consumer_fill_rate == 0
-    assert sum(
-        isinstance(event, ConsumerSaleEvent)
-        for event in events
-    ) == 2 * DAIRY_V1_SCENARIO.days
-
-
-def test_evaluator_rejects_an_incomplete_episode() -> None:
-    engine = EconomyEngine()
-    initial = engine.initial_state(DAIRY_V1_SCENARIO, seed=42)
-
-    with pytest.raises(ValueError, match="complete episode"):
-        Evaluator().evaluate(
-            DAIRY_V1_SCENARIO,
-            initial,
-            initial,
-            (),
-            (),
-        )
+def test_schema_rejects_sub_quantum_operation_and_quote_values() -> None:
+    with pytest.raises(ValidationError, match=r"multiple of 0\.0001"):
+        _produce("0.00001")
+    with pytest.raises(ValidationError, match=r"multiple of 0\.0001"):
+        _quote(MarketSide.BUY, ProductId.RAW_MILK, "1.00001", "1")

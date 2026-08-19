@@ -1,145 +1,243 @@
 # Dairy Bench
 
-Dairy Bench 是 Multi-Agent Company Bench 的第一个可运行场景：2 家牧场、2 家加工厂和 2 家零售商共同经营一条鲜牛奶产业链。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-这里的 “Multi-Agent” 指多家公司相互交易和竞争，**每家公司只由一个独立 Agent 控制**，不实现公司内部多 Agent 团队。一局持续 30 天：
+Dairy Bench is an event-driven benchmark for long-horizon business decisions in
+a perishable dairy supply chain. Nine independent companies—three farms, three
+processors, and three retailers—must coordinate production, spot trading,
+inventory, pricing, and cash without sharing private state.
 
-```text
-原奶生产 → 原奶交易 → 加工盒装奶 → 盒装奶交易
-→ 消费者购买 → 库存过期 → 效率/公平评分 → SQLite 留档
-```
+The current and only supported scenario is `flow.dairy.base.s9.v9`: 52 weekly
+settlements, deterministic physical rules, independent company Agents, a shared
+consumer market, durable recovery, and auditable enterprise scoring.
 
-核心原则：
+## Quick start
 
-> Agent 只能提交经营决策；只有经济引擎能够改变现金、库存和交易结果。
+Requirements:
 
-## 已实现
+- Windows 10/11
+- Python 3.12+
+- Node.js 20.19+
+- a NewAPI key only for model-backed profiles
 
-- 6 家异质企业、两种易腐商品、FEFO 库存和两级现货市场；
-- 每家公司一个独立决策器，可选择规则基线、Codex Agent、OpenAI Agent 或历史回放；
-- 6 个 Agent 分别拥有独立记忆、`ModelGateway` 和模型客户端；
-- 后台运行、30 天进度轮询、失败状态和完整模型调用审计；
-- 确定性经济引擎，以及效率、公平、缺货和浪费等指标；
-- SQLite v2 持久化、FastAPI API 和 React 中文仪表盘。
-
-```text
-React → FastAPI → RunCoordinator → DairyBenchmark → EconomyEngine
-                         │              └─ Evaluator
-                         ├─ PolicyFactory
-                         │   ├─ BaselinePolicy
-                         │   ├─ LlmCompanyPolicy × 6 → ModelGateway × 6 → Codex / OpenAI
-                         │   └─ ReplayPolicy × 6
-                         └─ LifecycleRepository → SQLite
-```
-
-## 本地运行
-
-要求 Python 3.12+、Node.js 20.19+。
-
-依赖只需安装一次：
+Install the backend and frontend:
 
 ```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench\backend"
+cd backend
 python -m pip install -e ".[dev]"
 
 cd "..\frontend"
 npm.cmd install
+cd ..
 ```
 
-以后从项目根目录直接运行：
+Configure one or more isolated NewAPI profiles:
 
-```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench"
-.\start.cmd
+```bat
+start.cmd --configure-newapi model
+start.cmd --configure-newapi codex
+start.cmd --configure-newapi claude-code
 ```
 
-`start.cmd` 会分别打开后端和前端终端，等待 3 秒后打开
-`http://127.0.0.1:5173`。默认启用 `gpt-5.6-terra` 的 `high` 推理模式。停止时在
-两个服务终端中分别按 `Ctrl+C`；如需更换模型，修改 `start.cmd` 顶部的环境变量。
+Each command validates `/v1/models`, stores the key with Windows user-scoped
+encryption, and refreshes that profile's model and capability catalogs. Keys
+remain backend-only and are never written to run journals or SQLite.
 
-不配置或不选择模型也仍可运行“规则基线”。
+Start both processes:
 
-## 接入 Codex Agent（无需 API Key）
-
-先在普通 PowerShell 中确认 Codex 已使用你的 ChatGPT 账号登录：
-
-```powershell
-codex login
-codex login status
+```bat
+start.cmd
 ```
 
-默认认证目录是 `%USERPROFILE%\.codex`。后端和 Codex 必须由同一个 Windows
-用户启动；项目不会读取、复制或保存 `auth.json`。
+The dashboard opens at `http://127.0.0.1:5173`. Run `start.cmd --check` for a
+read-only dependency and profile check.
 
-登录成功后，直接从项目根目录启动：
+## Policy profiles
 
-```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench"
-.\start.cmd
+| Profile | Controller | Model protocol |
+|---|---|---|
+| Rule baseline | Deterministic in-process rules | None |
+| Model agents via NewAPI | One isolated model Agent per company | Chat Completions |
+| Codex via NewAPI | Dairy Bench remains the Agent runtime | Responses |
+| Claude Code via NewAPI | Dairy Bench remains the Agent runtime | Anthropic Messages |
+| Exact Replay | Replays a completed V9 Turn Journal | None |
+
+All model traffic goes through NewAPI. The protocol-specific profiles are wire
+adapters; the benchmark does not launch Codex CLI, Claude Code, or a vendor
+Company Agent runtime. Every model completion must contain exactly one
+authorized typed function call.
+
+## One trading week
+
+The simulation unit is one day:
+
+| Day | Runtime behavior |
+|---|---|
+| Monday | Open the week, realize private capacity and cost conditions, wake companies |
+| Tuesday–Saturday | Finish due work and deliveries, then process company decisions |
+| Sunday | Finish commitments, close spot markets, collect sealed retail prices, settle shared consumer sales, charge store costs, expire inventory, check bankruptcy, issue reports, and snapshot |
+
+Each active company can receive at most one operating call per day and six per
+week. Every active retailer receives one additional sealed Sunday pricing call
+after all procurement and deliveries. Competing retailers see the same
+pre-pricing state and learn the three prices only after all decisions commit.
+
+Production, processing, and delivery each take one simulated day. Raw milk
+expires after two weekly settlements; bottled milk expires after four.
+
+## V9 economy and information
+
+The default physical scale is intentionally aligned:
+
+- three farms each have normal weekly capacity `60`;
+- three processors each accept normal weekly input `50` and yield `0.8`, for
+  aggregate normal bottled output `120`;
+- the three normal consumer cohorts also total `120` units;
+- each active retailer accrues a fixed weekly store cost of `5.0000`.
+
+Capacity and convex unit cost are realized privately for every productive
+company-week. Retail demand is one finite shared market, not three independent
+demand curves. Three hidden willingness-to-pay cohorts buy the cheapest
+eligible inventory first, spill to the next retailer after a stockout, and split
+equal prices deterministically. Persistent slump, normal, and boom regimes alter
+market size, cohort composition, and willingness to pay.
+
+Agents know the market rules, regime names, 6–10 week duration, and alternation
+structure. They do not receive exact cohort sizes, willingness-to-pay values,
+regime multipliers, purchasing-power shifts, current regime, or switch dates.
+Each Agent receives its own last eight weekly reports; every Agent also receives
+the last eight public retail reports containing prices, sales, market shares,
+stockout flags, and company status.
+
+## Determinism, concurrency, and recovery
+
+Independent `RunJob`s execute concurrently. Within a run, Agents woken on the
+same day observe the same base state and may infer concurrently. Accepted
+decisions apply serially in the persisted order derived from:
+
+```text
+SHA256(seed | absolute_day | company_id)
 ```
 
-刷新前端，选择“Codex 公司 Agent”即可运行。六家公司各自拥有一个独立
-`AsyncCodex` runtime；每次公司日决策使用一个新的持久化 thread，历史信息仍只由
-Benchmark 明确提供的最近 7 天记忆决定。Codex 原始 Session 保留在
-`CODEX_HOME/sessions`，公开轨迹和最终输出同时导出到项目根目录的
-`run_artifacts/<run_id>/`。
-
-若要使用专门的、与日常 Codex 配置隔离的认证目录，可在登录和启动后端前同时设置：
+Provider latency therefore cannot change economic ordering. The default ceiling
+is 100 concurrent runs and 100 concurrent NewAPI requests. Gateways with lower
+limits can override both values:
 
 ```powershell
-$env:CODEX_HOME="$env:LOCALAPPDATA\DairyBench\codex"
-$env:DAIRY_BENCH_CODEX_HOME=$env:CODEX_HOME
-codex login
+$env:DAIRY_BENCH_MAX_CONCURRENT_RUNS = "20"
+$env:DAIRY_BENCH_MAX_CONCURRENT_NEWAPI_REQUESTS = "50"
 ```
 
-## 接入 OpenAI API Agent
+Journal entries and checkpoints commit atomically. A stopped or interrupted run
+can resume under the same run ID; failed runs are terminal. Exact Replay remains
+model-free and rejects observation, decision, outcome, or lineage drift.
 
-在**启动后端的同一个 PowerShell 终端**先设置 API Key：
+## Scoring
 
-```powershell
-$env:OPENAI_API_KEY="你的 OpenAI API Key"
+After every completed week, running, stopped, interrupted, and failed runs expose
+the same provisional score, company table, usage summary, and trend panels as a
+completed run. Only fully settled weeks are included.
 
-# 可选；不设置时默认使用 gpt-5.6-terra
-$env:DAIRY_BENCH_OPENAI_MODEL="gpt-5.6-terra"
+For nine companies, the official enterprise score is:
 
-python -m uvicorn company_bench.web:create_app --factory --host 127.0.0.1 --port 8000
+```text
+Score = 100 × E × sqrt(F × P)
+
+E = clamp(total realized enterprise surplus / feasible Oracle surplus, 0, 1)
+F = 1 - global Gini(final enterprise values) / (8/9)
+P = 1 - L/9
 ```
 
-刷新页面，在“公司决策方式”中选择“OpenAI 公司 Agent”，输入 seed，再点击“运行 30 天”。API Key 只由后端读取，不会发送到浏览器或写入数据库。
+`L` is the number of companies with strictly negative final surplus. A company
+with zero surplus is non-loss-making. `D` is reported separately as the number
+of bankrupt companies; bankruptcy occurs when total assets are strictly below
+`1.0000` at Sunday settlement.
 
-一局包含 `6 家公司 × 30 天 = 180` 次模型决策，因此会比规则基线慢，并产生相应 API 费用。模型返回的业务内容不合法时，仅将该公司当日决策降级为 `NoOp`；认证、网络或服务端故障会把整局标记为 `failed`，避免生成失真的 Benchmark 成绩。
+The deterministic Oracle uses the realized capacities, convex costs, processing
+yield, shelf lives, shared consumer market, and mandatory store costs. It
+maximizes total **enterprise** surplus and deliberately excludes consumer
+surplus.
 
-完整配置、调用流程和审计说明见 [Agent 接入说明](docs/AGENT_INTEGRATION.md)。
+## Local data
 
-## 数据与验证
+Mutable state is Git-ignored:
 
-默认数据库位于 `backend/data/dairy_bench.sqlite3`，可用 `DAIRY_BENCH_DB` 指定其他路径。
-Codex 导出目录默认为 `run_artifacts`；需要迁移时可设置
-`DAIRY_BENCH_ARTIFACTS_DIR`。
+```text
+.dairy-bench/
+|-- credentials/
+|   |-- newapi-model/{token.clixml,models.json,model-capabilities.json}
+|   |-- newapi-codex/{token.clixml,models.json,model-capabilities.json}
+|   `-- newapi-claude-code/{token.clixml,models.json,model-capabilities.json}
+`-- data/
+    |-- oracle-v2/
+    `-- runs-v9.sqlite3
+```
+
+Set `DAIRY_BENCH_HOME` only when a different runtime root is required. This
+release intentionally has no migration or reader for databases from earlier
+scenarios or payload contracts; start with an empty `data` directory.
+
+## Project map
+
+```text
+backend/src/company_bench/
+|-- agents/       policy adapters, memory, and NewAPI protocols
+|-- domain/       typed scenario, company, event, and precision contracts
+|-- economy/      engine, markets, ledger, reports, valuation, scoring, Oracle
+|-- runs/         run lifecycle and prefix evaluation
+|-- runtime/      deterministic scheduler and episode orchestration
+|-- storage/      repository seam plus in-memory and SQLite adapters
+|-- timeline/     journal-derived read models and market reconstruction
+`-- web/          FastAPI adapter
+
+frontend/src/
+|-- app/          composition and run workspace state
+|-- features/     runs, market, timeline, and evaluation views
+`-- shared/       typed API client, formatting, labels, and reusable UI
+```
+
+The core write path is deliberately singular:
+
+```text
+Wake → AgentTurn → one CompanyDecision → EconomyEngine → Journal → next Wake
+```
+
+Only `EconomyEngine` mutates economic state. Model text and UI projections never
+settle transactions.
+
+## Verification
 
 ```powershell
-cd "G:\Project in DeepWisdom\Multi Agent Company Bench\Dairy Bench\backend"
-New-Item -ItemType Directory -Force ".tmp" | Out-Null
-python -m pytest --basetemp ".tmp\pytest"
-python -m ruff check .
+cd backend
+python -m pytest -q -p no:cacheprovider
+python -m ruff check src tests
 
 cd "..\frontend"
 npm.cmd run build
+
+cd ..
+start.cmd --check
 ```
 
-主要 API：
+## HTTP interfaces
 
-- `GET /api/policy-profiles`：读取可用决策模式及后端模型配置；
-- `POST /api/runs`：创建后台任务，立即返回 `202 RunJob`；
-- `GET /api/run-jobs/{run_id}`：读取状态和 30 天进度；
-- `GET /api/runs/{run_id}`：读取已完成的完整结果；
-- `GET /api/runs/{run_id}/invocations`：读取逐公司、逐日模型审计记录；
-- `GET /api/runs/{run_id}/invocations/{invocation_id}/artifacts`：读取已导出的
-  Codex 公开推理轨迹与最终输出；
-- `GET /api/runs`：读取历史运行摘要。
+- `GET /api/health` — API, scenario, score, database, and Journal contract identity
+- `GET /api/policy-profiles`
+- `POST /api/runs`
+- `GET /api/run-jobs`
+- `GET /api/run-jobs/{run_id}`
+- `POST /api/run-jobs/{run_id}/stop`
+- `POST /api/run-jobs/{run_id}/resume`
+- `GET /api/replay-sources`
+- `GET /api/runs/{run_id}` — completed episodes only
+- `GET /api/runs/{run_id}/evaluation`
+- `GET /api/runs/{run_id}/timeline?week={week}`
+- `GET /api/runs/{run_id}/timeline/{entry_id}`
+- `GET /api/runs/{run_id}/turns`
+- `GET /api/runs/{run_id}/invocations`
 
-其他设计说明：
+For complete contracts, see:
 
-- [Agent 接入说明](docs/AGENT_INTEGRATION.md)
-- [MVP 框架设计](docs/MVP_FRAMEWORK.md)
-- [第一版场景目录](docs/SCENARIO_CATALOG_V1.md)
+- [Architecture and invariants](docs/ARCHITECTURE.md)
+- [Agent integration](docs/AGENT_INTEGRATION.md)
+- [Frontend guide](frontend/README.md)

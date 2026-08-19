@@ -1,0 +1,1 @@
+"""External model-provider adapters."""

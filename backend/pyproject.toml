@@ -4,21 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multi-agent-company-bench"
-version = "0.1.0"
+version = "0.10.0"
 description = "A deterministic multi-company dairy supply-chain benchmark."
 readme = { text = "Multi-Agent Company Bench dairy MVP.", content-type = "text/markdown" }
 requires-python = ">=3.12"
 dependencies = [
+    "cvxpy>=1.6,<2",
     "fastapi>=0.115,<1",
-    "openai>=2.15,<3",
-    "openai-codex==0.144.4",
+    "httpx>=0.28,<1",
+    "osqp>=1,<2",
     "pydantic>=2.10,<3",
     "uvicorn[standard]>=0.34,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.28,<1",
     "pytest>=8,<10",
     "ruff>=0.9,<1",
 ]

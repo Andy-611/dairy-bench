@@ -1,3 +1,3 @@
-"""Multi-Agent Company Bench dairy MVP."""
+"""Dairy Bench package."""
 
-__version__ = "0.1.0"
+__version__ = "0.10.0"

@@ -1,0 +1,800 @@
+"""Strongly typed decisions and runtime records for event-driven episodes."""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Annotated, Final, Literal, Self
+
+from pydantic import Field, model_validator
+
+from company_bench.domain.calendar import SimDay
+from company_bench.domain.models import (
+    ZERO,
+    CompanyId,
+    CompanyObservation,
+    DomainEvent,
+    EventRecord,
+    Identifier,
+    InventoryBookPosition,
+    Money,
+    OperationQuantity,
+    OrderQuantity,
+    PositiveMoney,
+    PositiveQuantity,
+    ProductFlowSummary,
+    ProductId,
+    ProtocolIssueKind,
+    Quantity,
+    StrictModel,
+)
+from company_bench.domain.precision import EconomicDecimal
+
+__all__ = [
+    "PROTOCOL_ERROR_PREFIX",
+    "ActionDecision",
+    "AgentTurn",
+    "AttentionPlan",
+    "CompanyDecision",
+    "DecisionEnvelope",
+    "DecisionOutcome",
+    "DecisionPhase",
+    "DecisionStatus",
+    "DeliveryExpiryBucket",
+    "EconomicCommand",
+    "IdleDecision",
+    "IncomingDeliveryView",
+    "InventoryExpiryBucket",
+    "JournalEntryKind",
+    "JournalEntryReference",
+    "MarketSide",
+    "OpenOrderView",
+    "OperationJobView",
+    "OrderBookView",
+    "PriceLevelView",
+    "PrivateCashFlow",
+    "PrivateEconomicsView",
+    "PrivateUnitEconomics",
+    "Produce",
+    "QuoteAlert",
+    "QuoteLadder",
+    "QuoteLadderResult",
+    "QuoteLevel",
+    "QuoteLevelAction",
+    "QuoteLevelResult",
+    "RejectionCategory",
+    "RetailPricingContext",
+    "ScheduledCompletion",
+    "SetQuoteLadder",
+    "SetRetailPrice",
+    "SimDay",
+    "SystemEventKind",
+    "SystemStepRecord",
+    "Transform",
+    "TurnRecord",
+    "TurnReplayOrigin",
+    "WakeReason",
+    "WakeSignal",
+    "system_step_id",
+]
+
+PROTOCOL_ERROR_PREFIX: Final = "agent protocol error: "
+
+
+class WakeReason(StrEnum):
+    """Why a company is receiving a new Agent turn."""
+
+    WEEK_OPEN = "week_open"
+    DECISION_DAY_STARTED = "decision_day_started"
+    REVIEW_DUE = "review_due"
+    PRICE_ALERT = "price_alert"
+    TRADE_EXECUTED = "trade_executed"
+    DECISION_REJECTED = "decision_rejected"
+    OPERATION_COMPLETED = "operation_completed"
+    DELIVERY_COMPLETED = "delivery_completed"
+    EXTERNAL_EVENT = "external_event"
+    RETAIL_PRICING = "retail_pricing"
+
+
+class DecisionPhase(StrEnum):
+    """Economic authority granted to one Agent turn."""
+
+    OPERATIONS = "operations"
+    RETAIL_PRICING = "retail_pricing"
+
+
+class JournalEntryKind(StrEnum):
+    """Kinds that can own causal links in the turn journal."""
+
+    TURN = "turn"
+    SYSTEM_STEP = "system_step"
+
+
+class JournalEntryReference(StrictModel):
+    """Stable causal pointer to another immutable journal entry."""
+
+    entry_id: Identifier
+    entry_type: JournalEntryKind
+
+
+class WakeSignal(StrictModel):
+    """One typed wake reason with its causal journal source."""
+
+    reason: WakeReason
+    source: JournalEntryReference | None = None
+    reference_ids: tuple[Identifier, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_references(self) -> Self:
+        """Reject duplicated opaque references."""
+        if len(self.reference_ids) != len(set(self.reference_ids)):
+            raise ValueError("wake signal reference_ids must be unique")
+        return self
+
+
+class SystemEventKind(StrEnum):
+    """Kinds understood by the simulation runtime."""
+
+    WEEK_OPEN = "week_open"
+    DAY_STARTED = "day_started"
+    WEEK_CLOSE = "week_close"
+    COMPANY_WAKE = "company_wake"
+    OPERATION_COMPLETED = "operation_completed"
+    DELIVERY_COMPLETED = "delivery_completed"
+    MARKET_CLOSE = "market_close"
+    CONSUMER_SALES = "consumer_sales"
+    TURN_LIMIT_REACHED = "turn_limit_reached"
+    AGENT_WAKE_SUPPRESSED = "agent_wake_suppressed"
+
+    @property
+    def priority(self) -> int:
+        """Define economic ordering for events sharing one simulation day."""
+        return {
+            self.WEEK_OPEN: 10,
+            self.DAY_STARTED: 10,
+            self.OPERATION_COMPLETED: 20,
+            self.DELIVERY_COMPLETED: 20,
+            self.MARKET_CLOSE: 30,
+            self.CONSUMER_SALES: 40,
+            self.WEEK_CLOSE: 50,
+            self.TURN_LIMIT_REACHED: 90,
+            self.AGENT_WAKE_SUPPRESSED: 90,
+            self.COMPANY_WAKE: 100,
+        }[self]
+
+
+class MarketSide(StrEnum):
+    """A company's intent in the order book."""
+
+    BUY = "buy"
+    SELL = "sell"
+
+
+class Produce(StrictModel):
+    """Request primary production of one product."""
+
+    kind: Literal["produce"] = "produce"
+    product: ProductId
+    quantity: OperationQuantity
+
+
+class Transform(StrictModel):
+    """Request conversion from one product into another."""
+
+    kind: Literal["transform"] = "transform"
+    input_product: ProductId
+    output_product: ProductId
+    input_quantity: OperationQuantity
+
+    @model_validator(mode="after")
+    def validate_products(self) -> Self:
+        """Require transformation to change the product identity."""
+        if self.input_product == self.output_product:
+            raise ValueError("input_product and output_product must differ")
+        return self
+
+
+class QuoteLevel(StrictModel):
+    """One independently collateralized price-quantity level."""
+
+    quantity: OrderQuantity
+    limit_price: PositiveMoney
+
+
+class QuoteLadder(StrictModel):
+    """Validated target levels for one side of one product market."""
+
+    side: MarketSide
+    levels: tuple[QuoteLevel, ...] = Field(default=(), max_length=3)
+
+    @model_validator(mode="after")
+    def validate_levels(self) -> Self:
+        """Require unique levels ordered from most to least competitive."""
+        prices = tuple(level.limit_price for level in self.levels)
+        if len(prices) != len(set(prices)):
+            raise ValueError("quote ladder prices must be unique")
+        expected = tuple(sorted(prices, reverse=self.side is MarketSide.BUY))
+        if prices != expected:
+            direction = "descending" if self.side is MarketSide.BUY else "ascending"
+            raise ValueError(f"quote ladder prices must be {direction}")
+        return self
+
+
+class SetQuoteLadder(QuoteLadder):
+    """Atomically set one validated target ladder."""
+
+    kind: Literal["set_quote_ladder"] = "set_quote_ladder"
+    product: ProductId
+
+
+class SetRetailPrice(StrictModel):
+    """Set one consumer-facing unit price."""
+
+    kind: Literal["set_retail_price"] = "set_retail_price"
+    product: ProductId
+    unit_price: PositiveMoney
+
+
+class QuoteAlert(StrictModel):
+    """Wake when one visible best quote crosses a price threshold."""
+
+    product: ProductId
+    quote: Literal["best_bid", "best_ask"]
+    operator: Literal["at_least", "at_most"]
+    price: PositiveMoney
+
+
+class AttentionPlan(StrictModel):
+    """Declare when a company should next receive an Agent turn."""
+
+    review_after_days: int | None = Field(default=None, ge=1)
+    alerts: tuple[QuoteAlert, ...] = Field(default=(), max_length=3)
+
+
+type EconomicCommand = Annotated[
+    Produce | Transform | SetQuoteLadder | SetRetailPrice,
+    Field(discriminator="kind"),
+]
+
+
+class ActionDecision(StrictModel):
+    """Apply one economic command and arm its next attention plan atomically."""
+
+    kind: Literal["action"] = "action"
+    action: EconomicCommand
+    attention: AttentionPlan
+
+
+class IdleDecision(StrictModel):
+    """Leave economic state unchanged while arming the next attention plan."""
+
+    kind: Literal["idle"] = "idle"
+    attention: AttentionPlan
+
+
+type CompanyDecision = Annotated[
+    ActionDecision | IdleDecision,
+    Field(discriminator="kind"),
+]
+
+
+class DecisionEnvelope(StrictModel):
+    """Bind an untrusted decision to runtime-owned identity and time."""
+
+    turn_id: Identifier
+    decision_id: Identifier
+    company_id: CompanyId
+    issued_on: SimDay
+    state_version: int = Field(ge=0)
+    decision: CompanyDecision
+
+    @property
+    def action(self) -> EconomicCommand | None:
+        """Return the economic command, if this is an action decision."""
+        return self.decision.action if isinstance(self.decision, ActionDecision) else None
+
+
+class DecisionStatus(StrEnum):
+    """Immediate disposition of a submitted company decision."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class RejectionCategory(StrEnum):
+    """Authority responsible for rejecting one submitted decision."""
+
+    ECONOMIC = "economic"
+    PROTOCOL = "protocol"
+    ATTENTION = "attention"
+
+
+class QuoteLevelAction(StrEnum):
+    """How one target quote reconciled with the prior ladder."""
+
+    KEEP = "keep"
+    PLACE = "place"
+    REPLACE = "replace"
+
+
+class QuoteLevelResult(StrictModel):
+    """Auditable application result for one target quote level."""
+
+    level: QuoteLevel
+    action: QuoteLevelAction
+    order_id: Identifier
+    replaced_order_id: Identifier | None = None
+    priority_sequence: int = Field(ge=1)
+    remaining_quantity: Quantity
+
+    @model_validator(mode="after")
+    def validate_result(self) -> Self:
+        """Keep identities and post-match quantity consistent with the action."""
+        if self.remaining_quantity > self.level.quantity:
+            raise ValueError("remaining quote quantity cannot exceed its target")
+        if self.action is QuoteLevelAction.REPLACE:
+            if self.replaced_order_id is None or self.replaced_order_id == self.order_id:
+                raise ValueError("replacement requires distinct old and new order ids")
+        elif self.replaced_order_id is not None:
+            raise ValueError("only replacement levels may reference an old order")
+        if self.action is QuoteLevelAction.KEEP and self.remaining_quantity != self.level.quantity:
+            raise ValueError("kept quote quantity must remain unchanged")
+        return self
+
+
+class QuoteLadderResult(StrictModel):
+    """Complete reconciliation result for one atomic target ladder."""
+
+    levels: tuple[QuoteLevelResult, ...] = Field(default=(), max_length=3)
+    cancelled_order_ids: tuple[Identifier, ...] = Field(default=(), max_length=3)
+
+    @model_validator(mode="after")
+    def validate_identities(self) -> Self:
+        """Require each old and new order identity to appear only once."""
+        current_ids = [level.order_id for level in self.levels]
+        old_ids = [
+            level.replaced_order_id for level in self.levels if level.replaced_order_id is not None
+        ]
+        if len(current_ids) != len(set(current_ids)):
+            raise ValueError("quote ladder order ids must be unique")
+        retired_ids = [*old_ids, *self.cancelled_order_ids]
+        if len(retired_ids) != len(set(retired_ids)):
+            raise ValueError("retired quote ladder order ids must be unique")
+        if set(current_ids) & set(retired_ids):
+            raise ValueError("current and retired quote ladder order ids must be disjoint")
+        return self
+
+
+class ScheduledCompletion(StrictModel):
+    """A future economic completion requested by the engine."""
+
+    event_id: Identifier
+    kind: SystemEventKind
+    scheduled_for: SimDay
+    reference_id: Identifier
+    company_id: CompanyId
+
+    @model_validator(mode="after")
+    def validate_kind(self) -> Self:
+        """Only asynchronous completions may be scheduled by decisions."""
+        allowed = {
+            SystemEventKind.OPERATION_COMPLETED,
+            SystemEventKind.DELIVERY_COMPLETED,
+        }
+        if self.kind not in allowed:
+            raise ValueError("decision schedules must be operation or delivery completions")
+        return self
+
+
+class DecisionOutcome(StrictModel):
+    """Auditable immediate result of applying one company decision."""
+
+    turn_id: Identifier
+    decision_id: Identifier
+    company_id: CompanyId
+    occurred_on: SimDay
+    status: DecisionStatus
+    accepted: bool
+    rejection_category: RejectionCategory | None = None
+    reason: str | None = Field(default=None, min_length=1, max_length=500)
+    resulting_state_version: int = Field(ge=0)
+    apply_sequence: int = Field(ge=1)
+    quote_ladder_result: QuoteLadderResult | None = None
+    job_id: Identifier | None = None
+    events: tuple[DomainEvent, ...] = ()
+    scheduled_completions: tuple[ScheduledCompletion, ...] = ()
+    next_available_on: SimDay | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> Self:
+        """Keep status, time, and rejection details internally consistent."""
+        if self.accepted != (self.status is DecisionStatus.ACCEPTED):
+            raise ValueError("accepted must agree with status")
+        if self.status is DecisionStatus.REJECTED and self.reason is None:
+            raise ValueError("rejected decisions require a reason")
+        if self.accepted != (self.rejection_category is None):
+            raise ValueError("rejection_category is required only for rejected decisions")
+        if (
+            self.next_available_on is not None
+            and self.next_available_on.absolute_day < self.occurred_on.absolute_day
+        ):
+            raise ValueError("next_available_on cannot precede occurred_on")
+        return self
+
+
+class OpenOrderView(StrictModel):
+    """Immutable order-book projection safe to expose to an Agent."""
+
+    order_id: Identifier
+    owner_id: CompanyId
+    side: MarketSide
+    product: ProductId
+    remaining_quantity: PositiveQuantity
+    limit_price: PositiveMoney
+    placed_on: SimDay
+    priority_sequence: int = Field(ge=1)
+    queue_ahead_quantity: Quantity
+
+
+class PriceLevelView(StrictModel):
+    """Anonymous aggregate resting at one public price level."""
+
+    unit_price: PositiveMoney
+    quantity: PositiveQuantity
+    order_count: int = Field(ge=1)
+
+
+class OrderBookView(StrictModel):
+    """Complete anonymous order-book depth visible to one Agent."""
+
+    product: ProductId
+    bids: tuple[PriceLevelView, ...] = ()
+    asks: tuple[PriceLevelView, ...] = ()
+    last_trade_price: PositiveMoney | None = None
+    weekly_volume: Quantity = ZERO
+
+    @model_validator(mode="after")
+    def validate_book(self) -> Self:
+        """Require unique sorted levels and an uncrossed resting book."""
+        bid_prices = tuple(level.unit_price for level in self.bids)
+        ask_prices = tuple(level.unit_price for level in self.asks)
+        if bid_prices != tuple(sorted(set(bid_prices), reverse=True)):
+            raise ValueError("bid levels must have unique descending prices")
+        if ask_prices != tuple(sorted(set(ask_prices))):
+            raise ValueError("ask levels must have unique ascending prices")
+        if bid_prices and ask_prices and bid_prices[0] >= ask_prices[0]:
+            raise ValueError("a continuous order book cannot remain crossed")
+        return self
+
+    def best_price(self, side: MarketSide) -> PositiveMoney | None:
+        """Return the first public price on one side, if present."""
+        levels = self.bids if side is MarketSide.BUY else self.asks
+        return levels[0].unit_price if levels else None
+
+
+class InventoryExpiryBucket(StrictModel):
+    """Owned spot inventory sharing one product and expiry week."""
+
+    product: ProductId
+    expires_end_of_week: int = Field(ge=1)
+    available_quantity: Quantity
+    reserved_quantity: Quantity
+
+    @model_validator(mode="after")
+    def validate_quantity(self) -> Self:
+        """Omit economically empty expiry buckets."""
+        if self.available_quantity + self.reserved_quantity <= ZERO:
+            raise ValueError("an inventory expiry bucket must contain inventory")
+        return self
+
+
+class DeliveryExpiryBucket(StrictModel):
+    """Quantity within one incoming delivery sharing an expiry week."""
+
+    quantity: PositiveQuantity
+    expires_end_of_week: int = Field(ge=1)
+
+
+class IncomingDeliveryView(StrictModel):
+    """One buyer-visible delivery already guaranteed by a trade."""
+
+    trade_id: Identifier
+    product: ProductId
+    quantity: PositiveQuantity
+    arrives_on: SimDay
+    expiry_buckets: tuple[DeliveryExpiryBucket, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_expiry_buckets(self) -> Self:
+        """Keep expiry detail ordered, unique, and quantity preserving."""
+        weeks = tuple(bucket.expires_end_of_week for bucket in self.expiry_buckets)
+        if weeks != tuple(sorted(set(weeks))):
+            raise ValueError("delivery expiry buckets must be unique and ordered")
+        if sum((bucket.quantity for bucket in self.expiry_buckets), start=ZERO) != (self.quantity):
+            raise ValueError("delivery expiry buckets must sum to quantity")
+        return self
+
+
+class OperationJobView(StrictModel):
+    """The company's currently active production resource."""
+
+    job_id: Identifier
+    kind: Literal["production", "transformation"]
+    completes_on: SimDay
+    output_product: ProductId
+    output_quantity: PositiveQuantity
+
+
+class PrivateCashFlow(StrictModel):
+    """Cumulative cash-flow facts visible only to their owning company."""
+
+    purchase_spend: Money = ZERO
+    wholesale_revenue: Money = ZERO
+    operation_cost: Money = ZERO
+    consumer_revenue: Money = ZERO
+    expiry_reference_loss: Money = ZERO
+    net_cash_flow: EconomicDecimal = ZERO
+
+
+class PrivateUnitEconomics(StrictModel):
+    """Current executable prices and private break-even economics."""
+
+    input_product: ProductId | None = None
+    output_product: ProductId | None = None
+    best_input_ask: PositiveMoney | None = None
+    best_output_bid: PositiveMoney | None = None
+    marginal_operation_cost: Money | None = None
+    output_per_input: PositiveQuantity | None = None
+    break_even_output_price: Money | None = None
+    consumer_unit_price: Money | None = None
+    expected_unit_margin: EconomicDecimal | None = None
+
+
+class PrivateEconomicsView(StrictModel):
+    """Decision-ready private ledger and unit economics for one Agent."""
+
+    cash_flow: PrivateCashFlow = PrivateCashFlow()
+    unit_economics: PrivateUnitEconomics = PrivateUnitEconomics()
+
+
+class RetailPricingContext(StrictModel):
+    """Private post-procurement facts for one sealed Sunday price decision."""
+
+    current_cash: Money
+    saleable_quantity: Quantity
+    saleable_book_value: Money
+    weighted_unit_cost: Money | None = None
+    current_week_procurement: ProductFlowSummary
+    inventory_by_expiry: tuple[InventoryBookPosition, ...] = ()
+    previous_retail_price: PositiveMoney | None = None
+    all_deliveries_completed: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_cost(self) -> Self:
+        """Pair positive saleable inventory with a weighted unit cost."""
+        has_inventory = self.saleable_quantity > ZERO
+        if has_inventory != (self.weighted_unit_cost is not None):
+            raise ValueError("saleable inventory and weighted unit cost must be paired")
+        return self
+
+
+class AgentTurn(StrictModel):
+    """Runtime-bound input metadata for one company decision."""
+
+    turn_id: Identifier
+    company_id: CompanyId
+    sim_day: SimDay
+    state_version: int = Field(ge=0)
+    phase: DecisionPhase = DecisionPhase.OPERATIONS
+    turn_number_this_week: int = Field(ge=1)
+    turn_limit_this_week: int = Field(ge=1)
+    wake_reasons: tuple[WakeReason, ...] = Field(min_length=1)
+    wake_signals: tuple[WakeSignal, ...] = ()
+    observation: CompanyObservation
+    available_cash: Money
+    reserved_cash: Money = ZERO
+    marked_surplus: EconomicDecimal
+    inventory_expiry: tuple[InventoryExpiryBucket, ...] = ()
+    open_orders: tuple[OpenOrderView, ...] = ()
+    order_books: tuple[OrderBookView, ...] = ()
+    pending_deliveries: tuple[IncomingDeliveryView, ...] = ()
+    active_operation: OperationJobView | None = None
+    private_economics: PrivateEconomicsView = PrivateEconomicsView()
+    retail_pricing_context: RetailPricingContext | None = None
+    visible_events: tuple[DomainEvent, ...] = ()
+    previous_outcome: DecisionOutcome | None = None
+
+    @property
+    def remaining_operation_capacity(self) -> Quantity | None:
+        """Derive remaining capacity from the sole private operation state."""
+        operation = self.observation.weekly_operation
+        return None if operation is None else operation.remaining_capacity
+
+    @model_validator(mode="after")
+    def validate_turn(self) -> Self:
+        """Reject inconsistent identity, version, and wake metadata."""
+        if self.turn_number_this_week > self.turn_limit_this_week:
+            raise ValueError("turn_number_this_week cannot exceed turn_limit_this_week")
+        pricing = self.phase is DecisionPhase.RETAIL_PRICING
+        expected_limit = 1 if pricing else self.observation.runtime.max_turns_per_company_week
+        if self.turn_limit_this_week != expected_limit:
+            message = (
+                "turn_limit_this_week must equal one for retail pricing"
+                if pricing
+                else "turn_limit_this_week must match the runtime turn limit"
+            )
+            raise ValueError(message)
+        if pricing != (self.retail_pricing_context is not None):
+            raise ValueError("retail pricing context must match the decision phase")
+        if pricing:
+            if not self.sim_day.is_settlement_day:
+                raise ValueError("retail pricing turns must occur on Sunday")
+            if self.wake_reasons != (WakeReason.RETAIL_PRICING,):
+                raise ValueError("retail pricing turns require their dedicated wake")
+        elif not self.sim_day.is_decision_day:
+            raise ValueError("operating turns must occur on Monday-Saturday")
+        if len(self.wake_reasons) != len(set(self.wake_reasons)):
+            raise ValueError("wake_reasons must be unique")
+        if self.wake_signals:
+            signal_reasons = tuple(dict.fromkeys(signal.reason for signal in self.wake_signals))
+            if signal_reasons != self.wake_reasons:
+                raise ValueError("wake_signals must cover wake_reasons in order")
+        if self.observation.company_id != self.company_id:
+            raise ValueError("observation company_id must match the turn")
+        if self.observation.sim_day != self.sim_day:
+            raise ValueError("observation sim_day must match the turn")
+        if self.observation.cash != self.available_cash:
+            raise ValueError("available_cash must match the observed cash")
+        if any(order.owner_id != self.company_id for order in self.open_orders):
+            raise ValueError("open_orders must be owned by the observed company")
+        product_order = {
+            product.product: index for index, product in enumerate(self.observation.products)
+        }
+        expiry_keys = tuple(
+            (bucket.product, bucket.expires_end_of_week) for bucket in self.inventory_expiry
+        )
+        if len(expiry_keys) != len(set(expiry_keys)):
+            raise ValueError("inventory_expiry keys must be unique")
+        if any(product not in product_order for product, _ in expiry_keys):
+            raise ValueError("inventory_expiry contains an unknown product")
+        if expiry_keys != tuple(
+            sorted(expiry_keys, key=lambda key: (product_order[key[0]], key[1]))
+        ):
+            raise ValueError("inventory_expiry must follow product and expiry order")
+        book_products = tuple(book.product for book in self.order_books)
+        if len(book_products) != len(set(book_products)):
+            raise ValueError("order_books products must be unique")
+        if any(product not in product_order for product in book_products):
+            raise ValueError("order_books contains an unknown product")
+        if book_products != tuple(sorted(book_products, key=product_order.__getitem__)):
+            raise ValueError("order_books must follow scenario product order")
+        if self.previous_outcome is not None:
+            if self.previous_outcome.company_id != self.company_id:
+                raise ValueError("previous outcome company_id must match the turn")
+            if self.previous_outcome.resulting_state_version > self.state_version:
+                raise ValueError("previous outcome cannot exceed the observed state version")
+            if self.previous_outcome.occurred_on.absolute_day > self.sim_day.absolute_day:
+                raise ValueError("previous outcome cannot occur after the turn")
+        return self
+
+
+class TurnReplayOrigin(StrictModel):
+    """Exact source Turn reused by a zero-model-call replay."""
+
+    source_run_id: Identifier
+    source_turn_id: Identifier
+
+
+class SystemStepRecord(StrictModel):
+    """One immutable system transition and its exact economic effects."""
+
+    run_id: Identifier
+    entry_id: Identifier
+    journal_sequence: int = Field(ge=1)
+    scheduled_event_id: Identifier
+    occurred_on: SimDay
+    kind: SystemEventKind
+    company_id: CompanyId | None = None
+    reference_ids: tuple[Identifier, ...] = ()
+    suppressed_wake_signals: tuple[WakeSignal, ...] = ()
+    state_version_before: int = Field(ge=0)
+    state_version_after: int = Field(ge=0)
+    effects: tuple[EventRecord, ...] = ()
+    snapshot_week: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_step(self) -> Self:
+        """Keep one system transition chronological and internally consistent."""
+        if self.kind is SystemEventKind.COMPANY_WAKE:
+            raise ValueError("company wakes are signals, not system journal steps")
+        company_audit = self.kind in {
+            SystemEventKind.TURN_LIMIT_REACHED,
+            SystemEventKind.AGENT_WAKE_SUPPRESSED,
+        }
+        if company_audit != (self.company_id is not None):
+            raise ValueError("Agent limit audit steps alone require company_id")
+        wake_suppressed = self.kind is SystemEventKind.AGENT_WAKE_SUPPRESSED
+        if wake_suppressed != bool(self.suppressed_wake_signals):
+            raise ValueError("suppressed-wake steps require their causal signals")
+        if self.state_version_after < self.state_version_before:
+            raise ValueError("system step cannot move the state version backwards")
+        if any(record.event.occurred_on != self.occurred_on for record in self.effects):
+            raise ValueError("system step effects must occur on its simulation day")
+        if self.snapshot_week is not None and self.snapshot_week != self.occurred_on.week:
+            raise ValueError("system step snapshot_week must match its simulation week")
+        return self
+
+
+def system_step_id(run_id: Identifier, scheduled_event_id: Identifier) -> Identifier:
+    """Build the stable journal identity for one scheduled system event."""
+    return f"{run_id}.system.{scheduled_event_id}"
+
+
+class TurnRecord(StrictModel):
+    """One complete Agent turn with its bound decision and outcome."""
+
+    run_id: Identifier
+    turn: AgentTurn
+    envelope: DecisionEnvelope
+    outcome: DecisionOutcome
+    observation_hash: Identifier
+    protocol_issue_kind: ProtocolIssueKind | None = None
+    protocol_error: str | None = Field(default=None, min_length=1, max_length=450)
+    protocol_fallback_applied: bool = False
+    journal_sequence: int | None = Field(default=None, ge=1)
+    replay_origin: TurnReplayOrigin | None = None
+
+    @model_validator(mode="after")
+    def validate_runtime_identity(self) -> Self:
+        """Require every runtime-owned identity and timestamp to agree."""
+        if self.envelope.turn_id != self.turn.turn_id:
+            raise ValueError("envelope turn_id must match the turn")
+        if self.envelope.company_id != self.turn.company_id:
+            raise ValueError("decision company_id must match the turn")
+        if self.envelope.issued_on != self.turn.sim_day:
+            raise ValueError("decision issued_on must match the turn day")
+        if self.envelope.state_version != self.turn.state_version:
+            raise ValueError("decision state_version must match the turn")
+        if self.outcome.turn_id != self.turn.turn_id:
+            raise ValueError("outcome turn_id must match the turn")
+        if self.outcome.company_id != self.turn.company_id:
+            raise ValueError("outcome company_id must match the turn")
+        if self.outcome.decision_id != self.envelope.decision_id:
+            raise ValueError("outcome decision_id must match the decision")
+        if self.outcome.resulting_state_version < self.envelope.state_version:
+            raise ValueError("outcome cannot move the state version backwards")
+        if self.outcome.occurred_on.absolute_day < self.envelope.issued_on.absolute_day:
+            raise ValueError("outcome cannot precede the decision")
+        action = self.envelope.action
+        result = self.outcome.quote_ladder_result
+        expects_ladder_result = self.outcome.accepted and isinstance(action, SetQuoteLadder)
+        if (result is not None) != expects_ladder_result:
+            raise ValueError("only an accepted quote ladder requires a ladder result")
+        if result is not None and tuple(level.level for level in result.levels) != action.levels:
+            raise ValueError("quote ladder result levels must match the action target")
+        if (
+            self.turn.previous_outcome is not None
+            and self.outcome.apply_sequence <= self.turn.previous_outcome.apply_sequence
+        ):
+            raise ValueError("apply_sequence must advance beyond the previous outcome")
+        if (self.protocol_issue_kind is None) != (self.protocol_error is None):
+            raise ValueError("protocol issue kind and message must be paired")
+        if self.protocol_error is not None:
+            if self.protocol_fallback_applied:
+                if (
+                    self.turn.phase is not DecisionPhase.RETAIL_PRICING
+                    or not self.outcome.accepted
+                    or not isinstance(self.envelope.action, SetRetailPrice)
+                ):
+                    raise ValueError("protocol fallback requires accepted retail pricing")
+            else:
+                if self.outcome.accepted:
+                    raise ValueError("a protocol error cannot produce an accepted outcome")
+                if self.outcome.rejection_category is not RejectionCategory.PROTOCOL:
+                    raise ValueError("protocol errors require a protocol rejection category")
+                if not isinstance(self.envelope.decision, IdleDecision):
+                    raise ValueError("protocol errors must normalize to an idle decision")
+                if self.outcome.reason != f"{PROTOCOL_ERROR_PREFIX}{self.protocol_error}":
+                    raise ValueError("protocol error must match the outcome reason")
+        elif self.protocol_fallback_applied:
+            raise ValueError("protocol fallback requires a protocol issue")
+        return self

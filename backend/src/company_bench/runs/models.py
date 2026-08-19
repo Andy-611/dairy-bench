@@ -1,0 +1,713 @@
+"""Typed lifecycle and audit records for asynchronous benchmark runs."""
+
+from __future__ import annotations
+
+from collections.abc import Hashable, Iterable
+from datetime import datetime
+from enum import StrEnum
+from typing import Literal, Protocol, Self
+
+from pydantic import Field, model_validator
+
+from company_bench.agents.memory import AgentCheckpoint
+from company_bench.domain.models import (
+    CompanyId,
+    CompanyObservation,
+    EpisodeQuality,
+    EpisodeResult,
+    EventRecord,
+    Identifier,
+    PolicyDescriptor,
+    PolicyKind,
+    PolicyProfileId,
+    ScenarioSpec,
+    ScoreCard,
+    StrictModel,
+    WeekSnapshot,
+)
+from company_bench.economy.engine import EconomyState
+from company_bench.runtime.attention import AgentAttention, ArmedAttention, AttentionRejected
+from company_bench.runtime.models import (
+    CompanyDecision,
+    DecisionOutcome,
+    JournalEntryKind,
+    SimDay,
+    SystemEventKind,
+    SystemStepRecord,
+    TurnRecord,
+    WakeReason,
+)
+from company_bench.runtime.scheduler import SchedulerCheckpoint
+
+
+class RunStatus(StrEnum):
+    """Persistent lifecycle state of one requested episode."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    STOPPED = "stopped"
+
+    @property
+    def terminal(self) -> bool:
+        """Return whether no more work is scheduled for this job."""
+        return self in {self.COMPLETED, self.FAILED, self.STOPPED}
+
+    @property
+    def resumable(self) -> bool:
+        """Return whether the same run may be explicitly continued."""
+        return self in {self.INTERRUPTED, self.STOPPED}
+
+
+class RunStopReason(StrEnum):
+    """Typed reason why a resumable run entered the stopped state."""
+
+    USER_REQUESTED = "user_requested"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+
+
+class RunJob(StrictModel):
+    """Progress record returned immediately by the run API."""
+
+    run_id: Identifier
+    profile_id: PolicyProfileId
+    kind: PolicyKind
+    provider: Identifier | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    wire_protocol: Identifier | None = None
+    adapter_version: Identifier | None = None
+    prompt_version: Identifier | None = None
+    config_fingerprint: Identifier | None = None
+    status: RunStatus = RunStatus.QUEUED
+    revision: int = Field(default=0, ge=0)
+    seed: int
+    source_run_id: Identifier | None = None
+    scenario_id: Identifier
+    current_absolute_day: int = Field(default=0, ge=0)
+    total_weeks: int = Field(ge=1)
+    submitted_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error_message: str | None = Field(default=None, max_length=500)
+    stop_reason: RunStopReason | None = None
+    quality: EpisodeQuality | None = None
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> RunJob:
+        """Keep reported progress inside the scenario duration."""
+        if self.current_absolute_day > self.total_weeks * 7:
+            raise ValueError("current_absolute_day exceeds the scenario calendar")
+        if self.profile_id.kind is not self.kind:
+            raise ValueError("profile_id and kind must describe the same policy")
+        route_fields = (
+            self.provider,
+            self.model,
+            self.wire_protocol,
+            self.adapter_version,
+            self.prompt_version,
+            self.config_fingerprint,
+        )
+        if self.kind is PolicyKind.MODEL and any(value is None for value in route_fields):
+            raise ValueError("Model Agent jobs require complete adapter identity")
+        if self.kind is not PolicyKind.MODEL and any(value is not None for value in route_fields):
+            raise ValueError("model adapter identity is only valid for Model Agent jobs")
+        if (self.status is RunStatus.COMPLETED) != (self.quality is not None):
+            raise ValueError("only completed runs require quality metadata")
+        if self.status is not RunStatus.STOPPED and self.stop_reason is not None:
+            raise ValueError("stop_reason is only valid for stopped runs")
+        if self.stop_reason is RunStopReason.QUOTA_EXHAUSTED and self.error_message is None:
+            raise ValueError("quota-exhausted runs require the provider diagnostic")
+        return self
+
+    def mark_running(self, started_at: datetime) -> Self:
+        """Start or resume the job and advance its persistent revision."""
+        return self._advance(
+            status=RunStatus.RUNNING,
+            started_at=self.started_at or started_at,
+            finished_at=None,
+            error_message=None,
+        )
+
+    def report_week_completed(self, week: int) -> Self:
+        """Record one newly completed trading week."""
+        if not 1 <= week <= self.total_weeks:
+            raise ValueError("completed week must belong to the run")
+        return self._advance(current_absolute_day=week * 7)
+
+    def mark_completed(self, finished_at: datetime, quality: EpisodeQuality) -> Self:
+        """Finish the full horizon without an error."""
+        return self._advance(
+            status=RunStatus.COMPLETED,
+            current_absolute_day=self.total_weeks * 7,
+            finished_at=finished_at,
+            error_message=None,
+            quality=quality,
+        )
+
+    def mark_interrupted(self, finished_at: datetime, reason: str) -> Self:
+        """Persist a resumable interruption."""
+        return self._advance(
+            status=RunStatus.INTERRUPTED,
+            finished_at=finished_at,
+            error_message=reason,
+        )
+
+    def mark_failed(self, finished_at: datetime, reason: str) -> Self:
+        """Persist a terminal failure without inventing a score."""
+        return self._advance(
+            status=RunStatus.FAILED,
+            finished_at=finished_at,
+            error_message=reason,
+        )
+
+    def mark_stopped(self, finished_at: datetime) -> Self:
+        """Pause the job by explicit user request without inventing a result."""
+        return self._advance(
+            status=RunStatus.STOPPED,
+            finished_at=finished_at,
+            error_message=None,
+            stop_reason=RunStopReason.USER_REQUESTED,
+        )
+
+    def mark_quota_exhausted(self, finished_at: datetime, reason: str) -> Self:
+        """Pause for exhausted provider quota while retaining its diagnostic."""
+        return self._advance(
+            status=RunStatus.STOPPED,
+            finished_at=finished_at,
+            error_message=reason,
+            stop_reason=RunStopReason.QUOTA_EXHAUSTED,
+        )
+
+    def queue_for_resume(self) -> Self:
+        """Queue an explicitly resumable run while preserving its identity and progress."""
+        if not self.status.resumable:
+            raise ValueError(f"a {self.status.value} run cannot be resumed")
+        return self._advance(
+            status=RunStatus.QUEUED,
+            finished_at=None,
+            error_message=None,
+        )
+
+    def _advance(self, **changes: object) -> Self:
+        """Apply one validated lifecycle transition."""
+        if changes.get("status", self.status) is not RunStatus.STOPPED:
+            changes.setdefault("stop_reason", None)
+        candidate = self.model_copy(
+            update={**changes, "revision": self.revision + 1},
+        )
+        return type(self).model_validate_json(candidate.model_dump_json())
+
+
+class ReplaySource(StrictModel):
+    """Completed run identity available for deterministic replay."""
+
+    run_id: Identifier
+    submitted_at: datetime
+    benchmark_eligible: bool
+
+
+class TokenUsage(StrictModel):
+    """Provider token counters retained without estimating money."""
+
+    input_tokens: int = Field(default=0, ge=0)
+    cached_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        """Add physical provider usage without losing cached-token detail."""
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+
+class AgentUsageSummary(StrictModel):
+    """Compact provider usage for one settled evaluation horizon."""
+
+    invocation_count: int = Field(ge=1)
+    successful_invocations: int = Field(ge=0)
+    providers: tuple[str, ...] = Field(min_length=1)
+    models: tuple[str, ...] = Field(min_length=1)
+    usage: TokenUsage
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> AgentUsageSummary:
+        """Keep successful calls and identity sets inside the summary."""
+        if self.successful_invocations > self.invocation_count:
+            raise ValueError("successful invocations cannot exceed all invocations")
+        if len(self.providers) != len(set(self.providers)):
+            raise ValueError("usage providers must be unique")
+        if len(self.models) != len(set(self.models)):
+            raise ValueError("usage models must be unique")
+        return self
+
+    @classmethod
+    def from_invocations(
+        cls,
+        invocations: Iterable[PolicyInvocation],
+        through_week: int,
+    ) -> AgentUsageSummary | None:
+        """Aggregate calls belonging to fully settled weeks only."""
+        settled = tuple(invocation for invocation in invocations if invocation.week <= through_week)
+        if not settled:
+            return None
+        return cls(
+            invocation_count=len(settled),
+            successful_invocations=sum(
+                invocation.outcome is InvocationOutcome.SUCCESS for invocation in settled
+            ),
+            providers=tuple(dict.fromkeys(invocation.provider for invocation in settled)),
+            models=tuple(dict.fromkeys(invocation.model for invocation in settled)),
+            usage=sum((invocation.usage for invocation in settled), start=TokenUsage()),
+        )
+
+
+class RunEvaluation(StrictModel):
+    """Settled economic projection available throughout a run's lifecycle."""
+
+    run_id: Identifier
+    scenario: ScenarioSpec
+    seed: int
+    completed_weeks: int = Field(ge=1)
+    provisional: bool
+    agent_usage: AgentUsageSummary | None = None
+    policies: tuple[PolicyDescriptor, ...]
+    snapshots: tuple[WeekSnapshot, ...]
+    score: ScoreCard
+    quality: EpisodeQuality
+
+    @model_validator(mode="after")
+    def validate_horizon(self) -> RunEvaluation:
+        """Align every projected fact to the most recent settled week."""
+        if self.completed_weeks > self.scenario.weeks:
+            raise ValueError("evaluation exceeds the scenario horizon")
+        if len(self.snapshots) != self.completed_weeks:
+            raise ValueError("evaluation snapshots must cover each settled week")
+        if not self.provisional and self.completed_weeks != self.scenario.weeks:
+            raise ValueError("only a full-horizon evaluation can be final")
+        return self
+
+    @classmethod
+    def from_episode(
+        cls,
+        episode: EpisodeResult,
+        agent_usage: AgentUsageSummary | None = None,
+    ) -> RunEvaluation:
+        """Project one immutable completed episode without recomputing it."""
+        return cls(
+            run_id=episode.run_id,
+            scenario=episode.scenario,
+            seed=episode.seed,
+            completed_weeks=episode.scenario.weeks,
+            provisional=False,
+            agent_usage=agent_usage,
+            policies=episode.policies,
+            snapshots=episode.snapshots,
+            score=episode.score,
+            quality=episode.quality,
+        )
+
+
+class CompanyRuntimeCursor(StrictModel):
+    """Per-company counters required for deterministic turn restoration."""
+
+    company_id: CompanyId
+    next_turn_sequence: int = Field(ge=1)
+    last_visible_event_sequence: int = Field(default=0, ge=0)
+    available_on: SimDay | None = None
+    active_attention: ArmedAttention | None = None
+
+
+class RunCheckpoint(StrictModel):
+    """Current mutable state needed to resume one V9 episode."""
+
+    schema_version: Literal[12] = 12
+    run_id: Identifier
+    episode_started_at: datetime
+    economy: EconomyState
+    scheduler: SchedulerCheckpoint
+    policies: tuple[PolicyDescriptor, ...]
+    agent_states: tuple[AgentCheckpoint, ...]
+    events: tuple[EventRecord, ...] = ()
+    snapshots: tuple[WeekSnapshot, ...] = ()
+    cursors: tuple[CompanyRuntimeCursor, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> RunCheckpoint:
+        """Keep every nested recovery value inside the same run."""
+        expected_company_ids = tuple(
+            company.company_id for company in self.economy.scenario.companies
+        )
+        if tuple(policy.company_id for policy in self.policies) != expected_company_ids:
+            raise ValueError("checkpoint policies must match scenario company order")
+
+        company_ids = [checkpoint.company_id for checkpoint in self.agent_states]
+        _require_unique(company_ids, "agent checkpoint company_ids")
+        expected_memory_ids = [
+            policy.company_id for policy in self.policies if policy.kind is PolicyKind.MODEL
+        ]
+        if company_ids != expected_memory_ids:
+            raise ValueError(
+                "Agent checkpoints must match memory-owning policies in scenario order"
+            )
+        if any(checkpoint.run_id != self.run_id for checkpoint in self.agent_states):
+            raise ValueError("agent checkpoints must belong to the checkpoint run")
+
+        _require_unique(
+            (record.sequence for record in self.events),
+            "checkpoint event sequences",
+        )
+        if tuple(record.sequence for record in self.events) != tuple(
+            range(1, len(self.events) + 1)
+        ):
+            raise ValueError("checkpoint event sequences must be contiguous")
+        _require_unique(
+            (snapshot.week for snapshot in self.snapshots),
+            "checkpoint snapshot weeks",
+        )
+        if tuple(snapshot.week for snapshot in self.snapshots) != tuple(
+            range(1, len(self.snapshots) + 1)
+        ):
+            raise ValueError("checkpoint snapshot weeks must be contiguous")
+
+        cursor_ids = [cursor.company_id for cursor in self.cursors]
+        _require_unique(cursor_ids, "runtime cursor company_ids")
+        economy_company_ids = {company.company_id for company in self.economy.companies}
+        if set(cursor_ids) != economy_company_ids:
+            raise ValueError("runtime cursors must match the active economy")
+        for cursor in self.cursors:
+            if cursor.last_visible_event_sequence > len(self.events):
+                raise ValueError("runtime cursor cannot exceed checkpoint events")
+        _validate_runtime_commitments(self)
+        return self
+
+
+class RunRecovery(StrictModel):
+    """One checkpoint paired with its authoritative append-only journals."""
+
+    checkpoint: RunCheckpoint
+    turns: tuple[TurnRecord, ...] = ()
+    system_steps: tuple[SystemStepRecord, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_journals(self) -> RunRecovery:
+        """Validate journal identity, order, continuity, and checkpoint cursors."""
+        run_id = self.checkpoint.run_id
+        turn_ids = [record.turn.turn_id for record in self.turns]
+        _require_unique(turn_ids, "recovery turn_ids")
+        _require_unique(
+            (record.outcome.apply_sequence for record in self.turns),
+            "recovery apply sequences",
+        )
+        if any(record.run_id != run_id for record in self.turns):
+            raise ValueError("turn records must belong to the recovery run")
+        if self.turns != tuple(sorted(self.turns, key=_checkpoint_turn_order)):
+            raise ValueError("recovery turns must be in deterministic apply order")
+
+        step_ids = [record.entry_id for record in self.system_steps]
+        _require_unique(step_ids, "recovery system step ids")
+        if any(record.run_id != run_id for record in self.system_steps):
+            raise ValueError("system steps must belong to the recovery run")
+        if self.system_steps != tuple(sorted(self.system_steps, key=_system_step_order)):
+            raise ValueError("recovery system steps must be chronological")
+
+        journal_sequences = [
+            sequence
+            for sequence in (
+                *(record.journal_sequence for record in self.turns),
+                *(record.journal_sequence for record in self.system_steps),
+            )
+            if sequence is not None
+        ]
+        _require_unique(journal_sequences, "recovery journal sequences")
+        if journal_sequences and sorted(journal_sequences) != list(
+            range(1, max(journal_sequences) + 1)
+        ):
+            raise ValueError("recovery journal sequences must be contiguous")
+
+        company_ids = {company.company_id for company in self.checkpoint.economy.companies}
+        turn_counts = {company_id: 0 for company_id in company_ids}
+        for record in self.turns:
+            if record.turn.company_id not in turn_counts:
+                raise ValueError("recovery turn company must belong to the active economy")
+            turn_counts[record.turn.company_id] += 1
+        for cursor in self.checkpoint.cursors:
+            if cursor.next_turn_sequence != turn_counts[cursor.company_id] + 1:
+                raise ValueError("runtime cursor must follow completed company turns")
+        _validate_attention_commitments(self.checkpoint, self.turns)
+        return self
+
+
+class PolicyProfileView(StrictModel):
+    """Safe server-side policy configuration exposed to the browser."""
+
+    profile_id: PolicyProfileId
+    kind: PolicyKind
+    label: str
+    available: bool
+    provider: str | None = None
+    model: str | None = None
+    models: tuple[str, ...] = ()
+    description: str
+    unavailable_reason: str | None = None
+
+
+class InvocationOutcome(StrEnum):
+    """Result category of one company Agent call."""
+
+    SUCCESS = "success"
+    AGENT_ERROR = "agent_error"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
+
+
+class ProviderAttemptOutcome(StrEnum):
+    """Physical outcome of one request sent to a model provider."""
+
+    HTTP_ERROR = "http_error"
+    PROTOCOL_ERROR = "protocol_error"
+    SUCCESS = "success"
+    TRANSPORT_ERROR = "transport_error"
+
+
+class ProviderAttempt(StrictModel):
+    """Auditable metadata for one physical provider request."""
+
+    sequence: int = Field(ge=1)
+    outcome: ProviderAttemptOutcome
+    request_id: str | None = None
+    response_id: str | None = None
+    usage: TokenUsage = TokenUsage()
+    latency_ms: int = Field(default=0, ge=0)
+    error_kind: str | None = None
+    error_message: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> Self:
+        """Pair errors with failed attempts and keep successes clean."""
+        if (self.error_kind is None) != (self.error_message is None):
+            raise ValueError("provider attempt error fields must be paired")
+        failed = self.outcome is not ProviderAttemptOutcome.SUCCESS
+        if failed != (self.error_kind is not None):
+            raise ValueError("only failed provider attempts require an error")
+        return self
+
+
+class ProviderCallAudit(StrictModel):
+    """Shared aggregate over every physical request in one provider call."""
+
+    usage: TokenUsage = TokenUsage()
+    attempts: int = Field(default=1, ge=0)
+    attempt_history: tuple[ProviderAttempt, ...] = ()
+    latency_ms: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_attempts(self) -> Self:
+        """Keep aggregate counters equal to the physical request history."""
+        if not self.attempt_history:
+            return self
+        sequences = tuple(attempt.sequence for attempt in self.attempt_history)
+        if sequences != tuple(range(1, len(sequences) + 1)):
+            raise ValueError("provider attempts must have contiguous sequences")
+        if self.attempts != len(self.attempt_history):
+            raise ValueError("attempt count must match attempt_history")
+        usage = sum(
+            (attempt.usage for attempt in self.attempt_history),
+            start=TokenUsage(),
+        )
+        if self.usage != usage:
+            raise ValueError("provider usage must equal physical attempt usage")
+        if self.latency_ms != sum(attempt.latency_ms for attempt in self.attempt_history):
+            raise ValueError("provider latency must equal physical attempt latency")
+        return self
+
+
+class PolicyInvocation(ProviderCallAudit):
+    """Auditable provider call for one V9 atomic company turn."""
+
+    invocation_id: Identifier
+    run_id: Identifier
+    company_id: CompanyId
+    week: int = Field(ge=1)
+    observation: CompanyObservation
+    profile_id: PolicyProfileId
+    provider: str
+    model: str
+    wire_protocol: Identifier
+    adapter_version: Identifier
+    config_fingerprint: Identifier
+    prompt_version: str
+    prompt_hash: str
+    started_at: datetime
+    finished_at: datetime
+    outcome: InvocationOutcome
+    domain_turn_id: Identifier | None = None
+    absolute_day: int | None = Field(default=None, ge=1)
+    state_version: int | None = Field(default=None, ge=0)
+    apply_sequence: int | None = Field(default=None, ge=1)
+    decision: CompanyDecision | None = None
+    decision_outcome: DecisionOutcome | None = None
+    error_kind: str | None = None
+    error_message: str | None = Field(default=None, max_length=500)
+    response_id: str | None = None
+    request_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_event_turn(self) -> PolicyInvocation:
+        """Keep optional event-driven audit fields complete and consistent."""
+        if self.domain_turn_id is not None and (
+            self.absolute_day is None
+            or self.state_version is None
+            or (self.outcome is InvocationOutcome.SUCCESS and self.decision is None)
+        ):
+            raise ValueError("event-driven invocation requires time, state, and decision")
+        if self.decision_outcome is not None:
+            if self.domain_turn_id != self.decision_outcome.turn_id:
+                raise ValueError("decision outcome must match domain_turn_id")
+            if self.decision is None:
+                raise ValueError("decision outcome requires a decision")
+            if self.apply_sequence != self.decision_outcome.apply_sequence:
+                raise ValueError("decision outcome must match apply_sequence")
+        return self
+
+
+class PolicyAuditSink(Protocol):
+    """Persistence port used by Agent policies without repository coupling."""
+
+    def record_invocation(self, invocation: PolicyInvocation) -> None:
+        """Persist or replace one deterministic invocation record."""
+        ...
+
+
+def _validate_runtime_commitments(checkpoint: RunCheckpoint) -> None:
+    """Pair every future economic commitment with exactly one scheduler event."""
+    pending = checkpoint.scheduler.pending_events
+
+    def completion_keys(kind: SystemEventKind) -> tuple[tuple[str, str | None, int], ...]:
+        keys: list[tuple[str, str | None, int]] = []
+        for event in pending:
+            if event.kind is not kind:
+                continue
+            if len(event.reference_ids) != 1:
+                raise ValueError("completion events require exactly one reference_id")
+            keys.append(
+                (
+                    event.reference_ids[0],
+                    event.company_id,
+                    event.scheduled_for.absolute_day,
+                )
+            )
+        _require_unique(keys, f"{kind.value} commitments")
+        return tuple(keys)
+
+    expected_jobs = {
+        (job.job_id, job.company_id, job.completes_on.absolute_day)
+        for job in checkpoint.economy.jobs
+    }
+    if set(completion_keys(SystemEventKind.OPERATION_COMPLETED)) != expected_jobs:
+        raise ValueError("operation jobs and completion events must match")
+
+    expected_deliveries = {
+        (
+            delivery.delivery_id,
+            delivery.buyer_id,
+            delivery.arrives_on.absolute_day,
+        )
+        for delivery in checkpoint.economy.deliveries
+    }
+    if set(completion_keys(SystemEventKind.DELIVERY_COMPLETED)) != expected_deliveries:
+        raise ValueError("deliveries and completion events must match")
+
+    calendar = checkpoint.economy.scenario.calendar
+    if any(
+        event.kind is SystemEventKind.COMPANY_WAKE
+        and (not calendar.contains(event.scheduled_for) or not event.scheduled_for.is_decision_day)
+        for event in pending
+    ):
+        raise ValueError("company wakes must remain on Monday-Saturday")
+
+
+def _validate_attention_commitments(
+    checkpoint: RunCheckpoint,
+    turns: tuple[TurnRecord, ...],
+) -> None:
+    """Pair each armed attention plan with its source Turn and fallback wake."""
+    attention = AgentAttention()
+    turns_by_id = {record.turn.turn_id: record for record in turns}
+    latest_by_company: dict[CompanyId, TurnRecord] = {}
+    for record in turns:
+        latest_by_company[record.turn.company_id] = record
+
+    expected: list[tuple[CompanyId, int, Identifier]] = []
+    for cursor in checkpoint.cursors:
+        plan = cursor.active_attention
+        if plan is None:
+            continue
+        source = turns_by_id.get(plan.source_turn_id)
+        if (
+            source is None
+            or source.turn.company_id != cursor.company_id
+            or latest_by_company.get(cursor.company_id) != source
+            or not source.outcome.accepted
+            or source.turn.turn_number_this_week >= source.turn.turn_limit_this_week
+        ):
+            raise ValueError("active attention must reference the latest accepted decision")
+        try:
+            derived = attention.arm(source.envelope.decision.attention, source.turn)
+        except AttentionRejected as error:
+            raise ValueError("attention source no longer forms a valid plan") from error
+        if derived != plan:
+            raise ValueError("active attention must match its source Turn")
+        if plan.review_on is not None:
+            expected.append((cursor.company_id, plan.review_on.absolute_day, plan.source_turn_id))
+
+    actual: list[tuple[CompanyId, int, Identifier]] = []
+    for event in checkpoint.scheduler.pending_events:
+        if event.kind is not SystemEventKind.COMPANY_WAKE or event.company_id is None:
+            continue
+        for signal in event.wake_signals:
+            if signal.reason is not WakeReason.REVIEW_DUE:
+                continue
+            if signal.source is None or signal.source.entry_type is not JournalEntryKind.TURN:
+                raise ValueError("review wakes require a source Turn")
+            actual.append(
+                (
+                    event.company_id,
+                    event.scheduled_for.absolute_day,
+                    signal.source.entry_id,
+                )
+            )
+    _require_unique(actual, "review commitments")
+    if set(actual) != set(expected):
+        raise ValueError("armed attention and review wakes must match")
+
+
+def _require_unique(values: Iterable[Hashable], label: str) -> None:
+    """Reject duplicate checkpoint identities with one shared rule."""
+    items = tuple(values)
+    if len(items) != len(set(items)):
+        raise ValueError(f"{label} must be unique")
+
+
+def _checkpoint_turn_order(record: TurnRecord) -> tuple[int, int, str]:
+    """Return the canonical order stored by a recovery checkpoint."""
+    return (
+        record.turn.sim_day.absolute_day,
+        record.outcome.apply_sequence,
+        record.turn.turn_id,
+    )
+
+
+def _system_step_order(record: SystemStepRecord) -> tuple[int, int, str]:
+    """Return the canonical order of one durable system journal entry."""
+    return (
+        record.occurred_on.absolute_day,
+        record.journal_sequence,
+        record.entry_id,
+    )

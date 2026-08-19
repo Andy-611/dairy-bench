@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp*/
+pytest-of-*/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -11,14 +12,14 @@ htmlcov/
 *.egg-info/
 
 # Local runtime and test data
+.dairy-bench/
+.ua/
 .tmp/
+.tmp_pytest/
 .test-artifacts/
-backend/data/
 *.db
 *.sqlite
 *.sqlite3
-run_artifacts/*
-!run_artifacts/README.md
 
 # Frontend
 frontend/dist/
@@ -26,6 +27,7 @@ frontend/node_modules/
 frontend/.npm-cache/
 
 # Local configuration and credentials
+.hermes/
 .env
 .env.*
 !.env.example
